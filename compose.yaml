@@ -1,0 +1,39 @@
+# Base compose — CROSS-PLATFORM. Works on Linux AND Apple Silicon (arm64).
+# CPU-only, bridge networking, no X11. This is what your Mac friend runs.
+#
+#   docker compose up -d
+#   docker compose exec meridian bash
+#   docker compose down -v          # nuke container + volumes
+#
+# The whole repo is mounted at /workspace, so it IS the colcon workspace:
+#   colcon build      → builds src/* + vendored submodules
+#   src/, vendor/, dependencies.repos, docs/ all live on the host and survive `down -v`.
+#
+# Visualization (both platforms): run the Foxglove bridge inside, then connect
+# the free Foxglove Studio app to  ws://localhost:8765
+#   (inside)  ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+#
+# NOTE for Mac / any non-CUDA host: meridian_map (L4, nvblox) needs CUDA and is
+# NOT built here. See DEVELOPMENT.md for the `--packages-skip` build line.
+services:
+  meridian:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+      args:
+        ROS_DISTRO: humble
+        USER_UID: "1000"
+        USER_GID: "1000"
+    image: meridian:humble
+    container_name: meridian
+    user: dev
+    working_dir: /workspace
+    volumes:
+      - .:/workspace:cached         # repo == workspace; build/install/log land here (gitignored)
+    environment:
+      ROS_DOMAIN_ID: "0"
+    ports:
+      - "8765:8765"                 # Foxglove bridge (cross-platform 3D viz)
+    stdin_open: true
+    tty: true
+    command: bash

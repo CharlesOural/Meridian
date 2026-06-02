@@ -1,0 +1,13 @@
+{
+  "names": {
+    "nvblox": {
+      "cmake-args": [
+        "-DBUILD_PYTORCH_WRAPPER=OFF",
+        "-DBUILD_RENDERER=OFF",
+        "-DBUILD_TESTING=OFF",
+        "-DBUILD_BENCHMARKS=OFF",
+        "-DBUILD_EXPERIMENTS=OFF"
+      ]
+    }
+  }
+}

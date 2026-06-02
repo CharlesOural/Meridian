@@ -1,0 +1,35 @@
+# Linux + NVIDIA override. Adds: CUDA toolkit image, RTX 3070 GPU at runtime,
+# native DDS networking, X11 so RViz opens on your desktop, and USB sensor access.
+# This is what builds & runs meridian_map (L4, nvblox).
+#
+#   docker compose -f compose.yaml -f compose.linux-gpu.yaml up -d
+#   docker compose -f compose.yaml -f compose.linux-gpu.yaml exec meridian bash
+#
+# Before first GUI use, allow the container to talk to your X server (host shell):
+#   xhost +local:root
+#
+# Do NOT use this file on macOS — host networking, X11 and NVIDIA aren't available there.
+services:
+  meridian:
+    build:
+      dockerfile: Dockerfile.gpu          # CPU base + CUDA 12 toolkit
+    image: meridian:humble-gpu
+    network_mode: host                    # best ROS 2 DDS discovery on real hardware
+    environment:
+      DISPLAY: ${DISPLAY}
+      QT_X11_NO_MITSHM: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      MERIDIAN_CUDA_ARCHITECTURES: "86;87"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw     # RViz
+      - /dev:/dev:rw                         # USB lidar/camera (ttyUSB*, ttyACM*, video*)
+    group_add:
+      - dialout                              # serial device permissions
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

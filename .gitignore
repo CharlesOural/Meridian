@@ -1,2 +1,15 @@
 _reference/
 *.pdf
+
+# colcon build artifacts (workspace == repo root)
+/build/
+/install/
+/log/
+
+# rosbag recordings (mounted, not versioned)
+/bags/*
+!/bags/.gitkeep
+
+# vcs-imported source deps land under src/ (nvblox, ouster-ros) — not versioned here
+/src/nvblox/
+/src/ouster-ros/
