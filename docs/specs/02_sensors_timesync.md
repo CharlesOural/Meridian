@@ -408,7 +408,7 @@ the LiDAR's built-in IMU is a wiring/config choice; either way it is a single
 `ImuSource`.
 
 **Wire → POD.** `RawImuFrame { Timestamp device_ns; bool has_device_ns;
-Vec3 acc; Vec3 gyro; Timestamp host_arrival; }`. **No orientation** is carried
+Eigen::Vector3d acc; Eigen::Vector3d gyro; Timestamp host_arrival; }`. **No orientation** is carried
 across, even if the device provides an AHRS quaternion — spec 01 §4.1 forbids
 trusting vendor fusion; the estimator owns orientation.
 

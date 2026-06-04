@@ -230,11 +230,14 @@ Right-invariant box-plus/box-minus (spec 01 §3.1; dossier 01 §0): on $SO(3)$,
 $R\boxplus\theta=R\,\mathrm{Exp}(\theta)$, $R_1\boxminus R_2=\mathrm{Log}(R_2^{\top}R_1)$
 (Rodrigues `so3_math.h:Exp/Log`). Control-point increments use this on each
 $\{R_i\}$ via a Ceres SO(3) manifold/`LocalParameterization`; $\{p_i\}$, biases are
-Euclidean. **All 6-DoF tangents and 6×6 blocks in anything that crosses the
-boundary order translation-first then rotation** (`[ρ;φ]`, spec 01 §3.1). The
+Euclidean. **All 6-DoF tangents and 6×6 blocks in the core order translation-first
+then rotation** (`[ρ;φ]`, spec 01 §3.1) — with **one exception**: the
+`KeyframePacket.constraint_cov` block crossing L2→L3 is ordered **rotation-first**
+`[rx,ry,rz,tx,ty,tz]` to match the GTSAM `Pose3` boundary (spec 01 §6.1). The
 spline's native rotation Jacobians are rotation-first inside basalt; the packet
-adapter (§6) performs the block-swap when assembling `constraint_cov` (exactly the
-reorder FAST-LIO does when packing `pose.covariance`, `laserMapping.cpp:597-606`).
+adapter (§6) assembles `constraint_cov` by reordering the window's translation-first
+marginal into that rotation-first layout exactly once (the reorder FAST-LIO does
+when packing `pose.covariance`, `laserMapping.cpp:597-606`).
 
 ### 1.6 The IMU kinematic model (the residual's reference equations)
 
@@ -312,7 +315,7 @@ free (dossier 10 §1; CLINS abstract "simultaneously removes the motion
 distortion").
 
 Architecturally L1 still transforms points only through an injected
-`IDeskewProvider::poseAt(Time)→SE3` (spec 00 §5.2, §7.3) whose concrete
+`IDeskewProvider::poseAt(Timestamp)→Pose` (spec 00 §5.2, §7.3) whose concrete
 implementation is **backed by the L2 spline**, so the build graph stays acyclic
 (L1 depends only on the interface) while data flows L2→L1→L2. **L2 owns the pose
 source.** Two regimes:
@@ -346,7 +349,7 @@ re-querying the spline.
 L1 ──(undeskewed LidarScan + ImuSample + CameraFrame + GnssFix)──▶ L2
 L1 ◀──(IDeskewProvider::poseAt, backed by L2 spline; IMU-only at cold start)── L2
 L2 ──(KeyframePacket)──▶ L3            (the only L2→L3 value, spec 01 §6)
-L3 ──(PoseCorrection / refined CalibrationSet snapshot)──▶ L2   (spec 01 §7.3, §5.3)
+L3 ──(GraphUpdate / refined CalibrationSet snapshot)──▶ L2   (spec 01 §7.3, §5.3)
 ```
 
 Deskew is **owned by L2** and is intrinsic to the spline; L1 publishes raw per-point
@@ -581,7 +584,7 @@ in debug:
 
 The scores **modulate the covariance** L2 attaches to the `KeyframePacket`
 (`constraint_cov`, spec 01 §6.1) — degenerate axes get inflated variance — so L3
-naturally down-weights ill-constrained directions (spec 05 maps `obs` to the noise
+naturally down-weights ill-constrained directions (spec 05 maps `observability` to the noise
 model). Under full degeneracy L2 may additionally **clamp** the update along weak
 directions (let IMU/GNSS carry them — the X-ICP "solution remapping"), gated by
 `degeneracy_handling` mode (§10). Because LiDAR and visual residuals sum into one
@@ -698,7 +701,8 @@ struct KeyframePacket {                 // SPEC 01 §6.1 is authoritative
                  constraint_kind;        // picks the L3 factor (§6.4)
   std::uint64_t  rel_to_id;              // previous KF id (RelativeBetween/ImuPreint)
   Pose           T_relto_this;           // relative transform (RelativeBetween)
-  PoseCov6       constraint_cov;         // 6x6 [ρ;φ] block; meaning set by kind
+  GaussianBlock<6> constraint_cov;       // 6x6 ROTATION-FIRST [rx,ry,rz,tx,ty,tz] block
+                                         // (GTSAM Pose3 boundary); meaning set by kind
   ObservabilityReport observability;     // 6 per-axis scores + frame (§4)
   std::shared_ptr<const std::vector<LidarPoint>> cloud_body;  // handle into store (§6.5)
   std::shared_ptr<const CameraFrame>            image;         // nullable
@@ -717,7 +721,7 @@ How each field is produced from the CT window:
 | `ref_frame`/`T_ref_body` | `Odom` + **spline evaluation** $T_{W\,F_e}(\text{stamp})$. |
 | `kinematics_included`,`v_ref`,`b_g`,`b_a` | **false** on the normal path; `v_ref=\dot p_{W\,F_e}(\text{stamp})$ and the local bias knots are filled as **seeds/telemetry** (L3 ignores them in `RelativeBetween`). `true` only on the `ImuPreintegration` restart (§6.4). |
 | `constraint_kind` | `RelativeBetween` default; `AbsolutePrior` on first KF / fresh GNSS anchor; `ImuPreintegration` on window-restart fallback (§6.4). |
-| `T_relto_this`,`constraint_cov` | $\hat T_{\text{prev}}^{-1}\hat T_{\text{cur}}$ (both spline-evaluated); marginal **relative** covariance read directly from the window posterior / marginalization, **inflated on weak axes by `obs`** (§4.3), reordered to `[ρ;φ]` (§1.5). |
+| `T_relto_this`,`constraint_cov` | $\hat T_{\text{prev}}^{-1}\hat T_{\text{cur}}$ (both spline-evaluated); marginal **relative** covariance read directly from the window posterior / marginalization, **inflated on weak axes by `observability`** (§4.3), reordered once into rotation-first `[rx,ry,rz,tx,ty,tz]` (the GTSAM-boundary exception, §1.5). |
 | `observability` | $\Lambda_{\text{pose}}$ pose block (§4). |
 | `cloud_body` | per-point spline-deskewed scan in $F_{e,\text{stamp}}$, retained in `IKeyframeStore` (§6.5). |
 | `image`/`T_body_cam` | the camera frame at this KF + the `CalibrationSet` $T_{F_e\,C}$ snapshot used. |
@@ -843,8 +847,8 @@ spec 01 §3.2) — for telemetry/control/L4 live integration, **not** the handof
 ### 7.3 Back-end feedback
 
 L3 corrections arrive via the wrapper calling `set_calibration` (refined extrinsics
-as a versioned `CalibrationSet` snapshot, spec 01 §5.3) and a `PoseCorrection` path
-(spec 00 §11.2, applied at safe points). On a `PoseCorrection`, L2 re-anchors the
+as a versioned `CalibrationSet` snapshot, spec 01 §5.3) and a `GraphUpdate` path
+(spec 00 §11.2, applied at safe points). On a `GraphUpdate`, L2 re-anchors the
 odom frame and **shifts the spline control poses** by the correction (and updates
 the cached `odom→map`/datum); it does **not** restart. On a new `CalibrationSet`
 snapshot, L2 re-seeds its online extrinsic/exposure estimates and bumps
@@ -950,7 +954,7 @@ the CT papers — tune empirically; dossier 10 §12 item 3.)
 | **Photometric failure** (low light, blur, over/under-exposure) | high photo residual / NCC fail / depth-continuity fail / `outlier_threshold` hit | drop visual residuals this step (LIO only); freeze exposure $\tau$; WARN. Degrade gracefully. |
 | **IMU saturation / dropout** | accel/gyro at FSR or gap > `imu_gap_max` | mark; if integration untrustworthy emit `AbsolutePrior` wide-cov new segment; ERROR. |
 | **Unknown clock offset $t_d$** | systematic, motion-correlated residual (dossier 10 §10.4) | nominally prevented by PTP (spec 02); enable `ct.time_offset_estimate` hook (§2.2). |
-| **Marginalization linearization staleness** | prior inconsistent after a large correction (dossier 10 §10.6) | re-linearize prior on `PoseCorrection`; bound window so the prior is never far from the current estimate. |
+| **Marginalization linearization staleness** | prior inconsistent after a large correction (dossier 10 §10.6) | re-linearize prior on `GraphUpdate`; bound window so the prior is never far from the current estimate. |
 | **GNSS spoof/jump/multipath** | fix-residual gate / `fix` type / jump vs odom | reject / inflate / disable; robust kernel; one bad fix never snaps the window. Authoritative robustness (PCM) in L3. |
 | **Divergence** (residual blow-up, all-axis obs collapse) | residual norm > thresh; min eigenvalue ≈ 0 across axes | **window restart**: discard the window, re-bootstrap from IMU-only deskew, emit `ImuPreintegration` (or wide `AbsolutePrior`) so L3 stitches the gap; prior keyframes preserved (§6.4). |
 | **Stale cloud handle after loop closure** | store eviction | consumers re-fetch from `IKeyframeStore` by `id`, never cache raw pointers (§6.5). |
@@ -1004,7 +1008,7 @@ represent the sub-scan trajectory the colourised-mesh goal benefits from (dossie
   marginal cov) on the normal path, `CombinedImuFactor` only on restart
   (mutually exclusive), `AbsolutePrior` for anchors/GNSS; `kinematics_included =
   false` except on restart; bias estimation in L2 (§6.4). Feeds back refined
-  `CalibrationSet` / `PoseCorrection` (§7.3).
+  `CalibrationSet` / `GraphUpdate` (§7.3).
 * **Spec 06 (L4 / nvblox / store):** L2 fills the retained per-keyframe body-frame
   cloud enabling nvblox clear-and-rebuild de-integration; handles only; nvblox is
   the sole GPU map backend (§6.5, §11).

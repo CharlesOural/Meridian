@@ -285,8 +285,8 @@ information crosses L2→L3 exactly once, audited at one site.
 - `id`, `stamp`
 - `ref_frame`, `T_ref_body` — pose hint, init only
 - `constraint_kind == RelativeBetween`, `rel_to_id`, `T_relto_this`,
-  `constraint_cov` (a `PoseCov6` = `GaussianBlock<6>` tagged `Covariance`,
-  ordering `[ρ(trans); φ(rot)]`, `01 §3.1/§3.3`)
+  `constraint_cov` (a `GaussianBlock<6>`, **rotation-first** `[rx,ry,rz,tx,ty,tz]` —
+  the GTSAM-boundary block, NOT a `PoseCov6`, `01 §6.1`)
 - `observability : ObservabilityReport` — `frame`, `score[6]` in
   `[tx,ty,tz,rx,ry,rz]`, optional `eigvecs` (`01 §3.4`)
 - `cloud_body`, `image`, `T_body_cam`, `calib_version`
@@ -355,8 +355,10 @@ that variance by `ρ_max`.
 
 **Frame handling.** The scores are expressed in `observability.frame`. The
 covariance lives in the factor's body tangent. Build a 6×6 block-diagonal
-rotation `R6` that maps the observability frame's axes to the factor frame, in
-**Meridian order** `[ρ;φ]`. If `eigvecs` is present (non-axis-aligned degeneracy,
+rotation `R6` that maps the observability frame's axes to the factor frame, on
+`constraint_cov`'s **rotation-first** axes `[rx,ry,rz,tx,ty,tz]` (`eigvecs`, stored
+translation-first per `01 §3.4`, are permuted onto them via `to_rotfirst`). If
+`eigvecs` is present (non-axis-aligned degeneracy,
 e.g. a tunnel at 30°), use it directly as the rotation of the degenerate
 sub-space instead of an axis-aligned `R6`:
 
@@ -365,23 +367,31 @@ $$
 \quad \Lambda = \mathrm{diag}(\lambda_{tx},\lambda_{ty},\lambda_{tz},\lambda_{rx},\lambda_{ry},\lambda_{rz}).
 $$
 
-Then reorder `[ρ;φ] → [φ;ρ]` for GTSAM (§12) before building the noise model.
+`constraint_cov` is already rotation-first (GTSAM order, `01 §6.1`), so the matrix is
+**not** reordered here — only the translation-first `observability` score (and any
+`eigvecs`) are permuted onto its axes. (`LoopConstraint.cov`, a translation-first
+`PoseCov6`, still goes through `reorder_meridian_to_gtsam`, §12.)
 
 ```cpp
-// Returns a 6x6 covariance in GTSAM order [rot; trans], ready for noiseModel.
-Mat6 inflate_by_observability(const PoseCov6& cov, const ObservabilityReport& o){
-  Mat6 Sig = cov.M;                                   // Meridian order [rho; phi]
-  Mat6 Lam_sqrt = Mat6::Identity();
-  // o.score order is [tx,ty,tz, rx,ry,rz] == Meridian [rho; phi]; aligns with Sig.
+// Returns a 6x6 covariance in GTSAM order [rx,ry,rz, tx,ty,tz], ready for noiseModel.
+// constraint_cov is ALREADY rotation-first (the GTSAM-boundary block, 01 §6.1), so the
+// matrix is used as-is; only the translation-first observability inputs are permuted onto
+// its axes. P maps a rotation-first axis index -> the matching o.score index.
+Eigen::Matrix<double,6,6> inflate_by_observability(const GaussianBlock<6>& cov, const ObservabilityReport& o){
+  static constexpr int P[6] = {3,4,5, 0,1,2};         // [rx,ry,rz,tx,ty,tz] <- score [tx,ty,tz,rx,ry,rz]
+  Eigen::Matrix<double,6,6> Sig = cov.M;              // rotation-first; used as-is (no reorder)
+  Eigen::Matrix<double,6,6> Lam_sqrt = Eigen::Matrix<double,6,6>::Identity();
   for (int k=0;k<6;++k){
-    double s   = std::clamp(o.score[k], 0.0, 1.0);
+    double s   = std::clamp(o.score[P[k]], 0.0, 1.0);
     double lam = 1.0 + (cfg.obs_inflation_max - 1.0)
                        * std::pow(1.0 - s, cfg.obs_inflation_gamma);
     Lam_sqrt(k,k) = std::sqrt(lam);
   }
-  Mat6 R6 = o.eigvecs ? *o.eigvecs : rotate_tangent(o.frame, kFactorFrame); // I if same
+  // Non-axis-aligned degeneracy: bring the eigenvector basis onto the rotation-first axes too.
+  Eigen::Matrix<double,6,6> R6 = o.eigvecs ? to_rotfirst(*o.eigvecs)
+                                           : rotate_tangent(o.frame, kFactorFrame); // I if same
   Sig = R6 * (Lam_sqrt * (R6.transpose() * Sig * R6) * Lam_sqrt) * R6.transpose();
-  return reorder_meridian_to_gtsam(Sig);                 // [rho;phi] -> [rx,ry,rz,tx,ty,tz] (§12)
+  return Sig;                                         // already GTSAM order — no reorder
 }
 ```
 
@@ -921,26 +931,27 @@ this).
 
 ```cpp
 // Permutation P swapping [rho; phi] (Meridian) <-> [phi; rho] (GTSAM Pose3 order).
-inline const Mat6& P_meridian_gtsam(){
-  static const Mat6 P = [](){
-    Mat6 m = Mat6::Zero();
-    m.block<3,3>(0,3) = Mat3::Identity();   // GTSAM rot rows  <- Meridian phi
-    m.block<3,3>(3,0) = Mat3::Identity();   // GTSAM trans rows<- Meridian rho
+inline const Eigen::Matrix<double,6,6>& P_meridian_gtsam(){
+  static const Eigen::Matrix<double,6,6> P = [](){
+    Eigen::Matrix<double,6,6> m = Eigen::Matrix<double,6,6>::Zero();
+    m.block<3,3>(0,3) = Eigen::Matrix3d::Identity();   // GTSAM rot rows  <- Meridian phi
+    m.block<3,3>(3,0) = Eigen::Matrix3d::Identity();   // GTSAM trans rows<- Meridian rho
     return m;
   }();
   return P;
 }
-inline Mat6 reorder_meridian_to_gtsam(const Mat6& S){ const Mat6& P=P_meridian_gtsam(); return P*S*P.transpose(); }
-inline Mat6 reorder_gtsam_to_meridian(const Mat6& S){ const Mat6& P=P_meridian_gtsam(); return P.transpose()*S*P; }
+inline Eigen::Matrix<double,6,6> reorder_meridian_to_gtsam(const Eigen::Matrix<double,6,6>& S){ const Eigen::Matrix<double,6,6>& P=P_meridian_gtsam(); return P*S*P.transpose(); }
+inline Eigen::Matrix<double,6,6> reorder_gtsam_to_meridian(const Eigen::Matrix<double,6,6>& S){ const Eigen::Matrix<double,6,6>& P=P_meridian_gtsam(); return P.transpose()*S*P; }
 ```
 
 `to_gtsam(Pose) → gtsam::Pose3` and `from_gtsam(gtsam::Pose3) → Pose` convert the
 group elements (`Pose` stores quaternion + translation, `01 §3.1`); the
 permutation above handles the *tangent* (covariance/score) ordering. **All
-spec-01 covariances entering a GTSAM noise model pass through
-`reorder_meridian_to_gtsam` exactly once** — at the construction site shown in §4.3
-and §7.2. The adapter at the boundary converts conventions; the core math never
-does (`01 §3.1` mandate).
+translation-first spec-01 covariances (`PoseCov6` — loop, GNSS, prior) entering a
+GTSAM noise model pass through `reorder_meridian_to_gtsam` exactly once** (e.g.
+§7.2). The `KeyframePacket.constraint_cov` block is the exception: it is already
+rotation-first (`01 §6.1`) and enters the noise model directly (§4.3). The adapter
+at the boundary converts conventions; the core math never does (`01 §3.1` mandate).
 
 > **Mandatory regression test** (`grounding 09 §8.3`): perturb `T_j` along one
 > tangent axis and assert the between-factor error grows along the *expected*

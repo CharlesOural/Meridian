@@ -48,7 +48,7 @@
 > $H$; information $\Omega=\Sigma^{-1}$; per-axis observability score
 > $s\in[0,1]^6$ (spec 01 §3.4). Tangent order is **`[tx,ty,tz,rx,ry,rz]`** (spec 01
 > §3.1, §3.4) — *translation-first*, the `ObservabilityReport`/`NavState`
-> convention; the `KeyframePacket.information` block (spec 00 §6.4, spec 01 §6.1)
+> convention; the `KeyframePacket.constraint_cov` block (spec 00 §6.4, spec 01 §6.1)
 > uses rotation-first `[rx,ry,rz,tx,ty,tz]`. **The debug layer always re-states the
 > order in the message** (§4.4) so a plot is never mis-axed.
 
@@ -399,7 +399,7 @@ topic and the text log.
 > **Axis-order discipline.** `vec()` *always* carries `axis_order`. The
 > observability vector is published as `axis_order="tx,ty,tz,rx,ry,rz"`
 > (translation-first, the `ObservabilityReport` order, spec 01 §3.4); the
-> covariance diagonal extracted from a `KeyframePacket.information` block is
+> covariance diagonal extracted from a `KeyframePacket.constraint_cov` block is
 > published as `axis_order="rx,ry,rz,tx,ty,tz"` (rotation-first, spec 00 §6.4).
 > A plotter therefore never has to *guess* the order — FAST-LIO's block-swap bug
 > (`laserMapping.cpp:597-606`) is impossible because the order is in the message.
@@ -484,7 +484,7 @@ failing, not just *that* the estimate is.
 |---|---|---|---|---|
 | `odom/body` | `pose` | `/meridian/odom` `Odometry` + TF `odom→base_link` | on | `/Odometry` `:857`. Live high-rate pose from the spline at "now". Covariance NOT smuggled in (it is `cov_diag`); the `Odometry.pose.covariance` carries the full 6×6 in the **stated** order, redundantly, for tools that expect it there. |
 | `frontend/init_done` | `event` | `/meridian/events` (Info) | on | NEW. The IMU-init → CT-tracking transition (cold-start, spec 00 §7.2; FAST-LIO's `flg_EKF_inited` flip, `:898`) as a visible event carrying estimated gravity/biases and the first knot time. |
-| `frontend/window_restart` | `event` | `/meridian/events` (Warn) | on | **NEW. Recovery made visible.** FAST-LIO bails silently (`ekfom_data.valid=false` when `effct_feat_num<1`, `:708-712`). Meridian's window-restart fallback (spec 00 §7.4) is an explicit event with a `reason`; the *next* keyframe carries `IMU_PREINT` (GTSAM `CombinedImuFactor`, mutually exclusive with the relative factor). |
+| `frontend/window_restart` | `event` | `/meridian/events` (Warn) | on | **NEW. Recovery made visible.** FAST-LIO bails silently (`ekfom_data.valid=false` when `effct_feat_num<1`, `:708-712`). Meridian's window-restart fallback (spec 00 §7.4) is an explicit event with a `reason`; the *next* keyframe carries `ImuPreintegration` (GTSAM `CombinedImuFactor`, mutually exclusive with the relative factor). |
 
 ### 5.2 Calibration (online extrinsic refinement, default on)
 
@@ -1025,7 +1025,7 @@ A module that does not emit its checklist set fails the `debug-surface` CI lint
 | Visual losing lock (texture/blur/exposure) | patch overlay reddens + thins, `frontend/visual/n_tracked` drops, `res_mean` climbs | §5.1 visual scalars + `/meridian/visual_patches` |
 | Exposure/gain drift | `frontend/visual/exposure_gain` wanders while scene is static | `frontend/visual/exposure_gain` |
 | Window not converging | `iter_count` hits the cap, `dx_norm`/`cost_total` plateau high | §5.1 solver scalars |
-| Window restart / divergence | yellow `window_restart` event in rviz/log with reason; odom origin rebases; next KF is `IMU_PREINT` | `frontend/window_restart` (spec 00 §7.4) |
+| Window restart / divergence | yellow `window_restart` event in rviz/log with reason; odom origin rebases; next KF is `ImuPreintegration` | `frontend/window_restart` (spec 00 §7.4) |
 | IMU init failure | no `init_done` event; estimator stays in cold-start | `frontend/init_done` absent |
 | Bad IMU / extrinsic | `frontend/imu/res_acc`/`res_gyr` climb; `grav_norm` ≠ 9.81 | §5.1 IMU scalars |
 | GNSS datum / quality problem | `frontend/gnss/res` large + persistent; correlates with `gnss/fix` type | `frontend/gnss/res`, `frontend/gnss/fix` |

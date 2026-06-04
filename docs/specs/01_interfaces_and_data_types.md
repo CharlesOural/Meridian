@@ -300,6 +300,8 @@ struct GaussianBlock {
   Eigen::Matrix<double, N, N> M = Eigen::Matrix<double, N, N>::Zero();  // the matrix
   // Ordering of the N tangent dims is fixed by the type that owns this block
   // (e.g. Pose order [rho; phi], NavState order [p|R|v|bg|ba|g]).
+  // EXCEPTION: KeyframePacket.constraint_cov (§6.1) is ordered rotation-first
+  // [rx,ry,rz,tx,ty,tz] to match the GTSAM Pose3 boundary — see §6.1.
 };
 
 using PoseCov6   = GaussianBlock<6>;    // for a relative/absolute Pose
@@ -616,7 +618,11 @@ struct KeyframePacket {
   } constraint_kind = ConstraintKind::RelativeBetween;
   std::uint64_t  rel_to_id = 0;          // for RelativeBetween: the id this pose is relative TO
   Pose           T_relto_this;           // for RelativeBetween: the relative transform itself
-  PoseCov6       constraint_cov;         // the 6-DoF block (Σ by default), meaning set by constraint_kind
+  GaussianBlock<6> constraint_cov;       // 6-DoF block; meaning set by constraint_kind. Form per kind (Σ default).
+                                         // ORDERED ROTATION-FIRST [rx,ry,rz,tx,ty,tz] to match the GTSAM Pose3
+                                         // boundary — the ONE exception to the translation-first core convention,
+                                         // so it is a bare GaussianBlock<6>, NOT a PoseCov6. The front-end's
+                                         // translation-first marginal is reordered exactly once when packing.
 
   // --- (4) Observability (per-axis degeneracy), for back-end noise inflation ---
   ObservabilityReport observability;     // 6 scores in a NAMED frame (§3.4)

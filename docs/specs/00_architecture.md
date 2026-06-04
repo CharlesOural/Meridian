@@ -53,13 +53,13 @@ This split is the single most important architectural decision; the project owne
 
 2. **Replaceability of the transport.** Tactical deployment may not want full ROS 2 at runtime (DDS discovery storms, security posture, footprint). With a clean core, the wrapper can be ROS 2 today, a Zenoh shim tomorrow, or a bare `main()` reading a bag — the algorithm is untouched. This is also how the **offline test harness** (`DATASET.md`) and the **live robot** become *the same code path*: both feed the same `ISensorSource`.
 
-3. **Reasoning at the right altitude.** ROS message types (`sensor_msgs::PointCloud2`, `nav_msgs::Odometry`) are wire formats, not domain types. They carry middleware concerns (QoS, `frame_id` strings), are awkward to compute on (XYZIRT packed in a byte blob), and version with ROS. The core computes on domain types (`meridian::PointCloud`, `meridian::SE3`, `KeyframePacket`) designed for the math, not the wire.
+3. **Reasoning at the right altitude.** ROS message types (`sensor_msgs::PointCloud2`, `nav_msgs::Odometry`) are wire formats, not domain types. They carry middleware concerns (QoS, `frame_id` strings), are awkward to compute on (XYZIRT packed in a byte blob), and version with ROS. The core computes on domain types (`meridian::PointCloud`, `meridian::Pose`, `KeyframePacket`) designed for the math, not the wire.
 
 4. **Contrast with the reference code.** FAST-LIO fuses everything into one translation unit: `laserMapping.cpp` *is* the ROS node, the parameter loader, the buffer manager, the estimator driver, and the publisher. It directly `news` publishers (`ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000)`, `laserMapping.cpp:849`), reads ~40 parameters inline (`nh.param<...>`, `laserMapping.cpp:761-793`), and runs the estimator loop in `main()` (`laserMapping.cpp:865-1019`) — 1055 lines, all concerns interleaved. That is fine for a research prototype and wrong for a system we intend to extend for years and run operationally. Meridian deliberately inverts it.
 
 ### 1.1 The hard rule
 
-> **No core library may depend on `rclcpp`, `rcl`, any `*_msgs` package, DDS, or the ROS parameter/clock/logging APIs.** Time is passed as `meridian::Time` (int64 nanoseconds, §6.2). Logging goes through `meridian::log` (a sink the wrapper binds to `rclcpp` logging at startup, §10.3). Parameters arrive as a populated `meridian::Config` struct (§8). **CUDA is not ROS:** GPU code (nvblox) is core, not wrapper — the no-ROS rule is about middleware, not about the GPU, which is always present (§9.5).
+> **No core library may depend on `rclcpp`, `rcl`, any `*_msgs` package, DDS, or the ROS parameter/clock/logging APIs.** Time is passed as `Timestamp` (int64 nanoseconds, §6.2). Logging goes through `meridian::log` (a sink the wrapper binds to `rclcpp` logging at startup, §10.3). Parameters arrive as a populated `meridian::Config` struct (§8). **CUDA is not ROS:** GPU code (nvblox) is core, not wrapper — the no-ROS rule is about middleware, not about the GPU, which is always present (§9.5).
 
 This is checkable mechanically (§9.4) and is the line that keeps the architecture honest.
 
@@ -73,9 +73,11 @@ Meridian is a **colcon workspace** of ROS 2 *ament_cmake* packages (ROS 2 **Humb
 meridian_ws/
 ├─ src/
 │  ├─ meridian_common/            # X-cut: math, geometry, core value types, KeyframePacket
-│  │   include/meridian/common/   #   se3.hpp, so3.hpp, time.hpp, point.hpp, cloud.hpp,
-│  │   src/                    #   keyframe_packet.hpp, odometry.hpp, pose_correction.hpp,
-│  │   test/                   #   loop_constraint.hpp, status.hpp, ring_buffer.hpp
+│  │   include/meridian/common/   #   pose.hpp, twist.hpp, nav_state.hpp, time.hpp, frame.hpp,
+│  │   test/                   #   point.hpp, cloud.hpp, sample.hpp, gaussian.hpp,
+│  │                           #   observability.hpp, keyframe_packet.hpp, graph_update.hpp,
+│  │                           #   loop_constraint.hpp, stamped_pose.hpp,
+│  │                           #   imu_preintegration.hpp, status.hpp, ring_buffer.hpp
 │  │
 │  ├─ meridian_config/            # X-cut: typed Config tree + YAML loader (no ROS)
 │  ├─ meridian_time/              # X-cut: time model, PTP/PPS clock model, interpolation
@@ -136,10 +138,10 @@ Each layer is summarized by **what it owns / consumes / produces**. Math is defe
 
 | Layer | Package | Consumes | Produces | Owns |
 |---|---|---|---|---|
-| **L0** sensor abstraction + time sync | `meridian_sensors`, `meridian_time` | raw driver buffers | time-stamped, frame-tagged measurements (`ImuSample`, `LidarScan`, `ImageFrame`, `GnssFix`) on one monotonic timeline | PTP/PPS clock model, per-sensor `ISensorSource` (one LiDAR, one IMU, one camera, GNSS), measurement aggregation |
+| **L0** sensor abstraction + time sync | `meridian_sensors`, `meridian_time` | raw driver buffers | time-stamped, frame-tagged measurements (`ImuSample`, `LidarScan`, `CameraFrame`, `GnssFix`) on one monotonic timeline | PTP/PPS clock model, per-sensor `ISensorSource` (one LiDAR, one IMU, one camera, GNSS), measurement aggregation |
 | **L1** preprocessing | `meridian_preprocess` | L0 measurements | downsampled, validity-flagged clouds; rectified images + pyramid | downsample (voxel grid), validity (blind radius, NaN/intensity), image pyramid; **IMU-only cold-start deskew provider** (steady-state deskew is implicit in L2's CT trajectory, §7) |
-| **L2** front-end (odometry) | `meridian_frontend` | L1 output + IMU + GNSS | high-rate `Odometry` (live pose) **and** `KeyframePacket` on keyframe events | the **CT sliding-window tightly-coupled LIVO+GNSS** estimator (B-spline trajectory; per-point LiDAR point-to-plane, sparse-direct photometric, IMU-derivative, GNSS residuals); per-axis observability scoring; online extrinsic refinement (default on) |
-| **L3** back-end | `meridian_backend` | `KeyframePacket` (L2) + loop constraints (L5) | optimized global trajectory; `PoseCorrection` broadcast to L4/L2 | GTSAM iSAM2 graph, online extrinsic variables, GNC robust kernels, PCM gate |
+| **L2** front-end (odometry) | `meridian_frontend` | L1 output + IMU + GNSS | high-rate `NavState` (live pose) **and** `KeyframePacket` on keyframe events | the **CT sliding-window tightly-coupled LIVO+GNSS** estimator (B-spline trajectory; per-point LiDAR point-to-plane, sparse-direct photometric, IMU-derivative, GNSS residuals); per-axis observability scoring; online extrinsic refinement (default on) |
+| **L3** back-end | `meridian_backend` | `KeyframePacket` (L2) + loop constraints (L5) | optimized global trajectory; `GraphUpdate` broadcast to L4/L2 | GTSAM iSAM2 graph, online extrinsic variables, GNC robust kernels, PCM gate |
 | **L4** layered map | `meridian_map` | corrected poses + retained clouds + RGB | **nvblox** GPU TSDF+colour; Marching-Cubes mesh; **per-keyframe cloud store** | de-integration / region rebuild on loop correction (GPU) |
 | **L5** place recognition | `meridian_place` | keyframe descriptors + retained clouds | verified loop constraints (with covariance) → L3 | ScanContext++ → STD/BTC candidate → GICP verify → PCM consistency |
 | **L6** operator surface | (`meridian_ros` + `meridian_map`) | mesh + per-vertex confidence | colour mesh, confidence overlay markers | the human-facing view |
@@ -202,18 +204,18 @@ public:
   // Feed measurements (thread-confined: called from the front-end stage thread).
   virtual void addImu(const ImuSample&)   = 0;
   virtual void addScan(LidarScan&&)       = 0;   // L1-preprocessed (single LiDAR)
-  virtual void addImage(ImageFrame&&)     = 0;   // sparse-direct photometric modality
+  virtual void addImage(CameraFrame&&)    = 0;   // sparse-direct photometric modality
   virtual void addGnss(const GnssFix&)    = 0;   // GNSS modality
 
   // Pull the latest high-rate estimate (live pose, for TF / control).
-  virtual Odometry latestOdometry() const = 0;
+  virtual NavState latestNavState() const = 0;
 
   // Keyframe handoff: invoked whenever a keyframe is born. The ONE thing L2 hands L3 (§6).
   using KeyframeSink = std::function<void(KeyframePacket&&)>;
   virtual void setKeyframeSink(KeyframeSink) = 0;
 
   // Back-end correction feedback (loop closure / global optimization result).
-  virtual void onGlobalCorrection(const PoseCorrection&) = 0;
+  virtual void onGlobalCorrection(const GraphUpdate&) = 0;
 
   // Introspection: hand the module a telemetry channel (§10).
   virtual void setTelemetry(TelemetrySink*) = 0;
@@ -232,7 +234,7 @@ The **factory free function** is the only place that names concrete implementati
 | Interface | Header | Key methods | Role / notes |
 |---|---|---|---|
 | `ISensorSource` | `meridian/sensors/isensor_source.hpp` | `onSample(cb)` | swap: live driver, ROS-bag replay, simulator (same code path for live & offline) |
-| `IDeskewProvider` | `meridian/preprocess/ideskew_provider.hpp` | `SE3 poseAt(Time)` | cold-start IMU-only; steady-state CT-trajectory-backed (§7) |
+| `IDeskewProvider` | `meridian/preprocess/ideskew_provider.hpp` | `Pose poseAt(Timestamp)` | cold-start IMU-only; steady-state CT-trajectory-backed (§7) |
 | `IFrontEnd` | `meridian/frontend/ifrontend.hpp` | `addScan/addImu/addImage/addGnss`, `setKeyframeSink`, `onGlobalCorrection` | **production: CT B-spline LIVO+GNSS** (`src/ct/`). Reference oracle: iEKF (`src/iekf/`), test-only (§5.4) |
 | `IBackEnd` | `meridian/backend/ibackend.hpp` | `addKeyframe(KeyframePacket)`, `addLoop`, `optimize`, `onResult(cb)` | iSAM2 (production); batch LM available for offline debugging only |
 | `IMapLayer` | `meridian/map/imaplayer.hpp` | `integrate(kf)`, `deintegrateRegion(aabb)`, `query`, `extractMesh` | **one impl: nvblox** (GPU TSDF+colour+mesh). Seam left for a deferred ESDF layer (§12) |
@@ -240,7 +242,7 @@ The **factory free function** is the only place that names concrete implementati
 | `IPlaceRecognizer` | `meridian/place/iplace_recognizer.hpp` | `add(kf)`, `query()→candidates`, `verify()→LoopConstraint` | ScanContext++ → STD/BTC → GICP → PCM |
 | `TelemetrySink` | `meridian/debug/telemetry.hpp` | `timing/scalar/vec/cloud/pose/marker/event` | ros, recording (tests), null (off) |
 
-Each interface lives in its **owning layer's package** so the contract and its implementation ship together; the *value types* they exchange (`KeyframePacket`, `Odometry`, `PoseCorrection`, `LoopConstraint`) live in `meridian_common`, so no layer needs to depend on another's package to name them.
+Each interface lives in its **owning layer's package** so the contract and its implementation ship together; the *value types* they exchange (`KeyframePacket`, `NavState`, `GraphUpdate`, `LoopConstraint`) live in `meridian_common`, so no layer needs to depend on another's package to name them.
 
 ### 5.3 Why interfaces, not templates
 
@@ -259,71 +261,74 @@ The single most important boundary in the system is what the front-end hands the
 ### 6.1 Definition
 
 ```cpp
-// include/meridian/common/keyframe_packet.hpp
+// include/meridian/common/keyframe_packet.hpp   — canonical def: spec 01 §6.1
 namespace meridian {
 
-enum class EdgeKind { RELATIVE_BETWEEN, ABSOLUTE_PRIOR, IMU_PREINT };
-
-struct ObservabilityScore {
-  FrameId              frame;     // reference frame the scores are expressed in
-  std::array<double,6> axis;      // [rx, ry, rz, tx, ty, tz], higher = better observed
-};
-
 struct KeyframePacket {
-  // --- identity / time ---
-  KeyframeId   id;            // monotonic, assigned by the front-end
-  Time         stamp;         // int64 ns, the keyframe's reference time (§6.2)
+  // identity / time
+  std::uint64_t   id    = 0;                 // monotonic keyframe id (graph node key)
+  Timestamp       stamp = 0;                 // int64 ns, a real measurement instant
 
-  // --- pose (REQUIRED) ---
-  FrameId      frame;         // the named frame this pose is expressed IN (e.g. "odom")
-  SE3          T_frame_body;  // pose of body in `frame` at `stamp`
+  // pose (REQUIRED)
+  Frame           ref_frame = Frame::Odom;   // frame T_ref_body is expressed in
+  Pose            T_ref_body;                // pose of the estimation frame F_e in ref_frame
 
-  // --- kinematic state (OPTIONAL, gated) ---
-  bool         has_velocity_bias = false;   // the "included" flag
-  Vec3         v_frame;       // body velocity in `frame`     (valid iff flag)
-  Vec3         bias_acc;      // IMU accel bias               (valid iff flag)
-  Vec3         bias_gyr;      // IMU gyro bias                (valid iff flag)
+  // kinematic state (OPTIONAL, gated; true only on the restart fallback)
+  bool            kinematics_included = false;
+  Eigen::Vector3d v_ref = Eigen::Vector3d::Zero();   // [m/s]    valid iff flag
+  Eigen::Vector3d b_g   = Eigen::Vector3d::Zero();   // [rad/s]  valid iff flag
+  Eigen::Vector3d b_a   = Eigen::Vector3d::Zero();   // [m/s^2]  valid iff flag
 
-  // --- uncertainty (REQUIRED) ---
-  EdgeKind     edge_kind;     // RELATIVE_BETWEEN (default) | ABSOLUTE_PRIOR | IMU_PREINT
-  KeyframeId   ref_id;        // for RELATIVE_BETWEEN/IMU_PREINT: the previous keyframe id
-  Mat6         information;   // 6x6 info matrix, ordering [rx,ry,rz,tx,ty,tz] (§6.4)
+  // uncertainty: ONE block, ONE constraint per interval
+  enum class ConstraintKind { RelativeBetween, AbsolutePrior, ImuPreintegration }
+                  constraint_kind = ConstraintKind::RelativeBetween;
+  std::uint64_t   rel_to_id = 0;             // RelativeBetween/ImuPreintegration: previous keyframe id
+  Pose            T_relto_this;              // RelativeBetween: the relative transform
+  GaussianBlock<6> constraint_cov;           // 6-DoF block, ROTATION-FIRST [rx,ry,rz,tx,ty,tz]
+                                             // (GTSAM Pose3 boundary; the one rotation-first block)
 
-  // --- observability (REQUIRED) ---
-  ObservabilityScore obs;     // 6 per-axis scores + their reference frame; shapes L3 noise
+  // observability (REQUIRED) — translation-first scores in a named frame
+  ObservabilityReport observability;
 
-  // --- data handles (REQUIRED for map / loop) ---
-  CloudHandle  cloud;         // handle into IKeyframeStore (NOT a copy) — §6.5
-  RgbHandle    rgb;           // handle to the keyframe image (for colourisation + visual cues)
+  // data (REQUIRED), shared-immutable, no copy
+  std::shared_ptr<const std::vector<LidarPoint>> cloud_body;  // deskewed, body frame at stamp
+  std::shared_ptr<const CameraFrame>             image;       // null if no cam at this KF
+  Pose            T_body_cam;                // extrinsic snapshot for colourisation
 
-  // --- provenance (debug) ---
-  std::string  producer;      // "ct_livo" (or "iekf_oracle" in test runs) — telemetry/forensics
+  // restart-fallback IMU summary (only when constraint_kind == ImuPreintegration)
+  std::optional<ImuPreintegrationSummary> imu_summary;
+
+  // provenance
+  std::uint32_t   calib_version = 0;         // CalibrationSet snapshot that produced this
+  std::uint32_t   frontend_kind = 0;         // 0=iEKF, 1=CT (diagnostics only; do not branch)
 };
 
 } // namespace meridian
 ```
 
+Canonical field-level definition: spec 01 §6.1.
+
 ### 6.2 Time model
 
-`Time` is **`int64` nanoseconds** on one monotonic timeline established by L0/PTP. There is no `ros::Time` below the wrapper. The CT B-spline knots, the per-point LiDAR sample times, the camera mid-exposure time, and the deskew/interpolation query (§7.3) all use this scalar. The wrapper converts `rclcpp::Time` ↔ `meridian::Time` in exactly one place (`conversions/`). This mirrors how FAST-LIO threads a single `double lidar_end_time` through everything (`laserMapping.cpp:593`) — we keep the single-scalar-time discipline but make it integer-ns to avoid double-precision drift at long uptime (critical for a CT spline whose knot times span the whole mission).
+`Timestamp` is **`int64` nanoseconds** on one monotonic timeline established by L0/PTP. There is no `ros::Time` below the wrapper. The CT B-spline knots, the per-point LiDAR sample times, the camera mid-exposure time, and the deskew/interpolation query (§7.3) all use this scalar. The wrapper converts `rclcpp::Time` ↔ `Timestamp` in exactly one place (`conversions/`). This mirrors how FAST-LIO threads a single `double lidar_end_time` through everything (`laserMapping.cpp:593`) — we keep the single-scalar-time discipline but make it integer-ns to avoid double-precision drift at long uptime (critical for a CT spline whose knot times span the whole mission).
 
 ### 6.3 One-constraint rule (kill double-counting)
 
 A naïve handoff double-counts information by simultaneously passing (a) an absolute marginal prior, (b) a relative between-factor, **and** (c) an IMU-preintegration factor derived from *the same* measurements. Meridian picks **one** clean contract per interval:
 
-> **Default and recommended:** `edge_kind = RELATIVE_BETWEEN`. The packet carries a single relative pose `T_ref_body = T(ref)^{-1} · T(this)` with its marginal covariance, and L3 inserts exactly **one** `BetweenFactor` between consecutive keyframes. Velocity and biases **do not** cross as live optimization variables in the default path (`kinematics_included = false`); they ride along only as *seeds / telemetry*, not as graph variables. The CT front-end has already fused IMU+LiDAR+visual+GNSS inside the window, so that information is *in* the relative covariance.
+> **Default and recommended:** `constraint_kind = RelativeBetween`. The packet carries a single relative pose `T_relto_this = T(ref)^{-1} · T(this)` with its marginal covariance, and L3 inserts exactly **one** `BetweenFactor` between consecutive keyframes. Velocity and biases **do not** cross as live optimization variables in the default path (`kinematics_included = false`); they ride along only as *seeds / telemetry*, not as graph variables. The CT front-end has already fused IMU+LiDAR+visual+GNSS inside the window, so that information is *in* the relative covariance.
 >
-> **Mutually-exclusive fallback:** `edge_kind = IMU_PREINT` is used **only on the window-restart fallback** (§7.4) when no valid relative pose spans the gap. Then the packet carries preintegrated IMU between `ref` and `this`, L3 inserts a GTSAM `CombinedImuFactor` (+ the velocity/bias variables that factor needs), and **no `BetweenFactor`** is added for that interval. The two are never both present for the same interval. Bias estimation otherwise lives in L2.
+> **Mutually-exclusive fallback:** `constraint_kind = ImuPreintegration` is used **only on the window-restart fallback** (§7.4) when no valid relative pose spans the gap. Then the packet carries preintegrated IMU between `ref` and `this`, L3 inserts a GTSAM `CombinedImuFactor` (+ the velocity/bias variables that factor needs), and **no `BetweenFactor`** is added for that interval. The two are never both present for the same interval. Bias estimation otherwise lives in L2.
 
-So for any keyframe interval the back-end receives **exactly one** geometric constraint. That is the line that keeps the information budget correct. (See `05_backend_graph.md` for GTSAM factor construction and how `information` and `obs` assemble the noise model — `obs` inflates the diagonal of weakly-observed axes, X-ICP / D²-LIO style, instead of a binary degeneracy switch.)
+So for any keyframe interval the back-end receives **exactly one** geometric constraint. That is the line that keeps the information budget correct. (See `05_backend_graph.md` for GTSAM factor construction and how `constraint_cov` and `observability` assemble the noise model — `observability` inflates the diagonal of weakly-observed axes, X-ICP / D²-LIO style, instead of a binary degeneracy switch.)
 
 ### 6.4 Tangent ordering and frames
 
-The `Mat6 information` and all 6-vectors use the ordering **`[rotation(x,y,z), translation(x,y,z)]`** in the *body* tangent space at `T_frame_body`, expressed in `frame`. `frame` is a named string id (`"odom"`, `"map"`); the back-end owns the `odom→map` relationship. This explicitness kills the classic "is this covariance in world or body, rotation-first or translation-first?" bug. (FAST-LIO hand-packs the EKF `P` into `pose.covariance` with a rotation/translation block-swap, `laserMapping.cpp:597-606` — easy to get wrong precisely because the convention is implicit. We make it explicit and typed.)
+The `GaussianBlock<6> constraint_cov` uses the ordering **`[rotation(x,y,z), translation(x,y,z)]`** (ROTATION-FIRST) in the *body* tangent space at `T_ref_body`, expressed in `ref_frame`. This is the **one** rotation-first block in the system — it matches the GTSAM `Pose3` convention at the L2→L3 boundary, and the front-end's translation-first marginal is reordered exactly once when packing the packet. Every other Meridian core type (`Pose`, `NavState`, `observability`) is **translation-first** `[tx,ty,tz,rx,ry,rz]` per spec 01 §3. `ref_frame` is a `Frame` enum (`Frame::Odom`, `Frame::Map`); the back-end owns the `odom→map` relationship. This explicitness kills the classic "is this covariance in world or body, rotation-first or translation-first?" bug. (FAST-LIO hand-packs the EKF `P` into `pose.covariance` with a rotation/translation block-swap, `laserMapping.cpp:597-606` — easy to get wrong precisely because the convention is implicit. We make it explicit and typed.)
 
-### 6.5 Cloud handle, not cloud copy
+### 6.5 Shared-immutable cloud, not cloud copy
 
-`CloudHandle` is an opaque id into the **`IKeyframeStore`** — the data structure that holds each keyframe's deskewed cloud once. The packet never copies the point cloud across the thread boundary — it carries a handle, the cloud lives once in the store, and **L4** (nvblox re-integration on loop correction), **L5** (GICP verification), and an optional offline export pass all read it from there. (Full treatment in `06_mapping.md`.)
+The packet carries `std::shared_ptr<const std::vector<LidarPoint>> cloud_body` and `std::shared_ptr<const CameraFrame> image` **directly** — not an opaque id. The packet never copies the point cloud across the thread boundary: the cloud lives once, shared-immutable, and the same `shared_ptr` bytes are handed to the **`IKeyframeStore`**, so **L4** (nvblox re-integration on loop correction), **L5** (GICP verification), and an optional offline export pass all read the very same buffer with no copy. (Full treatment in `06_mapping.md`.)
 
 ---
 
@@ -344,7 +349,7 @@ FAST-LIO gates the analogous transition with `flg_EKF_inited = (lidar_beg_time -
 
 ### 7.3 Deskew as a feedback edge
 
-`IDeskewProvider::poseAt(Time)` is injected into L1 by the pipeline. Its steady-state implementation is *backed by L2's current CT trajectory*, but L1 does **not** depend on `meridian_frontend` at build time — it depends on the `IDeskewProvider` interface (which lives in `meridian_preprocess`), and the pipeline wires the concrete provider that wraps the front-end. So:
+`IDeskewProvider::poseAt(Timestamp)` is injected into L1 by the pipeline. Its steady-state implementation is *backed by L2's current CT trajectory*, but L1 does **not** depend on `meridian_frontend` at build time — it depends on the `IDeskewProvider` interface (which lives in `meridian_preprocess`), and the pipeline wires the concrete provider that wraps the front-end. So:
 
 - **Build graph:** acyclic (L1 → interface only).
 - **Data flow:** L2 → (poses) → L1 → L2 — a genuine feedback loop, documented and intentional.
@@ -353,7 +358,7 @@ This is the explicit answer to "deskew is not strict bottom-up": it is a feedbac
 
 ### 7.4 Window-restart fallback
 
-If the estimator diverges or loses observability (degeneracy via per-axis `obs`, or residual blow-up — FAST-LIO's analogue is bailing with `ekfom_data.valid = false` when `effct_feat_num < 1`, `laserMapping.cpp:708-712`), the front-end performs a **window restart**: freeze the last good pose, re-run IMU-only deskew for the next scan, re-initialize the sliding CT window from there. On a restart the *first* keyframe emitted carries `edge_kind = IMU_PREINT` (§6.3) because no continuous relative pose spans the gap — the *only* time the IMU factor crosses the boundary, mutually exclusive with the between-factor. The restart is published on the debug bus (§10) so an operator sees exactly when and why recovery happened.
+If the estimator diverges or loses observability (degeneracy via per-axis `observability`, or residual blow-up — FAST-LIO's analogue is bailing with `ekfom_data.valid = false` when `effct_feat_num < 1`, `laserMapping.cpp:708-712`), the front-end performs a **window restart**: freeze the last good pose, re-run IMU-only deskew for the next scan, re-initialize the sliding CT window from there. On a restart the *first* keyframe emitted carries `constraint_kind = ImuPreintegration` (§6.3) because no continuous relative pose spans the gap — the *only* time the IMU factor crosses the boundary, mutually exclusive with the between-factor. The restart is published on the debug bus (§10) so an operator sees exactly when and why recovery happened.
 
 ### 7.5 Continuous-time registration (why deskew is mostly implicit)
 
@@ -402,7 +407,7 @@ meridian:
 
 ### 8.3 Rules
 
-- **Validated on load.** `Config::validate()` checks units, ranges, and cross-field consistency (e.g. `tsdf_voxel_m ≤ preprocess.voxel_surf_m`, CT `knot_dt_ms > 0`) and fails fast with a precise message — no silent defaults masking a typo (a real FAST-LIO foot-gun: a mistyped `nh.param` key silently uses the default).
+- **Validated on load.** `Config::validate(std::string* error)` checks units, ranges, and cross-field consistency (e.g. `tsdf_voxel_m ≤ preprocess.voxel_surf_m`, CT `knot_dt_ms > 0`), returning `false` with a precise message on the first violation; `load_config_yaml()` calls it and throws, so a bad config fails fast — no silent defaults masking a typo (a real FAST-LIO foot-gun: a mistyped `nh.param` key silently uses the default).
 - **`kind` strings select implementations** through the factories (§5.1). The production values are fixed (`ct_livo`, `isam2`, `nvblox`); `frontend.kind: iekf_lio` is reserved for the test oracle (§5.4) and is not a deployment configuration. `map.backend` has exactly one valid value, `nvblox` — there is no CPU/VDB alternative to select.
 - **Immutable after start.** `Config` is `const` once the pipeline is built. Runtime-tunable knobs (only debug verbosity and publish toggles) go through a separate `DebugControl` service (§10.5), never by mutating `Config`.
 
@@ -474,12 +479,12 @@ class TelemetrySink {
 public:
   virtual ~TelemetrySink() = default;
   virtual void timing(const char* stage, double ms)              = 0;  // per-stage timer
-  virtual void scalar(const char* key, double v, Time t)         = 0;  // residual, #eff pts…
-  virtual void vec(const char* key, const VecX&, Time t)         = 0;  // bias, obs[6]…
-  virtual void cloud(const char* key, const PointCloud&, FrameId, Time) = 0;
-  virtual void pose (const char* key, const SE3&,        FrameId, Time) = 0;
-  virtual void marker(const Marker&, Time)                       = 0;  // geometric overlays
-  virtual void event(Level, const char* tag, const std::string&, Time) = 0;
+  virtual void scalar(const char* key, double v, Timestamp t)    = 0;  // residual, #eff pts…
+  virtual void vec(const char* key, const VecX&, Timestamp t)    = 0;  // bias, observability[6]…
+  virtual void cloud(const char* key, const PointCloud&, Frame, Timestamp) = 0;
+  virtual void pose (const char* key, const Pose&,        Frame, Timestamp) = 0;
+  virtual void marker(const Marker&, Timestamp)                  = 0;  // geometric overlays
+  virtual void event(Level, const char* tag, const std::string&, Timestamp) = 0;
 };
 // RAII scoped timer: calls sink->timing(stage, elapsed) on destruction.
 struct ScopedTimer { ScopedTimer(TelemetrySink*, const char* stage); ~ScopedTimer(); };
@@ -500,7 +505,7 @@ The core never knows whether telemetry becomes a ROS topic, a CSV, or `/dev/null
 | **CT spline / window state** | none (FAST-LIO is discrete-time) | `pose("frontend/spline_knots")` + `marker("frontend/window")` — the B-spline control points and active window, so the CT trajectory is **visible**. Strict new signal. |
 | **Visual (sparse-direct) residual** | none (LiDAR-only reference) | `scalar("frontend/photometric_res")` + `cloud("frontend/visual_patches")` — FAST-LIVO2-style photometric inliers exposed |
 | Online extrinsic | (FAST-LIO logs `offset_R_L_I/offset_T_L_I` to `fout_*` only) | `pose("calib/T_imu_lidar")`, `pose("calib/T_imu_cam")` — exposes the online extrinsic refinement |
-| **Per-axis observability** | none (only the binary `flg_EKF_inited`) | `vec("frontend/observability", obs[6])` — the 6 scores driving back-end noise; rendered as a 6-bar rviz marker (§10.4). Strict upgrade. |
+| **Per-axis observability** | none (only the binary `flg_EKF_inited`) | `vec("frontend/observability", observability.score)` — the 6 scores driving back-end noise; rendered as a 6-bar rviz marker (§10.4). Strict upgrade. |
 | Per-stage timing | `aver_time_match/solve/icp/...` to `printf`+CSV (`:991-1009`) | `ScopedTimer` on every stage → `StageTiming` topic: `preprocess`, `frontend.ct_solve`, `frontend.lidar_assoc`, `frontend.visual`, `backend.optimize`, `map.integrate`, `mesh.extract`. Live breakdown, not a logfile. |
 | State/bias trace | `dump_lio_state_to_log` (`:150`) | `vec("frontend/bias_acc")`, `vec("frontend/bias_gyr")`, `scalar("frontend/grav_norm")` |
 | GNSS | none (LiDAR-only reference) | `pose("frontend/gnss_anchor")` + `event("frontend/gnss_fix", fix_type)` — GNSS fusion made visible |
@@ -511,13 +516,13 @@ The core never knows whether telemetry becomes a ROS topic, a CSV, or `/dev/null
 
 ### 10.3 Structured logging
 
-`meridian::log` is a thin macro layer (`MERIDIAN_INFO(...)`, `MERIDIAN_WARN(...)`) forwarding to a `LogSink`. The wrapper binds it to `rclcpp` logging; tests to a buffer; offline to stdout+file. Logs are **structured** (key=value), greppable and parseable, with module tag and `Time` always present. The core never calls `RCLCPP_INFO` or `ROS_WARN`.
+`meridian::log` is a thin macro layer (`MERIDIAN_INFO(...)`, `MERIDIAN_WARN(...)`) forwarding to a `LogSink`. The wrapper binds it to `rclcpp` logging; tests to a buffer; offline to stdout+file. Logs are **structured** (key=value), greppable and parseable, with module tag and `Timestamp` always present. The core never calls `RCLCPP_INFO` or `ROS_WARN`.
 
 ### 10.4 rviz markers (geometric introspection)
 
 The wrapper turns `marker(...)` calls into a `MarkerArray`. Standard markers Meridian ships:
 
-- **Observability hexagon:** 6 bars (rx,ry,rz,tx,ty,tz) scaled by `obs`, coloured green→red, anchored at the body — the operator instantly sees which axes are weakly observed (a long corridor → weak forward translation).
+- **Observability hexagon:** 6 bars (tx,ty,tz,rx,ry,rz) scaled by `observability.score`, coloured green→red, anchored at the body — the operator instantly sees which axes are weakly observed (a long corridor → weak forward translation).
 - **CT sliding-window view:** the B-spline control points and the active window span, so the operator sees the trajectory the front-end is currently optimising.
 - **Loop edges:** lines between keyframe centroids for accepted/rejected loops (PCM result coloured).
 - **Dirty-region AABB:** the voxel region L4 (nvblox) is rebuilding after a loop correction.
@@ -547,11 +552,11 @@ Meridian uses a **small fixed set of stage threads connected by bounded single-p
                    │ synced measurements (1 LiDAR, IMU, cam, GNSS)
                    ▼
               (Q_meas) ─▶ [L2 CT LIVO+GNSS front-end]             thread T2 (hot)
-                              │ Odometry  ──────────────▶ TF/odom publish (low latency)
+                              │ NavState  ──────────────▶ TF/odom publish (low latency)
                               │ KeyframePacket
                               ▼
                          (Q_kf) ─▶ [L3 back-end + L5 place-rec]     thread T3
-                                       │ PoseCorrection ──▶ feedback to L2 & L4
+                                       │ GraphUpdate ──▶ feedback to L2 & L4
                                        ▼
                                   (Q_map) ─▶ [L4 nvblox integrate (GPU)] thread T4
                                                 │ mesh extract (on demand, GPU) thread T5
@@ -564,7 +569,7 @@ Meridian uses a **small fixed set of stage threads connected by bounded single-p
 - **Each stage is single-threaded internally** (its module is *not* required to be thread-safe; it is *thread-confined*). Concurrency lives only in the queues. The simplest model that keeps the front-end deterministic and easy to reason about. (nvblox launches GPU kernels from its single map thread; the host-side stage is still thread-confined.)
 - **Queues are bounded** with an explicit per-edge overflow policy. `Q_meas` is lossy under overload (real-time: never block the sensor thread; drop oldest and emit a telemetry `event`). `Q_kf` and `Q_map` are **lossless** (back-pressure) — losing a keyframe corrupts the map, so if the back-end falls behind, the front-end keeps producing odometry but keyframe creation slows.
 - **Front-end is the priority thread** (T2). Expensive, lower-rate work (back-end optimize, GPU map integration, meshing) runs on separate threads so a 200 ms iSAM2 relinearization never stalls the 10–20 Hz odometry. This is the structural reason to split threads at all.
-- **Feedback (`PoseCorrection`) is applied at safe points:** L2 consumes corrections between scans (rebasing its odometry origin via `onGlobalCorrection`); L4 receives them and schedules a region rebuild. No mid-iteration mutation.
+- **Feedback (`GraphUpdate`) is applied at safe points:** L2 consumes corrections between scans (rebasing its odometry origin via `onGlobalCorrection`); L4 receives them and schedules a region rebuild. No mid-iteration mutation.
 - **Determinism mode:** for tests and bag replay, a `--single-thread` pipeline mode runs all stages sequentially on one thread so results are bit-reproducible. Stage interfaces are identical; only the executor differs. In this mode any OpenMP in the CT residual assembly is disabled (or fixed-scheduled) so residual sums are order-deterministic; GPU kernels that reduce non-deterministically are run in their deterministic variant where available. Bit-reproducibility is therefore a **test-only** guarantee, not a production one.
 
 ### 11.3 Ownership and lifetime
@@ -579,7 +584,7 @@ Meridian uses a **small fixed set of stage threads connected by bounded single-p
 The architecture is built so the deferred work *slots onto the same substrate* without rework. The guiding rule: **deferred features attach as new interface implementations or new consumers of existing value types — never as edits to existing layer contracts.**
 
 - **ESDF / path planning:** an additional `IMapLayer` implementation consuming the **same nvblox TSDF** the surface layer maintains (nvblox already computes ESDF on the GPU). Because map layers sit behind `IMapLayer` and are fed by the same corrected keyframes + retained clouds, adding ESDF is "register one more layer," not "rebuild the map." No L0–L3 change.
-- **Semantics / object detection:** `KeyframePacket` already carries an `RgbHandle`, and the keyframe store retains cloud + image. A semantics module becomes a consumer of the store plus an annotation channel in L4; the TSDF/colour voxel can carry an extra label channel. Boundary types do not change.
+- **Semantics / object detection:** `KeyframePacket` already carries a shared-immutable `image`, and the keyframe store retains cloud + image. A semantics module becomes a consumer of the store plus an annotation channel in L4; the TSDF/colour voxel can carry an extra label channel. Boundary types do not change.
 - **Offline high-fidelity export:** the nvblox Marching-Cubes mesh **is** the deliverable mesh. An *optional* one-shot Screened-Poisson pass over the retained keyframe clouds may be offered as an export utility in `meridian_tools`, never as a core runtime path.
 - **Multi-LiDAR:** out of scope and not designed now. Meridian is single-LiDAR. If ever needed, additional LiDARs would attach behind the same `ISensorSource`/extrinsic machinery as added measurement streams into the same CT window — a future extension, not a current contract.
 - **Multi-robot:** out of scope, but because the back-end consumes `KeyframePacket`s and `LoopConstraint`s by value, a peer's keyframes are just more inputs to L3/L5 — no contract change to the single-robot path.
@@ -594,7 +599,7 @@ There is **one** system — the full CT LIVO+GNSS estimator with nvblox mapping.
 2. **L0/L1** (`meridian_sensors`, `meridian_preprocess`) — get real measurements onto the monotonic timeline and through preprocessing; verify with the bag replay harness.
 3. **L2 CT front-end** (`meridian_frontend/src/ct/`) — the CT spline window, then the residual blocks (LiDAR point-to-plane, IMU-derivative, sparse-direct photometric, GNSS) integrated into one solve. The `src/iekf/` oracle is brought up alongside purely to differential-test the CT estimator (§5.4).
 4. **L4 nvblox map** (`meridian_map/src/nvblox/`) — GPU TSDF+colour+mesh consuming keyframe clouds; the keyframe store.
-5. **L3 back-end** (`meridian_backend`) — iSAM2 graph consuming `KeyframePacket`s, broadcasting `PoseCorrection`.
+5. **L3 back-end** (`meridian_backend`) — iSAM2 graph consuming `KeyframePacket`s, broadcasting `GraphUpdate`.
 6. **L5 place recognition** (`meridian_place`) — ScanContext++ → STD/BTC → GICP → PCM feeding loop constraints to L3, closing the map-correction loop into L4.
 7. **L6 + wrapper polish** — operator surface, full debug-bus binding, launch/config/rviz.
 
@@ -605,7 +610,7 @@ This ordering is a convenience for integration; the **design** is the complete s
 ## 14. Summary of the contracts (the things you must not break)
 
 1. **No ROS below `meridian_ros`.** Core is plain C++ (and CUDA); time is int64 ns; logging/telemetry are sinks bound by the wrapper. CUDA/nvblox is core, not middleware. (§1, §6.2, §9.5, §10)
-2. **`KeyframePacket` is the only L2→L3 value.** Concretely defined; one geometric constraint per interval (`RELATIVE_BETWEEN` default; `IMU_PREINT` only on restart, mutually exclusive, via GTSAM `CombinedImuFactor`); velocity/bias ride as seeds, not graph variables, by default; bias estimation lives in L2. (§6)
+2. **`KeyframePacket` is the only L2→L3 value.** Concretely defined; one geometric constraint per interval (`RelativeBetween` default; `ImuPreintegration` only on restart, mutually exclusive, via GTSAM `CombinedImuFactor`); velocity/bias ride as seeds, not graph variables, by default; bias estimation lives in L2. (§6)
 3. **The front-end is the CT LIVO+GNSS estimator.** A B-spline trajectory fusing per-point LiDAR, sparse-direct vision, IMU, and GNSS. The iEKF is a test oracle only, never a product path. (§5.4, §7.5)
 4. **The map is nvblox, GPU-only.** One backend, no CPU fallback, no VDB path. nvblox does TSDF + colour + Marching-Cubes mesh; loop correction = clear-and-rebuild of the affected region from retained clouds at corrected poses. (§2, §9.5, §6.5, and `06_mapping.md`)
 5. **One LiDAR + one IMU + one camera + GNSS.** No multi-LiDAR merge logic in the design. (§2, §3, §8.2)
@@ -619,33 +624,60 @@ This ordering is a convenience for integration; the **design** is the complete s
 ## Appendix A — `KeyframePacket` schema (canonical, returnable)
 
 ```cpp
-enum class EdgeKind { RELATIVE_BETWEEN, ABSOLUTE_PRIOR, IMU_PREINT };
-struct ObservabilityScore { FrameId frame; std::array<double,6> axis; }; // [rx,ry,rz,tx,ty,tz]
+// include/meridian/common/keyframe_packet.hpp   — canonical def: spec 01 §6.1
+namespace meridian {
 
 struct KeyframePacket {
-  KeyframeId   id;                    // monotonic, front-end assigned
-  Time         stamp;                 // int64 ns, single monotonic timeline
-  FrameId      frame;                 // name of the frame T_frame_body is in
-  SE3          T_frame_body;          // REQUIRED pose
-  bool         has_velocity_bias;     // "included" flag (true only on restart fallback)
-  Vec3         v_frame, bias_acc, bias_gyr;   // valid iff flag (seed/telemetry, not graph vars by default)
-  EdgeKind     edge_kind;             // RELATIVE_BETWEEN | ABSOLUTE_PRIOR | IMU_PREINT
-  KeyframeId   ref_id;                // previous keyframe (relative / preint edge)
-  Mat6         information;           // 6x6, ordering [rx,ry,rz,tx,ty,tz] in frame's body tangent
-  ObservabilityScore obs;            // 6 per-axis scores + reference frame
-  CloudHandle  cloud;                 // handle into IKeyframeStore (no copy)
-  RgbHandle    rgb;                   // image handle (colourisation + visual cues)
-  std::string  producer;             // "ct_livo" (or "iekf_oracle" in test runs)
+  // identity / time
+  std::uint64_t   id    = 0;                 // monotonic keyframe id (graph node key)
+  Timestamp       stamp = 0;                 // int64 ns, a real measurement instant
+
+  // pose (REQUIRED)
+  Frame           ref_frame = Frame::Odom;   // frame T_ref_body is expressed in
+  Pose            T_ref_body;                // pose of the estimation frame F_e in ref_frame
+
+  // kinematic state (OPTIONAL, gated; true only on the restart fallback)
+  bool            kinematics_included = false;
+  Eigen::Vector3d v_ref = Eigen::Vector3d::Zero();   // [m/s]    valid iff flag
+  Eigen::Vector3d b_g   = Eigen::Vector3d::Zero();   // [rad/s]  valid iff flag
+  Eigen::Vector3d b_a   = Eigen::Vector3d::Zero();   // [m/s^2]  valid iff flag
+
+  // uncertainty: ONE block, ONE constraint per interval
+  enum class ConstraintKind { RelativeBetween, AbsolutePrior, ImuPreintegration }
+                  constraint_kind = ConstraintKind::RelativeBetween;
+  std::uint64_t   rel_to_id = 0;             // RelativeBetween/ImuPreintegration: previous keyframe id
+  Pose            T_relto_this;              // RelativeBetween: the relative transform
+  GaussianBlock<6> constraint_cov;           // 6-DoF block, ROTATION-FIRST [rx,ry,rz,tx,ty,tz]
+                                             // (GTSAM Pose3 boundary; the one rotation-first block)
+
+  // observability (REQUIRED) — translation-first scores in a named frame
+  ObservabilityReport observability;
+
+  // data (REQUIRED), shared-immutable, no copy
+  std::shared_ptr<const std::vector<LidarPoint>> cloud_body;  // deskewed, body frame at stamp
+  std::shared_ptr<const CameraFrame>             image;       // null if no cam at this KF
+  Pose            T_body_cam;                // extrinsic snapshot for colourisation
+
+  // restart-fallback IMU summary (only when constraint_kind == ImuPreintegration)
+  std::optional<ImuPreintegrationSummary> imu_summary;
+
+  // provenance
+  std::uint32_t   calib_version = 0;         // CalibrationSet snapshot that produced this
+  std::uint32_t   frontend_kind = 0;         // 0=iEKF, 1=CT (diagnostics only; do not branch)
 };
+
+} // namespace meridian
 ```
+
+Canonical field-level definition: spec 01 §6.1.
 
 ## Appendix B — Interface roster (one line each)
 
 ```
 ISensorSource    : onSample(cb)                                              — L0,  swap: live/bag/sim
-IDeskewProvider  : SE3 poseAt(Time)                                         — L1,  cold-start imu-only / steady-state CT-backed
+IDeskewProvider  : Pose poseAt(Timestamp)                                   — L1,  cold-start imu-only / steady-state CT-backed
 IFrontEnd        : addScan/addImu/addImage/addGnss; setKeyframeSink;
-                   latestOdometry; onGlobalCorrection; setTelemetry         — L2,  prod: ct_livo (iekf oracle = test-only)
+                   latestNavState; onGlobalCorrection; setTelemetry         — L2,  prod: ct_livo (iekf oracle = test-only)
 IBackEnd         : addKeyframe(KeyframePacket); addLoop; optimize; onResult  — L3,  isam2 (batch LM = offline debug)
 IMapLayer        : integrate(kf); deintegrateRegion(aabb); query; extractMesh— L4,  one impl: nvblox (GPU); seam for deferred ESDF
 IKeyframeStore   : put(id,cloud,rgb,pose); get(id); clouds(region)          — L4,  ram (mmap = future)

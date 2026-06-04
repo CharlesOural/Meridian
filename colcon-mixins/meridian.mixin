@@ -1,0 +1,19 @@
+build:
+  release:
+    cmake-args:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+  debug:
+    cmake-args:
+      - -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+  asan:
+    cmake-args:
+      - -DCMAKE_BUILD_TYPE=Debug
+      - "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer"
+      - -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+  orin:
+    cmake-args:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_CUDA_ARCHITECTURES=87
+      - -DCMAKE_EXPORT_COMPILE_COMMANDS=ON

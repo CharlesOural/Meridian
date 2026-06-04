@@ -826,7 +826,7 @@ canonical `map` datum.
 ### 7.4 Output (GNSS)
 
 The `GnssFix` (unchanged geodetic data + `cov_enu`) plus a
-`GnssVerdict { bool accepted; Reason reason; Vec3 enu_provisional; }`. Only accepted
+`GnssVerdict { bool accepted; Reason reason; Eigen::Vector3d enu_provisional; }`. Only accepted
 fixes are forwarded toward L3; rejected fixes are dropped but **counted and logged**
 so denial/spoofing episodes are visible (§10).
 

@@ -151,8 +151,8 @@ L4 consumes exactly two boundary values (spec 01 §6, §7.4):
    after an `IBackEnd::optimize()`, with their new `map`-frame poses. This is the
    *only* trigger for de-integration / rebuild (§7).
 
-There is also a high-rate, **non-keyframe** path: the live `NavState` /
-`Odometry` the front-end emits every scan. L4 uses the live registered scan to
+There is also a high-rate, **non-keyframe** path: the live `NavState`
+the front-end emits every scan. L4 uses the live registered scan to
 keep Tier R fresh *between* keyframes (so the front-end has something to register
 against immediately), but **only `KeyframePacket` clouds enter the
 `KeyframeStore` and Tier S** — see §3.4 for why the live path is "best-effort
