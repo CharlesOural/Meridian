@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>meridian_preprocess</name>
+  <version>0.0.0</version>
+  <description>L1 per-sensor preprocessing: LiDAR validity gate + decimation, stationary
+    IMU init (gravity/gyro-bias) and IMU-only cold-start deskew, GNSS quality + spoof
+    gate with LLA-to-ENU, and camera debayer/photometric/pyramid. Outputs undeskewed
+    validated scans; deskew against the trajectory belongs to L2. No ROS.</description>
+  <maintainer email="charles@cfglobal.fr">Charles Farhat</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>meridian_cmake</buildtool_depend>
+
+  <depend>meridian_common</depend>
+  <depend>meridian_config</depend>
+  <depend>meridian_debug</depend>
+  <depend>meridian_calib</depend>
+  <depend>eigen</depend>
+  <depend>libopencv-dev</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

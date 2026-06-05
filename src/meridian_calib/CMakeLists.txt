@@ -19,10 +19,9 @@ target_compile_features(meridian_calib PUBLIC cxx_std_20)
 meridian_apply_warnings(meridian_calib)
 
 target_link_libraries(meridian_calib PUBLIC
-  meridian::common
+  meridian_common::meridian_common
   Eigen3::Eigen Sophus::Sophus)
 
-add_library(meridian::calib ALIAS meridian_calib)
 
 install(DIRECTORY include/ DESTINATION include)
 install(TARGETS meridian_calib EXPORT meridian_calibTargets

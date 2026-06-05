@@ -16,20 +16,25 @@ if(NOT TARGET meridian::vendor_basalt AND EXISTS "${MERIDIAN_VENDOR_DIR}/basalt-
   add_library(meridian::vendor_basalt ALIAS meridian_vendor_basalt)
 endif()
 
-# ikd-Tree: small header + one .cpp, built as a tiny static lib (registration oracle).
-if(NOT TARGET meridian::vendor_ikdtree AND EXISTS "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd_Tree.cpp")
-  add_library(meridian_vendor_ikdtree STATIC "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd_Tree.cpp")
-  target_include_directories(meridian_vendor_ikdtree PUBLIC "${MERIDIAN_VENDOR_DIR}/ikd-Tree")
+# ikd-Tree: header + one .cpp (nested ikd-Tree/ dir upstream), built as a tiny static
+# lib (registration oracle).
+if(NOT TARGET meridian::vendor_ikdtree
+   AND EXISTS "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree/ikd_Tree.cpp")
+  add_library(meridian_vendor_ikdtree STATIC
+    "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree/ikd_Tree.cpp")
+  target_include_directories(meridian_vendor_ikdtree PUBLIC
+    "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree")
   target_link_libraries(meridian_vendor_ikdtree PUBLIC Eigen3::Eigen)
   set_target_properties(meridian_vendor_ikdtree PROPERTIES POSITION_INDEPENDENT_CODE ON)
   add_library(meridian::vendor_ikdtree ALIAS meridian_vendor_ikdtree)
 endif()
 
-# Scan Context++: header-only loop descriptor.
-if(NOT TARGET meridian::vendor_scancontext AND EXISTS "${MERIDIAN_VENDOR_DIR}/scancontext")
+# Scan Context++: the C++ module inside the upstream evaluation repo.
+if(NOT TARGET meridian::vendor_scancontext
+   AND EXISTS "${MERIDIAN_VENDOR_DIR}/scancontext/cpp/module/Scancontext")
   add_library(meridian_vendor_scancontext INTERFACE)
   target_include_directories(meridian_vendor_scancontext INTERFACE
-    "${MERIDIAN_VENDOR_DIR}/scancontext")
+    "${MERIDIAN_VENDOR_DIR}/scancontext/cpp/module/Scancontext")
   target_link_libraries(meridian_vendor_scancontext INTERFACE Eigen3::Eigen)
   add_library(meridian::vendor_scancontext ALIAS meridian_vendor_scancontext)
 endif()

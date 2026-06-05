@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 #include "meridian/calib/calibration_set.hpp"
 
@@ -21,8 +22,9 @@ class ICalibrationProvider {
 };
 
 // Write side: exactly one writer (the back-end thread); many readers. current()
-// is a lock-free atomic load of the snapshot pointer; publish() atomically swaps
-// in a freshly built set (copy-on-write), so no reader ever sees a half update.
+// copies the snapshot pointer under a light mutex; publish() swaps in a freshly
+// built set (copy-on-write), so no reader ever sees a half update and the sets
+// themselves are immutable.
 class CalibrationStore final : public ICalibrationProvider {
  public:
   explicit CalibrationStore(std::shared_ptr<const CalibrationSet> seed_v0);
@@ -34,8 +36,9 @@ class CalibrationStore final : public ICalibrationProvider {
   void publish(std::shared_ptr<const CalibrationSet> refined);
 
  private:
-  // Atomic shared_ptr: reads are lock-free and never tear against a concurrent publish().
-  std::atomic<std::shared_ptr<const CalibrationSet>> snapshot_;
+  // Guards only the pointer swap/copy; the pointed-to set is immutable.
+  mutable std::mutex m_;
+  std::shared_ptr<const CalibrationSet> snapshot_;
   std::atomic<std::uint32_t> version_;
 };
 

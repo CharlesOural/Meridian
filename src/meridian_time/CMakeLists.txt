@@ -19,9 +19,8 @@ target_compile_features(meridian_time PUBLIC cxx_std_20)
 meridian_apply_warnings(meridian_time)
 
 target_link_libraries(meridian_time PUBLIC
-  meridian::common)
+  meridian_common::meridian_common)
 
-add_library(meridian::time ALIAS meridian_time)
 
 ament_export_targets(meridian_timeTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(meridian_common)

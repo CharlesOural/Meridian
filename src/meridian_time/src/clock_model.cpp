@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <mutex>
 
 namespace meridian {
 
@@ -37,6 +38,7 @@ const ClockState& ClockModel::at(ClockId id) const {
 }
 
 Timestamp ClockModel::to_meridian(Timestamp device_ns, ClockId id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
   const ClockState& s = at(id);
 
   // Disciplined clocks are already on the host timeline (offset/skew ~ 0).
@@ -58,6 +60,7 @@ Timestamp ClockModel::to_meridian(Timestamp device_ns, ClockId id) const {
 
 void ClockModel::on_ptp_stats(ClockId id, double offset_ns,
                               double /*path_delay_ns*/, bool locked) {
+  const std::lock_guard<std::mutex> lock(mutex_);
   ClockState& s = at(id);
 
   if (locked) {
@@ -81,6 +84,7 @@ void ClockModel::on_ptp_stats(ClockId id, double offset_ns,
 }
 
 void ClockModel::on_pps_edge(Timestamp host_ns_of_edge) {
+  const std::lock_guard<std::mutex> lock(mutex_);
   // A PPS edge disciplines the GNSS clock against the host timeline.
   last_pps_host_ns_ = host_ns_of_edge;
 
@@ -95,6 +99,7 @@ void ClockModel::on_pps_edge(Timestamp host_ns_of_edge) {
 
 void ClockModel::on_correspondence(ClockId id, Timestamp device_ns,
                                    Timestamp host_ns, double meas_std_ns) {
+  const std::lock_guard<std::mutex> lock(mutex_);
   ClockState& s = at(id);
   RlsState& r = rls_[static_cast<std::size_t>(id)];
 
@@ -151,14 +156,24 @@ void ClockModel::on_correspondence(ClockId id, Timestamp device_ns,
 }
 
 bool ClockModel::ptp_locked(ClockId id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
   const ClockState& s = at(id);
   return s.disciplined && s.source == StampSource::HwPtp;
 }
 
-bool ClockModel::disciplined(ClockId id) const { return at(id).disciplined; }
+bool ClockModel::disciplined(ClockId id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return at(id).disciplined;
+}
 
-StampSource ClockModel::stamp_source(ClockId id) const { return at(id).source; }
+StampSource ClockModel::stamp_source(ClockId id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return at(id).source;
+}
 
-ClockState ClockModel::state(ClockId id) const { return at(id); }
+ClockState ClockModel::state(ClockId id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return at(id);
+}
 
 }  // namespace meridian

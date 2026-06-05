@@ -44,7 +44,7 @@ distrobox enter meridian
 Then, one-time workspace bring-up from the repo root:
 
 ```bash
-git submodule update --init --recursive          # vendor/ (basalt, ikd-Tree, scancontext)
+git submodule update --init          # vendor/ (basalt, ikd-Tree, scancontext)
 vcs import src < dependencies.repos              # nvblox (GPU) + ouster-ros
 vcs custom src --git --args submodule update --init --recursive   # nested submodules (ouster-sdk)
 rosdep install --from-paths src --ignore-src -y
@@ -90,7 +90,7 @@ docker compose exec meridian bash
 Workspace bring-up (note: **skip the GPU layer**):
 
 ```bash
-git submodule update --init --recursive
+git submodule update --init
 # do NOT `vcs import` nvblox on Mac — it needs CUDA.
 CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install \
     --parallel-workers 1 \
@@ -126,3 +126,11 @@ Version pins live in `install-deps.sh` (source builds) and follow spec 11 §3.
 > **Pinning TODO.** A few refs are not yet locked to a SHA (`small_gicp`,
 > `nvblox`, `ouster-ros`, and the `vendor/` submodules). Pin them per spec 11 §3
 > before any release/air-gapped build so nothing floats on a moving branch.
+
+---
+
+## Testing with a dataset
+
+`docs/TESTING.md` walks the full bag pipeline: download a FusionPortable sequence,
+convert it with `rosbags-convert`, confirm the topics, and drive the live node with
+`ros2 bag play --clock` while watching the deskewed cloud and telemetry.

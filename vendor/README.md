@@ -1,9 +1,13 @@
 # vendor/ — pinned upstream submodules
 
+> `COLCON_IGNORE` keeps colcon out of this tree: the upstreams ship their own
+> CMake projects (basalt-headers even pins its bundled Eigen), but they are
+> consumed as header sources through `MeridianVendored.cmake`, never built
+> standalone.
+
 These three upstreams are vendored as git submodules (see `../.gitmodules`) and
 consumed in-tree via `MeridianVendored.cmake` (which wraps each as a
-`meridian::vendor_*` CMake target). They are pinned by submodule SHA, not fetched
-at build time, so a clean checkout is reproducible and offline-buildable.
+`meridian::vendor_*` CMake target).
 
 | Submodule | Used by | Role |
 |---|---|---|
@@ -14,5 +18,5 @@ at build time, so a clean checkout is reproducible and offline-buildable.
 Fetch them with:
 
 ```bash
-git submodule update --init --recursive
+git submodule update --init
 ```

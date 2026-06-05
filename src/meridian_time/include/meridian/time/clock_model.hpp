@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 #include "meridian/common/time.hpp"
 #include "meridian/time/stamp_source.hpp"
@@ -33,6 +34,8 @@ struct ClockState {
 // single monotonic Meridian timeline. It does not implement PTP/PPS; it only
 // observes their quality (on_ptp_stats / on_pps_edge) and runs a lightweight
 // software estimator (on_correspondence) for clocks no hardware disciplines.
+//
+// Thread-safe: read from sensor ingest threads, written by the time estimator.
 class ClockModel {
  public:
   // Map a device-clock value to the Meridian (host) timeline. Disciplined
@@ -80,6 +83,10 @@ class ClockModel {
 
   // Last host instant a PPS edge was observed; reported via the Gnss clock.
   Timestamp last_pps_host_ns_ = 0;
+
+  // Guards all state; held by every public method so reads from ingest threads
+  // never observe a partial write from the estimator.
+  mutable std::mutex mutex_;
 };
 
 }  // namespace meridian

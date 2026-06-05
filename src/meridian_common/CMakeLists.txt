@@ -13,7 +13,6 @@ target_include_directories(meridian_common INTERFACE
   $<INSTALL_INTERFACE:include>)
 target_compile_features(meridian_common INTERFACE cxx_std_20)
 target_link_libraries(meridian_common INTERFACE Eigen3::Eigen Sophus::Sophus)
-add_library(meridian::common ALIAS meridian_common)
 
 install(DIRECTORY include/ DESTINATION include)
 install(TARGETS meridian_common EXPORT meridian_commonTargets)

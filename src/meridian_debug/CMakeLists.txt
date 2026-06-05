@@ -20,10 +20,9 @@ target_compile_features(meridian_debug PUBLIC cxx_std_20)
 meridian_apply_warnings(meridian_debug)
 
 target_link_libraries(meridian_debug PUBLIC
-  meridian::common
+  meridian_common::meridian_common
   Eigen3::Eigen Sophus::Sophus)
 
-add_library(meridian::debug ALIAS meridian_debug)
 
 install(DIRECTORY include/ DESTINATION include)
 install(TARGETS meridian_debug EXPORT meridian_debugTargets
@@ -35,6 +34,8 @@ if(BUILD_TESTING)
   include(MeridianTesting)
   meridian_add_gtest(test_telemetry test/test_telemetry.cpp)
   target_link_libraries(test_telemetry meridian_debug)
+  meridian_add_gtest(test_sinks test/test_sinks.cpp)
+  target_link_libraries(test_sinks meridian_debug)
 endif()
 
 ament_package()

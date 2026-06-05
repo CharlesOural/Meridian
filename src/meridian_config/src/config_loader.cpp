@@ -107,6 +107,7 @@ void load_sensors(const YAML::Node& root, SensorsConfig& c) {
     get(i, "cov_gyr", c.imu.cov_gyr);
     get(i, "b_acc_cov", c.imu.b_acc_cov);
     get(i, "b_gyr_cov", c.imu.b_gyr_cov);
+    get(i, "has_device_clock", c.imu.has_device_clock);
   }
 
   const YAML::Node cam = n["camera"];
@@ -153,6 +154,27 @@ void load_preprocess(const YAML::Node& root, PreprocessConfig& c) {
   get(n, "blind", c.lidar.blind);
   get(n, "point_filter_num", c.lidar.point_filter_num);
   get(n, "det_range", c.lidar.det_range);
+
+  const YAML::Node g = n["gnss"];
+  if (g) {
+    get(g, "enable", c.gnss.enable);
+    if (g["min_fix_type"]) {
+      c.gnss.min_fix_type = parse_enum<GnssFix::FixType>(
+          g["min_fix_type"], "preprocess.gnss.min_fix_type",
+          {{"none", GnssFix::FixType::None},
+           {"spp", GnssFix::FixType::SPP},
+           {"dgps", GnssFix::FixType::DGPS},
+           {"rtk_float", GnssFix::FixType::RTK_Float},
+           {"rtk_fixed", GnssFix::FixType::RTK_Fixed}});
+    }
+    get(g, "min_sats", c.gnss.min_sats);
+    get(g, "max_pos_var", c.gnss.max_pos_var);
+    get(g, "max_dop", c.gnss.max_dop);
+    get(g, "spoof_check", c.gnss.spoof_check);
+    get(g, "spoof_vel_thresh", c.gnss.spoof_vel_thresh);
+    get(g, "spoof_persist", c.gnss.spoof_persist);
+    get(g, "spoof_window_ms", c.gnss.spoof_window_ms);
+  }
 }
 
 void load_frontend(const YAML::Node& root, FrontendConfig& c) {

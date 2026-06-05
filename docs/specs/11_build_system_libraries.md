@@ -296,7 +296,7 @@ target_include_directories(meridian_frontend PUBLIC
 target_compile_features(meridian_frontend PUBLIC cxx_std_20)
 
 target_link_libraries(meridian_frontend PUBLIC
-  meridian::common meridian::config meridian::debug meridian::calib
+  meridian_common::meridian_common meridian_config::meridian_config meridian_debug::meridian_debug meridian_calib::meridian_calib
   Eigen3::Eigen Sophus::Sophus
   Ceres::ceres
   ${OpenCV_LIBS}
@@ -317,7 +317,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_ct_spline meridian_frontend)
 endif()
 
-add_library(meridian::frontend ALIAS meridian_frontend)
 ament_package()
 ```
 
@@ -354,17 +353,17 @@ find_package(meridian_pipeline REQUIRED)          # the whole core, via one pack
 add_library(meridian_ros_conversions src/conversions/ros2core.cpp src/conversions/core2ros.cpp)
 ament_target_dependencies(meridian_ros_conversions
   rclcpp sensor_msgs nav_msgs geometry_msgs visualization_msgs tf2 tf2_ros meridian_msgs)
-target_link_libraries(meridian_ros_conversions meridian::pipeline)
+target_link_libraries(meridian_ros_conversions meridian_pipeline::meridian_pipeline)
 
 add_executable(odometry_node src/odometry_node.cpp)
 ament_target_dependencies(odometry_node
   rclcpp rclcpp_components sensor_msgs nav_msgs message_filters tf2_ros diagnostic_updater meridian_msgs)
-target_link_libraries(odometry_node meridian_ros_conversions meridian::pipeline)
+target_link_libraries(odometry_node meridian_ros_conversions meridian_pipeline::meridian_pipeline)
 
 add_executable(mapping_node src/mapping_node.cpp)
 ament_target_dependencies(mapping_node
   rclcpp visualization_msgs sensor_msgs rosbag2_cpp meridian_msgs)
-target_link_libraries(mapping_node meridian_ros_conversions meridian::pipeline)
+target_link_libraries(mapping_node meridian_ros_conversions meridian_pipeline::meridian_pipeline)
 
 install(TARGETS odometry_node mapping_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch config rviz DESTINATION share/${PROJECT_NAME})
@@ -527,7 +526,7 @@ target_include_directories(meridian_map PUBLIC
   $<INSTALL_INTERFACE:include>)
 
 target_link_libraries(meridian_map PUBLIC
-  meridian::common meridian::debug meridian::calib
+  meridian_common::meridian_common meridian_debug::meridian_debug meridian_calib::meridian_calib
   Eigen3::Eigen
   nvblox::nvblox                   # TSDF + colour + Marching Cubes (GPU)
   CUDA::cudart
@@ -539,7 +538,6 @@ ament_export_dependencies(meridian_common meridian_debug meridian_calib Eigen3 n
 install(TARGETS meridian_map EXPORT meridian_mapTargets
         ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include)
-add_library(meridian::map ALIAS meridian_map)
 ament_package()
 ```
 

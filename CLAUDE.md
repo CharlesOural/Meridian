@@ -30,7 +30,8 @@ single source of truth never drifts. When in doubt, follow the spec, not this fi
 - `docs/grounding/` — `file:line` + paper citations into the **reference** systems
   (FAST-LIO2, FAST-LIVO2, nvblox, iSAM2, Coco-LIC); these describe *those* systems,
   not Meridian's API. `docs/course/` — textbook-depth math.
-- `DEVELOPMENT.md` — the dev-environment runbook (summarised below).
+- `docs/DEVELOPMENT.md` — the dev-environment runbook (summarised below).
+- `docs/TESTING.md` — running the system against a dataset bag (FusionPortable).
 
 ## Dev environment & commands
 
@@ -40,7 +41,7 @@ Eigen/Sophus/Ceres 2.1/GTSAM 4.2/PCL/OpenCV/small_gicp, clang tooling); both
 Dockerfiles run it. CUDA/nvblox is Linux-GPU only, so Apple Silicon builds
 everything except `meridian_map` and the packages that link it.
 
-**`DEVELOPMENT.md` is the runbook** — container setup (distrobox / Docker), the
+**`docs/DEVELOPMENT.md` is the runbook** — container setup (distrobox / Docker), the
 one-time workspace bring-up (`git submodule update`, `vcs import src < dependencies.repos`),
 build invocations, and viz. Follow it rather than duplicating commands here. Tests
 run via ament/GoogleTest: `colcon test`; `--packages-select <pkg>` for one package;

@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# An unset build type compiles without optimization, which the per-scan hot loops
+# cannot afford; default to Release and let an explicit -DCMAKE_BUILD_TYPE override.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 # CUDA settings only take effect in a package that enables the CUDA language.
 # Default arch is SM 8.7; override per build target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)

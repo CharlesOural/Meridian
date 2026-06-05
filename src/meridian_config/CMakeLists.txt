@@ -21,11 +21,10 @@ target_compile_features(meridian_config PUBLIC cxx_std_20)
 meridian_apply_warnings(meridian_config)
 
 target_link_libraries(meridian_config PUBLIC
-  meridian::common
+  meridian_common::meridian_common
   Eigen3::Eigen Sophus::Sophus
   PRIVATE yaml-cpp)
 
-add_library(meridian::config ALIAS meridian_config)
 
 ament_export_targets(meridian_configTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(meridian_common Eigen3 Sophus)

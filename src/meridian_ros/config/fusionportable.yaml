@@ -1,0 +1,58 @@
+# Meridian configuration for FusionPortable bag replay (e.g. 20220216_garden_day).
+#
+# Topic names below are the descriptor defaults for FusionPortable sequences. CONFIRM
+# them against your converted bag before the first run:
+#     ros2 bag info <bag>
+# and adjust the four `topic:` keys if they differ.
+#
+# The dataset ships Kalibr calibration; the LiDAR extrinsic below is identity until the
+# per-sequence calibration is imported (good enough to view the deskewed cloud; required
+# before judging geometry against ground truth).
+meridian:
+  pipeline:
+    mode: live              # the node ingests from topics; ros2 bag play drives them
+  time:
+    source: host            # bag replay: no live PTP discipline; stamps pass through
+    max_skew_ms: 5.0
+  sensors:
+    lidar:
+      topic: /os_cloud_node/points
+      model: ouster_os1_128
+      nominal_rate_hz: 10.0
+      ptp: false            # no PTP servo during replay; recorded stamps are final
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+    imu:
+      topic: /stim300/imu/data_raw   # the 200 Hz body IMU (confirmed from the bags)
+      rate_hz: 200.0
+      cov_acc: 0.1
+      cov_gyr: 0.1
+      b_acc_cov: 1.0e-4
+      b_gyr_cov: 1.0e-4
+    camera:
+      # The frame cameras ship compressed-only in the bags; the DAVIS left camera is
+      # the raw-Image stream. The camera path is optional for this phase either way.
+      topic: /stereo/davis_left/image_raw
+      model: pinhole
+      nominal_rate_hz: 40.0
+      # [fx, fy, cx, cy] — zeros until the Kalibr intrinsics are imported; the camera
+      # path only decodes + pyramids in this phase, so geometry is not consumed yet.
+      intrinsics: [0.0, 0.0, 0.0, 0.0]
+      photometric:
+        exposure_comp: true
+    gnss:
+      topic: /ublox/fix
+      enable: false # No GPS heres
+  preprocess:
+    blind: 0.5
+    det_range: 120.0
+    point_filter_num: 2
+    voxel_surf_m: 0.5
+  debug:
+    level: info
+    publish_clouds: true
+    publish_markers: true
+    timing: true
+    telemetry_rate_hz: 10.0

@@ -440,7 +440,6 @@ target_link_libraries(meridian_frontend PUBLIC
   meridian_common meridian_config meridian_debug meridian_calib
   Eigen3::Eigen Sophus::Sophus Ceres::ceres ${PCL_LIBRARIES})  # NO rclcpp — enforced (§9.4)
 ament_target_dependencies(meridian_frontend Eigen3 PCL)
-add_library(meridian::frontend ALIAS meridian_frontend)
 ament_export_targets(meridian_frontendTargets HAS_LIBRARY_TARGET)
 ```
 
