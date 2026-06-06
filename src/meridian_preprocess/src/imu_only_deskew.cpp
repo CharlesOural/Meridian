@@ -61,6 +61,45 @@ void ImuOnlyDeskew::pushImu(const ImuSample& s) {
   anchor_ = s.stamp;
 }
 
+void ImuOnlyDeskew::integrateSweep(const std::vector<ImuSample>& imu, Timestamp t_begin,
+                                   Timestamp t_end) {
+  if (imu.empty()) {
+    return;
+  }
+
+  // One self-measured IMU period: the group's mean inter-sample gap. With a single
+  // sample there is no measurable cadence, so no hold is applied.
+  Duration period = 0;
+  if (imu.size() >= 2) {
+    period = (imu.back().stamp - imu.front().stamp) /
+             static_cast<Duration>(imu.size() - 1);
+  }
+
+  // Head-hold: when the first sample lands after t_begin and within one period, hold its
+  // measurement back to t_begin as a synthetic interval head. A larger gap is a real IMU
+  // hole and is left to fail the horizon check.
+  const Duration head_gap = imu.front().stamp - t_begin;
+  if (head_gap > 0 && period > 0 && head_gap <= period) {
+    ImuSample head = imu.front();
+    head.stamp = t_begin;
+    pushImu(head);
+  }
+
+  for (const ImuSample& s : imu) {
+    pushImu(s);
+  }
+
+  // ZOH tail: hold the last in-interval measurement forward to t_end so the anchor is
+  // inside the horizon. Bounded by one period for the same reason as the head hold.
+  if (imu.back().stamp < t_end) {
+    ImuSample tail = imu.back();
+    tail.stamp = t_end;
+    pushImu(tail);
+  }
+
+  anchor_ = t_end;
+}
+
 bool ImuOnlyDeskew::imuPoseAt(Timestamp t, Pose* T_ref_imu) const {
   if (!seeded_) {
     return false;

@@ -14,9 +14,11 @@ find_package(meridian_debug REQUIRED)
 find_package(meridian_calib REQUIRED)
 find_package(meridian_sensors REQUIRED)
 find_package(meridian_preprocess REQUIRED)
+find_package(meridian_frontend REQUIRED)
 
 add_library(meridian_pipeline
-  src/meridian_pipeline.cpp)
+  src/meridian_pipeline.cpp
+  src/calibration_from_config.cpp)
 
 target_include_directories(meridian_pipeline PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -28,6 +30,7 @@ meridian_apply_warnings(meridian_pipeline)
 target_link_libraries(meridian_pipeline PUBLIC
   meridian_common::meridian_common meridian_config::meridian_config meridian_time::meridian_time meridian_debug::meridian_debug
   meridian_calib::meridian_calib meridian_sensors::meridian_sensors meridian_preprocess::meridian_preprocess
+  meridian_frontend::meridian_frontend
   Eigen3::Eigen Sophus::Sophus)
 
 
@@ -37,6 +40,7 @@ install(TARGETS meridian_pipeline EXPORT meridian_pipelineTargets
 ament_export_targets(meridian_pipelineTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(meridian_common meridian_config meridian_time meridian_debug
                           meridian_calib meridian_sensors meridian_preprocess
+                          meridian_frontend
                           Eigen3 Sophus)
 
 if(BUILD_TESTING)

@@ -12,6 +12,7 @@ find_package(meridian_debug REQUIRED)
 find_package(meridian_config REQUIRED)
 
 add_library(meridian_sensors
+  src/input_validator.cpp
   src/source_base.cpp
   src/sources.cpp
   src/aggregator.cpp)
@@ -49,6 +50,13 @@ if(BUILD_TESTING)
 
   meridian_add_gtest(test_sources test/test_sources.cpp)
   target_link_libraries(test_sources meridian_sensors)
+
+  # The validator is a private (src/) component; the test reaches its header through the
+  # source include dir and links the symbols from the library archive.
+  meridian_add_gtest(test_input_validator test/test_input_validator.cpp)
+  target_include_directories(test_input_validator PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_input_validator meridian_sensors meridian_debug::meridian_debug)
 endif()
 
 ament_package()

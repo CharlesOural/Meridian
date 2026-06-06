@@ -53,7 +53,7 @@
 > datasets ship in ([`DATASET.md`](../DATASET.md): the datasets ship Kalibr-format
 > intrinsics + extrinsics + IMU noise — these *seed the priors*, §8).
 >
-> **Notation** follows spec 01 §0 / course §02: $T_{A\_B}\in SE(3)$ maps a point
+> **Notation** follows spec 01 §0: $T_{A\_B}\in SE(3)$ maps a point
 > from frame $B$ to frame $A$ ($p_A = T_{A\_B}\,p_B$); the estimation frame is
 > $F_e$ (normally `imu_link`, spec 01 §2.3); tangent ordering is **translation
 > first, rotation second** $\xi=[\rho;\phi]\in\mathbb{R}^6$ with the **right**

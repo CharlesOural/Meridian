@@ -27,13 +27,12 @@
 > now**. Nothing in this spec may require an ESDF or a semantic label to function.
 >
 > **Grounding.** The surface/mesh tier is grounded in **nvblox** (GPU TSDF + GPU
-> colour + GPU Marching Cubes), per the dossier
-> `docs/grounding/07_mapping_tsdf_mesh.md` (§0 verdict, §1 fusion equations, §5
-> Marching Cubes, §8 clear-and-rebuild, §10 recommendation). The clear-and-rebuild
-> contract is the dossier's "load-bearing constraint" (07 §8): a running-average
-> TSDF is not per-keyframe reversible, so loop correction is *clear and
-> re-integrate from retained clouds at corrected poses*, never per-voxel
-> subtraction. The registration tier is grounded in FAST-LIO's incremental
+> colour + GPU Marching Cubes); the fusion-equation, Marching-Cubes and ESDF
+> reference digests are in Appendix R. The clear-and-rebuild contract is the
+> load-bearing constraint of any running-average TSDF: it is not per-keyframe
+> reversible, so loop correction is *clear and re-integrate from retained clouds at
+> corrected poses*, never per-voxel subtraction (the argument is in §7.4). The
+> registration tier is grounded in FAST-LIO's incremental
 > k-d tree, `slam-reference/FAST_LIO/include/ikd-Tree/ikd_Tree.{h,cpp}`, and the
 > ikd-Tree paper `slam-reference/papers/2102.10808.txt`; we keep its incremental
 > insert / box-delete / nearest-neighbour *behaviour* and replace its data layout
@@ -120,8 +119,7 @@ The discipline that makes loop closure tractable: **Tiers R and S are disposable
 caches of the `KeyframeStore`.** Any region of either tier can be discarded and
 rebuilt from the retained clouds at corrected poses (§7). This is the
 architectural choice behind MUST-FIX #4, and it is *forced* on Tier S because
-nvblox's running-average TSDF is mathematically non-invertible (07 §8.1, §4.4
-below).
+nvblox's running-average TSDF is mathematically non-invertible (§4.4 below).
 
 > **Why no out-of-core archive tier.** An earlier design carried a third
 > "global NanoVDB archive" tier for evicted registration voxels. That is removed:
@@ -163,7 +161,7 @@ scratch" and the keyframe path is "canonical".
 | Consumer | Value | Mechanism |
 |---|---|---|
 | L2 front-end | `PlaneHit` (nearest plane to a query point) | `IRegistrationMap::query_plane` (§3.5), synchronous, hot, CPU |
-| L6 operator surface | `ColorMesh` (colourised triangles) | `ISurfaceMap::extract_mesh` (§5), on-demand/throttled, Moved from GPU |
+| L6 operator surface | `ColorMesh` (colourised triangles) | `ISurfaceMap::extract_mesh` (§5), on-demand/throttled; the standing host mesh is updated by streaming only changed blocks, and the L4→L6 `IMeshExtractor` boundary hands L6 a moved snapshot of it (spec 01 §7.7, §9) |
 | L5 place recognition | retained clouds in a region | `KeyframeStore::in_region` (§6), Shared-immutable |
 | Debug bus | timing/scalars/markers | `TelemetrySink` (§11) |
 
@@ -261,9 +259,11 @@ struct VoxelKeyHash {          // spatial hash (the FAST-LIVO2 / Loam-style mix)
 struct RegVoxel {
   // Adaptive occupancy: a voxel holds a SMALL bounded set of representative
   // points (capacity Nv, default 20) rather than every point, like ikd-Tree's
-  // on-insert downsample (Add_Points/downsample_size). Newest-wins eviction.
+  // on-insert downsample (Add_Points/downsample_size). Once full, points are
+  // replaced by deterministic reservoir sampling (§3.2a), not newest-wins.
   std::array<Eigen::Vector3f, kMaxPtsPerVoxel> pts;  // map-frame points
   std::uint8_t  n = 0;                                // valid count
+  std::uint32_t seen = 0;                             // total points offered (reservoir counter)
 
   // Cached local plane (n·x + d = 0), refit lazily when `dirty` && n>=kMinPlanePts.
   Eigen::Vector3f plane_n {0,0,0};
@@ -292,6 +292,23 @@ class VoxelHashMap final : public IRegistrationMap {
 O(1); it is the direct analogue of ikd-Tree's per-voxel downsample cap
 (`Add_Points` with `downsample_size` — one representative survives per downsample
 cell). `kNShards` keeps the front-end's read lock contention low (§3.6).
+
+### 3.2a Bounded-voxel eviction is deterministic (reservoir, not newest-wins)
+
+Once a voxel holds `kMaxPtsPerVoxel` points, a further insert must drop one. A
+**newest-wins** policy (overwrite the oldest slot) makes the surviving point set —
+and therefore the cached plane — depend on the *order* points were offered, which
+the multi-threaded live path (§3.4) does not fix; the same bag would yield a
+different plane cache run to run, breaking the determinism mode (§9). Eviction is
+therefore **reservoir sampling** with a per-process **seeded** RNG: the voxel keeps
+a `seen` counter, and the $k$-th offered point ($k>$`kMaxPtsPerVoxel`) replaces a
+uniformly-chosen existing slot with probability `kMaxPtsPerVoxel`$/k$, else is
+dropped. This keeps a uniform sample of all points ever offered to the voxel
+(unbiased toward early *or* late returns) and, because the RNG is seeded from a
+fixed config seed (`map.reg_seed`, default 0) and advanced in keyframe-insert order
+on T4, the retained set is **reproducible** across runs of the same bag in
+single-thread replay. The reservoir draw is the only randomness in Tier R and is
+confined to the eviction decision, never to the query path.
 
 ### 3.3 Adaptive resolution & the plane cache
 
@@ -422,19 +439,18 @@ re-inserting everything in it.
 
 Tier S is the **dense surface representation**, and it is **nvblox on the GPU,
 full stop** — the only surface/map backend in Meridian (spec 00 §2.1, §9.5; spec 11
-§7; grounding 07 §0, §10). nvblox maintains a sparse, block-allocated grid of
+§7). nvblox maintains a sparse, block-allocated grid of
 **Truncated Signed Distance Function (TSDF)** voxels (signed distance + fusion
 weight) and a separate **colour** layer, fused with **running-average** semantics
-(07 §1.3, §1.5), from which nvblox extracts the mesh (§5). Unlike Tier R (which
+(§4.3), from which nvblox extracts the mesh (§5). Unlike Tier R (which
 stores points + cached planes for *registration*), Tier S models **free space and
 surface** so Marching Cubes can produce a watertight, colourised mesh.
 
 There is **no CPU fallback and no second implementation.** nvblox runs on the
 guaranteed-present Jetson Orin CUDA GPU; a missing GPU at runtime is a hard,
 fail-fast configuration error, not a degraded mode (spec 00 §9.5). VDBFusion,
-Voxblox, OpenVDB and NanoVDB were considered and rejected (grounding 07 §0; spec
-11 §11) — they do not appear in the build or this spec except as the named
-alternatives we declined.
+Voxblox, OpenVDB and NanoVDB were considered and rejected (spec 11 §11) — they do
+not appear in the build or this spec except as the named alternatives we declined.
 
 ### 4.2 How Meridian drives nvblox
 
@@ -451,8 +467,8 @@ class NvbloxSurfaceMap final : public ISurfaceMap {
   // Mirrors the per-keyframe -> touched block set for §7 rebuild provenance.
   std::unordered_map<std::uint64_t, std::vector<BlockKey>> kf_blocks_;
   float voxel_m_, trunc_m_;  // truncation distance trunc_m = trunc_voxels * voxel_m
-  // nvblox::Mapper / TsdfLayer / ColorLayer / MeshLayer handles ...  (8^3 blocks,
-  // CUDA unified memory; grounding 07 §3.1)
+  // nvblox::Mapper / TsdfLayer / ColorLayer / MeshLayer handles ...
+  // (8^3 voxel blocks in CUDA unified memory)
 };
 ```
 
@@ -463,9 +479,9 @@ surface detail (0.05 m) is finer than registration (0.2 m).
 
 Per `integrate(kf, T_map_body)`, the host wrapper projects the keyframe's
 deskewed cloud into a depth image (and carries the RGB image), then launches
-nvblox's **projective** integrators (grounding 07 §2.1, §2.4 — the GPU-native
-one-update-per-voxel pass nvblox is built around). The math nvblox applies, stated
-for reference (07 §1.2–§1.5):
+nvblox's **projective** integrators (the GPU-native one-update-per-voxel pass
+nvblox is built around; projective vs raycast contrast in Appendix R.1). The math
+nvblox applies, stated for reference:
 
 **Geometric (TSDF) update.** For each measured point $p$ (range $\rho$ along the
 ray from sensor origin $o$ in map frame), nvblox updates voxels in the truncation
@@ -479,20 +495,67 @@ fused by the running average with measurement weight $w$:
 $$
 d \leftarrow \frac{W\,d + w\,d(x)}{W + w},\qquad W \leftarrow \min(W + w,\ W_{\max}).
 $$
-$W_{\max}$ caps the weight so the surface stays adaptive to corrections — a fully
-saturated voxel can never be updated, which would fight loop closure (07 §1.3,
-§9). The first pass uses a constant LiDAR measurement weight $w=1$ inside the band, $0$
-outside (07 §1.4, §2.4 LiDAR recommendation).
+$W_{\max}$ (`tsdf_w_max`, default **8**) is deliberately **small** — a handful of
+observations, not a hundred. Two forces set it low. First, **scene
+responsiveness**: once $W$ reaches $W_{\max}$ each new observation carries weight
+$w/(W_{\max}+w)$, so a small cap keeps a stale voxel correctable by fresh geometry
+— a transient or slowly-displaced surface (a parked car that leaves, a door that
+opens) fades within a few sweeps instead of being burned in for the mission. A
+large cap (the rejected $W_{\max}=100$) makes a fused voxel almost immovable: each
+new measurement moves it by under 1 %, so dynamics ghost and never clear. Second,
+**loop correction is owned by clear-and-rebuild, not by re-fusion** (§7): the map
+does not depend on a high $W_{\max}$ to absorb a pose snap, because the affected
+blocks are cleared and re-integrated from scratch at corrected poses. The weight
+cap therefore exists only to damp per-sweep range noise on a *static* surface
+(roughly $1/\sqrt{W_{\max}}$ noise reduction at saturation), and ~5–10 is enough
+for that; pushing it higher trades responsiveness for a noise-reduction floor the
+LiDAR does not need. The first pass uses a constant LiDAR measurement weight $w=1$
+inside the band, $0$ outside (the constant-weight choice for range-independent
+LiDAR returns; weight models in Appendix R.4).
+
+**Integration distance is the map's own cutoff, decoupled from preprocessing.**
+Fusion ignores any point whose range exceeds `tsdf_max_integration_dist_m`
+(default **50 m**). This is a **distinct** parameter from preprocessing's
+`det_range` (spec 03, default 120 m): `det_range` governs which returns the
+*front-end* registers against (it wants long-range structure for odometry), while
+`tsdf_max_integration_dist_m` governs how far the *dense surface* is fused — and
+the surface must be cut much closer because TSDF VRAM scales with the integrated
+volume. Allocated 8³ blocks grow roughly with the swept volume out to the cutoff
+($\propto r^2$ along the trajectory for a ground vehicle), so a 120 m surface
+cutoff would allocate ~5–6× the blocks of a 50 m one for geometry the operator
+mesh does not need at that range and that the LiDAR resolves too sparsely to mesh
+well. Setting the surface cutoff to ~40–60 m keeps the dense map dense where it is
+useful and is the **primary VRAM control** alongside `tsdf_voxel_m` and
+`reg_hot_radius_m` (the GPU-OOM remedy, §9). Tier R is unaffected — it indexes the
+full `det_range` cloud, since CPU voxels are cheap relative to GPU TSDF blocks.
 
 **Colour update.** nvblox's colour integrator projects each surface voxel into the
 keyframe image using `T_body_cam` (carried in the packet so colourisation is
 reproducible after online extrinsic refinement, spec 01 §6.2 item 6) and the
-camera intrinsics: $u = \pi(K_{cam}, T_{cam\_body}\,T_{body\_map}\,x)$. If $u$ is
-in-bounds and the voxel is near the surface ($|d|$ small), it running-averages the
-sampled colour into the colour layer with its **own** weight, decoupled from the
-TSDF weight because a voxel's geometry may be well-observed while its colour is
-seen from few views (07 §1.5). Exposure/gain normalisation (spec 01 §4.3) is
-applied to the image before fusion.
+camera intrinsics: $u = \pi(K_{cam}, T_{cam\_body}\,T_{body\_map}\,x)$. A voxel is
+coloured only when three conditions hold: $u$ is in-bounds, the voxel is near the
+surface ($|d| \le$ truncation), and the voxel is **not occluded** from the camera.
+Occlusion is rejected by a **sphere trace** from the camera origin toward $x$
+through the TSDF — if the trace crosses the zero level set before reaching $x$,
+some nearer surface lies between camera and voxel, so the sampled pixel belongs to
+that nearer surface and must not be painted onto $x$. Skipping the occlusion test
+bleeds foreground colour onto background geometry at every depth discontinuity (a
+wall behind a pole takes the pole's colour), so the test is on by default
+(`color_occlusion_check`, default `true`).
+
+Colour fusion is an **exponentially-weighted moving average (EWMA)** toward the
+newest accepted observation, not the running mean used for geometry:
+$$
+\mathbf{c} \leftarrow (1-\alpha)\,\mathbf{c} + \alpha\,\mathbf{c}_{\text{obs}},
+\qquad \alpha = \texttt{color\_ewma\_alpha}\ (\text{default } 0.8),
+$$
+applied per channel in linear-light space. The colour channel is therefore weighted
+**independently of the TSDF weight** — geometry may be well-observed from many
+sweeps while colour is seen from few, and a high $\alpha$ keeps the surface tint
+tracking the most recent good view (correct exposure, no glare) rather than
+averaging toward a muddy mean over a long revisit. Before fusion the image has
+exposure/gain normalisation applied (spec 01 §4.3); the first observation of a
+voxel ($\mathbf{c}$ unset) is taken verbatim ($\alpha=1$ effectively).
 
 **Provenance.** Every nvblox block touched by keyframe `kf.id` is appended to
 `kf_blocks_[kf.id]` (§7 needs this). We read the touched-block set from nvblox's
@@ -504,17 +567,45 @@ The running average $d \leftarrow (Wd + w d')/(W+w)$ is **not invertible**: once
 voxel has fused observations from several keyframes you cannot exactly *subtract*
 one keyframe's contribution (nvblox does not retain the per-keyframe terms, and
 the order/weights are entangled). This is the precise technical reason MUST-FIX #4
-mandates **clear-and-rebuild**, not per-voxel de-integration (grounding 07 §8.1) —
-detailed in §7.4.
+mandates **clear-and-rebuild**, not per-voxel de-integration — detailed in §7.4.
 
----
+### 4.5 Designed-but-deferred: free-space decay of stale geometry (post-MVP)
 
-## 5. The mesh stage — nvblox Marching Cubes + colour
+A long mission accumulates two classes of stale TSDF: **far-range range outliers**
+(atmospheric returns, rain, a momentary spurious echo that fused a thin sliver of
+surface in free space) and **slowly-displaced scene geometry** the small $W_{\max}$
+(§4.3) does not fully clear because the voxel stops being re-observed at all. Two
+optional, off-by-default mechanisms address these; both are **specified now, built
+post-MVP**, and neither runs in the first pass.
+
+* **`invalid_depth_decay`** (config, default `false`). When enabled, a voxel that
+  projects **inside** a later keyframe's depth image but with **no return at or
+  beyond its range** (i.e. the ray passed through where the voxel claims surface)
+  has its weight decremented by a fixed step each such observation, and is freed
+  when $W$ reaches zero. This is a **reproducible** prune: the decrement is driven
+  only by the keyframe stream, applied in keyframe order, so a `--single-thread`
+  replay produces the identical pruned set (the determinism requirement of §9). It
+  prunes the far-range outlier class — geometry that free-space evidence
+  contradicts — without touching well-observed surface. It is **never** a substitute
+  for clear-and-rebuild on a loop correction (§7); it is a maintenance prune that
+  rides the ordinary `integrate` path.
+
+* **`decayTsdfExcludeLastView`** stays **optional and never-default.** nvblox offers
+  a global TSDF decay that uniformly fades every voxel each step (excluding the most
+  recent view). Meridian does **not** enable it: a uniform global decay mutates the
+  canonical-looking surface in a way the `KeyframeStore` cannot reproduce by
+  re-integration (a rebuilt region would not match a decayed one), which violates
+  the invariant that Tiers R and S are pure caches of the store (§1). It is exposed
+  only as an explicit long-mission operator tool, never wired into the default
+  pipeline and never part of the rebuild path.
 
 ### 5.1 Output type
 
 `ColorMesh` is the canonical L4→L6 boundary type (spec 01 §7.7); `IMeshExtractor::extract`
-returns it. It is the host-side mirror of nvblox's `MeshLayer`, copied out of GPU memory for L6:
+returns it (moved to L6). It is the host-side mirror of nvblox's `MeshLayer`. The
+host mirror is a **standing** mesh maintained incrementally — each cycle streams in
+only the changed blocks (§5.4) rather than re-copying the whole `MeshLayer` out of
+GPU memory — and the L4→L6 boundary hands L6 a snapshot of it:
 
 ```cpp
 // Canonical declaration in spec 01 §7.7 / Appendix A — repeated for reference.
@@ -530,25 +621,25 @@ struct ColorMesh {
 
 ### 5.2 Algorithm
 
-nvblox runs **Marching Cubes over the TSDF on the GPU** (grounding 07 §5.1); we do
-not reimplement it. For reference, nvblox's mesher:
+nvblox runs **Marching Cubes over the TSDF on the GPU**; we do not reimplement it.
+For reference, nvblox's mesher (the MC ambiguity → MC33 background is in
+Appendix R.3):
 
 1. For each allocated TSDF block (and its + neighbours, so cube corners that span
    a block boundary are handled), iterates cubes of 8 adjacent voxels.
 2. Classifies each corner by the sign of `distance` (skipping cubes with any
    zero-weight corner — unobserved). The 8 signs index the Marching Cubes case
-   table (256 → 15 base cases, 07 §5.1).
+   table (256 configurations → 15 symmetry-reduced base cases).
 3. For each edge crossing the zero level set, places a vertex by **linear
    interpolation** of the SDF: for edge endpoints $x_a,x_b$ with distances
-   $d_a,d_b$ of opposite sign, $x_v = x_a + \frac{d_a}{d_a-d_b}(x_b-x_a)$
-   (07 §5.1, Eq. MC-1).
+   $d_a,d_b$ of opposite sign, $x_v = x_a + \frac{d_a}{d_a-d_b}(x_b-x_a)$.
 4. Normal = normalised TSDF gradient $\nabla d$ (central differences), or the
    triangle normal as fallback.
 5. Colours the vertex by sampling nvblox's colour layer at $x_v$.
 
 The mesh is **open** at unobserved boundaries (no hole-filling) — exactly what is
-wanted for the online, interactive, colourised mesh (07 §5.1). Watertight
-hole-filling is the deferred offline Poisson export utility (§10), not this path.
+wanted for the online, interactive, colourised mesh. Watertight hole-filling is the
+deferred offline Poisson export utility (§10), not this path.
 
 ### 5.3 Per-vertex confidence (feeds L6 overlay)
 
@@ -557,21 +648,36 @@ a monotone map of the local **TSDF weight** $W$ (more observations → more
 confident) and, optionally, the **pose covariance** of the contributing
 keyframes (a keyframe with loose covariance taints its surface). First pass:
 $$
-c = \mathrm{sat}\!\left(\frac{W}{W_{\text{conf}}}\right),\quad W_{\text{conf}}=10,
+c = \mathrm{sat}\!\left(\frac{W}{W_{\text{conf}}}\right),
 $$
-clamped to $[0,1]$. The pose-covariance term is a deferred refinement hook (the
-data — `GraphUpdate::Moved::cov` — is available, spec 01 §7.4).
+clamped to $[0,1]$, with $W_{\text{conf}}=$ `mesh_conf_w` (default **8**) set equal
+to `tsdf_w_max` so a fully-fused (saturated) voxel reads as full confidence and an
+under-observed one is tinted down in proportion to its support. The pose-covariance
+term is a deferred refinement hook (the data — `GraphUpdate::Moved::cov` — is
+available, spec 01 §7.4).
 
-### 5.4 Incremental meshing & threading
+### 5.4 Incremental meshing, streaming & threading
 
 * **Block-incremental.** nvblox re-meshes only blocks whose TSDF changed since the
   last extraction (it tracks dirty blocks internally); a single re-integrated
   region re-meshes only its blocks. We mark a keyframe's blocks dirty in `§7`'s
   rebuild and let nvblox's mesher pick them up.
-* **Off the critical path.** `extract_mesh` runs on T5: nvblox meshes the dirty
-  blocks on the GPU and we copy the result to a host `ColorMesh`, so T4 integration is
-  never stalled by meshing (arch §11.1, §11.2: meshing is off the front-end
-  critical path).
+* **Streamed, not re-copied wholesale.** The runtime `extract_mesh` path returns a
+  **delta**: it serialises only the changed mesh blocks via nvblox's
+  `serializeSelectedLayers` over the dirty/cleared block set (the union of this
+  cycle's integrated blocks and the `getClearedBlocks` set from any rebuild,
+  §7.3a), and a host-side **layer streamer** applies that delta onto L6's standing
+  `ColorMesh` block-for-block (new/updated block meshes replace their slots, cleared
+  blocks drop out). Export cost therefore scales with the **changed** surface per
+  cycle, not the total map size — a multi-kilometre map costs the same per cycle as
+  a small one as long as the per-cycle change is bounded. This is what keeps mesh
+  export affordable on the Orin over a long mission; a **full** mesh serialisation
+  over every allocated block is **offline-only** (the §10 export utility / a
+  one-shot end-of-mission dump), never the per-cycle runtime path.
+* **Off the critical path.** The mesh path runs on T5: nvblox meshes the dirty
+  blocks on the GPU and the streamer applies the delta to the host `ColorMesh`, so
+  T4 integration is never stalled by meshing (arch §11.1, §11.2: meshing is off the
+  front-end critical path).
 * **On-demand / throttled.** Triggered by L6 request or a rate limit
   (`mesh.max_rate_hz`), never per-scan.
 
@@ -638,10 +744,24 @@ First pass **retains all keyframe clouds in RAM**. Budget sanity: a keyframe at
 `keyframe.dist_m = 1.0` m spacing, deskewed+downsampled to ~10–20k points × 16 B
 (`LidarPoint` xyz+intensity+meta) ≈ 0.2–0.3 MB/keyframe; a 2 km trajectory ≈
 2000 keyframes ≈ 0.4–0.6 GB. Acceptable for the target sequences (`DATASET.md`).
-The `IKeyframeStore` interface allows an **mmap'd on-disk store** swap (arch §5.2
-roster) for longer missions without touching consumers — a deferred hook, not
-first-pass work, and the *single* place long-mission RAM is addressed (there is no
-voxel-level archive tier).
+
+This is the one component of L4 that is **deliberately unbounded** — the store is
+the canonical source of truth, so it cannot evict clouds the way the derived tiers
+prune voxels (§3.4) or cap fusion weight (§4.3). Growth is therefore linear in
+trajectory length and **must be watched**: `store.size()` and the resident byte
+total are exported every cycle (`map/kf_count`, `map/store_bytes`, §11), and the
+failure-mode table (§9) routes "RAM pressure from retained clouds" to the on-disk
+store. The growth is **bounded only by keyframe spacing** — a denser
+`keyframe.dist_m` (spec 05) multiplies store RAM proportionally, which is the knob
+to widen if a long mission approaches the host budget. The `IKeyframeStore`
+interface allows an **mmap'd on-disk store** swap (arch §5.2 roster) for longer
+missions without touching consumers — a deferred hook, not first-pass work, and the
+*single* place long-mission RAM is addressed (there is no voxel-level archive tier).
+Every other L4 store is bounded by design: Tier R by its hot window
+(`reg_hot_radius_m`), Tier S by `tsdf_max_integration_dist_m` and the GPU VRAM cap,
+the host mesh by the streamed delta (§5.4). The retained-cloud store is the
+intentional exception, made safe by being watched and swappable rather than
+unbounded-and-silent.
 
 ---
 
@@ -677,24 +797,38 @@ apply_graph_update(update, store):
   dirtyBlk  = ∪_{m in update.moved} kf_blocks_[m.id]      # Tier S (nvblox blocks)
   regionAabb = bounding_aabb(dirtyVox ∪ dirtyBlk)
 
-  # 3. CLEAR those derived cells (Tier R voxels + nvblox Tier S blocks on GPU).
+  # 3. CLEAR those derived cells. Tier R erases at voxel granularity (its own hash);
+  #    Tier S clears at nvblox's native 8^3-BLOCK granularity across ALL of its
+  #    layers (TSDF + colour + mesh) for the touched blocks (§7.3a).
   for k in dirtyVox: tierR.erase(k);   tierR.forget_provenance(moved ids)
-  tierS.clear_blocks(dirtyBlk);        tierS.forget_provenance(moved ids)   # nvblox layer clear
+  clearedBlk = tierS.clear_blocks(dirtyBlk)   # clears TSDF+colour+mesh; returns blocks actually cleared
+  tierS.forget_provenance(moved ids)
 
   # 4. Determine the FULL rebuild set: every keyframe whose cloud overlaps the
   #    cleared region, not just the moved ones (a stationary KF may have co-fused
   #    voxels with a moved KF; those voxels were cleared and must be rebuilt).
   rebuildIds = { e.id for e in store.in_region(regionAabb) }   # superset of moved
 
-  # 5. RE-INTEGRATE from the retained store at CORRECTED poses.
+  # 5. RE-INTEGRATE from the retained store at CORRECTED poses, in TWO passes.
   emit telemetry event "map/region_rebuild" with regionAabb, |rebuildIds|
-  for id in topological/spatial order(rebuildIds):
+  order = stamp-ascending(rebuildIds)             # deterministic, oldest->newest
+  #  5a. GEOMETRY PASS: rebuild all TSDF + Tier R voxels first, so the truncation
+  #      band and zero level set in the region are correct before any colouring.
+  for id in order:
       e = store.get(id)
-      reintegrate_tierR(e.cloud_body, e.T_map_body)   # rebuild voxels + plane cache + provenance
-      reintegrate_tierS(e.cloud_body, e.image, e.T_map_body, e.T_body_cam)  # re-fuse nvblox TSDF+RGB on GPU
+      reintegrate_tierR(e.cloud_body, e.T_map_body)        # voxels + plane cache + provenance
+      reintegrate_tierS_geometry(e.cloud_body, e.T_map_body)   # nvblox TSDF only
+  #  5b. COLOUR PASS: replay colour over the now-correct geometry, oldest->newest,
+  #      so the EWMA's newest-wins bias lands on the freshest view and the
+  #      sphere-traced occlusion test sees the completed surface.
+  for id in order:
+      e = store.get(id)
+      reintegrate_tierS_colour(e.cloud_body, e.image, e.T_map_body, e.T_body_cam)
       # nvblox marks the re-fused blocks dirty; the mesher (§5.4) picks them up.
 
-  # 6. nvblox re-meshes only the dirty blocks (incremental, on T5).
+  # 6. nvblox re-meshes only the dirty blocks (incremental, on T5); the streamed
+  #    mesh delta (§5.4) covers the re-fused blocks plus `clearedBlk` (blocks that
+  #    must drop out of L6's standing mesh), and L6 swaps them block-for-block.
 ```
 
 ### 7.3 Why provenance + region superset (steps 2 & 4)
@@ -708,7 +842,42 @@ apply_graph_update(update, store):
   keyframe's contribution to those same voxels. Correctness requires
   re-integrating **every** keyframe overlapping the cleared region, found by
   `store.in_region(regionAabb)`. Missing this is the classic "ghost surface after
-  loop closure" bug (grounding 07 §8.2 step 3).
+  loop closure" bug — re-integrating only the moved keyframes leaves the cleared
+  co-fused voxels permanently missing a stationary keyframe's contribution.
+* **Step 5 (two passes, geometry then colour):** colour fusion is order-dependent
+  — the EWMA (§4.3) biases toward the newest observation, and the sphere-traced
+  occlusion test reads the TSDF zero level set to decide whether a voxel is visible.
+  Both require the region's *geometry* to already be correct. Interleaving colour
+  with geometry per keyframe would colour against a half-built surface (spurious
+  occlusion rejections, foreground bleed) and would let an early keyframe's colour
+  dominate. The geometry pass therefore rebuilds the whole region's TSDF first; the
+  colour pass then replays oldest→newest over the completed surface, so occlusion is
+  tested against final geometry and the freshest accepted view wins the EWMA. The
+  stamp-ascending order makes the rebuilt colour deterministic (the determinism
+  requirement of §9).
+
+### 7.3a Clear granularity: nvblox clears whole 8³ blocks, not voxels
+
+nvblox stores all of its layers as sparse, block-allocated grids of **8³-voxel
+blocks** in CUDA unified memory; its public clear API deallocates or zeroes **whole
+blocks**, not individual voxels. Tier S therefore clears at block granularity: the
+provenance the wrapper keeps is a **block** set (`kf_blocks_`, §4.2 — `BlockKey`,
+not `VoxelKey`), and `clear_blocks(dirtyBlk)` clears the matching blocks across the
+**TSDF, colour, and mesh layers together** so the three never desynchronise (a
+cleared TSDF block with a stale colour or mesh block would re-mesh into a coloured
+ghost). Because a block spans 8³ voxels, the cleared set is the block-rounded
+super-set of the moved keyframes' touched voxels — clearing is slightly coarser
+than the exact voxel footprint, which is harmless (the rebuild superset of step 4
+re-fuses every keyframe overlapping the region anyway) and is the only granularity
+nvblox actually offers. Tier R, being our own CPU hash, still clears at its finer
+voxel granularity.
+
+**Mesh swap is driven by the cleared-block report.** `clear_blocks` returns the set
+of blocks it actually cleared (`getClearedBlocks` on the nvblox mapper). The mesher
+(§5.4) treats those blocks as dirty and re-meshes exactly them; L6 keeps the
+previously extracted host `ColorMesh` until the re-meshed blocks are ready, then the
+new mesh is swapped in block-for-block (§7.5). The operator therefore never sees a
+hole where a cleared region's mesh has been removed but not yet rebuilt.
 
 ### 7.4 Why clear-and-rebuild, not subtraction (the running-average argument)
 
@@ -716,12 +885,12 @@ nvblox's TSDF fusion is the running average $d\leftarrow(Wd+wd')/(W+w)$ (§4.3).
 *subtract* keyframe $k$'s contribution you would need to invert this for one
 term, which requires retaining every per-keyframe $(d'_k, w_k)$ ever fused into
 each voxel and replaying the exact arithmetic — orders of magnitude more memory
-than the clouds themselves, and numerically fragile (grounding 07 §8.1).
+than the clouds themselves, and numerically fragile.
 **Clear-and-rebuild from the retained clouds is exact, bounded, and matches nvblox
 semantics** (it reproduces the same running average the voxel would have had if
 the corrected poses had been used from the start). This is the explicit resolution
 of MUST-FIX #4, consistent with spec 01 §7.5 ("we do NOT do per-voxel
-subtraction") and grounding 07 §8.2 (the required architecture).
+subtraction").
 
 ### 7.5 Consistency during rebuild (no torn map)
 
@@ -736,9 +905,10 @@ half-cleared region:
   feasible; for large regions it is chunked, and an in-progress chunk returns
   `nullopt` rather than a partial plane).
 * Tier S / mesh: nvblox meshing reads the GPU mesh layer on T5; L6 keeps the
-  previously extracted host `ColorMesh` until the rebuilt blocks are re-meshed and the
-  new mesh is swapped in (§5.4) — the front-end never queries Tier S, so no
-  hot-path consistency concern exists there.
+  previously extracted host `ColorMesh` until the cleared blocks (the
+  `getClearedBlocks` set, §7.3a) are re-meshed, then swaps the new block meshes in
+  block-for-block (§5.4) — the front-end never queries Tier S, so no hot-path
+  consistency concern exists there.
 * The whole operation emits `event("map/region_rebuild", ...)` with the AABB and
   keyframe count, and a `marker("map/dirty_region", aabb)` so an operator *sees*
   the correction (arch §10.2, §10.4).
@@ -785,11 +955,20 @@ public:
 class ISurfaceMap {
 public:
   virtual ~ISurfaceMap() = default;
+  // Live path: lay this keyframe's TSDF geometry then its colour in one call.
+  // (The §7 rebuild splits geometry and colour into two region-wide passes
+  // internally — see §7.2 — because co-fused colour is order-sensitive.)
   virtual void integrate(std::uint64_t id, const std::vector<LidarPoint>& cloud_body,
                          const std::shared_ptr<const CameraFrame>& image,
                          const Pose& T_map_body, const Pose& T_body_cam) = 0;
+  // Clears the blocks the given keyframes touched (kf_blocks_ -> 8^3 blocks),
+  // across the TSDF+colour+mesh layers together (§7.3a). The cleared-block set
+  // feeds the next mesh delta so L6 drops the removed blocks.
   virtual void clear_keyframes(const std::vector<std::uint64_t>& ids) = 0;      // §7 step 3
-  virtual ColorMesh extract_mesh() const = 0;                                   // §5 (spec 01 §7.7 type)
+  // Updates the standing host ColorMesh by streaming ONLY the changed/cleared
+  // blocks (serializeSelectedLayers + layer streamer, §5.4) and returns a const
+  // reference to it; it never re-serialises the whole map (that is offline-only).
+  virtual const ColorMesh& extract_mesh() = 0;                                  // §5 (spec 01 §7.7 type)
   virtual MapDiagnostics diagnostics() const = 0;
 };
 // The only ISurfaceMap implementation: NvbloxSurfaceMap (meridian/map/src/nvblox/).
@@ -842,6 +1021,7 @@ map:
   backend:           nvblox        # the ONLY valid value (GPU; no fallback)
   reg_voxel_m:       0.2           # Tier R base voxel (== arch reg_voxel_m)
   reg_max_pts:       20            # kMaxPtsPerVoxel
+  reg_seed:          0             # seed for deterministic reservoir voxel eviction (§3.2a)
   reg_max_level:     3             # adaptive subdivision cap
   reg_planarity:     0.1           # lambda0/lambda1 plane-accept threshold
   reg_min_plane_pts: 5             # kMinPlanePts
@@ -849,11 +1029,15 @@ map:
   reg_hot_radius_m:  100.0         # hot-window half-extent (FOV segment)
   tsdf_voxel_m:      0.05          # Tier S voxel (== arch tsdf_voxel_m)
   tsdf_trunc_voxels: 4             # truncation = 4 * tsdf_voxel_m = 0.2 m
-  tsdf_w_max:        100.0         # weight cap (keeps surface correctable)
+  tsdf_w_max:        8.0           # fusion weight cap (small: keeps surface responsive; §4.3)
+  tsdf_max_integration_dist_m: 50.0  # depth cutoff for fusion; decoupled from preproc det_range (§4.3)
   color_enable:      true
+  color_ewma_alpha:  0.8           # colour EWMA blend toward newest in-band observation (§4.3)
+  color_occlusion_check: true      # sphere-trace before colouring a voxel (§4.3)
+  invalid_depth_decay: false       # optional reproducible far-outlier prune (§4.5, post-MVP)
   mesh:              marching_cubes
   mesh_max_rate_hz:  2.0           # extract throttle
-  mesh_conf_w:       10.0          # W_conf for per-vertex confidence
+  mesh_conf_w:       8.0           # W_conf for per-vertex confidence (= tsdf_w_max)
   store:
     backend:         ram           # ram | mmap (deferred)
 ```
@@ -872,22 +1056,28 @@ fallback/`cpu:` key anywhere in the map schema.
 | `GraphUpdate` references unknown id | `store.get(id)` empty | skip that id, `event(ERROR,"map/unknown_kf_in_update")`; rebuild the rest (degraded but safe) |
 | Rebuild set too large (global snap) | `|rebuildIds|` > `rebuild_chunk_max` | chunk across T4 cycles (§7.6); front-end runs on hot window meanwhile |
 | `Q_map` back-pressure (T4 behind) | queue near capacity | lossless: front-end keyframe creation slows (arch §11.2); **never drop** a keyframe cloud |
-| GPU out of memory (nvblox, unbounded extent) | nvblox allocation failure | `event(ERROR,"map/gpu_oom")`; coarsen `tsdf_voxel_m` / tighten `reg_hot_radius_m` is the operator remedy. Fail-fast, **not** a silent CPU fallback (spec 00 §9.5; grounding 07 §9 VRAM exhaustion) |
+| GPU out of memory (nvblox, unbounded extent) | nvblox allocation failure | `event(ERROR,"map/gpu_oom")`; operator remedy is to lower `tsdf_max_integration_dist_m` (the primary VRAM control, §4.3), coarsen `tsdf_voxel_m`, or tighten `reg_hot_radius_m`. Fail-fast, **not** a silent CPU fallback (spec 00 §9.5; VRAM-exhaustion sharp edge, Appendix R.4) |
 | CUDA GPU absent at startup | nvblox/CUDA init fails | hard fail-fast configuration error (spec 00 §9.5) — Meridian does not run mapping without a GPU |
-| TSDF voxel saturated, can't correct | weight at `tsdf_w_max` yet pose moved | `w_max` cap + clear-and-rebuild (§7) guarantees corrected re-fuse; saturation can't lock a wrong surface |
+| TSDF voxel saturated, can't correct | weight at `tsdf_w_max` yet pose moved | small `w_max` cap + clear-and-rebuild (§7) guarantees corrected re-fuse; saturation can't lock a wrong surface |
+| Dynamic object burned into surface | stale surface persists where scene changed | small `tsdf_w_max` (default 8) lets fresh free-space/geometry fade it within a few sweeps (§4.3); the optional `invalid_depth_decay` (§4.5) prunes the far-outlier class |
+| Foreground colour bled onto background | wrong tint at a depth discontinuity | `color_occlusion_check` sphere-traces before colouring; occluded voxels are not painted (§4.3) |
 | RAM pressure from retained clouds | `store.size()` × avg over budget | enable `store.backend: mmap` (deferred hook §6.4) |
-| Projective-integrator silhouette artefact | spurious surface at depth discontinuity (07 §9) | accepted for the online mesh; the offline Poisson export (§10) is the clean archival path |
+| Projective-integrator silhouette artefact | spurious surface at depth discontinuity (Appendix R.1) | accepted for the online mesh; the offline Poisson export (§10) is the clean archival path |
 | NaN/inf in fused distance | non-finite `distance` after fuse | nvblox rejects the measurement; `event(WARN,"map/nonfinite_sdf")` from the host wrapper |
 
 **Determinism mode** (arch §11.2): in `--single-thread` replay, integrate / mesh
 / rebuild run inline on the replay thread in the same order; nvblox kernels are run
 in their deterministic variant where available, so the map (and mesh) is
 reproducible across runs of the same bag to the extent the GPU reductions allow
-(arch §11.2 notes bit-reproducibility is a test-only guarantee).
+(arch §11.2 notes bit-reproducibility is a test-only guarantee). The two
+order-sensitive CPU/host decisions are pinned to be reproducible: Tier R voxel
+eviction is seeded reservoir sampling (`reg_seed`, §3.2a), and the rebuild colour
+pass replays keyframes in stamp-ascending order (§7.2), so neither the retained
+point set nor the rebuilt surface colour depends on thread interleaving.
 
 ---
 
-## 10. Deferred-but-designed hooks: ESDF, semantics, Poisson export
+## 10. Deferred-but-designed hooks: ESDF, semantics, Poisson export, ground-alignment
 
 First-pass scope **stops at the colour mesh**. The following are *not built now*
 but the substrate is shaped so they attach without changing any L4 boundary
@@ -895,10 +1085,12 @@ but the substrate is shaped so they attach without changing any L4 boundary
 consumers of existing value types — never as edits to existing layer contracts").
 
 * **ESDF (path planning).** nvblox already computes a GPU ESDF from the same TSDF
-  layer (`EsdfIntegrator`, grounding 07 §4.4). A deferred `EsdfMap` registers as
-  one more derived consumer fed by the same `integrate` / `apply_graph_update`
-  events; clear-and-rebuild applies unchanged (the ESDF is rebuilt whenever its
-  TSDF region is, grounding 07 §4.5). **No change** to L0–L3, the `KeyframeStore`,
+  layer (`EsdfIntegrator`; the incremental raise/lower wavefront is digested in
+  Appendix R.2). A deferred `EsdfMap` registers as one more derived consumer fed by
+  the same `integrate` / `apply_graph_update` events; clear-and-rebuild applies
+  unchanged (the ESDF is rebuilt whenever its TSDF region is — the incremental
+  queues catch only local changes, not a global pose shift). **No change** to
+  L0–L3, the `KeyframeStore`,
   the registration tier, or the mesh. Hook: a config slot keyed `map.esdf.enable`
   (absent in first pass).
 * **Semantic / label channel.** nvblox's voxel can carry an extra label channel
@@ -912,17 +1104,46 @@ consumers of existing value types — never as edits to existing layer contracts
 * **Offline Screened-Poisson export (utility, not a runtime path).** The nvblox
   Marching-Cubes mesh **is** Meridian's deliverable mesh (spec 00 §12). *Optionally*,
   a one-shot offline export utility in `meridian_tools` may run **Screened-Poisson
-  Surface Reconstruction** (grounding 07 §5.3, §5.4) over the retained
+  Surface Reconstruction** (Appendix R.3) over the retained
   `KeyframeStore` oriented-point clouds *after* the final globally-optimised
   trajectory is known, to produce a watertight archival mesh with density
   trimming. This is an export pass, **never** a core runtime tier, never an
   alternative online mesher, and it consumes the existing store without changing
   any boundary.
+* **MapClosures ground-alignment hook (interface only).** A place-recognition
+  variant (MapClosures-style, off the dense local map rather than per-scan
+  descriptors) can detect a revisit and propose a **ground-aligned** relative
+  transform between two map regions — a constraint whose vertical / roll-pitch
+  components are pinned by a shared ground plane. L4 specifies only the **shape of
+  the hook**, not the detector: a single function that hands L4 the candidate's
+  region clouds and receives a ground-plane estimate,
 
-The rule, restated: ESDF, semantics, and Poisson are *new derived consumers /
-optional channels / an offline utility*, riding the existing `integrate` /
-`apply_graph_update` / `KeyframeStore` machinery. The first-pass code must compile
-and run with all three absent.
+  ```cpp
+  // meridian/map/iground_align.hpp  — interface only; no first-pass implementation.
+  struct GroundPlane { Eigen::Vector3f n; float d; float rms; };  // map frame, n·x+d=0
+  class IGroundAligner {
+  public:
+    virtual ~IGroundAligner() = default;
+    // Fit the dominant ground plane over the retained clouds in a region. Pure
+    // read of the KeyframeStore; produces NO map mutation of its own.
+    virtual std::optional<GroundPlane> fit_ground(const Aabb& region,
+                                                  const KeyframeStore& store) const = 0;
+  };
+  ```
+
+  The hook is **read-only against L4**: it consumes `KeyframeStore::in_region`
+  (§6) and returns a `GroundPlane`. It does **not** move the map. Any correction it
+  implies still reaches L4 through the one and only de-integration trigger — the
+  back-end's `GraphUpdate` (§7) — after L5 turns the ground-aligned candidate into a
+  `LoopConstraint` and the back-end optimises. This keeps the L4 contract intact
+  (the map is corrected only by clear-and-rebuild on a `GraphUpdate`) and confines
+  the new code to a read-only consumer of the store. First pass ships without it
+  (`map.ground_align.enable`, absent in first pass).
+
+The rule, restated: ESDF, semantics, Poisson, and ground-alignment are *new derived
+consumers / optional channels / an offline utility / a read-only store consumer*,
+riding the existing `integrate` / `apply_graph_update` / `KeyframeStore` machinery.
+The first-pass code must compile and run with all of them absent.
 
 ---
 
@@ -934,7 +1155,7 @@ to topics/markers. The L4-specific signals (extending arch §10.2 Appendix C):
 | Signal | Channel & key | Purpose |
 |---|---|---|
 | Registration map cloud | `cloud("map/registered")` | the Tier R hot voxels (centroids) — the `/cloud_registered` analogue |
-| Surface mesh | `mesh`/`cloud("map/mesh")` → wrapper `ColorMesh` msg | the nvblox colour mesh for L6 |
+| Surface mesh | `mesh`/`cloud("map/mesh")` → wrapper `ColorMesh` msg | the nvblox colour mesh for L6 (streamed block delta, §5.4) |
 | Per-stage timing | `timing("map.integrate")`, `timing("map.tsdf_fuse")`, `timing("map.mesh_extract")`, `timing("map.region_rebuild")` | live breakdown (replaces FAST-LIO's CSV `aver_time_*`) |
 | Plane-query stats | `scalar("map/plane_hit_rate")`, `scalar("map/empty_voxel_rate")` | how well Tier R is serving the front-end |
 | Voxel / block counts | `scalar("map/reg_voxels")`, `scalar("map/tsdf_blocks")` | growth / memory watch |
@@ -957,18 +1178,23 @@ runtime without restart; `NullSink` makes them zero-cost when off (arch §10.6).
 | `map.backend` | nvblox | surface map backend (the only valid value) | §4, arch §8.2 |
 | `map.reg_voxel_m` | 0.2 | Tier R base voxel edge [m] | §3.2, arch §8.2 |
 | `map.reg_max_pts` | 20 | points kept per voxel (downsample cap) | §3.2 (ikd-Tree `downsample_size` analogue) |
+| `map.reg_seed` | 0 | seed for deterministic reservoir voxel eviction | §3.2a |
 | `map.reg_max_level` | 3 | adaptive subdivision depth cap | §3.3 |
 | `map.reg_planarity` | 0.1 | $\lambda_0/\lambda_1$ plane-accept threshold | §3.3 |
 | `map.reg_min_plane_pts` | 5 | min support to fit a plane | §3.3 |
 | `map.reg_neighbor_ring` | 1 | neighbour probe radius on empty/non-planar voxel | §3.5 |
 | `map.reg_hot_radius_m` | 100 | hot-window half-extent (FOV segment) | §3.4 |
 | `map.tsdf_voxel_m` | 0.05 | nvblox voxel edge [m] (≤ `reg_voxel_m`) | §4.2, arch §8.3 |
-| `map.tsdf_trunc_voxels` | 4 | truncation band in voxels ($\tau = 4\cdot v$) | §4.3, grounding 07 §6 |
-| `map.tsdf_w_max` | 100 | fusion weight cap (keeps surface correctable) | §4.3, §9 |
+| `map.tsdf_trunc_voxels` | 4 | truncation band in voxels ($\tau = 4\cdot v$) | §4.3, Appendix R.4 |
+| `map.tsdf_w_max` | 8 | fusion weight cap [obs]; small ⇒ surface stays responsive to change | §4.3, §9 |
+| `map.tsdf_max_integration_dist_m` | 50.0 | surface-fusion depth cutoff [m]; decoupled from preproc `det_range`; primary VRAM control | §4.3, §9 |
 | `map.color_enable` | true | fuse RGB into nvblox colour layer | §4.3 |
+| `map.color_ewma_alpha` | 0.8 | colour EWMA blend toward newest in-band observation | §4.3 |
+| `map.color_occlusion_check` | true | sphere-trace occlusion test before colouring a voxel | §4.3 |
+| `map.invalid_depth_decay` | false | optional reproducible far-outlier prune (post-MVP) | §4.5 |
 | `map.mesh` | marching_cubes | mesher kind (nvblox MC) | §5, arch §8.2 |
 | `map.mesh_max_rate_hz` | 2.0 | mesh extraction throttle | §5.4 |
-| `map.mesh_conf_w` | 10 | $W_{\text{conf}}$ for per-vertex confidence | §5.3 |
+| `map.mesh_conf_w` | 8 | $W_{\text{conf}}$ for per-vertex confidence (= `tsdf_w_max`) | §5.3 |
 | `map.store.backend` | ram | retained store impl (`ram`/`mmap`) | §6.4 |
 
 ---
@@ -984,12 +1210,199 @@ runtime without restart; `NullSink` makes them zero-cost when off (arch §10.6).
    per-voxel planes, keeping ikd-Tree's incremental-insert/box-delete/k-NN
    *behaviour* (§3). The front-end's hot query never touches the GPU.
 4. **The surface map is nvblox, GPU-only** (TSDF + colour + Marching-Cubes mesh),
-   weight-capped so it stays correctable. No CPU fallback, no VDBFusion/OpenVDB,
-   one `ISurfaceMap` implementation (§4, §5; spec 00 §9.5).
+   with a **small** fusion-weight cap (`tsdf_w_max` ≈ 8) for scene responsiveness —
+   correctability is owned by clear-and-rebuild, not the cap (§4.3). Colour is fused
+   by EWMA with a sphere-traced occlusion test (§4.3); the runtime mesh is streamed
+   as a per-cycle block delta, full extraction is offline-only (§5.4). No CPU
+   fallback, no VDBFusion/OpenVDB, one `ISurfaceMap` implementation (§4, §5;
+   spec 00 §9.5).
 5. **Loop correction is clear-and-rebuild from retained clouds at corrected
-   poses** — never per-voxel subtraction (MUST-FIX #4, §7; grounding 07 §8); exact
-   via per-keyframe provenance + region-overlap superset.
-6. **Scope stops at the colour mesh**; ESDF, semantics, and the Screened-Poisson
-   export are deferred consumers / optional channels / an offline utility that
-   ride existing machinery and change no boundary (§10).
+   poses** — never per-voxel subtraction (MUST-FIX #4, §7); exact
+   via per-keyframe provenance + region-overlap superset, cleared at nvblox's 8³
+   block granularity (§7.3a) and replayed geometry-pass-then-colour-pass (§7.2).
+6. **Scope stops at the colour mesh**; ESDF, semantics, the Screened-Poisson
+   export, and the ground-alignment hook are deferred consumers / optional channels
+   / an offline utility / a read-only store consumer that ride existing machinery
+   and change no boundary (§10).
 7. **Region rebuild and pruning are visible** on the debug bus (§11).
+
+---
+
+## Appendix R — SOTA reference grounding (non-normative)
+
+This appendix is evidence, not contract: curated digests of the reference systems
+this spec's design was validated against. Nothing here binds Meridian's behavior —
+the normative sections above own the design. Each block names the reference
+checkout it was verified against; the clones live in `/home/user/slam-reference`.
+
+> **Source-of-record note for this appendix.** The dense-mapping reference systems
+> (Voxblox, nvblox, VDBFusion, OpenVDB/NanoVDB, PoissonRecon) are **not** cloned
+> into `/home/user/slam-reference` — only the LIO/LIVO/back-end/loop systems are.
+> These blocks are therefore digests of the **primary papers + canonical repos**
+> and are the **local source of record**; values flagged *verify against repo* must
+> be confirmed against the upstream config headers (they drift per release) before
+> they are ever treated as load-bearing.
+
+### R.1 TSDF integrators — Voxblox `simple` / `merged` / `fast` contrast
+
+Verified against the Voxblox paper (Oleynikova et al., IROS 2017, arXiv:1611.03631,
+§III) + `ethz-asl/voxblox` — clone of 2026-06 (not in slam-reference).
+
+| Integrator | Strategy | Cost driver | When |
+|---|---|---|---|
+| `simple` (raycast) | one ray per measured point; update every band voxel along it | redundant near-sensor updates (many rays overlap) | reference / accuracy baseline |
+| `merged` (bundled raycast) | group points landing in the same endpoint voxel, cast **one bundled ray per group** with combined weight + merged colour | bundling cost; near-raycast quality at near-projective cost | the CPU-raycast design to copy if ever writing a bespoke integrator |
+| `fast` | subsample start voxels, per-voxel "already-updated-this-frame" guard, cap consecutive ray collisions, bound integrated rays | tuned for predictable latency, trades accuracy | hard real-time CPU |
+
+**Projective (voxel→image) vs raycasting (ray→voxels):** projective iterates
+candidate frustum voxels and looks each up in the depth image — one pass,
+embarrassingly parallel ⇒ the GPU-native form nvblox is built around
+(`ProjectiveTsdfIntegrator`); artefacts at depth discontinuities (a voxel may
+project onto a foreground pixel off its true ray). Raycasting is more faithful near
+edges but redundant near the origin. Meridian's Tier S uses the projective form
+(§4.3).
+
+### R.2 ESDF — incremental raise/lower wavefront digest
+
+Verified against Voxblox paper §IV + `ethz-asl/voxblox` `EsdfIntegrator` — clone of
+2026-06 (not in slam-reference). (ESDF is a deferred hook for Meridian, §10.)
+
+Two-queue brushfire seeded by the TSDF integrator's per-frame **changed-voxel**
+report ⇒ cost O(changed voxels), not a full recompute:
+
+1. **Fixed band:** voxels within TSDF truncation copy `ESDF.dist = TSDF.dist`,
+   marked `fixed` (seeds / boundary conditions).
+2. **Lower queue** (a closer obstacle appeared): relax neighbours —
+   `if dist(v)+edge(v,n) < dist(n): dist(n)=dist(v)+edge(v,n); parent(n)=v; push n`.
+3. **Raise queue** (obstacle removed/farther): for each neighbour, if `parent(n)==v`
+   invalidate `n` and push to raise; else push `n` to lower to re-seed a correct
+   smaller value. **Process raise first** (invalidate stale), then lower
+   (re-propagate).
+
+**Quasi-Euclidean** propagation to 26-connected neighbours with edge weights `1`
+(face), `√2` (edge), `√3` (corner), tracking a `parent` direction — near-Euclidean
+at a fraction of the exact cost. nvblox computes the same wavefront on GPU
+(`EsdfIntegrator`, can emit a 2D height slice for a Nav2 costmap). Sharp edge: an
+ESDF derived from a TSDF that was cleared-and-rebuilt (§7) must also be rebuilt —
+the incremental queues catch only *local* changes, not a global pose shift.
+
+### R.3 Surface extraction — MC33, Dual Contouring, Screened Poisson
+
+Verified against the source papers + canonical repos (Lorensen & Cline 1987;
+Nielson & Hamann 1991; Chernyaev 1995; Ju et al. 2002; Kazhdan & Hoppe ToG 2013,
+`mkazhdan/PoissonRecon`) — clones of 2026-06 (not in slam-reference).
+
+**Marching Cubes ambiguity → MC33.** The 256 corner-sign configurations reduce by
+symmetry to 15 base cases; face/interior ambiguities can connect adjacent cubes
+inconsistently ⇒ cracks/holes. Fixes: the **asymptotic decider** (bilinear saddle
+value on the ambiguous face chooses connectivity consistently) and **Marching
+Cubes 33** (33-case table + asymptotic decider ⇒ topologically correct, crack-free,
+manifold). nvblox's online MC (§5) does not need watertightness; MC33 is the
+reference if a watertight *live* mesh is ever wanted.
+
+**Dual Contouring (sharp-edge alternative, not used).** One vertex per cell (dual
+of MC's on-edge vertices) from **Hermite data** `(p_i, n_i)` per sign-changing
+edge, minimising the QEF
+$$E(x)=\textstyle\sum_i\big[\,n_i\cdot(x-p_i)\,\big]^2.$$
+Reproduces sharp edges/corners MC rounds off and adapts to octrees, but needs
+reliable normals and can be non-manifold without extra care.
+
+| | Marching Cubes | Dual Contouring |
+|---|---|---|
+| Vertex placement | on edges (interpolated) | one per cell (QEF) |
+| Inputs | scalar field | Hermite (point + normal) |
+| Sharp features | rounded | preserved |
+| Manifold | yes (with MC33) | needs care |
+| Octree adaptivity | harder | natural |
+| Used by TSDF libs | **yes** (Voxblox/nvblox) | rare |
+
+TSDFs are noisy and organic-scene-dominated, so DC's sharp-feature advantage does
+not pay off; Meridian uses MC (§5).
+
+**Screened Poisson (offline archival mesh, §10).** Operates on **oriented points**,
+not a grid; the indicator function χ (1 inside, 0 outside) has gradient equal to
+the surface normal at the surface ⇒ solve a Poisson equation, screened by a
+positional constraint pulling the iso-surface through the input points:
+$$
+E(\chi)=\int\lVert\nabla\chi-V\rVert^2\,dx
+       +\alpha\,\frac{1}{\sum_i w_i}\sum_i w_i\big(\chi(p_i)-\text{iso}\big)^2.
+$$
+χ is on an octree-adaptive B-spline basis ⇒ memory ∝ surface area; discretising
+gives a sparse SPD system solved by multigrid in near-linear time; the single
+globally-defined smooth χ yields a watertight closed manifold across data gaps.
+
+Key `mkazhdan/PoissonRecon` CLI parameters (*verify defaults against current
+release*):
+
+| Flag | Meaning | Note |
+|---|---|---|
+| `--depth` | octree depth (~8–11) | dominant detail/cost knob; 10–11 for archival |
+| `--pointWeight` (α) | screening strength | default ≈ 4; higher ⇒ closer to data, less smoothing |
+| `--samplesPerNode` | min samples per node (~1–5) | raise for noisy data ⇒ smoother |
+| `--density` + **trim** | density-trim post-step | cut low-density extrapolated triangles to kill hallucinated surface in unobserved regions |
+
+Normals for Poisson: TSDF gradient ∇D sampled at vertices (already denoised by
+fusion) or per-point PCA on k-NN oriented toward the sensor.
+
+### R.4 Parameter sharp-edges (Tier S relevant subset)
+
+Verified against Voxblox/nvblox/PoissonRecon papers + repos — clones of 2026-06
+(not in slam-reference). Starting values are *room-indoor / outdoor-LiDAR*.
+
+| Parameter | Effect | Indoor start | Outdoor LiDAR start |
+|---|---|---|---|
+| `voxel_size` | master detail/cost knob; cost ∝ ~1/voxel³ | 0.02–0.05 m | 0.10–0.20 m |
+| `truncation_distance` δ | small = sharp but noise-sensitive & thin ESDF band; large = smooth, robust, more updates | 3–5 × voxel | 3 × voxel (≈0.3 m) |
+| `max_weight` (W_max) | small = adapts fast to change; large = stable but stale | moderate | moderate–high |
+| `max_integration_distance` | depth cutoff; bound work, drop noisy far returns | ~5–7 m (depth cam) | sensor max (50–100 m) |
+| weight model | const vs 1/z² vs behind-surface drop-off | 1/z² (depth cam) | const (LiDAR) |
+| colour weight / band | restrict colour blend to \|D\|≪δ near surface | near-surface | near-surface |
+| Poisson `--depth`/`--pointWeight`/trim | archival detail / data-fidelity / hole-trim | 9–10, ≈4, trim | 10–11, ≈4, trim |
+
+Rule of thumb: set `voxel_size` from the smallest feature you must capture and the
+compute budget, then `δ = (3–5)·voxel_size`, then tune the weight model and
+`max_weight` to scene dynamics. Failure-mode pairings carried into §9:
+projective-integrator silhouette artefacts at depth discontinuities; W_max too high
+⇒ dynamic objects "burned in"; truncation too small ⇒ noisy/holey surface and a
+thin ESDF fixed band; Poisson hallucination in unobserved regions ⇒ always
+density-trim.
+
+### R.5 Source index (papers + repos, none cloned locally)
+
+The dense-mapping reference systems below are **not in `/home/user/slam-reference`**;
+this index is the local source of record. Verified against the cited papers/repos —
+clones/PDFs of 2026-06.
+
+**Papers**
+- Oleynikova et al. — *Voxblox*, IROS 2017, arXiv:1611.03631 (integrators §III;
+  incremental ESDF wavefront §IV; weighted-average update). *Exact in-paper eq.
+  numbering unverified — confirm against PDF.*
+- Curless & Levoy — *A Volumetric Method for Building Complex Models from Range
+  Images*, SIGGRAPH 1996 (origin of cumulative weighted-average TSDF).
+- Newcombe et al. — *KinectFusion*, ISMAR 2011 (real-time GPU TSDF + projective
+  integration + MC).
+- Lorensen & Cline — *Marching Cubes*, SIGGRAPH 1987 (256→15 cases; edge/triangle
+  tables; edge interpolation).
+- Nielson & Hamann — *The Asymptotic Decider*, IEEE Vis 1991; Chernyaev —
+  *Marching Cubes 33*, 1995 (ambiguity fixes).
+- Ju, Losasso, Schaefer, Warren — *Dual Contouring of Hermite Data*, SIGGRAPH 2002
+  (DC + QEF).
+- Kazhdan & Hoppe — *Screened Poisson Surface Reconstruction*, ACM ToG 2013
+  (Poisson + screening; octree B-spline multigrid; `--depth`/`--pointWeight`/trim).
+- Millane et al. (NVIDIA/ETH ASL) — *nvblox: GPU-Accelerated Incremental Signed
+  Distance Field Mapping*, ICRA 2024, arXiv:2311.00626 (reports ~177× surface-recon
+  and ~31× ESDF speed-up vs CPU SOTA; defaults best read from repo config headers).
+
+**Repositories**
+- `ethz-asl/voxblox` (+ `voxblox_ros`) — `simple`/`merged`/`fast` integrators;
+  `tsdf_voxel_size`, `tsdf_voxels_per_side`=16, `truncation_distance`, `max_weight`,
+  `voxel_carving_enabled`, `use_const_weight`; `TsdfMap/Layer/Block/TsdfVoxel`;
+  `EsdfIntegrator`, `MeshIntegrator`.
+- `nvidia-isaac/nvblox` (+ `isaac_ros_nvblox`, `nvblox_torch`) — GPU
+  TSDF/ESDF/colour/mesh; 8³ `VoxelBlock` in CUDA unified memory; SQLite
+  serialisation; `ProjectiveTsdfIntegrator`, `ProjectiveColorIntegrator`,
+  `EsdfIntegrator`, `MeshIntegrator`. *Current default
+  `voxel_size`/`truncation_distance_vox`/`max_integration_distance_m`/`max_weight`
+  drift per release — read from repo config headers.*
+- `mkazhdan/PoissonRecon` — reference Screened Poisson; CGAL
+  `poisson_surface_reconstruction` as a library alternative.

@@ -28,10 +28,13 @@ class ILidarPreprocessor {
 };
 
 // Builds the concrete validity-filter preprocessor. The self-hit mask referenced by
-// cfg.lidar.selfhit_mask is resolved against T_imu_lidar / the calibration upstream;
-// telemetry is non-owning and may be nullptr (no-op).
+// cfg.lidar.selfhit_mask is resolved against T_imu_lidar / the calibration upstream.
+// nominal_rate_hz is the LiDAR's nominal sweep rate; it sets the sweep_duration floor so
+// an over-filtered sweep cannot collapse the deskew horizon. telemetry is non-owning and
+// may be nullptr (no-op).
 std::unique_ptr<ILidarPreprocessor> makeLidarPreprocessor(const PreprocessConfig& cfg,
                                                           const Extrinsic& T_imu_lidar,
+                                                          double nominal_rate_hz,
                                                           TelemetrySink* telemetry);
 
 }  // namespace meridian

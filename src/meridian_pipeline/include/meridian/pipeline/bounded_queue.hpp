@@ -3,7 +3,9 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 namespace meridian {
@@ -44,6 +46,41 @@ class BoundedQueue {
     }
     cv_.notify_one();
     return dropped;
+  }
+
+  // Outcome of a protected push: the new element is always enqueued (unless the queue
+  // is closed); `evicted` is the element dropped to make room, if any. The caller
+  // distinguishes a benign eviction from a costly one by inspecting *evicted.
+  struct ProtectedPush {
+    bool enqueued = false;
+    std::optional<T> evicted;
+  };
+
+  // Lossy push that prefers to evict an UNprotected element. When full, scans from the
+  // oldest end for the first element `protect` returns false for and evicts that one;
+  // only if every queued element is protected does it fall back to evicting the oldest
+  // (so the queue can never deadlock by refusing to make room). The new element is
+  // always enqueued. The caller inspects the returned eviction to report which kind of
+  // element was lost.
+  ProtectedPush push_protecting(T&& v, const std::function<bool(const T&)>& protect) {
+    ProtectedPush out;
+    {
+      std::lock_guard<std::mutex> lock(m_);
+      if (closed_) return out;
+      if (q_.size() >= capacity_) {
+        auto victim = q_.begin();
+        for (; victim != q_.end(); ++victim) {
+          if (!protect(*victim)) break;
+        }
+        if (victim == q_.end()) victim = q_.begin();
+        out.evicted = std::move(*victim);
+        q_.erase(victim);
+      }
+      q_.push_back(std::move(v));
+      out.enqueued = true;
+    }
+    cv_.notify_one();
+    return out;
   }
 
   // Blocks until an element is available or the queue is closed.

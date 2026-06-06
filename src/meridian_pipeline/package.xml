@@ -20,6 +20,7 @@
   <depend>meridian_calib</depend>
   <depend>meridian_sensors</depend>
   <depend>meridian_preprocess</depend>
+  <depend>meridian_frontend</depend>
   <depend>eigen</depend>
   <depend>libopencv-dev</depend>
 

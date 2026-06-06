@@ -11,6 +11,10 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Static archives must stay linkable into shared libraries (and Python bindings),
+# so everything compiles position-independent.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # CUDA settings only take effect in a package that enables the CUDA language.
 # Default arch is SM 8.7; override per build target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)

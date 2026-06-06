@@ -5,7 +5,9 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <tf2_ros/transform_broadcaster.h>
 
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <meridian_msgs/srv/reset_timing.hpp>
 #include <meridian_msgs/srv/set_debug_key.hpp>
 #include <meridian_msgs/srv/set_log_level.hpp>
@@ -15,6 +17,7 @@
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
+#include "conversions/core2ros.hpp"
 #include "conversions/ros2core.hpp"
 #include "debug/ros_telemetry_sink.hpp"
 #include "meridian/config/config_loader.hpp"
@@ -38,6 +41,8 @@ class OdometryNode : public rclcpp::Node {
     sink_ = sink.get();
     log_sink_ = std::make_unique<RclcppLogSink>(get_logger(), cfg_.debug.level);
     set_log_sink(log_sink_.get());
+
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
     pipeline_ = std::make_unique<MeridianPipeline>(cfg_, std::move(sink));
     pipeline_->set_group_sink([this](PreprocessedGroup&& g) { on_group(g); });
@@ -145,6 +150,28 @@ class OdometryNode : public rclcpp::Node {
         static_cast<unsigned long>(n), g.group.scan.points ? g.group.scan.points->size() : 0,
         g.group.imu.size(), g.group.image.has_value() ? 1 : 0,
         g.deskewed.has_value() ? 1 : 0);
+
+    // This callback runs on the front-end stage thread, where live_state() is valid, so
+    // the odom->body TF tracks the estimate at group rate. The front-end also pushes the
+    // pose onto the "odom/body" telemetry key for /meridian/odom; TF is what rviz and
+    // downstream nodes consume to place body-frame data in odom.
+    publish_body_tf(pipeline_->live_state());
+  }
+
+  void publish_body_tf(const NavState& s) {
+    const Pose& T = s.T_world_body;
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp = to_ros(s.stamp);
+    tf.header.frame_id = frame_name(s.ref_frame);  // "odom"
+    tf.child_frame_id = "body";
+    tf.transform.translation.x = T.t.x();
+    tf.transform.translation.y = T.t.y();
+    tf.transform.translation.z = T.t.z();
+    tf.transform.rotation.w = T.q.w();
+    tf.transform.rotation.x = T.q.x();
+    tf.transform.rotation.y = T.q.y();
+    tf.transform.rotation.z = T.q.z();
+    tf_broadcaster_->sendTransform(tf);
   }
 
   Config cfg_;
@@ -153,6 +180,7 @@ class OdometryNode : public rclcpp::Node {
   // can dereference sink_ after the owning pipeline is gone.
   RosTelemetrySink* sink_ = nullptr;
   std::unique_ptr<RclcppLogSink> log_sink_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::unique_ptr<MeridianPipeline> pipeline_;
 
   // Reused conversion buffer for incoming scans; only ever touched by the single executor

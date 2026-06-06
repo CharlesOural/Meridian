@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <string>
 #include <utility>
 
 #include "meridian/debug/telemetry.hpp"
@@ -16,6 +17,35 @@ constexpr std::size_t kImuCap = 8192;
 constexpr std::size_t kImageCap = 16;
 constexpr std::size_t kGnssCap = 64;
 constexpr std::size_t kSweepCap = 8;
+
+// Stable short names for the modality prefix and the fault code, used to build the
+// sensors/validator/<sensor>/<code>_count telemetry key.
+const char* modality_name(Modality m) {
+  switch (m) {
+    case Modality::Lidar:
+      return "lidar";
+    case Modality::Camera:
+      return "cam";
+    case Modality::Gnss:
+      return "gnss";
+    case Modality::Imu:
+    default:
+      return "imu";
+  }
+}
+
+const char* code_name(HealthCode code) {
+  switch (code) {
+    case HealthCode::Dropout:
+      return "Dropout";
+    case HealthCode::LateDrop:
+      return "LateDrop";
+    case HealthCode::ImuLate:
+      return "ImuLate";
+    default:
+      return "None";
+  }
+}
 
 }  // namespace
 
@@ -39,8 +69,22 @@ bool Aggregator::past_reorder_window(Timestamp watermark, Timestamp t) const {
 void Aggregator::flag(std::uint8_t sensor_id, Modality modality, HealthCode code,
                       Timestamp t) {
   if (health_) health_->degrade(sensor_id, code);
-  (void)modality;
-  (void)t;
+
+  // Keep an exact occurrence count per (sensor, code) and surface it as the validator
+  // count so a sustained aggregator fault is visible without one event per occurrence.
+  const std::uint64_t count =
+      ++flag_counts_[{sensor_id, static_cast<std::uint16_t>(code)}];
+  if (telemetry_) {
+    std::string key = "sensors/validator/";
+    key += modality_name(modality);
+    key += std::to_string(static_cast<unsigned>(sensor_id));
+    key += '/';
+    key += code_name(code);
+    key += "_count";
+    if (telemetry_->enabled(key.c_str())) {
+      telemetry_->scalar(key.c_str(), static_cast<double>(count), t);
+    }
+  }
 }
 
 template <typename T>

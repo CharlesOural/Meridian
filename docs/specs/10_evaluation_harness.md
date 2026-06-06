@@ -1,6 +1,6 @@
 # Meridian — Evaluation & Test Harness (Spec 10)
 
-> Status: DRAFT for build. Cross-cutting spec. Authoritative for: the offline replay harness, accuracy metrics (ATE/RPE via evo), full-system + module-integration acceptance criteria, the unit/integration/regression test strategy, and map-quality (cloud-to-cloud / cloud-to-mesh) metrics. Consumes the `RunManifest` (Spec 00 §6 / `specs/00_architecture.md`), the telemetry bus (Spec 00 §10), and the core interfaces (Spec 01 / `specs/01_interfaces_and_data_types.md`). References — does **not** duplicate — the dataset decision in `docs/DATASET.md`. Frame/unit conventions inherited from Spec 01 §2. Logging/timing primitives (`ScopedTimer`, `TimingRegistry`, the Parquet/`DebugSink` telemetry sink) are defined in Spec 09 (`specs/09_debug_introspection.md`) and consumed here.
+> Status: DRAFT for build. Cross-cutting spec. Authoritative for: the offline replay harness, accuracy metrics (ATE/RPE via evo), full-system + module-integration acceptance criteria, the unit/integration/regression test strategy, and map-quality (cloud-to-cloud / cloud-to-mesh) metrics. Consumes the `RunManifest` (Spec 00 §6 / `specs/00_architecture.md`), the telemetry bus (Spec 00 §10), and the core interfaces (Spec 01 / `specs/01_interfaces_and_data_types.md`). References — does **not** duplicate — the dataset decision in `docs/DATASET.md`. Frame/unit conventions inherited from Spec 01 §2. Logging/timing primitives (`ScopedTimer`, `TimingRegistry`, the `ParquetTelemetrySink` and its fixed columnar schema, the pinned determinism hash, and the `Config::dump`/`RunManifest` provenance) are defined in Spec 09 (`specs/09_debug_introspection.md`) and consumed here.
 >
 > **What Meridian is, for the purposes of this spec.** A single, complete **continuous-time (CT), tightly-coupled LiDAR-Inertial-Visual-GNSS** estimator (Spec 00): one CT B-spline sliding-window front-end (`ct_livo`) fusing direct point-to-plane LiDAR at each point's true sample time, FAST-LIVO2-style sparse-direct photometric vision, IMU, and GNSS; an iSAM2 factor-graph back-end; and a GPU **nvblox** TSDF+colour+Marching-Cubes map. There is **one** system to evaluate — not a sequence of shippable versions. The harness therefore measures one estimator against ground truth; it does not gate a "filter v1" against a "CT v2." (The FAST-LIO2-style iEKF in `meridian_frontend/src/iekf/` exists **only** as a differential-test oracle behind the same `IFrontEnd`, Spec 00 §5.4; §8.2 below uses it that way and nowhere treats it as a product path.)
 >
@@ -62,7 +62,7 @@ Two stages, deliberately decoupled by files on disk:
 1. **Replay stage** (`meridian_eval`, built under `meridian_tools` per Spec 00 §9.3): drives the core, produces *artifacts* (estimated trajectory in TUM, optional exported cloud/mesh, the per-module telemetry Parquet, and the `RunManifest`). This stage links `meridian_core` only and is the part that must be bit-for-bit the live path. It constructs **one** `MeridianPipeline` — the identical object the ROS node owns.
 2. **Metrics stage** (`meridian_eval_metrics`): pure post-processing of artifacts vs ground truth. It links nothing of the estimator; it is Python (evo) + a thin C++/Open3D tool for C2C/C2M. Decoupling means a metric bug never invalidates a (re-runnable) replay, and metrics can be recomputed or added retroactively against archived runs.
 
-> **Determinism corollary.** Because the replay stage is the only place core code runs, and it is single-threaded (Spec 00 §11.2 determinism mode) and clock-driven by the bag, *two replays of the same (bag, config, calib, git SHA) must produce byte-identical trajectory and telemetry artifacts.* This is itself a test (§6.4) and it is what makes regression baselines (§7) meaningful. Bit-reproducibility is a test-only guarantee (the production pipeline is multi-threaded); replay always runs in single-thread/determinism mode.
+> **Determinism corollary.** Because the replay stage is the only place core code runs, and it is single-threaded (Spec 00 §11.2 determinism mode) and clock-driven by the bag, *two replays of the same (bag, config, calib, git SHA) must produce byte-identical trajectory and telemetry artifacts.* This is itself a test (§6.4) and it is what makes regression baselines (§7) meaningful. Bit-reproducibility is a test-only guarantee (the production pipeline is multi-threaded); replay always runs in single-thread/determinism mode. The equality is checked through the **pinned determinism hash** (Spec 09 §13.4): a SHA-256 over the `ParquetTelemetrySink` record set sorted canonically by `(stamp_ns, key, seq)`, so the hash depends only on *what was computed*, never on the order rows were written. Spec 09 owns the hash definition; this spec consumes it (§4.5, §7.4).
 
 ### 1.2 Directory layout
 
@@ -153,13 +153,12 @@ The orchestrator owns the L0→L6 object graph **as a `MeridianPipeline`** (Spec
 loop:
   s = bag.next();  if (!s) break
   clock.set(s.t)
-  switch s.sensor:
-    imu:   frontend.ingest(imu)                    # Spec 01 §7.3  — high-rate propagation / preint
-    gnss:  frontend.ingest(fix)                    # Spec 01 §7.3  — GNSS modality into the CT window
-    image: frontend.ingest(image)                  # Spec 01 §7.3  — sparse-direct photometric modality
-    lidar:
-      scan = preprocess.process(raw_scan)          # ILidarPreprocessor (Spec 01 §7.2): filter, NOT deskew
-      frontend.ingest(scan)                         # CT front-end: per-point registration @ true point time
+  pipeline.ingest(s.raw)                           # L0 stamping → L1 validity/aggregation (Spec 02 §8)
+  # The pipeline forwards each IMU sample to frontend.ingest_imu_live (live state
+  # only) and, once per sweep, hands the assembled bundle to the front-end —
+  # the same call order the live node produces:
+  on PreprocessedGroup g:                          # Spec 01 §7.3 — THE L1→L2 value
+      frontend.ingest(g)                           # CT window: per-point registration @ true point time
       traj_odom.append(clock.now(), frontend.live_state())   # live odom trace (Spec 01 §7.3)
       # keyframe handoff fires via the keyframe sink the orchestrator registered:
       on KeyframePacket kf:                          # Spec 01 §6 — the ONE L2→L3 value
@@ -411,7 +410,7 @@ Tolerances (initial): ATE RMSE +5% or +0.02 m (whichever larger), drift% +10%, t
 
 ### 7.4 Determinism as a regression invariant
 
-Because replay is deterministic (§1.1), `determinism.trajectory_hash` is itself a tracked baseline field. A change in the hash with *no* change in git SHA/config/calib is a bug (nondeterminism crept in — a stray thread, a wall-clock read, an unordered container iteration, or a non-deterministic GPU reduction not run in its deterministic variant). CI runs the replay twice on the smoke clip and asserts equal hashes (the M0 gate).
+Because replay is deterministic (§1.1), `determinism.trajectory_hash` is itself a tracked baseline field. It is the **pinned hash of Spec 09 §13.4** — SHA-256 over the canonically `(stamp_ns, key, seq)`-sorted `ParquetTelemetrySink` record set, computed only on the single-threaded replay path, hashing each record's `(stamp_ns, key, kind, values, axis_order, unit, level, tag, message)` by exact IEEE bits (the `seq` counter orders but is not hashed). Because the ordering is canonical, the hash is invariant to write interleaving; a change in the hash with *no* change in git SHA/config/calib is therefore by construction a bug (nondeterminism crept in — a stray thread, a wall-clock read, an unordered container iteration, or a non-deterministic GPU reduction not run in its deterministic variant). CI runs the replay twice on the smoke clip and asserts equal hashes (the M0 gate).
 
 ---
 
@@ -427,7 +426,7 @@ Per core module, table-driven tests on each interface contract (Spec 01) with sy
 - **CT registration / deskew**: a synthetic constant-twist trajectory registers a known scan to a known cloud; assert residual < ε. Includes the IMU-only cold-start branch (Spec 00 §7.2) and the steady-state CT per-point registration (Spec 00 §7.5) as separate cases.
 - **Data association / voxel map**: insertion/query correctness, plane fit on synthetic planes (`query_plane`, Spec 01 §7.5).
 - **KeyframePacket round-trip**: serialize/deserialize equality; `kinematics_included` flag honoured (Spec 01 §6).
-- **iSAM2 factor builder**: given two `KeyframePacket`s with `RelativeBetween`, exactly one `BetweenFactor` is produced; on a forced `ImuPreintegration` restart, exactly one `CombinedImuFactor` and zero between-factors (Spec 01 §6.4).
+- **iSAM2 factor builder**: given two `KeyframePacket`s with `RelativeBetween`, exactly one `BetweenFactor` is produced; on a forced `ImuPreintegration` restart, exactly one `CombinedImuFactor` and zero between-factors (Spec 01 §6.4). These are asserted **white-box** by binding a recording `IntrospectionHooks` consumer (Spec 09 §2.4) to read the live `gtsam::NonlinearFactorGraph`/`ISAM2ResultExt` directly — factor count by type, the gauge-anchor presence, the relinearised set — with no message schema between the test and the real object. The hook is `const`-ref, producer-thread-synchronous, and unbound (`NullHooks`) everywhere but these tests.
 
 ### 8.2 Integration tests (multi-module, tiny synthetic or smoke clip)
 
@@ -505,7 +504,7 @@ meridian_regress  --pr                                 # compare tracked runs vs
 
 ## 11. Open dependencies on other specs
 
-- **Spec 09** (`specs/09_debug_introspection.md`, logging/timing/provenance): `ScopedTimer`, `TimingRegistry`, the recording/Parquet `TelemetrySink`, and the canonical `RunManifest` serializer. This spec *consumes* them; if their field names change, §4.5/§9 schemas follow.
+- **Spec 09** (`specs/09_debug_introspection.md`, logging/timing/provenance): `ScopedTimer`, `TimingRegistry`, the `ParquetTelemetrySink` and its fixed columnar schema (Spec 09 §2.5) that this spec's `run_dir/debug/*.parquet` artifacts and metrics stage read, the pinned determinism hash (Spec 09 §13.4) surfaced as `determinism.trajectory_hash`, the `IntrospectionHooks` slot (Spec 09 §2.4) the white-box back-end integration tests (§8.1–§8.2) bind a recording consumer to, the `Config::dump(run_dir)` resolved-config snapshot and the canonical `RunManifest` serializer (Spec 09 §9.6) that anchors every baseline. This spec *consumes* them; if their field names change, §4.5/§9 schemas follow.
 - **Spec 11** (`specs/11_build_system_libraries.md`, build & libraries): pins evo, Open3D, mcap, GoogleTest and the eval CLI targets; it is also where any *considered-then-rejected* alternative (e.g. PCL vs Open3D for C2C, VDBFusion as a map backend) is recorded — this spec names only the single chosen tool per job.
 - **Spec 08** (`specs/08_calibration.md`, calibration): the static extrinsics file hashed into the manifest and used in §3.2 body-frame reconciliation and the online-extrinsic convergence gate (M4).
 - **Spec 00 / 01** are authoritative for all core types used here; this spec adds **no** new core types — only harness-side types (`StampedSample`, `DatasetDescriptor`, `Metric`, `RunArtifacts`, the injector decorators), which live in `meridian_eval` / `meridian_tools`, never in `meridian_core`.

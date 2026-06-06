@@ -106,3 +106,76 @@ This exercises sensing + preprocessing (Phase 1). Odometry, TF, the map and drif
 metrics arrive with the L2 front-end and later layers; the evaluation harness
 (`docs/specs/10_evaluation_harness.md`) then replays the same sequences off-ROS for
 ATE/RPE scoring.
+
+## Front-end verification
+
+The L2 CT front-end now runs inside the pipeline (`frontend.kind: ct_livo` in the
+config). It owns a trajectory, so rviz's fixed frame is `odom`, the node publishes
+the `odom -> body` TF, and `/meridian/cloud_registered` is the world-stable map view.
+The body-frame `/meridian/cloud_body` stays available (rviz display **DeskewedBodyScan**,
+disabled by default) as a debug view.
+
+### Build/test gates
+
+```bash
+colcon test --packages-select meridian_frontend && colcon test-result --verbose
+colcon test --packages-select meridian_pipeline meridian_config
+```
+
+The front-end's own unit/integration tests (spline, IMU/LiDAR residuals,
+marginalization, oracle differential) must be green before judging a bag run.
+
+### Bag run
+
+Same launch as above (`fusionportable.yaml` already carries the `frontend:` block).
+
+```bash
+ros2 launch meridian_ros meridian.launch.py \
+    config_file:=$(pwd)/src/meridian_ros/config/fusionportable.yaml \
+    use_sim_time:=true rviz:=true
+ros2 bag play bags/garden_day --clock          # second terminal
+```
+
+### Visual checklist (rviz, fixed frame `odom`)
+
+- **World-stable geometry**: walls/ground in `/meridian/cloud_registered` stay put as
+  the rig moves — they do not smear or swim with each sweep.
+- **Smooth odom track**: the **Odometry** arrows (`/meridian/odom`, last ~100) trace a
+  continuous path with no teleports between sweeps.
+- **Stationary start holds**: while the rig is still at the start, the `odom -> body`
+  TF and the odom track do not drift.
+- **No restarts**: `/meridian/events` shows the one-time `preprocess/imu_init_done` and
+  recurring `frontend/keyframe`, and **no** window-restart / no-effective-points events.
+
+### Topic checklist
+
+```bash
+ros2 topic hz /meridian/odom               # ~ sweep rate (≈10 Hz on this bag)
+ros2 topic hz /meridian/cloud_registered   # heavy key, rate-limited (≈2 Hz)
+ros2 topic echo /meridian/odom --once      # pose in frame_id "odom", child "body"
+ros2 run tf2_ros tf2_echo odom body        # the live transform, updating at sweep rate
+ros2 topic echo /meridian/telemetry        # frontend/keyframe_count climbs; queue gauges
+```
+
+Expected ranges: `/meridian/odom` near the LiDAR rate; `pipeline/q_meas_dropped` should
+stay absent (front-end keeps up); `frontend/keyframe_count` increments roughly on the
+keyframe cadence (`frontend.keyframe.{dist_m,rot_deg,time_s}`).
+
+### TUM export + ATE
+
+Record the track to a TUM file (runs inside the box; flushes on Ctrl-C):
+
+```bash
+python3 tools/record_tum.py /tmp/meridian_odom.tum     # start before the bag
+# ... play the bag, Ctrl-C the recorder when it finishes ...
+```
+
+Compare against the FusionPortable ground truth with `evo` (optional — not assumed
+installed; `pip install evo` if missing):
+
+```bash
+evo_ape tum GT.tum /tmp/meridian_odom.tum -a            # align (Sim(3)) and report ATE
+```
+
+The ground-truth TUM comes with the sequence (see `docs/DATASET.md`); `-a` removes the
+arbitrary odom-origin offset before scoring.

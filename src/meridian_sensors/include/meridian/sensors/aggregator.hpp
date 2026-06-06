@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <optional>
+#include <utility>
 
 #include "meridian/common/measure_group.hpp"
 #include "meridian/common/sample.hpp"
@@ -73,7 +75,8 @@ class Aggregator {
   // elapsed against `now_ns` (the stamp of the sample currently being processed).
   void try_close(Timestamp now_ns);
 
-  // Raise a code on a sensor and surface a telemetry event.
+  // Raise a code on a sensor, increment its per-code occurrence counter, and surface the
+  // running count as sensors/validator/<sensor>/<code>_count.
   void flag(std::uint8_t sensor_id, Modality modality, HealthCode code, Timestamp t);
 
   // Drop the oldest entries of a staging deque until it is within `cap`. Each call that
@@ -108,6 +111,10 @@ class Aggregator {
 
   Duration max_wait_ns_ = 0;
   Duration reorder_ns_ = 0;
+
+  // Per-(sensor, code) occurrence count of the flags the aggregator raises (LateDrop,
+  // ImuLate, staging-overflow Dropout), surfaced as the validator count telemetry.
+  std::map<std::pair<std::uint8_t, std::uint16_t>, std::uint64_t> flag_counts_;
 };
 
 }  // namespace meridian

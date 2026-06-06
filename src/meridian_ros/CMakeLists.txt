@@ -12,6 +12,7 @@ find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(meridian_msgs REQUIRED)
 find_package(meridian_pipeline REQUIRED)
 find_package(meridian_common REQUIRED)
@@ -34,6 +35,8 @@ ament_target_dependencies(meridian_ros_support
 
 add_executable(odometry_node src/odometry_node.cpp)
 target_link_libraries(odometry_node meridian_ros_support)
+ament_target_dependencies(odometry_node
+  rclcpp tf2_ros geometry_msgs sensor_msgs meridian_msgs)
 
 install(TARGETS odometry_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch config rviz DESTINATION share/${PROJECT_NAME})

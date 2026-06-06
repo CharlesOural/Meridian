@@ -2,7 +2,7 @@
 
 **Meridian** is a from-scratch, SOTA, **continuous-time tightly-coupled LiDAR-Inertial-Visual-GNSS SLAM** system for tactical operational mapping. It produces a **colourised 3D mesh** in real time on an **NVIDIA Jetson Orin**.
 
-It is a clean-slate rebuild — it reuses no prior code. Every technical claim in these docs is grounded in the apex open-source references (FAST-LIO2, FAST-LIVO2, Point-LIO, ikd-Tree) and the canonical papers (Coco-LIC/CLINS for continuous-time, iSAM2/GTSAM, nvblox, Scan Context++), captured in `grounding/`.
+It is a clean-slate rebuild — it reuses no prior code. Every technical claim in these docs is grounded in the apex open-source references (FAST-LIO2, FAST-LIVO2, Point-LIO, ikd-Tree) and the canonical papers (Coco-LIC/CLINS for continuous-time, iSAM2/GTSAM, nvblox, Scan Context++); that reference grounding lives in each spec's non-normative **Appendix R**, verified against the clones in `/home/user/slam-reference`.
 
 ## The system in one paragraph
 
@@ -16,11 +16,9 @@ One LiDAR + one IMU + one camera + GNSS feed a **continuous-time B-spline trajec
 
 ## How to read these docs
 
-**If you want to understand the system →** start with [`SYSTEM_OVERVIEW.md`](SYSTEM_OVERVIEW.md) (the end-to-end narrative, photons-to-mesh), then the [`course/`](course/) chapter for the math.
-
 **If you want to build it →** read [`specs/00_architecture.md`](specs/00_architecture.md) and [`specs/01_interfaces_and_data_types.md`](specs/01_interfaces_and_data_types.md) first (they fix the module layout and the contracts every other spec depends on), then [`specs/11_build_system_libraries.md`](specs/11_build_system_libraries.md) to stand up the workspace, then the per-component specs.
 
-**If you want to verify a claim →** every spec cites a `grounding/` dossier; the dossiers cite `file:line` in the reference code and paper sections.
+**If you want to verify a claim →** each spec's non-normative **Appendix R** cites the SOTA references by `repo@sha` and `file:symbol`, verified against the clones in `/home/user/slam-reference`, with paper sections for the math.
 
 ---
 
@@ -41,19 +39,10 @@ One LiDAR + one IMU + one camera + GNSS feed a **continuous-time B-spline trajec
 | 10 | [`10_evaluation_harness.md`](specs/10_evaluation_harness.md) | Replay==live harness; evo ATE/RPE; per-dataset acceptance |
 | 11 | [`11_build_system_libraries.md`](specs/11_build_system_libraries.md) | Library choice per job (justified); colcon workspace; CUDA/nvblox on Orin; version pins |
 
-## `grounding/` — evidence base
+## Reference grounding — each spec's Appendix R
 
-Code- and paper-grounded dossiers (`file:line` + paper section citations). See [`grounding/README.md`](grounding/README.md) for the full index. 01 manifold/ESIKF · 02 IMU/deskew · 03 LiDAR/ikd-Tree · 04 FAST-LIVO2 visual · 05 Point-LIO · 06 engineering/debug · 07 TSDF/mesh · 08 loop closure · 09 iSAM2 · 10 continuous-time.
-
-## `course/` — the textbook chapter
-
-[`course/TIGHTLY_COUPLED_ESTIMATION.md`](course/TIGHTLY_COUPLED_ESTIMATION.md) — a ~430 KB graduate-level chapter on tightly-coupled multi-sensor estimation and residuals (12 sections, also under `course/sections/`): manifolds → probability → IMU → LiDAR → visual → GNSS → batch & filter solving → continuous-time → robustness → synthesis. Written to the depth of a robotics textbook, grounded in the reference code.
+Each spec carries a non-normative **Appendix R — SOTA reference grounding** that cites the apex open-source references by `repo@sha` and `file:symbol` (plus paper eq/section for the math), verified against the clones in `/home/user/slam-reference`. By topic: manifold/ESIKF, IMU/deskew, LiDAR/ikd-Tree, FAST-LIVO2 visual, and the CT B-spline → `04_frontend_estimation.md`; iSAM2/GTSAM → `05_backend_graph.md`; TSDF/mesh → `06_mapping.md`; loop closure → `07_loop_closure.md`; engineering/debug → `03_preprocessing.md` and `09_debug_introspection.md`.
 
 ## Other
 
 - [`DATASET.md`](DATASET.md) — dev/eval datasets (FusionPortable primary, M2DGR co-primary — all modalities at once).
-- [`reference/`](reference/) — the 2026 SOTA survey (`SOTA.md`) and the archived arc-slam design exploration (`NEXT_GEN_DESIGN_archived.md`, superseded — kept for rationale only).
-
-## Status
-
-Specs complete and internally consistent (reframed to full-CT / single-LiDAR / nvblox-only; cross-references self-contained within this repo). **Next step: Phase 0 scaffolding** — stand up the colcon workspace (`meridian_common`, `meridian_core` layers, `meridian_ros`, `meridian_msgs`, `meridian_tools`) per spec 00/11 and the bag-replay harness on FusionPortable.

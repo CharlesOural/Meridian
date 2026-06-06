@@ -8,7 +8,7 @@
 >
 > **Scope reminder.** First-pass scope ends at a **colourised triangle mesh** (nvblox Marching Cubes). ESDF/path-planning and semantics/object-detection are *designed-for* but *not built now*; the architecture must leave clean seams for them (§12).
 >
-> **Companion docs.** `DATASET.md` (FusionPortable primary, M2DGR co-primary — evaluation data). Sibling specs: `01_interfaces_and_data_types`, `02_sensors_timesync`, `03_preprocessing`, `04_frontend_estimation`, `05_backend_graph`, `06_mapping`, `07_loop_closure`, `08_calibration`, `09_debug_introspection`, `10_evaluation_harness`. For broader background see `docs/grounding/` and `docs/course/`.
+> **Companion docs.** `DATASET.md` (FusionPortable primary, M2DGR co-primary — evaluation data). Sibling specs: `01_interfaces_and_data_types`, `02_sensors_timesync`, `03_preprocessing`, `04_frontend_estimation`, `05_backend_graph`, `06_mapping`, `07_loop_closure`, `08_calibration`, `09_debug_introspection`, `10_evaluation_harness`. Reference grounding (SOTA `repo@sha`/`file:symbol` citations, verified against the clones in `/home/user/slam-reference`) lives in each spec's non-normative Appendix R.
 >
 > **Grounding.** Meridian combines the best parts of the apex references — **FAST-LIVO2** (sequential ESIKF, sparse-direct photometric vision, unified voxel map, exposure comp), **nvblox** (GPU TSDF+colour+Marching-Cubes mesh), **iSAM2/GTSAM** (incremental factor graph), and **Coco-LIC/CLINS + basalt-headers** (continuous-time SE(3) B-spline) — to beat any single published system. Engineering and debug recommendations are additionally grounded in the reference implementation `slam-reference/FAST_LIO/src/laserMapping.cpp`, cited as `laserMapping.cpp:NNN`; we keep what is good there and fix what is not.
 
@@ -77,7 +77,8 @@ meridian_ws/
 │  │   test/                   #   point.hpp, cloud.hpp, sample.hpp, gaussian.hpp,
 │  │                           #   observability.hpp, keyframe_packet.hpp, graph_update.hpp,
 │  │                           #   loop_constraint.hpp, stamped_pose.hpp,
-│  │                           #   imu_preintegration.hpp, status.hpp, ring_buffer.hpp
+│  │                           #   imu_preintegration.hpp, status.hpp, ring_buffer.hpp,
+│  │                           #   bounded_queue.hpp
 │  │
 │  ├─ meridian_config/            # X-cut: typed Config tree + YAML loader (no ROS)
 │  ├─ meridian_time/              # X-cut: time model, PTP/PPS clock model, interpolation
@@ -196,38 +197,46 @@ Every layer boundary is a pure-virtual interface plus a factory. The pattern is 
 // include/meridian/frontend/ifrontend.hpp   (in meridian_frontend, NO ros)
 namespace meridian {
 
-class IFrontEnd {
+class IFrontEnd {                                          // canonical def: spec 01 §7.3
 public:
-  using Ptr = std::unique_ptr<IFrontEnd>;
   virtual ~IFrontEnd() = default;
 
-  // Feed measurements (thread-confined: called from the front-end stage thread).
-  virtual void addImu(const ImuSample&)   = 0;
-  virtual void addScan(LidarScan&&)       = 0;   // L1-preprocessed (single LiDAR)
-  virtual void addImage(CameraFrame&&)    = 0;   // sparse-direct photometric modality
-  virtual void addGnss(const GnssFix&)    = 0;   // GNSS modality
+  // Calibration snapshot: at start + on every back-end refine (spec 01 §5.3).
+  virtual void set_calibration(std::shared_ptr<const CalibrationSet> calib) = 0;
+
+  // PRIMARY input, thread-confined to the front-end stage thread: one
+  // PreprocessedGroup per sweep (MeasureGroup + cold-start deskew product).
+  // Triggers the window optimisation.
+  virtual void ingest(const PreprocessedGroup& group) = 0;
+
+  // High-rate IMU between sweeps: live-state propagation only, never a solve.
+  virtual void ingest_imu_live(const ImuSample& imu) = 0;
+
+  // Back-end correction feedback (loop closure / global optimization result),
+  // applied by the pipeline at a safe point between ingests.
+  virtual void apply_correction(const GraphUpdate& update) = 0;
 
   // Pull the latest high-rate estimate (live pose, for TF / control).
-  virtual NavState latestNavState() const = 0;
+  virtual NavState live_state() const = 0;
 
   // Keyframe handoff: invoked whenever a keyframe is born. The ONE thing L2 hands L3 (§6).
   using KeyframeSink = std::function<void(KeyframePacket&&)>;
-  virtual void setKeyframeSink(KeyframeSink) = 0;
+  virtual void set_keyframe_sink(KeyframeSink sink) = 0;
 
-  // Back-end correction feedback (loop closure / global optimization result).
-  virtual void onGlobalCorrection(const GraphUpdate&) = 0;
-
-  // Introspection: hand the module a telemetry channel (§10).
-  virtual void setTelemetry(TelemetrySink*) = 0;
+  // Introspection pull; live telemetry flows through the sink given at construction (§10).
+  virtual FrontEndDiagnostics diagnostics() const = 0;
 };
 
 // Factory selects the implementation by name from config (§8). Default: "ct_livo".
-IFrontEnd::Ptr makeFrontEnd(const FrontEndConfig&, const Calibration&);
+// Telemetry may be null (NullSink semantics), matching every other module factory.
+std::unique_ptr<IFrontEnd> makeFrontEnd(const FrontendConfig& cfg,
+                                        std::shared_ptr<const CalibrationSet> calib,
+                                        TelemetrySink* telemetry);
 
 } // namespace meridian
 ```
 
-The **factory free function** is the only place that names concrete implementations. `meridian_pipeline` calls `makeFrontEnd(cfg.frontend, calib)` and gets back an `IFrontEnd::Ptr`. The production path is `cfg.frontend.kind == "ct_livo"`; the `iekf_lio` entry exists strictly as a reference oracle for differential testing (§5.4), not as a deployable alternative.
+The **factory free function** is the only place that names concrete implementations. `meridian_pipeline` calls `makeFrontEnd(cfg.frontend, calib, sink)` and gets back a `std::unique_ptr<IFrontEnd>`. The production path is `cfg.frontend.kind == "ct_livo"`; the `iekf_oracle` entry exists strictly as a reference oracle for differential testing (§5.4), not as a deployable alternative.
 
 ### 5.2 The interface roster
 
@@ -235,7 +244,7 @@ The **factory free function** is the only place that names concrete implementati
 |---|---|---|---|
 | `ISensorSource` | `meridian/sensors/isensor_source.hpp` | `onSample(cb)` | swap: live driver, ROS-bag replay, simulator (same code path for live & offline) |
 | `IDeskewProvider` | `meridian/preprocess/ideskew_provider.hpp` | `Pose poseAt(Timestamp)` | cold-start IMU-only; steady-state CT-trajectory-backed (§7) |
-| `IFrontEnd` | `meridian/frontend/ifrontend.hpp` | `addScan/addImu/addImage/addGnss`, `setKeyframeSink`, `onGlobalCorrection` | **production: CT B-spline LIVO+GNSS** (`src/ct/`). Reference oracle: iEKF (`src/iekf/`), test-only (§5.4) |
+| `IFrontEnd` | `meridian/frontend/ifrontend.hpp` | `ingest(PreprocessedGroup)`, `ingest_imu_live`, `set_keyframe_sink`, `apply_correction` | **production: CT B-spline LIVO+GNSS** (`src/ct/`). Reference oracle: iEKF (`src/iekf/`), test-only (§5.4) |
 | `IBackEnd` | `meridian/backend/ibackend.hpp` | `addKeyframe(KeyframePacket)`, `addLoop`, `optimize`, `onResult(cb)` | iSAM2 (production); batch LM available for offline debugging only |
 | `IMapLayer` | `meridian/map/imaplayer.hpp` | `integrate(kf)`, `deintegrateRegion(aabb)`, `query`, `extractMesh` | **one impl: nvblox** (GPU TSDF+colour+mesh). Seam left for a deferred ESDF layer (§12) |
 | `IKeyframeStore` | `meridian/map/ikeyframe_store.hpp` | `put(id,cloud,rgb,pose)`, `get(id)`, `clouds(region)` | RAM store (production); mmap'd on-disk store is a future option behind the same seam |
@@ -381,7 +390,8 @@ The core only ever sees a fully-populated `Config`. This avoids FAST-LIO's patte
 
 ```yaml
 meridian:
-  pipeline:   { mode: live|replay, threads: { frontend: 1, backend: 1, map: 1 } }
+  pipeline:   { mode: live|replay, threads: { frontend: 1, backend: 1, map: 1 },
+                queue: { meas_capacity: 8, kf_capacity: 64, map_capacity: 64 } }  # BoundedQueue sizes (§11.1.1)
   time:       { source: ptp|pps|host, max_skew_ms: 5 }
   sensors:
     lidar:    { topic: /os/points, model: ouster_os1_128,
@@ -397,7 +407,7 @@ meridian:
                 lidar: { voxel_map_m: 0.5 }, visual: { patch: 8, levels: 3 },
                 gnss: { use: true }, extrinsic_refine: true,
                 keyframe: { dist_m: 1.0, rot_deg: 10, time_s: 1.0 } }
-  backend:    { kind: isam2, relinearize_thresh: 0.1, robust: gnc_cauchy }
+  backend:    { kind: isam2, relinearize_thresh: 0.1, robust: huber }   # committed incremental loop kernel; GNC runs off-thread (spec 05 §8)
   map:        { backend: nvblox, tsdf_voxel_m: 0.05, mesh: marching_cubes,
                 colour: true }                              # GPU; no fallback key
   place:      { kind: scan_context_pp, pcm: true, gicp_fitness_max: 0.3 }
@@ -407,7 +417,7 @@ meridian:
 
 ### 8.3 Rules
 
-- **Validated on load.** `Config::validate(std::string* error)` checks units, ranges, and cross-field consistency (e.g. `tsdf_voxel_m ≤ preprocess.voxel_surf_m`, CT `knot_dt_ms > 0`), returning `false` with a precise message on the first violation; `load_config_yaml()` calls it and throws, so a bad config fails fast — no silent defaults masking a typo (a real FAST-LIO foot-gun: a mistyped `nh.param` key silently uses the default).
+- **Validated on load.** `Config::validate(std::string* error)` checks units, ranges, and cross-field consistency (e.g. `tsdf_voxel_m ≤ preprocess.voxel_surf_m`, CT `knot_dt_ms > 0`, every `pipeline.queue.*_capacity > 0` per §11.1.1), returning `false` with a precise message on the first violation; `load_config_yaml()` calls it and throws, so a bad config fails fast — no silent defaults masking a typo (a real FAST-LIO foot-gun: a mistyped `nh.param` key silently uses the default).
 - **`kind` strings select implementations** through the factories (§5.1). The production values are fixed (`ct_livo`, `isam2`, `nvblox`); `frontend.kind: iekf_lio` is reserved for the test oracle (§5.4) and is not a deployment configuration. `map.backend` has exactly one valid value, `nvblox` — there is no CPU/VDB alternative to select.
 - **Immutable after start.** `Config` is `const` once the pipeline is built. Runtime-tunable knobs (only debug verbosity and publish toggles) go through a separate `DebugControl` service (§10.5), never by mutating `Config`.
 
@@ -426,22 +436,36 @@ Each core package exports a single library target with a namespaced alias and a 
 
 ```cmake
 # meridian_frontend/CMakeLists.txt (sketch)
-add_library(meridian_frontend
+# SHARED so privately-linked vendored kernels (basalt spline, ikd-Tree oracle) fold
+# into this library and never leak through its exported link interface.
+add_library(meridian_frontend SHARED
   src/ct/ct_frontend.cpp          # PRIMARY: continuous-time LIVO+GNSS estimator
   src/ct/spline_window.cpp
   src/ct/residuals_lidar.cpp src/ct/residuals_visual.cpp src/ct/residuals_imu.cpp
+  src/ct/marginalization.cpp
   src/iekf/iekf_frontend.cpp      # baseline oracle (test-only, §5.4)
   src/frontend_factory.cpp)
 target_include_directories(meridian_frontend PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
+target_include_directories(meridian_frontend PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(meridian_frontend PUBLIC cxx_std_20)
 target_link_libraries(meridian_frontend PUBLIC
-  meridian_common meridian_config meridian_debug meridian_calib
-  Eigen3::Eigen Sophus::Sophus Ceres::ceres ${PCL_LIBRARIES})  # NO rclcpp — enforced (§9.4)
-ament_target_dependencies(meridian_frontend Eigen3 PCL)
+  meridian_common::meridian_common meridian_config::meridian_config
+  meridian_debug::meridian_debug meridian_calib::meridian_calib
+  Eigen3::Eigen Sophus::Sophus Ceres::ceres)  # NO rclcpp — enforced (§9.4)
+target_link_libraries(meridian_frontend PRIVATE
+  meridian::vendor_basalt meridian::vendor_ikdtree)  # folded in, not re-exported
 ament_export_targets(meridian_frontendTargets HAS_LIBRARY_TARGET)
+ament_export_dependencies(meridian_common meridian_config meridian_debug meridian_calib
+                          Eigen3 Sophus Ceres)
 ```
+
+The C++20 flags, the `Release`-when-unset build type, workspace-wide
+position-independent code, and the warning policy come from `MeridianToolchain.cmake`
+(via `find_package(meridian_cmake)` + `include(MeridianToolchain)`); the imported
+targets above are discovered once in `MeridianDeps.cmake`. See spec 11 §§5–8 for the
+full templates.
 
 OpenMP / CUDA are opt-in **per hot-loop library**: the CT residual assembly may use OpenMP, and `meridian_map` links CUDA/nvblox. We keep these flags **library-local** rather than a global flag so non-parallel modules stay deterministic, and we make any parallel section honour the determinism mode (§11.2).
 
@@ -454,12 +478,15 @@ OpenMP / CUDA are opt-in **per hot-loop library**: the CT residual assembly may 
 - **No-ROS gate:** a grep over `src/meridian_*` excluding `meridian_ros` for `rclcpp | ros/ros.h | sensor_msgs | rclcpp/clock` must return empty.
 - **Dependency lint:** a script asserts the §4 edge set and fails if any `meridian_<layer>/package.xml` lists `rclcpp`/`*_msgs`, or if a layer `#include`s a sibling's `src/`.
 - **Single-map-backend gate:** assert `meridian_map` contains exactly one map implementation directory (`src/nvblox/`) and that no source under `meridian_map` references VDBFusion/OpenVDB/NanoVDB — there is no CPU map path.
+- **No-grounding-in-code gate:** assert no source under `src/meridian_*` contains a reference dossier pointer (regex `grounding[ /][0-9]`, catching both `grounding/NN` and `grounding NN`), enforcing the self-contained-comment rule. Regex owned by spec 11 §9.3.
 - **clang-tidy / clang-format** on every TU; warnings-as-errors in core.
-- **Unit + replay tests** under `colcon test`, including the CT-vs-iEKF-oracle differential check (§5.4). Per-module testing detailed in `02..10`.
+- **Unit + replay tests** under `colcon test`, including the CT-vs-iEKF-oracle differential check (§5.4). Per-module testing detailed in `02..10`. CI builds both the full GPU configuration and the no-GPU configuration (`MERIDIAN_WITH_MAP=OFF`, §9.5) so the off-device dev-box build stays green.
 
 ### 9.5 CUDA / nvblox is core, not wrapper
 
 Meridian targets **Jetson Orin** and assumes a CUDA GPU is **always present**. nvblox (TSDF + colour + Marching-Cubes mesh) runs entirely on the GPU and lives in `meridian_map`, a *core* package — it is built and tested without any ROS. CUDA being a dependency of `meridian_map` (and of any GPU residual work in `meridian_frontend`) does **not** violate the no-ROS rule (§1.1): that rule is about *middleware*, not about the accelerator. There is **no CPU fallback** for mapping and the build does not provide one; a missing GPU at runtime is a hard, fail-fast configuration error, not a degraded mode.
+
+**Building without a GPU is a compile-time exclusion, never a runtime alternative.** A no-CUDA developer box (no Jetson, no discrete GPU) can build everything *except* the map by setting the workspace switch `MERIDIAN_WITH_MAP=OFF` (default `ON`). With the map excluded, `meridian_map` and every package that links it (`meridian_pipeline`, `meridian_ros`) build without CUDA/nvblox, so a developer can compile and unit-test L0–L3, L5, and the front-end on a laptop. This is purely a **build-configuration** facility for development: it removes the map from the binary, it does **not** substitute a CPU map. There is no runtime branch, no `IMapLayer` CPU implementation, and no degraded-but-running mode — a build with `MERIDIAN_WITH_MAP=ON` (the only deployment configuration) still hard-fails on a missing GPU. The deployed system is always the full GPU map; `MERIDIAN_WITH_MAP=OFF` produces a binary that simply has no map at all, used only for off-device development and CI of the non-map layers. Spec 11 §7 owns the CMake mechanics of the guard.
 
 ---
 
@@ -543,6 +570,8 @@ Telemetry is **pull-rate-limited and sink-gated**: a `scalar` call when the sink
 
 Meridian uses a **small fixed set of stage threads connected by bounded single-producer queues** — not a thread pool, not a task graph — because the data flow is a near-linear pipeline and predictability beats cleverness for a real-time estimator. (FAST-LIO runs single-threaded in `main()` with a `mutex` + `condition_variable` guarding the sensor buffers, `laserMapping.cpp:81-82, 281`; we make the stage boundaries explicit instead of implicit in one loop.)
 
+Every inter-stage edge is one concrete primitive — `BoundedQueue<T>` — and stages exchange nothing else. There is no second queue type and no ad-hoc `mutex`+`condition_variable` per edge; the policies in §11.2 are properties of this one primitive, configured per edge, so teardown and overflow behave identically everywhere.
+
 ```
 [ROS sub callbacks]            (rclcpp executor threads; wrapper only)
    │  convert msg→core, push (non-blocking)
@@ -563,18 +592,76 @@ Meridian uses a **small fixed set of stage threads connected by bounded single-p
                                            [L6 surface publish]
 ```
 
+### 11.1.1 The queue primitive: `BoundedQueue<T>`
+
+All inter-stage edges are instances of a single capacity-bounded, blocking-capable, move-only queue. It is the only concurrency primitive in the pipeline; a stage's interaction with the rest of the system is fully described by which `BoundedQueue<T>` it pops from and which it pushes to.
+
+```cpp
+// include/meridian/common/bounded_queue.hpp   (NO ros)
+namespace meridian {
+
+template <class T>
+class BoundedQueue {
+public:
+  explicit BoundedQueue(std::size_t capacity);   // capacity > 0; fixed for the queue's life
+
+  // Lossy producer (Q_meas): never blocks. If full, evicts the OLDEST element to
+  // make room, enqueues `item`, and returns the running count of elements dropped
+  // since construction. Returns 0 when no eviction was needed. The dropped count is
+  // the source of the q_*_dropped telemetry scalar (§10).
+  std::size_t push_drop_oldest(T&& item);
+
+  // Lossless producer (Q_kf, Q_map): blocks the caller while the queue is full and
+  // not shut down. Returns true once enqueued; returns false iff the queue was shut
+  // down while waiting (the item is NOT enqueued in that case).
+  bool push_block(T&& item);
+
+  // Consumer: blocks while empty and not shut down. Returns a value once available;
+  // returns std::nullopt iff the queue is shut down AND drained, so a worker loop is
+  // simply `while (auto v = q.pop()) { ... }` and exits cleanly on teardown.
+  std::optional<T> pop();
+
+  // Idempotent. Wakes ALL blocked producers and consumers (broadcast). After
+  // shutdown: push_* fail (return false / no enqueue), pop drains remaining elements
+  // then returns nullopt. This is the single teardown signal the pipeline uses to
+  // stop a stage; no stage spins or polls a flag.
+  void shutdown();
+
+  std::size_t size() const;          // snapshot, for the queue-depth telemetry (§10)
+  std::size_t capacity() const;
+};
+
+} // namespace meridian
+```
+
+Mechanics that the rest of §11 relies on:
+
+- **One mutex + one condition variable per queue, never sleep-polling.** `pop`, `push_block`, and a full `push_drop_oldest` wait on the condition variable; producers/consumers/`shutdown` notify it. A stage thread that has no work consumes no CPU. This replaces FAST-LIO's single hand-rolled `mutex`+`condition_variable` over shared buffers with one audited, reused type.
+- **Capacity is fixed at construction** from `pipeline.threads`/queue config (§8) and never resized at runtime; an overrun is a policy decision (drop vs. block), not an allocation.
+- **`shutdown()` broadcast is the teardown contract.** `MeridianPipeline` destruction (§11.3) calls `shutdown()` on every queue in reverse dependency order; each stage's `while (auto v = q.pop())` loop then returns `nullopt` and the thread joins. No queue is destroyed while a thread still blocks on it.
+- **Overflow policy is chosen at the call site, not baked into the type.** A lossy edge calls `push_drop_oldest`; a lossless edge calls `push_block`. The same `BoundedQueue<T>` serves both, which is why §11.2's per-edge policy table is just a statement of *which method each edge's producer calls*.
+
 ### 11.2 Rules
 
 - **Each stage is single-threaded internally** (its module is *not* required to be thread-safe; it is *thread-confined*). Concurrency lives only in the queues. The simplest model that keeps the front-end deterministic and easy to reason about. (nvblox launches GPU kernels from its single map thread; the host-side stage is still thread-confined.)
-- **Queues are bounded** with an explicit per-edge overflow policy. `Q_meas` is lossy under overload (real-time: never block the sensor thread; drop oldest and emit a telemetry `event`). `Q_kf` and `Q_map` are **lossless** (back-pressure) — losing a keyframe corrupts the map, so if the back-end falls behind, the front-end keeps producing odometry but keyframe creation slows.
+- **Queues are bounded** with an explicit per-edge overflow policy realised by the `BoundedQueue<T>` method the producer calls (§11.1.1). `Q_meas` is **lossy** under overload (real-time: never block the sensor thread) — its producer calls `push_drop_oldest`, dropping the oldest group and emitting the returned dropped-count as the `q_meas_dropped` telemetry scalar plus a rate-limited `event`. `Q_kf` and `Q_map` are **lossless** (back-pressure) — their producers call `push_block` — because losing a keyframe corrupts the map; if the back-end falls behind, the front-end keeps producing odometry but keyframe creation slows. Each queue's instantaneous `size()` is published as a queue-depth telemetry scalar (§10) so a building backlog is visible before it becomes a drop.
 - **Front-end is the priority thread** (T2). Expensive, lower-rate work (back-end optimize, GPU map integration, meshing) runs on separate threads so a 200 ms iSAM2 relinearization never stalls the 10–20 Hz odometry. This is the structural reason to split threads at all.
-- **Feedback (`GraphUpdate`) is applied at safe points:** L2 consumes corrections between scans (rebasing its odometry origin via `onGlobalCorrection`); L4 receives them and schedules a region rebuild. No mid-iteration mutation.
+- **Feedback (`GraphUpdate`) is applied at safe points and is never lossless.** The L3→L2 correction edge is **not** a `BoundedQueue`: it is a **size-1 latest-wins snapshot** — a single mailbox slot the back-end overwrites with its most recent `GraphUpdate` and the front-end reads (and clears) between ingests via `apply_correction`. A slow front-end therefore *coalesces* corrections (it only ever applies the newest) rather than building a backlog, and the back-end never blocks waiting to publish one. This deliberately breaks the L3→L2 cycle the references avoid: a stalled or slow L3 can never add latency to L2 odometry, because L2 only ever does a bounded, non-blocking read of the latest snapshot. L4 receives the same `GraphUpdate` and schedules a region rebuild. No mid-iteration mutation; corrections are consumed at a scan boundary, rebasing the odometry origin. A fault-injection test stalls L3 and asserts L2 odometry latency is unchanged. (Whether `Q_kf` itself may become lossy is a separate, open question — gated on confirming a dropped keyframe degrades map *density*, not *correctness* — and is **not** decided here: `Q_kf` stays lossless per the rule above until that is shown.)
 - **Determinism mode:** for tests and bag replay, a `--single-thread` pipeline mode runs all stages sequentially on one thread so results are bit-reproducible. Stage interfaces are identical; only the executor differs. In this mode any OpenMP in the CT residual assembly is disabled (or fixed-scheduled) so residual sums are order-deterministic; GPU kernels that reduce non-deterministically are run in their deterministic variant where available. Bit-reproducibility is therefore a **test-only** guarantee, not a production one.
 
 ### 11.3 Ownership and lifetime
 
-- `MeridianPipeline` (in `meridian_pipeline`) owns every module (by `Ptr`), owns the queues, and owns the stage threads. Construction order = dependency order; destruction = reverse, draining queues. The wrapper owns exactly one `MeridianPipeline`.
+- `MeridianPipeline` (in `meridian_pipeline`) owns every module (by `Ptr`), owns the queues, and owns the stage threads. Construction order = dependency order; destruction = reverse, calling `shutdown()` on each queue (§11.1.1) so blocked stage loops return and join. The wrapper owns exactly one `MeridianPipeline`.
 - Point clouds cross thread boundaries by **handle** (`IKeyframeStore`) or by `shared_ptr` move into a queue — never copied. The store is the single owner of keyframe clouds (§6.5).
+
+### 11.4 Front-end propagate/solve split (control path vs. window solve)
+
+The L2 front-end (T2) runs **two decoupled paths** so the operational, control-facing pose never inherits solver jitter:
+
+- a **window-solve path** — the CT sliding-window optimisation, triggered by each `ingest(PreprocessedGroup)`, which produces a freshly solved trajectory segment; and
+- an **IMU-rate propagate/publish path** — the high-rate `NavState` consumed by TF/odom/control, produced by `ingest_imu_live` between solves.
+
+The propagate path reads from a **double-buffered last-solved snapshot**: when the window solve completes it publishes its result into the back buffer and atomically swaps it to the front; the propagate path always reads the current front buffer and never blocks on, or is mutated mid-read by, the solver. Live pose at an IMU instant past the newest solved knot is obtained by extending the most recently solved trajectory — the snapshot carries everything the propagate step needs to do so. The **estimator math of that extension** (how the spline is evaluated past the newest knot, what state the snapshot carries, the IMU integration model) is owned by `04_frontend_estimation.md`; this section fixes only the *thread/queue shape* — one solve path, one propagate path, a lock-free double-buffered handoff between them — and the invariant that `live_state()` latency is bounded by the propagate step alone and is independent of window-solve cost. The two paths are still inside the single thread-confined T2 stage (§11.2): "two paths" means two code paths over a shared snapshot, not two threads, so determinism mode (§11.2) runs them in deterministic order on the single thread.
 
 ---
 
@@ -675,8 +762,8 @@ Canonical field-level definition: spec 01 §6.1.
 ```
 ISensorSource    : onSample(cb)                                              — L0,  swap: live/bag/sim
 IDeskewProvider  : Pose poseAt(Timestamp)                                   — L1,  cold-start imu-only / steady-state CT-backed
-IFrontEnd        : addScan/addImu/addImage/addGnss; setKeyframeSink;
-                   latestNavState; onGlobalCorrection; setTelemetry         — L2,  prod: ct_livo (iekf oracle = test-only)
+IFrontEnd        : ingest(PreprocessedGroup); ingest_imu_live; set_keyframe_sink;
+                   live_state; apply_correction; diagnostics                — L2,  prod: ct_livo (iekf oracle = test-only)
 IBackEnd         : addKeyframe(KeyframePacket); addLoop; optimize; onResult  — L3,  isam2 (batch LM = offline debug)
 IMapLayer        : integrate(kf); deintegrateRegion(aabb); query; extractMesh— L4,  one impl: nvblox (GPU); seam for deferred ESDF
 IKeyframeStore   : put(id,cloud,rgb,pose); get(id); clouds(region)          — L4,  ram (mmap = future)

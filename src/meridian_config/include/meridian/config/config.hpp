@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -34,9 +35,16 @@ struct ThreadCounts {
   int backend = 1;
   int map = 1;
 };
+// BoundedQueue capacities for the inter-stage edges (Q_meas lossy, Q_kf/Q_map lossless).
+struct QueueConfig {
+  int meas_capacity = 8;
+  int kf_capacity = 64;
+  int map_capacity = 64;
+};
 struct PipelineConfig {
   PipelineMode mode = PipelineMode::Live;
   ThreadCounts threads{};
+  QueueConfig queue{};
 };
 
 // ---- time ----
@@ -70,6 +78,12 @@ struct TimeHealth {
   double failed_timeout_ms = 1000.0;
   double rate_tolerance_frac = 0.20;
 };
+// Standing live stamp-integrity gate; one instance per sensor in L0.
+struct ValidatorConfig {
+  double gap_periods = 2.5;       // dropout when a raw gap exceeds this many periods
+  double skew_warn_ppm = 200.0;   // |skew_ppm| above this raises SkewOutOfRange
+  double nan_ratio_warn = 0.05;   // LiDAR NaN/Inf fraction above this raises a warning
+};
 struct TimeConfig {
   TimeSource source = TimeSource::Ptp;
   double max_skew_ms = 5.0;
@@ -77,6 +91,7 @@ struct TimeConfig {
   PpsConfig pps{};
   SwOffsetConfig swoffset{};
   TimeHealth health{};
+  ValidatorConfig validator{};
 };
 
 // ---- sensors ----
@@ -119,6 +134,14 @@ struct CameraSensorConfig {
   double nominal_rate_hz = 20.0;
   // Pinhole intrinsics [fx, fy, cx, cy] in pixels.
   Eigen::Vector4d intrinsics = Eigen::Vector4d::Zero();
+  // Lens distortion. distortion_model selects the IntrinsicsCamera::Distortion
+  // mapping (none | radtan | equidistant; plumb_bob is accepted as radtan). The
+  // coefficient layout follows the model: radtan k1,k2,p1,p2,k3; equidistant
+  // k1..k4 with the last entry unused. width/height carry the image size geometry
+  // and the on-image projection gate need.
+  std::string distortion_model = "none";
+  std::array<double, 5> distortion_coeffs = {0, 0, 0, 0, 0};
+  int width = 0, height = 0;
   // T_body_cam: camera frame expressed in body.
   Pose extrinsic{};
   CameraPhotometric photometric{};
@@ -153,6 +176,13 @@ struct PreprocLidar {
   double blind = 0.5;       // [m] reject returns closer than this
   double det_range = 120.0; // [m] max usable range
   int point_filter_num = 3; // keep every Nth point
+  // Surf-voxel downsample: bucket survivors into a grid of edge voxel_surf_m and keep
+  // at most surf_max_pts per cell. The sweep-duration floor never drops below this
+  // fraction of one nominal period so deskew always has a horizon to cover.
+  double voxel_surf_m = 0.5;        // [m] downsample voxel edge
+  double sweep_floor_frac = 0.5;    // sweep-duration floor as a fraction of one period
+  int surf_max_pts = 1;             // points kept per surf voxel
+  std::uint64_t surf_seed = 0;      // reservoir RNG seed when surf_max_pts > 1
   bool intensity_gate = false;
   double i_min = 0.0;
   double i_max = 1e9;
@@ -195,7 +225,6 @@ struct PreprocGnss {
   double spoof_clock_thresh = 0.05;  // [s]
 };
 struct PreprocessConfig {
-  double voxel_surf_m = 0.5;  // surf-point voxel-grid leaf size [m]
   PreprocLidar lidar{};
   PreprocDeskew deskew{};
   PreprocCamera camera{};
@@ -208,8 +237,14 @@ struct FrontendSpline {
   SplineOrder order = SplineOrder::Cubic;
   double knot_dt_ms = 25.0;  // outer-knot spacing [ms]
   int window_knots = 8;
-  int n_cp_max = 0;  // adaptive control-point cap; 0 = auto
+  int n_cp_max = 0;  // adaptive control-point cap; <=1 disables adaptive density
   bool time_offset_estimate = false;
+  // Adaptive-knot band edges: each crossed threshold adds one control point. The
+  // rising edges are matched against peak per-sample IMU excitation in the segment;
+  // a band-down requires falling below the edge by knot_density_hysteresis (fraction).
+  std::vector<double> knot_omega_thresh{};  // [rad/s] angular-rate band edges
+  std::vector<double> knot_accel_thresh{};  // [m/s^2] specific-force band edges
+  double knot_density_hysteresis = 0.15;
 };
 struct FrontendLidar {
   double voxel_map_m = 0.5;
@@ -217,29 +252,107 @@ struct FrontendLidar {
   double max_match_dist_sq = 5.0;  // [m^2]
   double plane_thresh = 0.1;       // [m]
   double point_cov = 1e-3;
+  // Factor-count budget: cap residuals at max_lidar_factors, allocated across
+  // normal_strata stratified bins with a per-stratum floor of min_factors_per_normal.
+  int max_lidar_factors = 1500;
+  int min_factors_per_normal = 50;
+  int normal_strata = 7;
+  // Side length of the cubic local map kept around the current body position [m]. The
+  // ikd-Tree is segmented so points farther than half this from the body are deleted,
+  // bounding map RAM and nearest-neighbour search depth. Non-positive disables trimming
+  // (the map grows for the whole trajectory).
+  double local_map_cube_m = 500.0;
 };
 struct FrontendVisual {
+  // Master gate for the sparse-direct photometric stage. When off (or when the
+  // camera intrinsics are zero/invalid) the front-end runs LIO only and the visual
+  // code path is skipped entirely.
+  bool enable = true;
   int patch = 8;
   int levels = 3;
   double img_point_cov = 100.0;
   double outlier_threshold = 1000.0;
   double ncc_thre = 0.0;
   bool exposure_estimate_en = true;
+  // Exposure random-walk tie + positivity clamp: consecutive in-window inverse
+  // exposures are tied with weight 1/(inv_expo_cov * dt), and each tau is lower-
+  // bounded at inv_expo_min so it can never reach a non-positive value.
+  double inv_expo_cov = 1e-2;  // [1/s] random-walk density sigma_tau^2
+  double inv_expo_min = 1e-3;  // strict positivity lower bound on tau
+  // One-best-per-cell selection grid and the homography degenerate-warp guards.
+  int grid_cell_px = 32;
+  double warp_det_min = 0.1;
+  double warp_det_max = 10.0;
+  double warp_cond_max = 50.0;
 };
+// Conservative absolute-position GNSS residual. `use` is the master gate: with it off
+// (or with no fixes present) the GNSS code path is never entered and the trajectory is
+// bit-identical to a build without it. The floors are per-fix-type position-std pairs
+// (horizontal, vertical) in metres; the per-fix ENU covariance is floored element-wise
+// against them before weighting, since a receiver's reported covariance is optimistic.
+// innovation_k is the Mahalanobis k-sigma acceptance gate; reacquire_count is the run
+// of consecutive in-gate fixes required to re-admit GNSS after a gap or a gated-out run.
 struct FrontendGnss {
   bool use = true;
+  double floor_fixed_h = 0.05;   // RTK_Fixed horizontal std [m]
+  double floor_fixed_v = 0.10;   // RTK_Fixed vertical std [m]
+  double floor_float_h = 0.50;   // RTK_Float horizontal std [m]
+  double floor_float_v = 1.00;   // RTK_Float vertical std [m]
+  double floor_dgps_h = 1.50;    // DGPS horizontal std [m]
+  double floor_dgps_v = 3.00;    // DGPS vertical std [m]
+  double floor_spp_h = 3.00;     // SPP horizontal std [m]
+  double floor_spp_v = 6.00;     // SPP vertical std [m]
+  double innovation_k = 3.0;     // Mahalanobis innovation gate
+  int reacquire_count = 5;       // consecutive in-gate fixes to re-admit
 };
 struct FrontendKeyframe {
   double dist_m = 1.0;
   double rot_deg = 10.0;
   double time_s = 1.0;
 };
+// Deadline bracket for the wall-clock solve path. min_iterations always run before a
+// cutoff so a starved step never publishes a barely-improved pose; the replay path
+// ignores time_limit_ms and runs the fixed schedule.
+struct FrontendSolver {
+  double time_limit_ms = 60.0;
+  int min_iterations = 2;
+};
+// Per-inner-iteration update clamp (scaled down preserving direction, not rejected).
+struct FrontendStep {
+  double max_step_trans_m = 0.5;
+  double max_step_rot_deg = 10.0;
+};
+// Physical box bounds on the IMU biases so an outlier burst cannot drive a bias absurd.
+struct FrontendBias {
+  double gyr_max = 0.5;  // [rad/s]
+  double acc_max = 5.0;  // [m/s^2]
+};
+// Off-by-default low-weight jerk / angular-acceleration regularizer; engaged only on
+// under-excited spans (excitation below the floor and a degenerate eigenaxis).
+struct FrontendMotionReg {
+  bool enable = true;
+  double weight = 1e-3;            // relative to the IMU accel weight
+  double excitation_floor = 0.0;  // engage below this excitation level
+};
 struct FrontendConfig {
   FrontEndKind kind = FrontEndKind::CtLivo;
   double init_time_s = 0.1;
   int solver_max_iterations = 5;
   double solver_epsi = 1e-3;
-  double degeneracy_thresh = 0.0;
+  // Eigenvalue floor for the per-axis degeneracy score lambda/(lambda+thresh); a zero
+  // floor makes every axis score 1 and the degeneracy gate never fires, so keep > 0.
+  double degeneracy_thresh = 10.0;
+  // Fixed-cadence re-association: at most max_outer_iters association passes, each with
+  // reassoc_steps inner LM iterations, stopping early once the keyframe-time pose moves
+  // less than assoc_shift_thresh_m AND assoc_shift_thresh_deg since the prior pass.
+  int max_outer_iters = 4;
+  int reassoc_steps = 2;
+  double assoc_shift_thresh_m = 0.02;
+  double assoc_shift_thresh_deg = 0.2;
+  FrontendSolver solver{};
+  FrontendStep solve{};
+  FrontendBias bias{};
+  FrontendMotionReg motion_reg{};
   FrontendSpline spline{};
   FrontendLidar lidar{};
   FrontendVisual visual{};

@@ -110,6 +110,65 @@ TEST(ImuOnlyDeskew, ReturnsRestartWhenHorizonDoesNotCover) {
   EXPECT_FALSE(dk.deskew(in, &out));  // signals window restart
 }
 
+// integrateSweep pads the IMU horizon to the sweep with bounded zero-order holds: a
+// sweep whose ends fall just outside the raw IMU grid (head sample after t_begin, last
+// sample before t_end, each within one period) must still deskew, with the anchor at
+// t_end. A gap beyond one period is a real hole and must keep failing.
+TEST(ImuOnlyDeskew, IntegrateSweepHoldsHorizonToSweepEnds) {
+  ImuInitState init;
+  init.gravity = Eigen::Vector3d::Zero();
+  init.gyro_bias = Eigen::Vector3d::Zero();
+  ImuOnlyDeskew dk(init, Extrinsic{}, Pose{}, Eigen::Vector3d::Zero());
+
+  // IMU grid 10..90 ms at 10 ms cadence (period 10 ms). Sweep [5 ms, 95 ms]: the head
+  // sample (10 ms) is 5 ms after t_begin and the tail (90 ms) is 5 ms before t_end, both
+  // within one period, so the holds extend the horizon to cover the sweep.
+  std::vector<ImuSample> imu;
+  for (std::int64_t t = 10'000'000; t <= 90'000'000; t += 10'000'000) {
+    imu.push_back(mkImu(Eigen::Vector3d(0, 0, 0.5), t));
+  }
+  const std::int64_t t_begin = 5'000'000;
+  const std::int64_t t_end = 95'000'000;
+  dk.integrateSweep(imu, t_begin, t_end);
+
+  EXPECT_EQ(dk.anchor(), t_end);
+  EXPECT_TRUE(dk.validHorizonCovers(t_begin, t_end));
+  Pose at_begin;
+  Pose at_end;
+  EXPECT_TRUE(dk.poseAt(t_begin, &at_begin));  // covered by the head hold
+  EXPECT_TRUE(dk.poseAt(t_end, &at_end));      // covered by the tail ZOH
+
+  // A point at the very start of the sweep must deskew (no restart).
+  std::vector<LidarPoint> pts(1);
+  pts[0].xyz = Eigen::Vector3f(2.f, 0.f, 0.f);
+  pts[0].t_offset_ns = 0;  // at t_begin (offset is from stamp_start == t_begin)
+  LidarScan in;
+  in.stamp_start = t_begin;
+  in.sweep_duration = t_end - t_begin;
+  in.points = std::make_shared<const PointCloud>(std::move(pts));
+
+  LidarScan out;
+  EXPECT_TRUE(dk.deskew(in, &out));
+}
+
+// A head gap larger than one period is a genuine IMU hole: the head hold must not engage,
+// so the sweep start stays outside the horizon and deskew restarts.
+TEST(ImuOnlyDeskew, IntegrateSweepLeavesLargeHeadGapToFail) {
+  ImuInitState init;
+  init.gravity = Eigen::Vector3d::Zero();
+  ImuOnlyDeskew dk(init, Extrinsic{}, Pose{}, Eigen::Vector3d::Zero());
+
+  std::vector<ImuSample> imu;
+  for (std::int64_t t = 50'000'000; t <= 90'000'000; t += 10'000'000) {
+    imu.push_back(mkImu(Eigen::Vector3d::Zero(), t));  // period 10 ms, starts at 50 ms
+  }
+  const std::int64_t t_begin = 0;        // first sample is 50 ms late: a real hole
+  const std::int64_t t_end = 95'000'000;
+  dk.integrateSweep(imu, t_begin, t_end);
+
+  EXPECT_FALSE(dk.validHorizonCovers(t_begin, t_end));
+}
+
 TEST(ImuOnlyDeskew, NeverMutatesInputBuffer) {
   ImuInitState init;
   init.gravity = Eigen::Vector3d::Zero();

@@ -9,7 +9,8 @@ include(MeridianDeps)            # Eigen3::Eigen, Sophus::Sophus
 find_package(meridian_common REQUIRED)
 
 add_library(meridian_calib
-  src/calibration_store.cpp)
+  src/calibration_store.cpp
+  src/camera_model.cpp)
 
 target_include_directories(meridian_calib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -34,6 +35,8 @@ if(BUILD_TESTING)
   include(MeridianTesting)
   meridian_add_gtest(test_calibration_store test/test_calibration_store.cpp)
   target_link_libraries(test_calibration_store meridian_calib)
+  meridian_add_gtest(test_camera_model test/test_camera_model.cpp)
+  target_link_libraries(test_camera_model meridian_calib)
 endif()
 
 ament_package()

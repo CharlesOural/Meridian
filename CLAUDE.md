@@ -7,16 +7,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Meridian** is a from-scratch LiDAR-Inertial-Visual-GNSS SLAM system targeting
 the **NVIDIA Jetson Orin**. It is proprietary (see `LICENSE`).
 
-**Current state: docs + dev-environment only — there is no source code yet.**
-`src/` is the (empty) colcon source space. The system is fully specified in
-`docs/specs/` *before* being built. **The specs are the contract — read the
-relevant spec first and do not contradict it.** This file is a map and a runbook;
+`src/` is the colcon source space (cross-cutting layer, L0/L1 sensors/preprocess/
+pipeline, ROS wrapper, and the in-progress L2 front-end). The system was fully
+specified in `docs/specs/` *before* being built. **The specs are the contract —
+read the relevant spec first and do not contradict it.** This file is a map and a runbook;
 it deliberately does **not** restate the design — the specs own that, so the
 single source of truth never drifts. When in doubt, follow the spec, not this file.
 
 ## Where the design lives (authoritative — read these, not this file)
 
-- `docs/SYSTEM_OVERVIEW.md` — end-to-end narrative (photons → mesh) and the *why*.
 - `docs/specs/00_architecture.md` — package layout & dependency rules (§2, §4),
   threading (§11), the no-ROS rule (§1), the `KeyframePacket` contract (§6), build
   order (§13), and the **non-negotiable invariants** (§14). Start here to build.
@@ -27,9 +26,8 @@ single source of truth never drifts. When in doubt, follow the spec, not this fi
   colcon workspace, and the CUDA/nvblox build.
 - `docs/specs/02..10` — per-layer specs: sensors/time, preprocessing, front-end,
   back-end, mapping, loop closure, calibration, debug, evaluation.
-- `docs/grounding/` — `file:line` + paper citations into the **reference** systems
-  (FAST-LIO2, FAST-LIVO2, nvblox, iSAM2, Coco-LIC); these describe *those* systems,
-  not Meridian's API. `docs/course/` — textbook-depth math.
+  **Appendix R**, verified against the clones in `/home/user/slam-reference`; these
+  describe *those* systems, not Meridian's API.
 - `docs/DEVELOPMENT.md` — the dev-environment runbook (summarised below).
 - `docs/TESTING.md` — running the system against a dataset bag (FusionPortable).
 
@@ -46,6 +44,21 @@ one-time workspace bring-up (`git submodule update`, `vcs import src < dependenc
 build invocations, and viz. Follow it rather than duplicating commands here. Tests
 run via ament/GoogleTest: `colcon test`; `--packages-select <pkg>` for one package;
 `--ctest-args -R <name>` for one test.
+
+**Building/testing from outside the box (Claude):** the host has no toolchain; run
+build/test commands non-interactively through the distrobox (named `meridian`; it
+shares $HOME, so workspace paths are identical inside and out):
+
+```bash
+distrobox enter meridian -- bash -lc \
+  'source /opt/ros/humble/setup.bash && cd ~/Meridian && colcon build --symlink-install --packages-select <pkg>'
+distrobox enter meridian -- bash -lc \
+  'source /opt/ros/humble/setup.bash && cd ~/Meridian && colcon test --packages-select <pkg> && colcon test-result --verbose'
+```
+
+Additionally `source install/setup.bash` (after the ROS one) for anything needing
+built packages (`ros2 topic`, workspace tools). Interactive/GUI sessions (rviz,
+`ros2 bag play`) stay with the user.
 
 CI gates to keep green are defined in spec 11 §9.3 / spec 00 §9.4 (no-ROS grep,
 dependency lint, no CUDA outside `meridian_map`, clang-tidy/clang-format `-Werror`).

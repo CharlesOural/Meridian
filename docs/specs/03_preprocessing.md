@@ -3,12 +3,11 @@
 > **Spec status:** normative implementation spec for **layer L1** (`meridian_preprocess`).
 > This document tells you *how to build* the per-sensor conditioning stage: the data
 > structures, the interfaces, the algorithms (in pseudocode), the parameters, the
-> failure modes, and the debug hooks. It is **not** a tutorial — the fundamentals of
-> the IMU model and the deskew transform are derived in the grounding dossier
-> `../grounding/02_imu_propagation_deskew.md`, the continuous-time trajectory in
-> `../grounding/10_continuous_time.md`, and the front-end math in
-> `04_frontend_estimation.md`. Read those for the *why*; this spec is the *what* and
-> the *exactly how*.
+> failure modes, and the debug hooks. It is **not** a tutorial — the front-end math
+> (IMU model, deskew transform, continuous-time trajectory) is derived in
+> `04_frontend_estimation.md`. Read that for the *why*; this spec is the *what* and
+> the *exactly how*. Reference-system grounding for the engineering/ROS patterns this
+> spec validated against is in Appendix R.
 >
 > **What L1 is, in one line.** L1 turns the raw, time-synced samples L0 produces for
 > **one LiDAR + one IMU + one camera + GNSS** into clean, estimator-ready
@@ -28,11 +27,10 @@
 >   the spline, §2 there); L1 hands it an *undeskewed* validated scan plus per-point
 >   time.
 >
-> **Grounding rule.** Every code claim is cited `file:line` against the reference
-> trees in `C:/Users/charl/Sources/slam-reference/`. The cited files were read
-> byte-accurately. Paper equations are referenced by their published numbers and
-> flagged `[paper, not on disk]` because the four paper `.txt` files in
-> `slam-reference/papers/` are 0 bytes (see `../grounding/02_imu_propagation_deskew.md` §0).
+> **Grounding rule.** Code claims are cited `file:line` against the reference trees
+> in `/home/user/slam-reference/`; the cited files were read byte-accurately. Paper
+> equations are referenced by their published numbers. The engineering/ROS reference
+> grounding is collected in Appendix R (non-normative).
 >
 > **Scope note.** Meridian is a **direct** system (point-to-plane LiDAR + sparse-direct
 > photometric, FAST-LIVO2 lineage). L1 therefore does **no LOAM-style feature
@@ -70,7 +68,7 @@ feedback edge (§4). Concretely, per modality:
 
 | Modality | L0 gives L1 (`01_*` §4) | L1 gives L2 |
 |---|---|---|
-| LiDAR | raw `LidarScan` (sensor frame, per-point `t_offset_ns`, not deskewed) | filtered+validated `LidarScan` (still sensor frame, points time-sorted, **undeskewed**) — L2 registers each point at its true time |
+| LiDAR | raw `LidarScan` (sensor frame, per-point `t_offset_ns`, not deskewed) | filtered+validated+surf-voxel-downsampled `LidarScan` (still sensor frame, points time-sorted, **undeskewed**) — L2 registers each point at its true time |
 | Camera | raw `CameraFrame` (Bayer/Mono, exposure/gain) | photometrically-normalised, rectified `CameraFrame` + a built image pyramid |
 | IMU | raw `ImuSample` (specific force + rate, bias included) | the same `ImuSample`, *passed through*, **plus** an `ImuNoiseModel` (init-time) and a saturation flag |
 | GNSS | raw `GnssFix` (LLA + ENU cov + fix type) | a **gated, anti-spoof-checked** `GnssFix` with an explicit `accept/reject + reason` verdict |
@@ -157,9 +155,12 @@ public:
 // Shared (sensor-agnostic) validity gate + organized-cloud construction.
 class LidarValidityFilter {
 public:
-  explicit LidarValidityFilter(const L1Config::Lidar&, const Extrinsic& T_imu_lidar);
+  // nominal_rate_hz comes from the LiDAR's SensorInfo (spec 02 §3.2); it sets the
+  // sweep_duration floor (§3.5a) and nothing else here.
+  LidarValidityFilter(const L1Config::Lidar&, const Extrinsic& T_imu_lidar,
+                      double nominal_rate_hz);
   // In-place: drops invalid points, sorts by t_offset_ns, optionally builds organized
-  // index. Fills ValidityStats for telemetry (§10).
+  // index, floors sweep_duration (§3.5a). Fills ValidityStats for telemetry (§10).
   LidarScan apply(LidarScan&& in, ValidityStats* out_stats) const;
 };
 
@@ -208,10 +209,11 @@ never mutate the input bytes, because L4's retained store may alias them —
 
 ## 3. LiDAR preprocessing
 
-LiDAR L1 is three sequential stages: **decode** (per-sensor, §3.1) → **validity
-gate** (shared, §3.2) → **organized-cloud construction** (optional, §3.3). The
-output is an *undeskewed* validated scan; deskew (§4) happens in L2 against the
-spline, not inline here.
+LiDAR L1 is four sequential stages: **decode** (per-sensor, §3.1) → **validity
+gate** (shared, §3.2) → **surf-voxel downsample** (shared, §3.2a) →
+**organized-cloud construction** (optional, §3.3). The output is an *undeskewed*,
+density-reduced, validated scan; deskew (§4) happens in L2 against the spline, not
+inline here.
 
 ### 3.1 Decode (per-sensor adapter)
 
@@ -228,8 +230,7 @@ the PCL `curvature` field to carry per-point time in **milliseconds**
 (`added_pt.curvature = pl_orig.points[i].t * time_unit_scale`,
 `FAST_LIO/src/preprocess.cpp:226,275`, with `time_unit_scale` chosen from a
 `TIME_UNIT{SEC,MS,US,NS}` enum at `:52-69`). That implicit, undocumented
-ms-in-`curvature` convention is precisely what the grounding dossier flags as a
-gotcha (`../grounding/02_imu_propagation_deskew.md` §7.5). **Meridian uses an
+ms-in-`curvature` convention is a classic silent-unit gotcha. **Meridian uses an
 explicit, typed `int32 t_offset_ns` field** — no unit ambiguity, no field abuse.
 The adapter converts the sensor's native unit to ns once, here.
 
@@ -258,7 +259,9 @@ ALGORITHM decode(raw, info):                       # ILidarAdapter
      q.range     = p.range>0 ? p.range : norm(q.xyz)
      q.t_offset_ns = int32(p.t)                    # Ouster: native ns offset, no scale
      pts.push(q)
-  scan.sweep_duration = max(pts.t_offset_ns) - min(pts.t_offset_ns)
+  scan.sweep_duration = max(pts.t_offset_ns)        # sweep-end offset; offsets are
+                                                    # not guaranteed column-ordered, and
+                                                    # subtracting the min would move t_end
   scan.points = make_shared<const vector<LidarPoint>>(move(pts))
   return scan
 ```
@@ -331,9 +334,60 @@ ALGORITHM validity_apply(scan, cfg, mask):         # LidarValidityFilter
     out.push(p)
   sort(out by t_offset_ns ascending)
   stats.n_in = scan.points.size(); stats.n_out = out.size()
+  # surviving sweep-end, floored so a sparse/over-filtered scan cannot collapse the
+  # deskew horizon below a sane minimum (§3.5a):
+  surviving_end = out.empty() ? 0 : max(out.t_offset_ns)
+  floor_ns      = round(cfg.sweep_floor_frac * 1e9 / nominal_rate_hz)   # rate from SensorInfo
+  scan.sweep_duration = max(surviving_end, min(floor_ns, scan_in.sweep_duration))
   scan.points = make_shared<const vector<LidarPoint>>(move(out))
   return scan, stats
 ```
+
+### 3.2a Surf-voxel downsample (deterministic representative per cell)
+
+`point_filter_num` (§3.2) thins by valid-count, which does not bound *spatial*
+density — a near surface still arrives at full resolution while a far one is sparse.
+The architecture's L1 contract is a **downsampled** cloud (`00_*` §3 L1 row), so
+after the validity gate L1 applies a **surf-voxel downsample**: bucket the surviving
+points into a uniform voxel grid of edge `voxel_surf_m` (the `preprocess.voxel_surf_m`
+key, `00_*` §8.2; default 0.5 m, with `tsdf_voxel_m <= voxel_surf_m` enforced in
+`Config::validate`, `00_*` §8.3) and keep **at most `surf_max_pts` points per voxel**
+(default 1; a small cap > 1 retains a little within-cell structure for normal
+estimation when `organize` is on). This is the density the CT point-to-plane
+residual consumes; it is **not** the persistent registration map (that store, its
+per-voxel point cap, and its eviction policy are L4/Tier R, owned by `06_mapping.md`
+§3.2 / §3.2a — L1 only conditions the *incoming* sweep).
+
+**The representative is chosen deterministically — never newest-wins.** The obvious
+implementation (keep the last point that lands in a cell, overwrite as you iterate)
+makes the surviving set a function of *iteration order*, which violates the
+single-thread determinism mode (`00_*` §11.2): two runs over the same scan, or a
+reordered decode, can keep different points and produce a different cloud, breaking
+bit-reproducibility and the regression harness. L1 instead selects per cell by a
+**fixed, order-independent rule**:
+
+- **`surf_max_pts == 1` (default):** keep the point **nearest the voxel centre**,
+  ties broken by ascending `t_offset_ns` then by the point's decode index. This is
+  the deterministic analogue of the reference ikd-Tree on-insert downsample (which
+  keeps the point nearest the cell centre, `06_mapping.md` §3.2) and depends on no
+  traversal order.
+- **`surf_max_pts > 1`:** when a cell receives more than the cap, retain a bounded
+  sample by **reservoir sampling with a per-process seeded RNG** (`surf_seed`,
+  default 0): the draw is uniform over the cell's points, unbiased toward early or
+  late returns, and — because the RNG is seeded — identical across replays of the
+  same input on one thread. This mirrors the registration store's deterministic
+  reservoir eviction (`06_mapping.md` §3.2a) so both density-reduction points in the
+  pipeline share one determinism discipline rather than two ad-hoc policies. The
+  reservoir draw is the only randomness in L1 and is confined to the eviction
+  decision; it never touches a point's coordinates or time.
+
+The downsample runs after the validity gate (so dead points never occupy a cell)
+and keeps the gate's already-floored `sweep_duration` (§3.5a): thinning only removes
+points, none of which exceeds the anchor, so the horizon stays valid. It preserves
+the time-sort (re-sort the survivors by `t_offset_ns`, since cell bucketing reorders
+them) and the copy-on-write rule (§2.3 — a new Shared-immutable buffer, input bytes
+untouched). `ValidityStats` gains `n_voxel_out` (points after downsample) alongside
+`n_out` (points after the validity gate).
 
 ### 3.3 Organized-cloud construction (optional, ring-indexed)
 
@@ -364,10 +418,56 @@ descriptors (L5) and intensity-aided colourisation (L4) have it.
 ### 3.5 What L1 outputs to L2 (LiDAR)
 
 A validated `LidarScan`: sensor frame, raw `xyz`, time-sorted, decimated,
-self-hit-free, with `sensor_frame` set and `sweep_duration` recomputed post-filter.
+surf-voxel-downsampled (§3.2a), self-hit-free, with `sensor_frame` set and
+`sweep_duration` recomputed post-filter
+as the **max surviving `t_offset_ns`**, floored as in §3.5a (the sweep-end offset,
+never max−min of the survivors): culling the earliest columns must not pull `t_end`
+below points still in the cloud, and a point whose offset exceeds the recomputed end
+would fall outside the deskew horizon. (When nothing is dropped, `point_filter_num
+== 1`, no voxel cell exceeds `surf_max_pts`, and the input is already time-sorted,
+the original buffer and its `sweep_duration` pass through untouched to avoid a
+copy.)
 **Undeskewed** — L2 registers each point at its true `t_offset_ns` against the
 spline (§4 explains why deskew lives there). Plus a `ValidityStats` for telemetry
 (§10).
+
+### 3.5a `sweep_duration` floor (the deskew-horizon guard)
+
+`sweep_duration` is the span the deskew horizon must cover: `t_end = stamp_start +
+sweep_duration` is the warp anchor, and the IMU-only / spline providers must supply
+a pose for every `t ∈ [stamp_start, t_end]` (§4, spec 02 §4.6). Recomputing it as
+the *max surviving* `t_offset_ns` is correct for the common case, but a scan that
+filtering reduces to a few early-column points — a near-empty sweep through a
+tunnel, a self-hit storm, an aggressive `point_filter_num` on a sparse return — can
+collapse `sweep_duration` to a small value (or, when every survivor shares the first
+column, to ~0). A collapsed horizon makes the spline-query window vanishingly short
+and trips spurious window-restarts (§4.4) even though the trajectory was fine.
+
+L1 therefore **floors** the recomputed value at a fraction of the nominal sweep
+period:
+
+```
+floor_ns        = round(sweep_floor_frac / nominal_rate_hz * 1e9)
+sweep_duration  = max( max_surviving_t_offset_ns,
+                       min(floor_ns, original_sweep_duration) )
+```
+
+with `sweep_floor_frac` default `0.5` (§8 / Appendix A) and `nominal_rate_hz` from
+`SensorInfo`. Two clamps, both load-bearing:
+
+- The floor only ever **raises** `sweep_duration` toward a sane minimum, so the
+  surviving sweep-end (an upper bound on real point times) is always honoured — no
+  surviving point is ever pushed outside the horizon.
+- The floor is itself capped at the scan's **original** (pre-filter, L0)
+  `sweep_duration`: the physical sweep never lasted longer than the device reported,
+  so the anchor is never invented past the true sweep end. The padding it adds — at
+  most up to half a nominal period, and never beyond the real sweep — is the same
+  benign zero-order-hold the cold-start deskew already applies at the sweep tail
+  (spec 02 §4.6); the spline simply evaluates `T(t)` a few hundred microseconds
+  past the last surviving point, which it covers by construction.
+
+The floor never changes any point's `t_offset_ns`, only the anchor span; deskew and
+the per-point spline query are unaffected for every real point.
 
 ### 3.6 Explicitly rejected: LOAM feature extraction
 
@@ -438,8 +538,8 @@ built its first control points and the spline spans the sweep, the pipeline swap
 the injected provider to `SplineDeskew` — one pointer assignment, announced on the
 bus: `event(INFO,"deskew/mode=spline")`. The transition gate mirrors FAST-LIO's
 `flg_EKF_inited = (lidar_beg_time - first_lidar_time) >= INIT_TIME`
-(`FAST_LIO/src/laserMapping.cpp:898` per `../grounding/...` and `00_*` §7.2), but
-Meridian exposes it as telemetry instead of hiding it in a bool.
+(`FAST_LIO/src/laserMapping.cpp:898`; `00_*` §7.2), but Meridian exposes it as
+telemetry instead of hiding it in a bool.
 
 **Restart.** Mid-run, if L2's spline cannot cover the sweep (divergence, lost
 observability — §4.4), the pipeline swaps the provider *back* to `ImuOnlyDeskew`,
@@ -461,8 +561,7 @@ It is used when a standalone motion-compensated cloud is actually needed
 (cold-start, restart, visualisation); in steady state L2 folds the equivalent
 operation into its per-point residual and calls no standalone warp. The transform
 is the FAST-LIO backward-propagation, verified raw
-(`FAST_LIO/src/IMU_Processing.hpp:323-335`,
-`../grounding/02_imu_propagation_deskew.md` §4.3). For a point at sweep time
+(`FAST_LIO/src/IMU_Processing.hpp:323-335`). For a point at sweep time
 $t_i$, with the IMU interval head pose $(R_h, p_h, v_h)$, interval-constant world
 acceleration $a_h$ and body rate $\omega$, scan-end IMU pose $(R_e, p_e)$, and the
 LiDAR→IMU extrinsic $(R_{LI}, t_{LI})$ from `CalibrationSet`:
@@ -481,8 +580,12 @@ reading right-to-left: LiDAR@$t_i$ → IMU@$t_i$ → world (anchored at scan-end
 $T_{ei}$) → IMU@end → LiDAR@end. The reference computes this as
 `P_compensate = offset_R_L_I.conj() * (rot.conj() * (R_i*(offset_R_L_I*P_i +
 offset_T_L_I) + T_ei) - offset_T_L_I)`
-(`FAST_LIO/src/IMU_Processing.hpp:335`). FAST-LIVO2 uses the identical equation
-(`../grounding/02_imu_propagation_deskew.md` §5.4).
+(`FAST_LIO/src/IMU_Processing.hpp:335`). FAST-LIVO2 implements the *algebraically
+equivalent* warp but precomputes the extrinsic-rotation product
+`extR_Ri = R_LI^T · R_e^T` and `exrR_extT = R_LI^T · t_LI` once outside the
+per-point loop (`FAST-LIVO2/src/IMU_Processing.cpp:497-498,526`) rather than
+factoring `R_LI^T` outermost per point — same result, fewer multiplies, not a
+byte-identical expression.
 
 **Spline-query is exact; IMU-only is the approximation.** The reference flags this
 warp `// not accurate!` (`FAST_LIO/src/IMU_Processing.hpp:335`) because it warps with
@@ -574,6 +677,34 @@ the steady-state default in both.
 
 `IDeskewProvider::kind()` is published every scan as
 `scalar("deskew/mode", 0=spline|1=imu_only)` so the mode is plottable (§10).
+
+### 4.6 Bounding the IMU-only horizon to the sweep (cold-start edge holds)
+
+`ImuOnlyDeskew` integrates the group's IMU set into a piecewise trajectory whose
+valid horizon is exactly `[first_imu_stamp, last_imu_stamp]`; `poseAt(t)` returns
+false (and the warp restarts, §4.4) for any `t` outside it. But the sweep interval
+`[t_begin, t_end]` rarely lines up with the IMU sample grid: the straddling sample
+(spec 02 §8.2) lands at or *before* `t_begin`, and the last in-interval sample lands
+at or *before* `t_end`, so the very first and last points of the sweep can fall
+microseconds outside the raw IMU horizon and would needlessly fail the strict
+containment check. The cold-start deskew therefore pads the horizon to the sweep on
+both ends with a **zero-order hold**, each bounded by **one self-measured IMU
+period** (the group's mean inter-sample gap, `(last−first)/(n−1)`):
+
+- **Head-hold back to `t_begin`.** If the first IMU sample lands after `t_begin`
+  and the gap is within one period, the first sample's measurement is held constant
+  back to `t_begin` (a synthetic interval head at `t_begin`). A larger head gap is a
+  genuine IMU hole and is left to fail the horizon check.
+- **ZOH tail to `t_end`.** If the last in-interval IMU sample lands before `t_end`,
+  its measurement is held constant forward to `t_end` so the anchor (`t_end`) is
+  inside the horizon. The hold is at most one period for the same reason.
+
+Both holds are applied before integration, so the trajectory is continuous in
+velocity at the seam and the warp anchor `poseAt(t_end)` is always defined for a
+well-formed group. The period is measured from the group's own samples (not a
+configured nominal rate), so the bound tracks the actual IMU cadence. The strict
+`validHorizonCovers` test inside `ImuOnlyDeskew` is preserved; the holds widen the
+*input* horizon by a bounded amount rather than relaxing the check.
 
 ---
 
@@ -679,8 +810,7 @@ subtracting an init-time estimate would double-correct.
 At startup, with the platform **stationary**, accumulate the first
 `imu_init_count` samples (default 10 frames' worth, the reference `MAX_INI_COUNT`,
 `FAST_LIO/src/IMU_Processing.hpp:30`) using Welford's online mean/variance — the
-exact reference recurrence (`FAST_LIO/src/IMU_Processing.hpp:185-189`,
-`../grounding/02_imu_propagation_deskew.md` §2.1):
+exact reference recurrence (`FAST_LIO/src/IMU_Processing.hpp:185-189`):
 
 $$
 \bar a \mathrel{+}= \frac{a_k - \bar a}{N}, \quad
@@ -694,12 +824,12 @@ L1 *computes and publishes* them so init is observable and testable):
 - **Gravity:** $g_0 = -\dfrac{\bar a}{\lVert \bar a\rVert}\, G$, $G = 9.81$ —
   negated, normalised mean acceleration scaled to $G$
   (`FAST_LIO/src/IMU_Processing.hpp:196`). Meridian pins $\lVert g\rVert = 9.81$ on
-  $S^2$ (the FAST-LIO2 refinement, `use-ikfom.hpp:8,20`,
-  `../grounding/...` §2.2) — direction free, magnitude fixed.
+  $S^2$ (the FAST-LIO2 refinement, `use-ikfom.hpp:8,20`) — direction free, magnitude
+  fixed.
 - **Gyro bias:** $b_{g,0} = \bar\omega$ (valid only at rest,
   `FAST_LIO/src/IMU_Processing.hpp:199`).
 - **Accel bias:** left at prior $0$ — it is unobservable while static (cannot be
-  separated from gravity without motion; `../grounding/...` §2.2).
+  separated from gravity without motion).
 
 **Motion-during-init guard (Meridian addition).** The reference *assumes* stationary
 init and does not check. Meridian rejects init if the platform was moving: if
@@ -709,12 +839,25 @@ must be ≈ $G$), init **fails** with `event(WARN,"imu/init_moving")` and retrie
 on the next batch. This catches the common field error of bumping the rig during
 boot.
 
+**No accelerometer scale normalization (deliberate).** The reference rescales every
+raw accelerometer reading at propagation time by $G/\lVert\bar a\rVert$
+(`acc_avr = acc_avr * G_m_s2 / mean_acc.norm()`,
+`FAST_LIO/src/IMU_Processing.hpp:266`; `FAST-LIVO2/src/IMU_Processing.cpp:353`) —
+an implicit unit conversion that couples the runtime model to the init-time static
+norm and silently corrects an accelerometer reporting in $g$ rather than m/s². Meridian
+does **not** apply this rescale: the `ImuSample` is consumed in raw m/s² by both the
+iEKF process model and the CT accel residual (`04_*` §3.3). The `init_max_grav_err`
+gate above already enforces $\lVert\bar a\rVert \approx G$, i.e. the static scale is
+≈ 1 by construction, so a hidden $G/\lVert\bar a\rVert$ factor would be a no-op on a
+correctly-calibrated m/s² IMU and would mask a miscalibrated one rather than rejecting
+it. A genuine unit/scale fault is surfaced (gate rejection + telemetry), not absorbed.
+
 ### 6.3 Allan-variance noise model
 
 The continuous-time IMU noise densities feed L2's process noise $Q$ (the
 reference fills `Q` blocks from `cov_gyr/cov_acc/cov_bias_*`,
 `FAST_LIO/src/IMU_Processing.hpp:280-283`; `process_noise_cov()`,
-`use-ikfom.hpp:35-43`, `../grounding/...` §1.4; in the CT system these weight the
+`use-ikfom.hpp:35-43`; in the CT system these weight the
 IMU-derivative residual, `04_*` §3.3). The four parameters are the IMU spec sheet /
 Allan-deviation values:
 
@@ -728,9 +871,9 @@ Allan-deviation values:
 **Source-of-truth decision (deliberate, vs the reference foot-gun).** The
 reference *measures* `cov_acc/cov_gyr` during init and then **overwrites** them
 with configured `cov_*_scale` constants
-(`FAST_LIO/src/IMU_Processing.hpp:368-372`, `../grounding/...` §2.4 — "the rescale
-is immediately overwritten ... in practice uses the configured scales"). The
-empirical variance is silently discarded. Meridian makes this explicit: the
+(`FAST_LIO/src/IMU_Processing.hpp:368-372`): the measured value is immediately
+overwritten, so in practice the run uses the configured scales and the empirical
+variance is silently discarded. Meridian makes this explicit: the
 **Allan-variance values from `CalibrationSet` are the source of truth**
 (`noise_source=allan`, default). The init-measured variance is computed and
 *published as telemetry* (`vec("imu/init_cov_acc")`, `vec("imu/init_cov_gyr")`)
@@ -836,13 +979,19 @@ so denial/spoofing episodes are visible (§10).
 
 L1 reads its slice of the one typed `Config` tree (`00_*` §8). No `nh.param`
 scatter, no launch/YAML split, validated on load (`00_*` §8.3; the reference's
-silent-default foot-gun is documented in `../grounding/06_engineering_ros_debug.md`
-§2.3). The L1 keys extend the `preprocess:` block sketched in `00_*` §8.2
+silent-default foot-gun — `nh.param` falls back to a hard-coded default on a
+missing/misspelled key with no validation, no unknown-key warning, no resolved-config
+dump — is catalogued in Appendix R.2). The L1 keys extend the `preprocess:` block
+sketched in `00_*` §8.2
 (`blind, point_filter_num, voxel_surf_m`). Full schema in Appendix A. Cross-field
 validations L1 adds to `Config::validate()`:
 
 - `blind < det_range`; both positive.
 - `point_filter_num >= 1`.
+- `0 < sweep_floor_frac <= 1` (the floor is a fraction of one nominal period, never
+  more — §3.5a).
+- `voxel_surf_m > 0` and `tsdf_voxel_m <= voxel_surf_m` (the map cannot be finer
+  than the cloud feeding it, `00_*` §8.3); `surf_max_pts >= 1` (§3.2a).
 - `imu_init_count >= 1`; `bootstrap_max_scans >= 1`.
 - `restart_window_scans >= 1`.
 - camera `pyramid_levels >= 1`; intrinsics present iff a camera is configured.
@@ -872,8 +1021,8 @@ validations L1 adds to `Config::validate()`:
 | F14 | GNSS denial (no fixes) | no accepted fix for `T` | none (system runs without GNSS) | `scalar("gnss/accept_rate")` |
 
 The governing principle: **L1 never forwards a measurement it cannot vouch for,
-and every drop is counted and surfaced** — never a silent `continue` (the explicit
-anti-pattern from `../grounding/06_engineering_ros_debug.md`).
+and every drop is counted and surfaced** — never a silent `continue`/`ROS_WARN`, the
+reference anti-pattern catalogued in Appendix R.2.
 
 ---
 
@@ -887,12 +1036,14 @@ Each stage is wrapped in a `ScopedTimer`. The L1 surface:
 `preprocess.lidar.decode`, `preprocess.lidar.validity`, `preprocess.camera.rectify`,
 `preprocess.camera.pyramid`, `preprocess.gnss.gate` (and `preprocess.deskew` only on
 the cold-start/restart warp path). This is the live, per-stage breakdown the
-reference only dumped to CSV (`s_plot11[scan_count]` preprocess time,
-`../grounding/06...` §5.1).
+reference only dumped to CSV at shutdown (per-scan preprocess time stashed in the
+fixed global array `s_plot11[scan_count]`, `FAST_LIO/src/laserMapping.cpp:295,331`;
+Appendix R.3).
 
 **Scalars** (`scalar(key, v, t)` → `/meridian/telemetry`):
-- `lidar/n_in`, `lidar/n_out`, `lidar/n_nan`, `lidar/n_blind`, `lidar/n_far`,
-  `lidar/n_selfhit`, `lidar/selfhit_frac` — the validity funnel.
+- `lidar/n_in`, `lidar/n_out`, `lidar/n_voxel_out`, `lidar/n_nan`, `lidar/n_blind`,
+  `lidar/n_far`, `lidar/n_selfhit`, `lidar/selfhit_frac` — the validity +
+  downsample funnel (`n_voxel_out` is the point count after §3.2a).
 - `deskew/mode` (0 spline / 1 imu_only), `deskew/restart_count`.
 - `imu/saturated_frac`, `imu/grav_norm` (init), `imu/noise_ratio` (measured/Allan).
 - `gnss/accept_rate`, `gnss/spoof_score`.
@@ -941,6 +1092,18 @@ no clock, no middleware (`00_*` §1, the whole point of the split). Tests run un
   + valid points; assert exactly the expected survivors, the funnel stats, and that
   points are time-sorted afterward. Property test: filtering is idempotent; output
   never aliases input bytes (copy-on-write).
+- **Surf-voxel downsample (§3.2a):** feed a dense cell of points; assert
+  `surf_max_pts == 1` keeps the point nearest the voxel centre (with the documented
+  tie-break) and that the result is invariant under a **shuffle of the input order**
+  — the determinism property newest-wins fails. With `surf_max_pts > 1`, assert the
+  reservoir keeps exactly the cap, that two runs with the same `surf_seed` keep an
+  identical set, and that the survivors are re-sorted by `t_offset_ns`. Assert
+  `n_voxel_out` matches the survivor count.
+- **`sweep_duration` floor (§3.5a):** filter a scan down to a handful of
+  early-column survivors; assert the recomputed `sweep_duration` is raised to
+  `sweep_floor_frac / nominal_rate_hz`, that it never exceeds the original
+  (pre-filter) span, and that no surviving point's `t_offset_ns` exceeds the floored
+  end. A scan whose survivors already span past the floor passes through unchanged.
 - **Deskew (§4):**
   - *Synthetic motion:* generate a scan of a known plane while rotating/
     translating at a known $T(t)$; warp with a `SplineDeskew` fed the ground-truth
@@ -976,6 +1139,10 @@ struct L1Config {
     double  blind          = 0.5;   // m   (self-hit core; ref default 0.01, preprocess.cpp:7)
     double  det_range      = 120.0; // m   (far-range clip; ref det_range)
     int     point_filter_num = 3;   // keep 1 per N VALID points (ref preprocess.cpp:260)
+    double  sweep_floor_frac = 0.5; // min sweep_duration as fraction of nominal period (§3.5a)
+    double  voxel_surf_m   = 0.5;   // surf-voxel downsample edge (§3.2a; tsdf_voxel_m <= this)
+    int     surf_max_pts   = 1;     // points kept per surf voxel (§3.2a)
+    std::uint64_t surf_seed = 0;    // seed for deterministic reservoir when surf_max_pts > 1 (§3.2a)
     bool    intensity_gate = false; double i_min=0, i_max=1e9;
     bool    organize       = false; // build ring×col index (§3.3)
     std::string selfhit_mask;       // name of mask volume set in CalibrationSet
@@ -1041,6 +1208,62 @@ unit, ring count, the Ouster `range`-precomputed-vs-recompute choice). Validity
 handlers lack. **Future extension (not designed now):** a second LiDAR would register
 its own `ILidarAdapter` behind the same seam and produce a second tagged `LidarScan`;
 how/whether scans merge would be an L2 decision. One LiDAR is the committed design.
+
+---
+
+## Appendix R — SOTA reference grounding (non-normative)
+
+This appendix is evidence, not contract: curated digests of the reference systems
+this spec's design was validated against. Nothing here binds Meridian's behavior —
+the normative sections above own the design. Each block names the reference checkout
+it was verified against; the clones live in /home/user/slam-reference.
+
+### R.1 Per-sensor LiDAR config: the values that actually differ
+*verified against FAST_LIO@7cc4175*
+
+Each reference LiDAR ships one YAML (`config/{avia,horizon,ouster64,velodyne,…}.yaml`)
+that differs mainly in topic, `lidar_type`, `scan_line`, `timestamp_unit`,
+`blind`, `fov_degree`, `det_range`, `extrinsic_T/R`. Verified divergences:
+
+| sensor | det_range | fov | scan_line | timestamp_unit |
+|---|---|---|---|---|
+| avia | 450 | 90 | — | — |
+| velodyne | 100 | 180 | 32 | 2 (US) |
+| ouster64 | 150 | 180 | 64 | 3 (NS) |
+
+The duplicated covariance / publish / `pcd_save` blocks are copied verbatim across
+files and drift independently — the motivation for Meridian's single validated
+`Config` tree with per-sensor profiles over a shared base (§8, Appendix A). Meridian
+runs one LiDAR (Ouster OS1-128, native ns `t`), so there is no per-type unit table.
+
+### R.2 Parameter loading & the silent-default foot-gun
+*verified against FAST_LIO@7cc4175, FAST-LIVO2@0d2c034; Point-LIO digest below (source NOT in /home/user/slam-reference)*
+
+| sharp edge | reference behaviour |
+|---|---|
+| silent defaults | `nh.param(name, var, default)` falls back to the hard-coded default on a missing/misspelled key — no validation, no range check, no unknown-key warning, no resolved-config dump. A YAML typo → a silently wrong run. |
+| params split YAML↔launch | `point_filter_num`, `max_iteration`, `filter_size_*`, `cube_side_length`, logging toggle live in `mapping_*.launch`; topics/covariances/extrinsics in `config/*.yaml`. Undocumented, drift-prone: launch sets `cube_side_length=1000` while the code default is **200** (`laserMapping.cpp:774`). |
+| silent recovery | a dropped/invalid measurement is a bare `continue`/`ROS_WARN`, never counted or surfaced. |
+
+**Point-LIO digest (source absent from the clone set, recorded from a prior read):**
+factored param loading into `parameters.cpp` (`readParameters`) and init into
+`li_initialization.cpp` (good "one concern per file" instinct) but stitched them via
+`extern` globals in `parameters.h` — one shared mutable namespace spread across
+files — and carried dual-mode flags (`use_imu_as_input`, `prop_at_freq_of_imu`) that
+force global-flag branching throughout `laserMapping.cpp`. Treat as unverified.
+
+### R.3 Timing / logging instrumentation (what to retain, what to fix)
+*verified against FAST_LIO@7cc4175*
+
+FAST_LIO times pipeline stages with `omp_get_wtime()` snapshots and accumulators
+(`match_time`, `solve_time`, `kdtree_*_time`), and stashes per-scan stats into 12
+fixed global arrays `s_plot…s_plot11[MAXN]` with `MAXN=720000` (`laserMapping.cpp:65,70`)
+— per-scan **preprocess** time goes to `s_plot11[scan_count]`
+(`laserMapping.cpp:295,331`) — dumped to `Log/*.csv` only at shutdown
+(`:1040-1051`). Sharp edges Meridian fixes: all output is `printf`/`fprintf` to
+fixed-size global arrays (≈69 MB, overflows on long runs) and flat text — no levels,
+no per-line timestamps, no live timing stream. Meridian emits per-stage timing live
+(§10) through a leveled structured sink instead (spec 09).
 
 ---
 

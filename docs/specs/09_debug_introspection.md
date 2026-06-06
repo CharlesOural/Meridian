@@ -12,8 +12,8 @@
 > recompiling, at a cost that is *zero when off* and *bounded when on*.
 >
 > **Position in the stack.** This spec defines the `meridian_debug` cross-cutting
-> library (the `TelemetrySink` bus, declared in `00_architecture.md` §10.1 and used
-> by every layer via `setTelemetry`/`set_telemetry`), the `meridian_msgs` debug
+> library (the `TelemetrySink` bus, declared in `00_architecture.md` §10.1 and
+> injected into every layer at construction via its factory), the `meridian_msgs` debug
 > message set, the `RosTelemetrySink` adapter inside `meridian_ros`, the rviz layout,
 > the replay/bag path-equivalence guarantee, and the runtime toggle service. It is
 > the implementation spec behind `00_architecture.md` §10 and Appendix C; it amends
@@ -34,10 +34,11 @@
 > **nvblox** (GPU TSDF+colour+Marching-Cubes mesh), **iSAM2/GTSAM** (incremental
 > factor graph), **Coco-LIC/CLINS + basalt-headers** (CT SE(3) B-spline). The
 > *engineering pattern* for "what signal to publish and how to keep it cheap" is
-> additionally anchored to the reference implementation
-> `slam-reference/FAST_LIO/src/laserMapping.cpp` and its `rviz_cfg/`, cited as
-> `laserMapping.cpp:NNN`. FAST-LIO's introspection has the *right signals* but is
-> **entangled with the node, hard-coded, and partly disabled**; Meridian keeps the
+> additionally anchored to the FAST_LIO reference implementation, cited as
+> `laserMapping.cpp:NNN`; the verified inventory of that node's introspection (the
+> publisher/topic surface, timing instrumentation, and rviz configs) is collected in
+> **Appendix R** (non-normative). FAST-LIO's introspection has the *right signals* but
+> is **entangled with the node, hard-coded, and partly disabled**; Meridian keeps the
 > good signals, fixes the location/structure/cost discipline, and adds the signals
 > a CT LIVO+GNSS system needs that a LiDAR-only filter never had (spline window,
 > photometric residuals, per-stream inlier counts, GNSS anchoring). Where this spec
@@ -165,8 +166,9 @@ the photometric/visual stream, GNSS):
 
 `meridian_debug` defines a single pure-virtual `TelemetrySink` (declared in spec 00
 §10.1, finalised in §3 below). Every layer holds a `TelemetrySink*` injected by
-the pipeline (`IFrontEnd::setTelemetry`, spec 00 §5.1; analogous `set_telemetry`
-on every interface) and writes to it. The pointer is **never owned** by the layer;
+the pipeline at construction (a factory parameter — `makeFrontEnd(cfg, calib, sink)`,
+spec 00 §5.1; the same shape on every module factory) and writes to it. The
+pointer is **never owned** by the layer;
 `MeridianPipeline` owns the sink and outlives every module (spec 00 §11.3).
 
 ```
@@ -209,6 +211,100 @@ child sinks. This is how the offline tool publishes to rviz **and** records to C
 in one run, and how the live node can simultaneously publish ROS topics and write
 a black-box CSV for post-incident forensics. `MultiSink` short-circuits when all
 children are gated off for a key (§12).
+
+### 2.4 The `IntrospectionHooks` slot — white-box access without serialisation
+
+`TelemetrySink` is a *fan-out of copies*: every channel is a value type that the core
+hands off and forgets, by design, so a slow or misbehaving sink can never reach back
+into estimator state. That property is exactly what makes it unsuitable for one job —
+**white-box testing of rich, non-serialisable internal structures**: the live iSAM2
+Bayes tree and factor graph, the `ISAM2Result` detail, the active spline knot vector,
+the windowed Hessian before it is reduced to six observability scores. Serialising
+these into a `meridian_msgs` type to assert on them would be a large, brittle parallel
+representation that drifts from the real object — the very entanglement this spec
+exists to avoid.
+
+`meridian_debug` therefore defines a *second, parallel* slot, `IntrospectionHooks`,
+held by a layer alongside its `TelemetrySink*` and injected the same way (a factory
+parameter, never owned by the layer). Where the sink *pushes copies out*, the hook
+slot lets a consumer *look in* at a live object **by `const` reference**, under three
+non-negotiable constraints that keep it from becoming a backdoor:
+
+- **`const`-ref only, read-only.** A hook receives `const T&` to the live structure
+  and MUST NOT mutate it or retain the reference beyond the call. The signature is
+  `const`-qualified on the producer side; the slot exposes no non-`const` access.
+- **Subscriber-gated, zero-cost when unsubscribed.** The slot has a cheap
+  `bool subscribed(Hook) const` predicate — the white-box analogue of
+  `TelemetrySink::enabled()`. The default (production, replay-without-test) slot is a
+  `NullHooks` whose `subscribed()` is always `false`, so the producer skips the hook
+  call entirely. No serialisation, no copy, no allocation occurs unless a consumer is
+  registered. A live build binds `NullHooks`; a unit/integration test binds a
+  recording consumer.
+- **Thread-confined on the producer.** A hook fires **synchronously, on the producer
+  layer's own thread, inside the call that holds the structure** — never from another
+  thread and never deferred. The consumer runs to completion before the producer
+  proceeds, so the `const&` is valid for exactly the hook's duration and no locking of
+  estimator state is introduced. A consumer that blocks blocks that one stage; in the
+  single-threaded determinism/replay mode (spec 00 §11.2) used by tests this is simply
+  in-line execution. The hook is therefore **forbidden in production postures by
+  policy** — it exists for the deterministic test/replay path, and `NullHooks` is the
+  only binding a live node ever uses.
+
+This gives the back-end test surface (spec 10 §8.1–§8.2) a way to assert on the
+*actual* iSAM2 graph — factor count by type, the relinearised variables in a
+`GraphUpdate`, the gauge-anchor presence, that a window-restart produced exactly one
+`CombinedImuFactor` and no `BetweenFactor` — by reading the live object, with no
+message schema in between and no path that runs only under test in a way the live
+code does not (the call site is always present; only the binding differs, exactly the
+`TelemetrySink`/`NullSink` discipline of §2.1). It is ROS-agnostic: `IntrospectionHooks`
+lives in `meridian_debug` and names only core/GTSAM types, never a ROS message.
+
+### 2.5 The `ParquetTelemetrySink` — the harness recording sink and its schema
+
+The evaluation harness (spec 10) records every telemetry call to disk as columnar
+Parquet, one file per domain, and then computes metrics and the determinism hash over
+those files. That sink is `ParquetTelemetrySink`, defined here because it is a
+`meridian_debug`/`meridian_tools` `TelemetrySink` implementation (it owns no ROS) and
+because the harness depends on a *fixed* schema it can read without coordinating with
+the producer. It is the recording peer of `CsvTelemetrySink` — same input (the bus),
+durable columnar output instead of per-key CSV.
+
+**Routing.** `ParquetTelemetrySink` writes one file per domain prefix, splitting on
+the first path segment of the key so a query touches only the relevant file:
+`frontend.parquet` (`frontend/*`, `odom/*`, `calib/*`), `backend.parquet` (`backend/*`,
+`place/*`), `map.parquet` (`map/*`, `pipeline/*`), and `timing.parquet` (every
+`timing()` call). This is the `run_dir/debug/*.parquet` layout the harness consumes
+(spec 10 §1.2).
+
+**Fixed columnar schema.** Every scalar/vector/event/timing call lands as one row in a
+single, fixed wide schema (heavy payloads — clouds, images, markers, poses — are
+*not* written to Parquet; they go to their own artefact writers, spec 10 §1.1, and
+Parquet records only that they fired, via a `kind` tag and a null value vector). The
+columns are:
+
+| column | type | meaning |
+|---|---|---|
+| `stamp_ns` | `int64` | the `meridian::Timestamp` of the call (measurement time, never wall time, §13.2) |
+| `key` | `string` (dictionary) | the `const char*` channel key, or the stage name for `timing()` |
+| `kind` | `uint8` | `0 scalar, 1 vec, 2 timing, 3 event, 4 payload-marker` |
+| `values` | `list<float64>` | scalar → 1 elem; vec → N; timing → `[ms]`; event/payload-marker → empty |
+| `axis_order` | `string` (dictionary) | the `vec()` axis order (§4.4), else `""` |
+| `unit` | `string` (dictionary) | the `unit_of(key)` string (§10) |
+| `level` | `uint8` | for `kind=event`: the `Level`; else `0` |
+| `tag` | `string` (dictionary) | for `kind=event`: the event tag; else `""` |
+| `message` | `string` | for `kind=event`: the `key=value` detail line; else `""` |
+| `seq` | `uint64` | monotone per-(file) write counter, the deterministic tie-break for equal `(stamp_ns,key)` (§13.4) |
+
+The schema is **append-only and versioned** by a `schema_version` Parquet
+file-metadata key; a reader keys off it so adding a column never breaks an archived
+run (spec 10 §7.3 re-runs old baselines). Dictionary-encoding the low-cardinality
+string columns keeps the files small and fast to scan in pandas/duckdb (spec 10 §10).
+
+**Determinism contract.** The hash the harness pins (§13.4, spec 10 §7.4) is computed
+over these records under a canonical ordering, and `ParquetTelemetrySink` is the
+single producer of that record set. The sink is only used on the single-threaded
+replay/determinism path; it is not a live-node sink (the live node uses
+`RosTelemetrySink` plus an optional black-box `CsvTelemetrySink`, §11.1).
 
 ---
 
@@ -301,7 +397,59 @@ private:
 // are the only cost, and they vanish if s==nullptr is hoisted by the optimizer.
 #define MERIDIAN_SCOPED_TIME(sink, stage, t) ::meridian::ScopedTimer _ht_##__LINE__((sink),(stage),(t))
 
+// The white-box introspection slot (§2.4). Parallel to TelemetrySink, but instead
+// of fanning value copies OUT it lets a registered consumer look IN at a live,
+// non-serialisable internal structure by const reference, synchronously on the
+// producer's own thread. The producer guards every hook on subscribed() so an
+// unsubscribed slot (NullHooks, the production/replay-without-test default) costs one
+// bool. Enumerate the inspectable structures; each new hook is a new enumerator and a
+// new const-ref-taking virtual. ROS-agnostic — names only core/GTSAM types.
+enum class Hook {
+  BackendGraph,      // const gtsam::NonlinearFactorGraph& : the live factor graph
+  BackendISAM2,      // const gtsam::ISAM2&                 : Bayes tree / linearisation point
+  BackendUpdate,     // const ISAM2ResultExt&              : the last update's relinearised set
+  FrontendWindow,    // const SplineWindow&                : active knot vector + state
+  FrontendHessian    // const Eigen::MatrixXd&             : windowed Hessian pre-observability
+};
+
+class IntrospectionHooks {
+public:
+  virtual ~IntrospectionHooks() = default;
+  // Cheap gate: false for NullHooks and for any hook with no registered consumer.
+  // The producer MUST call this before assembling/handing a structure to a hook.
+  virtual bool subscribed(Hook) const = 0;
+
+  // Each visit hands the consumer a CONST reference, valid only for the call's
+  // duration, executed synchronously on the producer thread. The consumer MUST NOT
+  // mutate or retain. Defined per inspectable structure so the type is explicit and
+  // there is no type-erased downcast at the boundary.
+  virtual void visit_graph (const gtsam::NonlinearFactorGraph&) = 0;
+  virtual void visit_isam2 (const gtsam::ISAM2&)                = 0;
+  virtual void visit_update(const ISAM2ResultExt&)              = 0;
+  virtual void visit_window(const SplineWindow&)                = 0;
+  virtual void visit_hessian(const Eigen::MatrixXd&)            = 0;
+};
+
+// The production / live / replay-without-test binding: every subscribed() is false,
+// every visit is an empty body. Bound by default exactly as NullSink is.
+class NullHooks final : public IntrospectionHooks {
+public:
+  bool subscribed(Hook) const override { return false; }
+  void visit_graph (const gtsam::NonlinearFactorGraph&) override {}
+  void visit_isam2 (const gtsam::ISAM2&)                override {}
+  void visit_update(const ISAM2ResultExt&)              override {}
+  void visit_window(const SplineWindow&)                override {}
+  void visit_hessian(const Eigen::MatrixXd&)            override {}
+};
+
 } // namespace meridian
+```
+
+**Usage at the producer (back-end), guarded exactly like `enabled()`:**
+
+```cpp
+if (hooks_->subscribed(Hook::BackendUpdate))
+  hooks_->visit_update(result_ext);   // synchronous, const&, on the back-end thread
 ```
 
 **`PointCloudView`** is a non-owning `std::span`-like view over `LidarPoint`s (or
@@ -430,9 +578,12 @@ failing, not just *that* the estimate is.
 | `frontend/spline_knots` | `pose`×K → markers | `/meridian/markers` (Points+LineStrip) | **on** | **NEW. None in FAST-LIO** (discrete-time). The active B-spline control points $c_k$ (spec 00 §7.5) drawn as a strip, so the operator *sees the trajectory the front-end is currently optimising*. |
 | `frontend/window_box` | `marker` | `/meridian/markers` (Cube) | on | The sliding-window working-region AABB — analogue of FAST-LIO's `LocalMap_Points` box (`laserMapping.cpp:229`), here spanning the active knot set. |
 | `frontend/window_span_s` | `scalar` | `/meridian/telemetry` (`s`) | on | NEW. Time span of the active knot window (the optimisation horizon). |
+| `frontend/ct/n_cp` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Control points placed on the most recent outer segment by the adaptive-knot-density rule (spec 04 §5.5): `1` in low-excitation motion, climbing toward `n_cp_max` under aggressive rotation/acceleration. A jump tracks where the spline added degrees of freedom to follow the motion. |
 | `frontend/iter_count` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Window NLLS (Ceres) iterations to convergence. Spikes = hard scene. |
 | `frontend/dx_norm` | `scalar` | `/meridian/telemetry` (`-`) | on | NEW. $\lVert\delta x\rVert$ of the last iterate over the windowed state (convergence proof). |
 | `frontend/cost_total` | `scalar` | `/meridian/telemetry` (`-`) | on | NEW. Total windowed cost after the solve (sum over all residual streams). |
+| `frontend/solve_ms` | `scalar` | `/meridian/telemetry` (`ms`) | on | NEW. Wall time of the windowed solve on the live (wall-clock) path, the quantity the deadline controller bounds. Plotted against the LiDAR period it shows headroom. |
+| `frontend/deadline_hit` | `scalar` | `/meridian/telemetry` (`ratio`) | on | NEW. On the live wall-clock path only, the fraction (sliding-count EWMA) of window solves that returned early because they hit `solve.time_limit_ms` rather than converging — i.e. ran the deadline-bounded fallback after `min_iters`. The determinism path is fixed-iteration and never sets this. A sustained non-zero value is the runtime real-time-pressure signal that the post-hoc p99 gate (spec 10 §5.5) only sees after the run. |
 | `frontend/observability` | `vec` | `/meridian/telemetry` (6, `ratio`) + `/meridian/markers` | **on** | **NEW. None in FAST-LIO** (only binary `flg_EKF_inited` `:898`). The 6 per-axis scores $s\in[0,1]^6$ (spec 01 §3.4) from the windowed Hessian; drives back-end noise inflation. Rendered as the observability hexagon (§7.1). |
 | `frontend/cov_diag` | `vec` | `/meridian/telemetry` (6) | on | The 6 diagonal entries of the marginal keyframe-pose covariance, `axis_order` stated. Replaces FAST-LIO's hand-packed `pose.covariance` `:597-606`. |
 
@@ -447,6 +598,8 @@ failing, not just *that* the estimate is.
 | `frontend/lidar/inlier_ratio` | `scalar` | `/meridian/telemetry` (`ratio`) | on | NEW. The single best one-number health gauge of LiDAR registration. |
 | `frontend/lidar/res_mean` | `scalar` | `/meridian/telemetry` (`m`) | on | From `res_mean_last` `:715` (was a global). Mean point-to-plane residual. |
 | `frontend/lidar/res_max` | `scalar` | `/meridian/telemetry` (`m`) | on | NEW. Tail residual — catches a few wild correspondences a mean hides. |
+| `frontend/lidar/n_factors_kept` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Point-to-plane residuals actually built after the bounded-factor cap (normal-stratified subsample, spec 04 §3.1). With `n_factors_dropped` it shows how hard the cap is biting; a high drop fraction with a falling `inlier_ratio` is the bounded-solve warning. |
+| `frontend/lidar/n_factors_dropped` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Inlier hits discarded by the factor cap this step (`kept + dropped` = inlier count; zero when the inlier set fit the budget). |
 
 **Visual stream (FAST-LIVO2-style sparse-direct photometric, LiDAR-depth):**
 
@@ -475,8 +628,13 @@ failing, not just *that* the estimate is.
 | key | call | topic / type | default | FAST-LIO origin → improvement |
 |---|---|---|---|---|
 | `frontend/gnss/anchor` | `pose` | `/meridian/gnss` `Odometry` | on | **NEW. None in FAST-LIO** (LiDAR-only). The GNSS-derived position anchor projected into the estimation datum, as fused into the window. |
-| `frontend/gnss/res` | `scalar` | `/meridian/telemetry` (`m`) | on | NEW. GNSS position residual against the trajectory — large + persistent ⇒ datum/extrinsic or GNSS-quality problem. |
+| `frontend/gnss/innovation_m` | `scalar` | `/meridian/telemetry` (`m`) | on | NEW. The GNSS position innovation — the norm of the fix minus the trajectory position interpolated to the fix time — i.e. the quantity the $k\sigma$ acceptance gate is applied to. Large + persistent ⇒ datum/extrinsic or GNSS-quality problem. (Supersedes the older `frontend/gnss/res` name; the residual *fed to the solve* and the *gating innovation* are the same quantity computed at the fix-interpolated pose.) |
+| `frontend/gnss/accept_rate` | `scalar` | `/meridian/telemetry` (`ratio`) | on | NEW. Fraction of GNSS fixes accepted into the window over a sliding count (accepted / (accepted+rejected)). A collapse to zero with a healthy fix type is the signature of a datum-init heading error or a stale extrinsic. |
+| `frontend/gnss/yaw_uncertainty_deg` | `scalar` | `/meridian/telemetry` (`deg`) | on | NEW. The $1\sigma$ heading uncertainty of the `T_map_enu` datum, read off the yaw block of the datum-alignment Hessian. Watched at datum lock: a high value is the gate that keeps a poorly-excited baseline from baking in a wrong heading. |
+| `frontend/gnss/datum` | `pose` | `/meridian/gnss_datum` `Odometry` | on | NEW. The estimated `T_map_enu` datum transform (map frame → local-ENU). Published once at lock and on every drift-redistribution update so a global-frame jump is correlated with a datum change. |
+| `frontend/gnss/datum_lock` | `event` | `/meridian/events` (Info) | on | NEW. The datum-initialisation lock event, carrying the locked `T_map_enu`, the `yaw_uncertainty_deg` at lock, and the baseline length that satisfied the `min_baseline` and velocity-excitation pre-gates. A second `datum_lock` after a re-acquisition gap carries the drift-redistribution decision. |
 | `frontend/gnss/fix` | `event` | `/meridian/events` (Info) | on | NEW. Fix-type transitions (`SPP`/`DGPS`/`RTK_Float`/`RTK_Fixed`, spec 01 §4.4) so a residual change is correlated with fix quality. |
+| `frontend/gnss/reject` | `event` | `/meridian/events` (Warn) | on | NEW. A fix rejected by the innovation gate, the fix-quality floor, or the re-acquisition persistence check, carrying the `reason` (`gate`/`quality`/`reacq_persist`/`spacing`) and the innovation in metres. The false-anchor guard made visible, the GNSS analogue of `place/loop_rejected_pcm`. |
 
 **Live output, lifecycle & recovery:**
 
@@ -509,6 +667,9 @@ per-sensor-name'd because there is exactly one of each.
 | `backend/n_moved` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Keyframes whose pose changed in the last `GraphUpdate` (spec 01 §7.4) — i.e. how much the world just shifted. |
 | `backend/trajectory` | `pose`×N → Path | `/meridian/path_optimized` `Path` | on | The corrected `map`-frame trajectory. FAST-LIO `/path` `:859` is **odom-only** (no back-end); this is the globally consistent one. |
 | `backend/loop_correction_norm` | `scalar` | `/meridian/telemetry` (`m`) | on | NEW. Magnitude of the rigid jump when a loop snaps — the "how big was the correction" number. |
+| `backend/optimize_lag` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Queued items batched into the last `optimize()` because the solve cadence is decoupled from keyframe insertion — i.e. how many keyframes/constraints one optimise consumed. A persistently rising value means the back-end is not keeping its `optimize_interval_ms` budget. |
+| `backend/fallback_count` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Cumulative count of iSAM2 last-resort recoveries — a rebuild of the estimator from the retained factors and last linearisation point after an indefinite/ill-conditioned update. It MUST stay flat in nominal operation; any increment is paired with a `backend/fallback` event and is a field-survival signal, not a routine one. |
+| `backend/fallback` | `event` | `/meridian/events` (Warn) | on | NEW. The iSAM2 rebuild-from-factors recovery made visible, carrying the trigger (`indefinite`/`relinearize_fail`) and the factor/keyframe count rebuilt. |
 
 ### 5.4 Place recognition (L5)
 
@@ -540,7 +701,10 @@ backend (spec 00 §9.5). These channels observe that one GPU map.
 |---|---|---|---|---|
 | `pipeline/q_meas_depth` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. `Q_meas` occupancy; a rising value = front-end falling behind. |
 | `pipeline/q_kf_depth` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. `Q_kf` occupancy (lossless; back-pressure, spec 00 §11.2). |
-| `pipeline/q_meas_dropped` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Cumulative lossy drops on `Q_meas` overload (spec 00 §11.2) — must stay flat. |
+| `pipeline/q_map_depth` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. `Q_map` occupancy — the GPU-map ingest queue (spec 00 §11.1). Distinct from `map/integrate_lag` (which is the *time* lag): this is the *depth* gauge that pairs with the other `q_*_depth` keys so all three pipeline queues are watched the same way. |
+| `pipeline/q_meas_dropped` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Cumulative lossy drops on `Q_meas` overload (spec 00 §11.2) — the dropped count reported by the bounded-queue primitive — must stay flat. `Q_meas` interleaves sweeps and live IMU; the drop policy is type-aware and only ever evicts an `ImuSample`, never a `PreprocessedGroup`, so a sweep is never lost behind a benign IMU drop. |
+| `pipeline/q_meas_dropped_imu` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Subset of `q_meas_dropped` that evicted a live `ImuSample` (degrades only between-sweep live-state propagation; the next sweep's solve is unaffected). |
+| `pipeline/q_meas_dropped_sweep` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Subset of `q_meas_dropped` that evicted a whole `PreprocessedGroup` — only reachable when the queue holds nothing but sweeps. Paired with an `Error` event; must stay zero. A dropped sweep leaves the front-end's last-solved time behind the next group's `t_begin`, which the front-end's gap guard catches with a `frontend/window_restart`. |
 | `pipeline/scan_to_odom_ms` | `scalar` | `/meridian/telemetry` (`ms`) | on | NEW. End-to-end latency scan-in → odom-out, the real-time SLA gauge. |
 
 ---
@@ -712,7 +876,7 @@ all under fixed frame `map`:
 A companion **`rqt` perspective** (`meridian_ros/rqt/meridian.perspective`) preloads
 `rqt_plot` on the high-value scalars filtered from `/meridian/telemetry`:
 `frontend/lidar/inlier_ratio`, `frontend/lidar/res_mean`, `frontend/visual/n_tracked`,
-`frontend/visual/res_mean`, `frontend/gnss/res`, `pipeline/scan_to_odom_ms`,
+`frontend/visual/res_mean`, `frontend/gnss/innovation_m`, `pipeline/scan_to_odom_ms`,
 `backend/chi2`; an `Image` view on `/meridian/visual_patches`; and a `StageTiming` bar
 view. This is the "single glance" dashboard FAST-LIO never had (its equivalents
 were a CSV read post-run).
@@ -772,6 +936,90 @@ present, so logs are greppable and parseable (`mod=place stamp=172… event=loop
 call produces both an `/meridian/events` message (§4.3) *and* a log line at the same
 level. One call, two surfaces — the operator's rviz/rqt and the developer's
 `ros2 bag`/text log stay consistent.
+
+### 9.5 The always-on log ring buffer and flush-on-Error
+
+The text/structured log a developer reads after the fact is not a forensic store on
+its own: the line that explains a failure is usually written *seconds before* the
+failure is detected, and on a long field run those seconds have already scrolled out
+of any console and may never have reached a file the operator can retrieve. The
+estimator therefore keeps an **always-on, bounded, in-process log ring buffer** —
+running in every posture including production, at zero allocation in steady state and
+with no dependence on whether any sink is bound to disk.
+
+- **Structure.** A fixed-capacity ring of the most recent log records (level, module,
+  the `key=value` line, `Timestamp`) sized by `debug.log_ring_capacity` (default
+  `4096` records) and capped by `debug.log_ring_bytes` (default `1 MiB`); whichever
+  bound is hit first evicts oldest-first. The records are stored as already-formatted
+  lines so a flush is a copy, never a re-render. The ring lives in `meridian_debug`
+  behind the `LogSink` boundary (a `RingLogSink` decorator that the bound terminal
+  sink wraps), so it is ROS-agnostic and present in replay exactly as in the live
+  node.
+- **Admission floor.** The ring admits every record at or above `debug.log_ring_level`
+  (default `Debug`) regardless of the active surfacing level, so the buffer retains
+  the per-scan internals (§9.2 `Debug`) that the console may be suppressing. The
+  surfacing level (`Config.debug.level`, §11) still governs what is *emitted live*;
+  the ring is a separate, lower floor whose only cost is the bounded copy. `Trace`
+  is admitted only when `debug.log_ring_level=trace` is set, because per-point lines
+  would churn the ring.
+- **Flush-on-Error.** Any record at `Error` level — and any `event()` at
+  `Level::Error` (§9.4), since events are logged — triggers an **automatic forensic
+  flush**: the ring's current contents *and* the last `debug.forensic_window_s`
+  (default `10 s`) of the telemetry ring (§11.2) are written to a self-contained
+  forensic file, with the same payload and on-disk shape the manual
+  `SnapshotForensics` service produces (§11.2). The flush is **rate-limited** (one
+  per `debug.forensic_min_interval_s`, default `30 s`) so an `Error` storm cannot
+  itself starve the estimator with disk I/O, and it runs **off the hot path** — the
+  triggering call only sets a flag and notifies the forensics thread; the write
+  happens on that thread, never in the producing layer. A flush emits one `Info`
+  event (`forensic/flushed` carrying the path and the trigger tag) so the operator
+  knows a case file exists.
+- **Cost.** When no `Error` ever fires, the ring is a bounded circular write and
+  nothing is serialised — the always-on guarantee costs the steady-state copy of the
+  admitted lines only, inside the §12 budget. With a `NullSink`/`error`-only posture
+  the ring still runs (it is what makes a production incident reproducible), but its
+  admission floor may be raised to `Warn` via `debug.log_ring_level` to shrink it
+  further.
+
+The result: when the estimator hits an `Error`, the developer gets the run-up to it
+for free, paired with the telemetry of the same window, without having had foresight
+to turn anything on.
+
+### 9.6 Config provenance: fragments in, resolved snapshot out
+
+A telemetry number is meaningless without the configuration that produced it, and the
+single most common reproducibility failure is a run whose effective config nobody can
+reconstruct — a default that changed, a fragment that was overridden, a key the
+operator forgot they set. The debug/provenance contract closes this from both ends.
+
+- **Per-package YAML fragments under a root index (authoring side).** The
+  configuration source is split into one fragment per package
+  (`config/<package>.yaml` — e.g. `frontend.yaml`, `backend.yaml`, `map.yaml`,
+  `gnss.yaml`, `debug.yaml`) referenced from a single root index
+  (`config/meridian.yaml`) that lists the fragments and any profile overlays. The
+  fragments are merged into the one typed, validated `Config` tree (spec 00 §8.2) at
+  load — the typed model is unchanged and remains the source of truth; the split is
+  an authoring and review convenience (a package owner edits one file; a diff is
+  scoped) and does **not** introduce an untyped or per-package runtime config object.
+  The same merged tree is produced whether loaded from the index, from a single
+  flattened YAML, or from ROS parameters, so there is no drift between load paths
+  (§13.2).
+- **`Config::dump(run_dir)` of the fully-resolved tree (provenance side).** At startup
+  the pipeline writes the **fully-resolved, post-validation, post-overlay** config —
+  every key with its effective value, defaults included — to `run_dir/config.resolved.yaml`
+  and records its content hash in the `RunManifest` (spec 00 §6). This is the
+  *resolved* tree, not the input fragments: it captures the value the estimator
+  actually ran with, after every default and overlay is applied, so a run is
+  reproducible from the manifest alone. The dump is the canonical config artefact the
+  evaluation harness reads (spec 10 §1.2 `manifest.json` / `run_dir/`), and the same
+  resolved snapshot is bundled into every forensic case file (§9.5, §11.2) so an
+  incident carries its own configuration.
+
+The `RunManifest` serializer (the canonical owner of `git SHA`, config hash, calib
+hash, dataset id, input content hash; consumed by spec 10 §7.1) records the
+`config.resolved.yaml` hash as the config-hash field, making "what config produced
+this number" a one-line lookup and a regression-baseline invariant (spec 10 §7.2's
+`manifest.config_hash` check).
 
 ---
 
@@ -871,10 +1119,23 @@ queryable (`/meridian/debug_state` latched topic) so a UI can show what is on.
 
 ### 11.2 Forensic snapshot
 
-`SnapshotForensics(seconds)` dumps the last *N* seconds of a ring buffer the
-`RecordingSink` keeps (poses, scalars, inlier/patch overlays, events) to a self-
-contained file the offline `replay` tool can load — so a field anomaly becomes a
-desk-reproducible case (§13).
+`SnapshotForensics(seconds)` dumps the last *N* seconds of an **always-on, bounded
+telemetry ring** the `RecordingSink` keeps (poses, scalars, inlier/patch overlays,
+events) to a self-contained file the offline `replay` tool can load — so a field
+anomaly becomes a desk-reproducible case (§13). The telemetry ring is sized by
+`debug.forensic_window_s` (default `10 s`) and runs in every posture, the heavy-payload
+peer of the log ring buffer (§9.5); the two share one forensic-file format so a
+manual `SnapshotForensics` call and an automatic flush-on-Error produce
+interchangeable case files (the log lines from the §9.5 ring, the telemetry/overlays
+from this ring, and the resolved-config snapshot of §9.6, bundled with the
+`RunManifest` provenance).
+
+The same payload is emitted on two triggers — the explicit service call and the
+automatic flush-on-Error (§9.5) — so the forensic store is not contingent on an
+operator having reacted in time. Both paths share the `debug.forensic_min_interval_s`
+rate limit and run on the dedicated forensics thread, never on a producing layer's
+hot path. The dump is gated only by writable storage; on a full disk it logs one
+`Error` and disables further flushes (the debug layer's own failure mode, §15.1).
 
 ---
 
@@ -970,6 +1231,38 @@ event, final `backend/chi2` within tolerance of golden, ATE from
 same signals an operator watches are the signals CI gates on. FAST-LIO cannot do
 this (its signals are globals + CSV).
 
+### 13.4 The pinned determinism hash
+
+The determinism guarantee — two replays of the same `(bag, config, calib, git SHA)`
+produce byte-identical artefacts (spec 10 §1.1, §7.4) — is enforced by a single
+content hash over the recorded telemetry. To make that hash well-defined and stable
+it is pinned, not left to the order rows happened to be written:
+
+- **Canonical record set and ordering.** The hash is computed over the
+  `ParquetTelemetrySink` record set (§2.5) **sorted by `(stamp_ns, key, seq)`** — the
+  measurement timestamp first, the channel key second, and the monotone per-write
+  `seq` counter as the final, total tie-break for records that share a stamp and key.
+  This canonical sort removes any dependence on the order calls reached the sink, so
+  the hash is invariant to write interleaving and to harmless reorderings; only a real
+  change in *what was computed* moves it.
+- **Hashed fields.** Each record contributes its `(stamp_ns, key, kind, values,
+  axis_order, unit, level, tag, message)` to a streaming SHA-256 in the canonical
+  order; `seq` orders but is **not** itself hashed (it is a within-run artefact, not a
+  property of the computation). Floating-point `values` are hashed by their exact IEEE
+  bit pattern — the determinism mode is bit-reproducible (spec 00 §11.2), so this is
+  an equality, not a tolerance.
+- **Single-thread replay only.** The hash is a property of the
+  **single-threaded determinism/replay path** alone (spec 00 §11.2). The production
+  pipeline is multi-threaded and makes no bit-reproducibility claim; the hash is never
+  computed on, nor asserted against, a live multi-threaded run. The harness writes the
+  digest as `determinism.trajectory_hash` (spec 10 §4.5) and CI runs the replay twice
+  on the smoke clip and asserts equality (spec 10 §7.4, the M0 gate).
+
+This is what makes the regression baselines (spec 10 §7) meaningful: a hash change at
+a fixed SHA/config/calib is, by construction, a nondeterminism bug — a stray thread, a
+wall-clock read, an unordered-container iteration, or a non-deterministic GPU reduction
+not run in its deterministic variant.
+
 ---
 
 ## 14. Per-module debug-hook checklist
@@ -983,32 +1276,35 @@ reviewer can verify a module is "debuggable" before merge.)
 - **L2 front-end (the priority surface — CT LIVO+GNSS):**
   - *trajectory/solver:* `pose("frontend/spline_knots")`,
     `marker("frontend/window_box")`,
-    `scalar("frontend/iter_count"|"dx_norm"|"cost_total"|"window_span_s")`,
+    `scalar("frontend/iter_count"|"dx_norm"|"cost_total"|"window_span_s"|"solve_ms"|"deadline_hit"|"frontend/ct/n_cp")`,
     `vec("frontend/observability"|"cov_diag")`, `pose("odom/body")`,
     `timing("frontend.window_solve"|"frontend.total")`.
   - *LiDAR stream:* `cloud("frontend/lidar/inliers")`,
-    `scalar("frontend/lidar/n_inlier"|"n_input"|"inlier_ratio"|"res_mean"|"res_max")`,
+    `scalar("frontend/lidar/n_inlier"|"n_input"|"inlier_ratio"|"res_mean"|"res_max"|"n_factors_kept"|"n_factors_dropped")`,
     `timing("frontend.lidar_assoc")`.
   - *visual stream:* `image("frontend/visual/patches")`,
     `scalar("frontend/visual/n_tracked"|"n_converged"|"res_mean")`,
     `vec("frontend/visual/exposure_gain")`, `timing("frontend.visual")`.
   - *IMU/state:* `scalar("frontend/imu/res_acc"|"res_gyr"|"grav_norm")`,
     `vec("frontend/bias_acc"|"bias_gyr")`.
-  - *GNSS stream:* `pose("frontend/gnss/anchor")`, `scalar("frontend/gnss/res")`,
-    `event("frontend/gnss/fix")`.
+  - *GNSS stream:* `pose("frontend/gnss/anchor"|"frontend/gnss/datum")`,
+    `scalar("frontend/gnss/innovation_m"|"accept_rate"|"yaw_uncertainty_deg")`,
+    `event("frontend/gnss/fix"|"datum_lock"|"reject")`.
   - *lifecycle/calib:* `event("frontend/init_done"|"frontend/window_restart")`,
     `pose("calib/T_imu_lidar"|"calib/T_imu_cam")`, `scalar("calib/version")`.
 
   **This is the user-priority module; its debug surface is the richest by design.**
 - **L3 back-end:** `scalar("backend/chi2"|"n_factors"|"n_keyframes"|"n_moved"
-  |"loop_correction_norm")`, `event("backend/relinearize")`,
+  |"loop_correction_norm"|"optimize_lag"|"fallback_count")`,
+  `event("backend/relinearize"|"backend/fallback")`,
   `pose`→`backend/trajectory`, `timing("backend.optimize")`.
 - **L4 map (nvblox):** `event("map/region_rebuild")`, `marker("map/dirty_region")`,
   `timing("map.integrate"|"map.deintegrate"|"mesh.extract")`,
   `scalar("map/tsdf_blocks"|"map/integrate_lag")`.
 - **L5 place:** `marker("place/loop_edge")`, `event("place/loop_accepted"
   |"place/loop_rejected_pcm")`, `timing("place.query"|"place.verify")`.
-- **Pipeline:** `scalar("pipeline/q_*_depth"|"q_meas_dropped"|"scan_to_odom_ms")`.
+- **Pipeline:** `scalar("pipeline/q_meas_depth"|"q_kf_depth"|"q_map_depth"
+  |"q_meas_dropped"|"scan_to_odom_ms")`.
 
 A module that does not emit its checklist set fails the `debug-surface` CI lint
 (a grep over the module's sources for the required keys), making debuggability a
@@ -1028,7 +1324,8 @@ A module that does not emit its checklist set fails the `debug-surface` CI lint
 | Window restart / divergence | yellow `window_restart` event in rviz/log with reason; odom origin rebases; next KF is `ImuPreintegration` | `frontend/window_restart` (spec 00 §7.4) |
 | IMU init failure | no `init_done` event; estimator stays in cold-start | `frontend/init_done` absent |
 | Bad IMU / extrinsic | `frontend/imu/res_acc`/`res_gyr` climb; `grav_norm` ≠ 9.81 | §5.1 IMU scalars |
-| GNSS datum / quality problem | `frontend/gnss/res` large + persistent; correlates with `gnss/fix` type | `frontend/gnss/res`, `frontend/gnss/fix` |
+| GNSS quality problem | `frontend/gnss/innovation_m` large + persistent; correlates with `gnss/fix` type | `frontend/gnss/innovation_m`, `frontend/gnss/fix` |
+| GNSS datum / heading error | `frontend/gnss/accept_rate` collapses with a healthy fix type; `yaw_uncertainty_deg` was high at `datum_lock` | `frontend/gnss/accept_rate`, `frontend/gnss/yaw_uncertainty_deg`, `frontend/gnss/datum_lock` |
 | False loop closure | `loop_rejected_pcm` event; no map jump | `place/loop_rejected_pcm` |
 | Loop snap (good) | path_optimized jumps, dirty-region AABB blinks, `loop_correction_norm` reported | `backend/loop_correction_norm`, `map/region_rebuild` |
 | Front-end falling behind | `q_meas_depth` rising, `q_meas_dropped` incrementing, `scan_to_odom_ms` growing | §5.6 |
@@ -1042,6 +1339,12 @@ A module that does not emit its checklist set fails the `debug-surface` CI lint
 - **Sink slower than producer:** never blocks the core — best-effort QoS drops, and
   `MultiSink` short-circuits gated-off keys. A slow CSV sink on a full disk logs one
   `Error` and disables itself.
+- **Forensic flush cannot keep up / disk full:** the flush-on-Error path (§9.5) is
+  rate-limited (`debug.forensic_min_interval_s`) and runs on its own thread, so an
+  `Error` storm degrades to dropped flushes, never to a stalled producer; the always-on
+  ring keeps overwriting regardless. A full disk disables further flushes after one
+  `Error` (as for any disk sink) — the ring itself stays live for the next reachable
+  flush.
 - **Marker id collisions:** avoided by the stable `(ns, id)` contract (§7); a
   module reusing an id across semantically different markers is a lint failure.
 - **Clock skew in replay:** telemetry uses *measurement* stamps, so a replay at a
@@ -1098,16 +1401,30 @@ public:
   virtual void log(Level, const char* module, std::string_view kvline, Timestamp) = 0;
   virtual bool enabled(Level, const char* module) const = 0;
 };
+
+class IntrospectionHooks {                                // §2.4 white-box slot (parallel to TelemetrySink)
+public:
+  virtual ~IntrospectionHooks() = default;
+  virtual bool subscribed(Hook) const = 0;                // cheap gate; NullHooks→false
+  virtual void visit_graph (const gtsam::NonlinearFactorGraph&) = 0;   // const-ref, producer-thread, synchronous
+  virtual void visit_isam2 (const gtsam::ISAM2&)                = 0;
+  virtual void visit_update(const ISAM2ResultExt&)              = 0;
+  virtual void visit_window(const SplineWindow&)                = 0;
+  virtual void visit_hessian(const Eigen::MatrixXd&)            = 0;
+};
 ```
 
-### 16.2 Sink implementations (selected by `Config.debug`)
+### 16.2 Sink and hook implementations (selected by `Config.debug`)
 
 ```
-NullSink           default; empty bodies; enabled()→false        (meridian_debug)
-RecordingSink      captures all calls into a ring buffer          (meridian_debug; tests + forensics)
-MultiSink          fan-out to ordered children, short-circuits    (meridian_debug)
-CsvTelemetrySink   per-key CSV append                             (meridian_tools)
-RosTelemetrySink   →topics/TF/markers/images; owns the one to_ros (meridian_ros)
+NullSink             default; empty bodies; enabled()→false                 (meridian_debug)
+RecordingSink        captures all calls into the always-on bounded ring     (meridian_debug; tests + forensics, §9.5/§11.2)
+MultiSink            fan-out to ordered children, short-circuits             (meridian_debug)
+CsvTelemetrySink     per-key CSV append                                      (meridian_tools)
+ParquetTelemetrySink columnar, fixed schema, per-domain file; determinism    (meridian_tools; harness, §2.5)
+                       record set, single-thread replay only
+RosTelemetrySink     →topics/TF/markers/images; owns the one to_ros          (meridian_ros)
+NullHooks            default IntrospectionHooks; subscribed()→false          (meridian_debug; live + replay-without-test)
 ```
 
 ### 16.3 `meridian_msgs` debug messages
@@ -1133,13 +1450,15 @@ frontend/spline_knots          pose×K  → /meridian/markers          Mark NEW 
 frontend/window_box            marker  → /meridian/markers          Mark cf LocalMap_Points box        :229
 frontend/observability         vec(6)  → /meridian/telemetry+markers     NEW (none; only flg_EKF_inited :898)
 frontend/cov_diag              vec(6)  → /meridian/telemetry        Tel  was packed pose.covariance    :597-606
-frontend/iter_count|dx_norm|cost_total|window_span_s  scalar → /meridian/telemetry  Tel  NEW (window NLLS)
+frontend/iter_count|dx_norm|cost_total|window_span_s|solve_ms|deadline_hit  scalar → /meridian/telemetry  Tel  NEW (window NLLS + deadline ctrl)
+frontend/ct/n_cp               scalar  → /meridian/telemetry        Tel  NEW (adaptive knot density)
 odom/body                      pose    → /meridian/odom + TF        Odom /Odometry                     :857
 # --- L2 LiDAR stream (point-to-plane @ true point time) ---
 map/registered                 cloud   → /meridian/cloud_registered PC2  /cloud_registered  :849 / build :478 (via T(t_i))
 frontend/lidar/inliers         cloud   → /meridian/cloud_effective  PC2  /cloud_effected :853 / :551 (UNCOMMENTED vs :983)
 frontend/lidar/n_inlier        scalar  → /meridian/telemetry        Tel  effct_feat_num                :695  (NEW topic)
 frontend/lidar/n_input|inlier_ratio|res_mean|res_max  scalar → /meridian/telemetry  Tel  res_mean_last :715 + NEW
+frontend/lidar/n_factors_kept|n_factors_dropped       scalar → /meridian/telemetry  Tel  NEW (bounded-factor cap)
 # --- L2 visual stream (FAST-LIVO2 sparse-direct photometric) ---
 frontend/visual/patches        image   → /meridian/visual_patches   Img  NEW (patch overlay, residual-coloured)
 frontend/visual/n_tracked|n_converged|res_mean        scalar → /meridian/telemetry  Tel  NEW
@@ -1151,8 +1470,10 @@ frontend/bias_acc|bias_gyr     vec(3)  → /meridian/telemetry        Tel  dump_
 frontend/grav_norm             scalar  → /meridian/telemetry        Tel  NEW topic
 # --- L2 GNSS ---
 frontend/gnss/anchor           pose    → /meridian/gnss             Odom NEW (GNSS fusion)
-frontend/gnss/res              scalar  → /meridian/telemetry        Tel  NEW
-frontend/gnss/fix              event   → /meridian/events           Evt  NEW (fix-type transitions)
+frontend/gnss/datum            pose    → /meridian/gnss_datum       Odom NEW (T_map_enu, lock + redistribute)
+frontend/gnss/innovation_m|accept_rate|yaw_uncertainty_deg  scalar → /meridian/telemetry  Tel  NEW
+frontend/gnss/fix|datum_lock   event   → /meridian/events           Evt  NEW (fix-type / datum lock)
+frontend/gnss/reject           event   → /meridian/events           Evt  NEW (gate/quality/reacq reason)
 # --- L2 lifecycle / calibration ---
 frontend/init_done             event   → /meridian/events           Evt  NEW (cf flg_EKF_inited        :898)
 frontend/window_restart        event   → /meridian/events           Evt  NEW (recovery visible; cf :708-712)
@@ -1160,8 +1481,8 @@ calib/T_imu_lidar              pose    → /meridian/extrinsic        Odom was f
 calib/T_imu_cam                pose    → /meridian/extrinsic        Odom NEW (camera extrinsic)
 calib/version                  scalar  → /meridian/telemetry        Tel  NEW
 # --- L3 back-end ---
-backend/chi2|n_factors|n_keyframes|n_moved|loop_correction_norm  scalar → /meridian/telemetry  Tel  NEW
-backend/relinearize            event   → /meridian/events           Evt  NEW
+backend/chi2|n_factors|n_keyframes|n_moved|loop_correction_norm|optimize_lag|fallback_count  scalar → /meridian/telemetry  Tel  NEW
+backend/relinearize|fallback   event   → /meridian/events           Evt  NEW (relin / rebuild-from-factors)
 backend/trajectory             path    → /meridian/path_optimized   Path global; cf odom-only /path    :859/:622
 # --- L5 place ---
 place/loop_edge                marker  → /meridian/markers          Mark NEW (coloured by GICP fitness)
@@ -1172,7 +1493,7 @@ map/region_rebuild             event   → /meridian/events           Evt  NEW (
 map/dirty_region               marker  → /meridian/markers          Mark NEW
 map/tsdf_blocks|integrate_lag  scalar  → /meridian/telemetry        Tel  NEW
 # --- pipeline ---
-pipeline/q_*_depth|dropped     scalar  → /meridian/telemetry        Tel  NEW
+pipeline/q_meas_depth|q_kf_depth|q_map_depth|q_meas_dropped  scalar → /meridian/telemetry  Tel  NEW (queue health)
 pipeline/scan_to_odom_ms       scalar  → /meridian/telemetry        Tel  NEW (RT SLA)
 timing(stage,ms)               timing  → /meridian/stage_timing     ST   aver_time_* (live, not CSV)   :991-1009/:1042-1044
 ```
@@ -1183,3 +1504,80 @@ timing(stage,ms)               timing  → /meridian/stage_timing     ST   aver_
 preprocess  frontend.lidar_assoc  frontend.visual  frontend.window_solve  frontend.total
 backend.optimize  place.query  place.verify  map.integrate  map.deintegrate  mesh.extract
 ```
+
+---
+
+## Appendix R — SOTA reference grounding (non-normative)
+
+This appendix is evidence, not contract: curated digests of the reference systems
+this spec's design was validated against. Nothing here binds Meridian's behavior —
+the normative sections above own the design. Each block names the reference checkout
+it was verified against; the clones live in /home/user/slam-reference.
+
+### R.1 FAST_LIO `laserMapping.cpp` — the introspection-bearing functions
+*verified against FAST_LIO@7cc4175 (the file is 1055 lines: `main()` + ROS glue + EKF
+measurement model + map mgmt + all publishers + timing/logging, ~80 file-scope globals)*
+
+The `laserMapping.cpp:NNN` citations throughout this spec resolve here:
+
+| line | symbol | role |
+|---|---|---|
+| 143 | `SigHandle` | SIGINT → exit flag |
+| 150 | `dump_lio_state_to_log` | full state row → `pos_log.txt` (bias/state trace source, §5.1) |
+| 229 | `LocalMap_Points` | moving local-map cube (the `window_box` analogue, §7.2) |
+| 279 / 302 / 336 | `standard_pcl_cbk` / `livox_pcl_cbk` / `imu_cbk` | sensor callbacks |
+| 368 | `sync_packages` | LiDAR+IMU bundling into `MeasureGroup` |
+| 427 | `map_incremental` | ikd-Tree insertion |
+| 478 / 532 | `publish_frame_world` / `_body` | `/cloud_registered[_body]` |
+| 551 | `publish_effect_world` | `/cloud_effected` (effective/inlier points) |
+| 567 | `publish_map` | `/Laser_map` |
+| 589 | `publish_odometry` | `/Odometry` + 6×6 cov (block-swapped `:597-606`) + TF |
+| 622 | `publish_path` | `/path`, throttled `jjj % 10` |
+| 638 | `h_share_model` | measurement model; sets globals `effct_feat_num` `:695`, `res_mean_last` `:715` |
+| 756 | `main` | param load, sub/pub setup, loop, timing, logging |
+
+**Disabled-by-default debug views (sharp edge):** in `main` the two most diagnostic
+publishers are commented out at the call site — `publish_effect_world` and
+`publish_map` (`:983-984`) — and the map-flatten is gated `if(0)` (`:942`). Out of
+the box you cannot see the effective points or the live map. Meridian ships the
+inlier cloud (`frontend/lidar/inliers`) on by default (§5.1).
+
+### R.2 Topic / rviz surface contrast: FAST_LIO vs FAST-LIVO2
+*verified against FAST_LIO@7cc4175, FAST-LIVO2@0d2c034*
+
+| aspect | FAST_LIO | FAST-LIVO2 (the richer surface to emulate) |
+|---|---|---|
+| node shape | monolithic `laserMapping.cpp` | 11-line `main.cpp` → `LIVMapper` class; libs `vio/lio/pre/imu_proc/laser_mapping` |
+| residual normals | none | `pubNormal` MarkerArray, per-residual surface normals (`LIVMapper.cpp:201`) |
+| map-uncertainty viz | none | voxel/plane cubes coloured by plane covariance (`voxel_map.cpp:788 pubVoxelMap`, `:837 pubSinglePlane`) |
+| photometric overlay | n/a (LiDAR-only) | `/rgb_img` RGB overlay (`pubImage`, `LIVMapper.cpp:213`) |
+| low-latency odom | none (LiDAR-rate only) | `/LIVO2/imu_propagate` high-rate IMU-propagated odom (`LIVMapper.cpp:214`) |
+| rviz configs | one `loam_livox.rviz`; wires a `/MarkerArray` display nothing publishes | per-platform configs exercising image + normal/voxel/plane markers |
+
+FAST-LIVO2 still prints its per-stage timing as an ANSI-coloured stdout table
+(`LIVMapper.cpp:472`), not a topic — the UX Meridian copies into `StageTiming` (§6).
+
+### R.3 Timing / logging instrumentation
+*verified against FAST_LIO@7cc4175*
+
+`omp_get_wtime()` snapshots + accumulators (`match_time`, `solve_time`,
+`kdtree_*_time`, declared `:69-71`); 12 fixed global arrays `s_plot…s_plot11[MAXN]`
+with `MAXN=720000` (`:65,70`); running averages `printf`'d when `runtime_pos_log`
+(`:991-1009`) and CSV-dumped only at shutdown (`:1042-1051`). The block-swap that
+Meridian's `axis_order` field eliminates: the 6×6 covariance is hand-packed into
+`Odometry.pose.covariance` in `[pos|rot]` order at `:597-606`. Sharp edges: fixed
+arrays (≈69 MB) overflow on long runs; flat text with no levels, timestamps, or
+rotation; timing is read post-run, never live.
+
+### R.4 Point-LIO engineering observations (source NOT in /home/user/slam-reference)
+*digest only — recorded from a prior read of the Point-LIO tree, not re-verifiable
+against the current clone set; treat line numbers as indicative*
+
+- Split TUs (`parameters.cpp` for loading, `li_initialization.cpp` for init,
+  `Estimator.cpp` for math) — the right "one concern per file" instinct — but glued
+  by `extern` globals in `parameters.h` (one shared mutable namespace across files).
+- Dual estimator mode (`use_imu_as_input` vs as measurement; propagation at IMU vs
+  LiDAR frequency) forces global-flag branching throughout `laserMapping.cpp`,
+  hurting readability.
+- Debug surface narrower than FAST-LIVO2: `/cloud_effected` and a `Marker plane_pub`
+  exist but are commented out; no live marker-based residual/plane visualisation.

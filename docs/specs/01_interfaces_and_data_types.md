@@ -257,6 +257,12 @@ struct NavState {
   // [ p(3) | R(3) | v(3) | b_g(3) | b_a(3) | g(3) ].  (g handled as 2-DoF S2 in
   // the filter impl; exposed here as 3-DoF for a uniform interface — the impl
   // restricts to the tangent plane, matching FAST-LIO's S2, use-ikfom.hpp:8,20.)
+  // This boxplus is the BOUNDARY chart: the pose part uses the coupled SE(3)
+  // exponential (Pose::boxplus, §3.1). A filter impl MAY use a different INTERNAL
+  // error chart for its covariance/Jacobians — e.g. the iEKF oracle retracts
+  // position world-additively and rotation by SO(3)-exp, fully decoupled, to keep
+  // its analytic H rows exact (spec 04 §5.6.1). That internal chart never crosses
+  // the boundary; states (de)serialise through this coupled boxplus.
   static constexpr int kDof = 18;
   NavState boxplus(const Eigen::Matrix<double, kDof, 1>& dx) const;   // ⊞
   Eigen::Matrix<double, kDof, 1> boxminus(const NavState& rhs) const; // ⊟
@@ -857,20 +863,29 @@ public:
   // CalibrationSet snapshot (§5.3). The front-end copies what it needs.
   virtual void set_calibration(std::shared_ptr<const CalibrationSet> calib) = 0;
 
-  // --- Ingest: the front-end consumes a per-sweep MeasureGroup ---
+  // --- Ingest: the front-end consumes a per-sweep PreprocessedGroup ---
   // The PRIMARY input. L1 bundles one LiDAR sweep + the IMU spanning it (+ any
-  // image/GNSS in the interval) into a MeasureGroup (§ "MeasureGroup", spec 02 §8)
-  // and pushes it once per sweep. This call triggers the window optimisation. The
-  // front-end owns deskew internally (it has the trajectory), implementing the
-  // MUST-FIX #2 bootstrap: cold-start sweeps deskew with IMU-only integration,
-  // then trajectory-based deskew once the window is initialized (§4.2).
-  virtual void ingest(const MeasureGroup& group) = 0;  // one LiDAR sweep + spanning IMU/image/GNSS
+  // image/GNSS in the interval) into a MeasureGroup (§ "MeasureGroup", spec 02 §8);
+  // the pipeline wraps it as a PreprocessedGroup (Appendix A) carrying the
+  // cold-start deskew product (`deskewed`, `cold_start`) and pushes it once per
+  // sweep. This call triggers the window optimisation. The MUST-FIX #2 bootstrap
+  // splits across the boundary: while `cold_start` is true the front-end seeds
+  // from the bundled IMU-only deskew; once its window is initialized it deskews
+  // implicitly by evaluating the trajectory at each point's own time (§4.2) and
+  // ignores `deskewed`.
+  virtual void ingest(const PreprocessedGroup& group) = 0;  // one sweep + spanning IMU/image/GNSS
 
   // High-rate IMU path (between sweeps), for live-odometry propagation ONLY — it
   // updates live_state() at IMU rate and does NOT trigger a window solve. The same
-  // samples also arrive (bundled) in the next MeasureGroup, which is what the
+  // samples also arrive (bundled) in the next PreprocessedGroup, which is what the
   // window actually optimises against; this path is purely for low-latency output.
   virtual void ingest_imu_live(const ImuSample& imu) = 0;
+
+  // --- Back-end correction feedback (loop closure / relinearization) ---
+  // Applied by the pipeline at a safe point between ingests on the front-end
+  // thread. The front-end re-anchors its odom frame and shifts the trajectory
+  // (spline control poses) by the correction; it never restarts the window.
+  virtual void apply_correction(const GraphUpdate& update) = 0;
 
   // --- Live output: the smooth odom-frame state, published every scan ---
   // For introspection, control, and L4 live integration. NOT the keyframe handoff.
@@ -1097,11 +1112,11 @@ and applies $x \leftarrow x \boxplus K r$ until convergence.
 
 **Filling the contract:**
 
-| `IFrontEnd` element | iEKF realisation |
+| `IFrontEnd` element | iEKF realisation (all inside the per-sweep `ingest(group)`) |
 |---|---|
-| `ingest(ImuSample)` | forward-propagate the state + covariance (FAST-LIO `IMU_Processing` prediction) |
-| `ingest(LidarScan)` | deskew via the propagated trajectory (`UndistortPcl`, IMU_Processing.hpp:27), build point-to-plane residuals $r = n\cdot(R p_L + p) + d$, run the iterated update (esekfom.hpp) |
-| `ingest(CameraFrame)` | FAST-LIVO2-style sparse-direct photometric residual as an extra block in the same iterated update |
+| group's `imu` set | forward-propagate the state + covariance across the sweep (FAST-LIO `IMU_Processing` prediction); `ingest_imu_live` propagates a copy for low-latency output only |
+| group's `scan` | deskew via the propagated trajectory (`UndistortPcl`, IMU_Processing.hpp:27), build point-to-plane residuals $r = n\cdot(R p_L + p) + d$, run the iterated update (esekfom.hpp) |
+| group's `image` | FAST-LIVO2-style sparse-direct photometric residual as an extra block in the same iterated update |
 | `live_state()` | read the current `state_ikfom` into a `NavState` |
 | keyframe `T_ref_body` | the converged filter pose at the keyframe stamp |
 | keyframe `constraint_cov` | the marginal covariance over consecutive keyframe poses → relative cov (Schur-marginalise to a 6-DoF `RelativeBetween`) |
@@ -1117,11 +1132,11 @@ points $c_k$; the trajectory $T(t) = \prod_k \exp(\lambda_k(t)\,\Omega_k)$ is a
 
 **Filling the contract — the differences are all internal:**
 
-| `IFrontEnd` element | CT realisation |
+| `IFrontEnd` element | CT realisation (all inside the per-sweep `ingest(group)`) |
 |---|---|
-| `ingest(ImuSample)` | IMU residual = spline's analytic acceleration/angular-rate at $t$ vs. measurement; adds a factor on nearby $c_k$ |
-| `ingest(LidarScan)` | **no separate deskew step** — each point at time $t_i$ is registered using $T(t_i)$ directly (continuous-time deskew is implicit); point-to-plane residual on the $c_k$ |
-| `ingest(CameraFrame)` | photometric residual evaluated at $T(\text{mid-exposure})$ |
+| group's `imu` set | IMU residual = spline's analytic acceleration/angular-rate at each sample's $t$ vs. measurement; adds a factor on nearby $c_k$ |
+| group's `scan` | **no separate deskew step** — each point at time $t_i$ is registered using $T(t_i)$ directly (continuous-time deskew is implicit; the bundled `deskewed` scan is consumed only while `cold_start`); point-to-plane residual on the $c_k$ |
+| group's `image` | photometric residual evaluated at $T(\text{mid-exposure})$ |
 | `live_state()` | evaluate the spline + its derivative at "now" → `NavState` (velocity from the analytic derivative) |
 | keyframe `T_ref_body` | **evaluate the spline** $T(\text{stamp})$ at the keyframe instant |
 | keyframe `constraint_cov` | marginal of the relevant $c_k$ mapped to the 6-DoF relative pose between keyframes |
@@ -1143,7 +1158,7 @@ bags with **zero** changes downstream.
 | Edge | Producer | Consumer | **The one value** | Ownership | Thread |
 |---|---|---|---|---|---|
 | L0→L1 | `ISensorSource` | `IPreprocessor` | one raw `ImuSample` / `LidarScan` / `CameraFrame` / `GnssFix` | moved (Value) / Shared-immut. buffers | source thread [TS] |
-| L1→L2 | `ILidarPreprocessor` | `IFrontEnd` | filtered `LidarScan` (raw-frame) | Value + Shared-immut. points | front-end |
+| L1→L2 | L1 aggregator (pipeline) | `IFrontEnd` | `PreprocessedGroup` (one sweep + spanning IMU/image/GNSS + cold-start deskew) | Value + Shared-immut. points | front-end |
 | **L2→L3** | **`IFrontEnd`** | **`IBackEnd`** | **`KeyframePacket`** (§6) | **moved; clouds Shared-immut.** | **front-end→back-end [TS]** |
 | L2→(live) | `IFrontEnd` | L4 live / L6 / debug | `NavState` (odom frame) | Value | front-end |
 | L3→L4 | `IBackEnd` | `IMapLayer` | `GraphUpdate` (who moved) | Value | back-end→map [TS] |
@@ -1171,7 +1186,8 @@ Concrete trace of one keyframe, to make the contracts tangible.
 
 2. `OusterPreprocessor::process` range-filters and voxel-downsamples, returning a
    smaller `LidarScan`. ~60 µs. The L1 aggregator (spec 02 §8) bundles it with the
-   IMU spanning the sweep (and any image/GNSS in the interval) into a `MeasureGroup`.
+   IMU spanning the sweep (and any image/GNSS in the interval) into a `MeasureGroup`;
+   the pipeline wraps it as a `PreprocessedGroup` with the cold-start deskew product.
 
 3. `IFrontEnd::ingest(group)`. The CT front-end registers each LiDAR point at its
    true timestamp $t_i$ against the L4 voxel map (`query_plane`) using $T(t_i)$
@@ -1225,6 +1241,11 @@ enum class Frame : std::uint16_t {
   OsSensor0,            // the single LiDAR (room reserved for OsSensor1.. if a multi-LiDAR extension is ever added)
   Body /* alias of F_e */
 };
+// Frame tagging rule for F_e: `Body` is the canonical tag for estimation-frame
+// quantities emitted by L2+ (ObservabilityReport, deskewed clouds, debug topics).
+// `ImuLink` names the physical sensor frame and appears only in extrinsic lookups
+// (CalibrationSet.estimation_frame pins which physical frame F_e is). Consumers
+// must not compare a Body-tagged quantity against ImuLink by enum equality.
 
 struct SensorInfo {
   Frame frame; std::uint8_t id; double nominal_rate_hz; std::string model;
@@ -1242,18 +1263,32 @@ struct PlaneHit {
   std::uint8_t    n_pts;      // support count
 };
 
-// MeasureGroup — the L1→L2 currency: one LiDAR sweep plus the IMU spanning it
-// (and any image/GNSS in the interval). Built by the L1 aggregator (spec 02 §8);
-// the CT front-end ingests one MeasureGroup per sweep. (FAST-LIO sync analogue,
-// common_lib.h.) A multi-LiDAR rig — future extension only — would add sweeps
-// behind the same type; not designed now, so there is no secondary-sweep field.
+// MeasureGroup — the per-sweep measurement bundle: one LiDAR sweep plus the IMU
+// spanning it (and any image/GNSS in the interval). Built by the L1 aggregator
+// (spec 02 §8). (FAST-LIO sync analogue, common_lib.h.) A multi-LiDAR rig —
+// future extension only — would add sweeps behind the same type; not designed
+// now, so there is no secondary-sweep field.
 struct MeasureGroup {
   Timestamp                  t_begin = 0;   // sweep start (= scan.stamp_start)
   Timestamp                  t_end   = 0;   // sweep end   (= stamp_start + sweep_duration)
   LidarScan                  scan;          // the LiDAR sweep (Shared-immutable points)
-  std::vector<ImuSample>     imu;           // all IMU with stamp in [t_begin, t_end]
+  std::vector<ImuSample>     imu;           // samples in (lower, t_end] with
+                                            // lower = min(prev_t_end, t_begin), plus the
+                                            // one sample straddling t_begin; overlapped
+                                            // sweeps (stamp jitter) share their window
   std::optional<CameraFrame> image;         // image whose mid-exposure falls in the interval, if any
   std::vector<GnssFix>       gnss;          // fixes in the interval (usually 0 or 1)
+};
+
+// PreprocessedGroup — the L1→L2 currency: the assembled MeasureGroup plus the
+// pipeline's cold-start deskew product. `deskewed` is the IMU-only deskewed sweep
+// (points in the body frame at t_end), absent until the IMU bootstrap converges;
+// `cold_start` stays true until the front-end's own trajectory has taken over
+// deskew. The front-end ingests one PreprocessedGroup per sweep (§7.3).
+struct PreprocessedGroup {
+  MeasureGroup             group;
+  std::optional<LidarScan> deskewed;
+  bool                     cold_start = true;
 };
 
 struct FrontEndDiagnostics {

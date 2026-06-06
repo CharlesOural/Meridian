@@ -37,6 +37,7 @@ enum class HealthCode : std::uint16_t {
   LidarNoPointTime,
   LidarHighNanRatio,
   EmptyScan,
+  ImuNonFinite,
 };
 
 // Per-sensor health snapshot. `code` is the dominant active condition; `code_bits` is

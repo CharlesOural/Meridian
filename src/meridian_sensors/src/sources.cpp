@@ -13,9 +13,6 @@ namespace meridian {
 
 namespace {
 
-// Fraction of returns that may be non-finite before a sweep is flagged unusable.
-constexpr double kMaxNanRatio = 0.5;
-
 // Mid-exposure shift in nanoseconds for a given exposure time.
 Timestamp mid_exposure_shift_ns(float exposure_s) {
   return static_cast<Timestamp>(std::llround(static_cast<double>(exposure_s) / 2.0 * 1e9));
@@ -29,9 +26,10 @@ Timestamp mid_exposure_shift_ns(float exposure_s) {
 
 struct OusterLidarSource::Impl {
   Impl(SensorInfo info, const LidarSensorConfig& cfg, ClockModel* clock,
-       HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg)
+       HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg,
+       const ValidatorConfig& validator_cfg)
       : base(std::move(info), clock, health, telemetry, health_cfg.failed_timeout_ms,
-             health_cfg.rate_tolerance_frac),
+             health_cfg.rate_tolerance_frac, validator_cfg),
         clock_(clock),
         cfg(cfg) {}
 
@@ -44,9 +42,10 @@ struct OusterLidarSource::Impl {
 OusterLidarSource::OusterLidarSource(SensorInfo info, const LidarSensorConfig& cfg,
                                      ClockModel* clock, HealthSink* health,
                                      TelemetrySink* telemetry,
-                                     const TimeHealth& health_cfg)
+                                     const TimeHealth& health_cfg,
+                                     const ValidatorConfig& validator_cfg)
     : impl_(std::make_unique<Impl>(std::move(info), cfg, clock, health, telemetry,
-                                   health_cfg)) {}
+                                   health_cfg, validator_cfg)) {}
 
 OusterLidarSource::~OusterLidarSource() = default;
 
@@ -65,13 +64,11 @@ void OusterLidarSource::ingest_raw(const RawLidarFrame& f) {
   LidarScan scan;
   scan.sensor_id = impl_->base.info().id;
   scan.sensor_frame = impl_->base.info().sensor_frame;
-  scan.stamp_start = impl_->base.enforce_monotonic(
-      impl_->base.stamp_from(f.device_ns_first_column, ClockId::Lidar, src));
+  scan.stamp_start = impl_->base.note_stamp(
+      impl_->base.stamp_from(f.device_ns_first_column, ClockId::Lidar, src), src);
 
   auto pts = std::make_shared<PointCloud>();
   pts->reserve(f.pts.size());
-  std::size_t nan_count = 0;
-  bool any_point_time = false;
   std::int32_t max_t_offset = 0;
   for (const RawPoint& p : f.pts) {
     LidarPoint lp;
@@ -83,8 +80,6 @@ void OusterLidarSource::ingest_raw(const RawLidarFrame& f) {
     lp.ring = p.ring;
     lp.ambient = p.ambient;
     lp.range = p.range_m;
-    if (!lp.xyz.allFinite()) ++nan_count;
-    if (p.t != 0) any_point_time = true;
     max_t_offset = std::max(max_t_offset, lp.t_offset_ns);
     pts->push_back(lp);
   }
@@ -94,27 +89,9 @@ void OusterLidarSource::ingest_raw(const RawLidarFrame& f) {
   scan.sweep_duration = static_cast<Duration>(max_t_offset);
   scan.points = std::move(pts);
 
-  impl_->base.note_sample(scan.stamp_start, src);
-
-  // Content checks: empty sweep, missing per-point time, excessive non-finite returns.
-  const std::size_t n = scan.points->size();
-  if (n == 0) {
-    impl_->base.raise(HealthCode::EmptyScan, scan.stamp_start);
-    return;
-  }
-  if (!any_point_time) {
-    // An Ouster always provides per-column time; its absence is a malformed stream.
-    // The scan cannot be deskewed and is rejected rather than reconstructed.
-    impl_->base.raise(HealthCode::LidarNoPointTime, scan.stamp_start);
-    return;
-  }
-  if (static_cast<double>(nan_count) / static_cast<double>(n) > kMaxNanRatio) {
-    impl_->base.raise(HealthCode::LidarHighNanRatio, scan.stamp_start);
-    return;
-  }
-  impl_->base.clear(HealthCode::EmptyScan, scan.stamp_start);
-  impl_->base.clear(HealthCode::LidarNoPointTime, scan.stamp_start);
-  impl_->base.clear(HealthCode::LidarHighNanRatio, scan.stamp_start);
+  // The standing validator owns the per-point-time, NaN/Inf, and emptiness checks; it
+  // drops non-finite returns in place and rejects only an empty/time-less/all-NaN scan.
+  if (!impl_->base.accept_lidar(scan)) return;
 
   if (impl_->cb) impl_->cb(std::move(scan));
 }
@@ -125,9 +102,10 @@ void OusterLidarSource::ingest_raw(const RawLidarFrame& f) {
 
 struct ImuSource::Impl {
   Impl(SensorInfo info, const ImuSensorConfig& cfg, ClockModel* clock,
-       HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg)
+       HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg,
+       const ValidatorConfig& validator_cfg)
       : base(std::move(info), clock, health, telemetry, health_cfg.failed_timeout_ms,
-             health_cfg.rate_tolerance_frac),
+             health_cfg.rate_tolerance_frac, validator_cfg),
         clock_(clock),
         cfg(cfg) {}
 
@@ -139,9 +117,10 @@ struct ImuSource::Impl {
 
 ImuSource::ImuSource(SensorInfo info, const ImuSensorConfig& cfg, ClockModel* clock,
                      HealthSink* health, TelemetrySink* telemetry,
-                     const TimeHealth& health_cfg)
+                     const TimeHealth& health_cfg,
+                     const ValidatorConfig& validator_cfg)
     : impl_(std::make_unique<Impl>(std::move(info), cfg, clock, health, telemetry,
-                                   health_cfg)) {}
+                                   health_cfg, validator_cfg)) {}
 
 ImuSource::~ImuSource() = default;
 
@@ -176,9 +155,10 @@ void ImuSource::ingest_raw(const RawImuFrame& f) {
   s.gyro = f.gyro;  // raw angular rate [rad/s]
   // The stamp denotes the end of the integration interval; the configured shift maps a
   // device's mid/start-of-interval convention onto interval-end.
-  s.stamp = impl_->base.enforce_monotonic(base + impl_->cfg.interval_end_shift_ns);
+  s.stamp = impl_->base.note_stamp(base + impl_->cfg.interval_end_shift_ns, src);
 
-  impl_->base.note_sample(s.stamp, src);
+  // A non-finite acc/gyro component would become a corrupt spline residual; reject it.
+  if (!impl_->base.accept_imu(s)) return;
   if (impl_->cb) impl_->cb(std::move(s));
 }
 
@@ -188,9 +168,10 @@ void ImuSource::ingest_raw(const RawImuFrame& f) {
 
 struct CameraSource::Impl {
   Impl(SensorInfo info, const CameraSensorConfig& cfg, ClockModel* clock,
-       HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg)
+       HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg,
+       const ValidatorConfig& validator_cfg)
       : base(std::move(info), clock, health, telemetry, health_cfg.failed_timeout_ms,
-             health_cfg.rate_tolerance_frac),
+             health_cfg.rate_tolerance_frac, validator_cfg),
         clock_(clock),
         cfg(cfg) {}
 
@@ -202,9 +183,10 @@ struct CameraSource::Impl {
 
 CameraSource::CameraSource(SensorInfo info, const CameraSensorConfig& cfg,
                            ClockModel* clock, HealthSink* health,
-                           TelemetrySink* telemetry, const TimeHealth& health_cfg)
+                           TelemetrySink* telemetry, const TimeHealth& health_cfg,
+                           const ValidatorConfig& validator_cfg)
     : impl_(std::make_unique<Impl>(std::move(info), cfg, clock, health, telemetry,
-                                   health_cfg)) {}
+                                   health_cfg, validator_cfg)) {}
 
 CameraSource::~CameraSource() = default;
 
@@ -246,14 +228,12 @@ void CameraSource::ingest_raw(const RawCameraFrame& f) {
     // Without exposure the mid-exposure shift cannot be applied; downstream falls back
     // to robust photometric weighting.
     impl_->base.raise(HealthCode::CamNoExposure, base);
-    frame.stamp = impl_->base.enforce_monotonic(base);
+    frame.stamp = impl_->base.note_stamp(base, src);
   } else {
     impl_->base.clear(HealthCode::CamNoExposure, base);
-    frame.stamp =
-        impl_->base.enforce_monotonic(base + mid_exposure_shift_ns(f.exposure_s));
+    frame.stamp = impl_->base.note_stamp(base + mid_exposure_shift_ns(f.exposure_s), src);
   }
 
-  impl_->base.note_sample(frame.stamp, src);
   if (impl_->cb) impl_->cb(std::move(frame));
 }
 
@@ -263,9 +243,10 @@ void CameraSource::ingest_raw(const RawCameraFrame& f) {
 
 struct GnssSource::Impl {
   Impl(SensorInfo info, const GnssSensorConfig& cfg, ClockModel* clock,
-       HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg)
+       HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg,
+       const ValidatorConfig& validator_cfg)
       : base(std::move(info), clock, health, telemetry, health_cfg.failed_timeout_ms,
-             health_cfg.rate_tolerance_frac),
+             health_cfg.rate_tolerance_frac, validator_cfg),
         clock_(clock),
         cfg(cfg) {}
 
@@ -278,9 +259,10 @@ struct GnssSource::Impl {
 
 GnssSource::GnssSource(SensorInfo info, const GnssSensorConfig& cfg, ClockModel* clock,
                        HealthSink* health, TelemetrySink* telemetry,
-                       const TimeHealth& health_cfg)
+                       const TimeHealth& health_cfg,
+                       const ValidatorConfig& validator_cfg)
     : impl_(std::make_unique<Impl>(std::move(info), cfg, clock, health, telemetry,
-                                   health_cfg)) {}
+                                   health_cfg, validator_cfg)) {}
 
 GnssSource::~GnssSource() = default;
 
@@ -320,7 +302,7 @@ void GnssSource::ingest_raw(const RawGnssFrame& f) {
   GnssFix fix;
   fix.sensor_id = impl_->base.info().id;
   fix.sensor_frame = impl_->base.info().sensor_frame;
-  fix.stamp = impl_->base.enforce_monotonic(base);
+  fix.stamp = impl_->base.note_stamp(base, src);
   fix.lat_deg = f.lat_deg;   // raw geodetic; no metric/ENU conversion here
   fix.lon_deg = f.lon_deg;
   fix.alt_m = f.alt_m;
@@ -328,7 +310,6 @@ void GnssSource::ingest_raw(const RawGnssFrame& f) {
   fix.fix = f.fix;           // fix-quality gating is the back-end's job
   fix.num_sats = f.num_sats;
 
-  impl_->base.note_sample(fix.stamp, src);
   if (impl_->cb) impl_->cb(std::move(fix));
 }
 

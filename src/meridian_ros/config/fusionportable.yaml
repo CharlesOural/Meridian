@@ -11,35 +11,49 @@
 meridian:
   pipeline:
     mode: live              # the node ingests from topics; ros2 bag play drives them
+    queue:
+      meas_capacity: 8      # Q_meas (lossy under overload); ~0.8 s at 10 Hz
+      kf_capacity: 64       # Q_kf (lossless back-pressure)
+      map_capacity: 64      # Q_map (lossless back-pressure)
   time:
     source: host            # bag replay: no live PTP discipline; stamps pass through
     max_skew_ms: 5.0
+    validator:              # standing live stamp-integrity gate, always on
+      gap_periods: 2.5      # dropout when a raw gap exceeds 2.5 nominal periods
+      skew_warn_ppm: 200
+      nan_ratio_warn: 0.05  # reject only an all-NaN scan; drop offending points below this
   sensors:
     lidar:
       topic: /os_cloud_node/points
       model: ouster_os1_128
       nominal_rate_hz: 10.0
       ptp: false            # no PTP servo during replay; recorded stamps are final
-      extrinsic_T: [0.0, 0.0, 0.0]
-      extrinsic_R: [1.0, 0.0, 0.0,
-                    0.0, 1.0, 0.0,
-                    0.0, 0.0, 1.0]
+      extrinsic_T: [0.03740355034484978, -0.006940354329443638, 0.02005817278273524]
+      extrinsic_R: [0.9999596987151436, 0.00742968282823724, 0.005039916526211045, -0.007470043373071442, 0.999939799204621, 0.008037189721961666, -0.00497989934876298, -0.008074514207936692, 0.9999550003989089]
     imu:
       topic: /stim300/imu/data_raw   # the 200 Hz body IMU (confirmed from the bags)
       rate_hz: 200.0
-      cov_acc: 0.1
-      cov_gyr: 0.1
-      b_acc_cov: 1.0e-4
-      b_gyr_cov: 1.0e-4
+      cov_acc: 1.3229405297008181e-06
+      cov_gyr: 2.585023791758004e-09
+      b_acc_cov: 1.3911811376517125e-09
+      b_gyr_cov: 4.237780086074025e-13
     camera:
       # The frame cameras ship compressed-only in the bags; the DAVIS left camera is
       # the raw-Image stream. The camera path is optional for this phase either way.
       topic: /stereo/davis_left/image_raw
       model: pinhole
       nominal_rate_hz: 40.0
-      # [fx, fy, cx, cy] — zeros until the Kalibr intrinsics are imported; the camera
-      # path only decodes + pyramids in this phase, so geometry is not consumed yet.
-      intrinsics: [0.0, 0.0, 0.0, 0.0]
+      shutter: global         # rolling-shutter path is designed but not built
+      trigger: gpio
+      exposure_from_meta: true
+      # [fx, fy, cx, cy] — imported from the calib by tools/import_kalibr.py.
+      intrinsics: [291.047882, 291.041321, 162.948074, 133.054352]
+      # Lens distortion, also imported. plumb_bob in the source file is normalised to
+      # radtan; coeffs are k1,k2,p1,p2[,k3]. width/height are the image size.
+      distortion_model: radtan
+      distortion_coeffs: [-0.363157451, 0.146164939, -0.000412534573, -0.000807056727]
+      width: 346
+      height: 260
       photometric:
         exposure_comp: true
     gnss:
@@ -49,7 +63,85 @@ meridian:
     blind: 0.5
     det_range: 120.0
     point_filter_num: 2
-    voxel_surf_m: 0.5
+    voxel_surf_m: 0.5         # surf-voxel downsample edge
+    sweep_floor_frac: 0.5     # min sweep_duration = half a 10 Hz period
+    surf_max_pts: 1           # one representative per voxel (nearest centre)
+    surf_seed: 0              # only used when surf_max_pts > 1
+  frontend:
+    kind: ct_livo
+    init_time_s: 0.1          # static-start window before the first solve
+    solver_max_iterations: 5
+    solver_epsi: 1.0e-3
+    degeneracy_thresh: 10.0   # eigenvalue floor for the per-axis degeneracy score
+    max_outer_iters: 4        # re-association passes
+    reassoc_steps: 2          # inner LM steps per pass
+    assoc_shift_thresh_m: 0.02
+    assoc_shift_thresh_deg: 0.2
+    solver:
+      time_limit_ms: 60       # wall-clock deadline; the replay path ignores it
+      min_iterations: 2
+    solve:
+      max_step_trans_m: 0.5   # per-iteration step clamp
+      max_step_rot_deg: 10.0
+    bias:
+      gyr_max: 0.5            # [rad/s] gyro bias box bound
+      acc_max: 5.0            # [m/s^2] accel bias box bound
+    motion_reg:
+      enable: true            # gated jerk / ang-accel regularizer on under-excited spans
+      weight: 1.0e-3
+      excitation_floor: 0.05  # engage below ~0.05 rad/s & m/s2 (near-static spans only)
+    spline:
+      knot_dt_ms: 100         # one outer segment per 10 Hz sweep
+      window_knots: 8
+      n_cp_max: 3             # adaptive cap: up to 3 control points per segment
+      knot_omega_thresh: [0.5, 1.5]   # [rad/s] N_omega band edges raising n_cp to 2, 3
+      knot_accel_thresh: [1.0, 3.0]   # [m/s^2] N_a band edges raising n_cp to 2, 3
+      knot_density_hysteresis: 0.15
+    lidar:
+      voxel_map_m: 0.5
+      num_match_points: 5
+      max_match_dist_sq: 5.0
+      plane_thresh: 0.1
+      point_cov: 1.0e-3
+      max_lidar_factors: 1500 # bounded factor count
+      min_factors_per_normal: 50
+      normal_strata: 7
+    visual:
+      # Sparse-direct photometric stage. Gated off automatically whenever the camera
+      # intrinsics are zero/invalid; this is the operator master switch on top of that.
+      enable: true
+      patch: 8
+      levels: 3
+      img_point_cov: 100.0
+      outlier_threshold: 1000.0
+      ncc_thre: 0.5
+      exposure_estimate_en: true
+      inv_expo_cov: 1.0e-2
+      inv_expo_min: 1.0e-3
+      grid_cell_px: 32
+      warp_det_min: 0.1
+      warp_det_max: 10.0
+      warp_cond_max: 50.0
+    gnss:
+      # Conservative absolute-position residual. Off => the GNSS code path is never
+      # entered and the trajectory is bit-identical to a build without it. Floors are
+      # per-fix-type position-std (horizontal, vertical) [m]; cov_enu is floored to at
+      # least these before weighting.
+      use: false
+      floor_fixed_h: 0.05
+      floor_fixed_v: 0.10
+      floor_float_h: 0.50
+      floor_float_v: 1.00
+      floor_dgps_h: 1.50
+      floor_dgps_v: 3.00
+      floor_spp_h: 3.00
+      floor_spp_v: 6.00
+      innovation_k: 3.0         # Mahalanobis k-sigma acceptance gate
+      reacquire_count: 5        # consecutive in-gate fixes to re-admit after a gap
+    keyframe:
+      dist_m: 1.0
+      rot_deg: 10.0
+      time_s: 1.0
   debug:
     level: info
     publish_clouds: true

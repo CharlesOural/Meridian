@@ -30,6 +30,12 @@ struct Fixture {
     cfg.pipeline.mode = PipelineMode::Replay;
     cfg.preprocess.deskew.imu_init_count = 10;
     cfg.preprocess.lidar.point_filter_num = 1;
+    // Exercise the L0/L1 stage and its hand-off to the front-end with the stable iEKF
+    // estimator; the CT front-end's own behaviour is covered by its package tests.
+    cfg.frontend.kind = meridian::FrontEndKind::IekfOracle;
+    // Each flushed group carries only its straddling IMU sample, so let the front-end
+    // initialise from a single static sample and emit its first keyframe immediately.
+    cfg.frontend.init_time_s = 0.0;
     auto sink = std::make_unique<RecordingSink>();
     rec = sink.get();
     pipeline = std::make_unique<MeridianPipeline>(cfg, std::move(sink));
@@ -53,7 +59,9 @@ struct Fixture {
     std::vector<RawPoint> pts(50);
     for (std::size_t i = 0; i < pts.size(); ++i) {
       pts[i].x = 5.f;
-      pts[i].y = static_cast<float>(i) * 0.01f;
+      // Spread points >0.5 m apart in y so each lands in its own surf voxel and all 50
+      // survive the downsample.
+      pts[i].y = static_cast<float>(i) * 0.6f;
       pts[i].z = 1.f;
       pts[i].intensity = 100.f;
       pts[i].t = static_cast<std::uint32_t>(i * 2 * kMs);  // spans 0..98 ms
@@ -98,12 +106,16 @@ TEST(MeridianPipeline, BuffersSweepsUntilImuInitThenFlushesDeskewed) {
   ASSERT_EQ(fx.groups.size(), 2u);
   EXPECT_LT(fx.groups[0].group.t_begin, fx.groups[1].group.t_begin);
   for (const auto& g : fx.groups) {
-    EXPECT_TRUE(g.cold_start);
     ASSERT_TRUE(g.group.scan.points);
     EXPECT_EQ(g.group.scan.points->size(), 50u);
     ASSERT_TRUE(g.deskewed.has_value());
     EXPECT_EQ(g.deskewed->points->size(), 50u);
   }
+  // The first flushed group precedes any front-end keyframe, so it is cold-start; the
+  // front-end emits its first keyframe on that group, so the second group is no longer
+  // cold-start (the front-end now owns the trajectory).
+  EXPECT_TRUE(fx.groups[0].cold_start);
+  EXPECT_FALSE(fx.groups[1].cold_start);
 
   // The init-converged event fired exactly once.
   int init_events = 0;

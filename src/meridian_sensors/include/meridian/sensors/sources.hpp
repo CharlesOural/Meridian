@@ -39,7 +39,8 @@ class OusterLidarSource final : public ISensorSource<LidarScan> {
  public:
   OusterLidarSource(SensorInfo info, const LidarSensorConfig& cfg, ClockModel* clock,
                     HealthSink* health, TelemetrySink* telemetry,
-                    const TimeHealth& health_cfg);
+                    const TimeHealth& health_cfg,
+                    const ValidatorConfig& validator_cfg = ValidatorConfig{});
   ~OusterLidarSource() override;
 
   void set_callback(Callback cb) override;
@@ -61,7 +62,8 @@ class OusterLidarSource final : public ISensorSource<LidarScan> {
 class ImuSource final : public ISensorSource<ImuSample> {
  public:
   ImuSource(SensorInfo info, const ImuSensorConfig& cfg, ClockModel* clock,
-            HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg);
+            HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg,
+            const ValidatorConfig& validator_cfg = ValidatorConfig{});
   ~ImuSource() override;
 
   void set_callback(Callback cb) override;
@@ -88,7 +90,8 @@ class CameraSource final : public ISensorSource<CameraFrame> {
  public:
   CameraSource(SensorInfo info, const CameraSensorConfig& cfg, ClockModel* clock,
                HealthSink* health, TelemetrySink* telemetry,
-               const TimeHealth& health_cfg);
+               const TimeHealth& health_cfg,
+               const ValidatorConfig& validator_cfg = ValidatorConfig{});
   ~CameraSource() override;
 
   void set_callback(Callback cb) override;
@@ -110,7 +113,8 @@ class CameraSource final : public ISensorSource<CameraFrame> {
 class GnssSource final : public ISensorSource<GnssFix> {
  public:
   GnssSource(SensorInfo info, const GnssSensorConfig& cfg, ClockModel* clock,
-             HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg);
+             HealthSink* health, TelemetrySink* telemetry, const TimeHealth& health_cfg,
+             const ValidatorConfig& validator_cfg = ValidatorConfig{});
   ~GnssSource() override;
 
   void set_callback(Callback cb) override;

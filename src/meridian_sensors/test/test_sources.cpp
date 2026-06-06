@@ -1,6 +1,7 @@
 #include "meridian/sensors/sources.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -200,6 +201,87 @@ TEST(OusterLidarSource, RejectsEmptyScan) {
 
   EXPECT_TRUE(out.empty());
   EXPECT_TRUE(health.raised(HealthCode::EmptyScan));
+}
+
+// A few non-finite returns above the warn band are dropped in place and the surviving
+// cloud is still emitted; the whole scan is not rejected (the NaN policy, not a 0.5 cull).
+TEST(OusterLidarSource, NanPointsDroppedScanStillEmitted) {
+  ClockModel clock;
+  clock.on_ptp_stats(ClockId::Lidar, 0.0, 0.0, true);
+  RecordingHealth health;
+  LidarSensorConfig cfg;
+  TimeHealth hc;
+  ValidatorConfig vc;  // nan_ratio_warn = 0.05 default
+  OusterLidarSource src(lidar_info(), cfg, &clock, &health, nullptr, hc, vc);
+
+  std::vector<LidarScan> out;
+  src.set_callback([&](LidarScan&& s) { out.push_back(std::move(s)); });
+
+  // 10 returns, 2 non-finite (0.2 > 0.05). Every return carries per-point time.
+  std::vector<RawPoint> pts;
+  for (int k = 0; k < 10; ++k) {
+    RawPoint p;
+    p.x = (k == 3 || k == 8) ? std::numeric_limits<float>::quiet_NaN() : 1.f;
+    p.t = static_cast<std::uint32_t>(1000 * (k + 1));
+    pts.push_back(p);
+  }
+  RawLidarFrame f;
+  f.has_device_ns = true;
+  f.device_ns_first_column = 1'000;
+  f.pts = pts;
+  src.ingest_raw(f);
+
+  ASSERT_EQ(out.size(), 1u);  // emitted, not rejected
+  ASSERT_TRUE(out[0].points);
+  EXPECT_EQ(out[0].points->size(), 8u);  // the two NaN returns dropped
+  for (const LidarPoint& p : *out[0].points) EXPECT_TRUE(p.xyz.allFinite());
+  EXPECT_TRUE(health.raised(HealthCode::LidarHighNanRatio));
+}
+
+// A scan whose returns are entirely non-finite is rejected as empty.
+TEST(OusterLidarSource, AllNanScanRejected) {
+  ClockModel clock;
+  clock.on_ptp_stats(ClockId::Lidar, 0.0, 0.0, true);
+  RecordingHealth health;
+  LidarSensorConfig cfg;
+  TimeHealth hc;
+  OusterLidarSource src(lidar_info(), cfg, &clock, &health, nullptr, hc);
+
+  std::vector<LidarScan> out;
+  src.set_callback([&](LidarScan&& s) { out.push_back(std::move(s)); });
+
+  std::vector<RawPoint> pts;
+  for (int k = 0; k < 4; ++k) {
+    RawPoint p;
+    p.x = std::numeric_limits<float>::quiet_NaN();
+    p.t = static_cast<std::uint32_t>(1000 * (k + 1));
+    pts.push_back(p);
+  }
+  RawLidarFrame f;
+  f.has_device_ns = true;
+  f.device_ns_first_column = 1'000;
+  f.pts = pts;
+  src.ingest_raw(f);
+
+  EXPECT_TRUE(out.empty());
+  EXPECT_TRUE(health.raised(HealthCode::EmptyScan));
+}
+
+// An IMU sample carrying a non-finite component is rejected before the callback.
+TEST(ImuSource, NonFiniteSampleRejected) {
+  ClockModel clock;
+  RecordingHealth health;
+  ImuSensorConfig cfg;
+  TimeHealth hc;
+  ImuSource src(imu_info(), cfg, &clock, &health, nullptr, hc);
+
+  std::vector<ImuSample> out;
+  src.set_callback([&](ImuSample&& s) { out.push_back(std::move(s)); });
+
+  RawImuFrame f = raw_imu(1'000, /*has_dev=*/true, /*host=*/5'000);
+  f.gyro = Eigen::Vector3d(std::numeric_limits<double>::quiet_NaN(), 0, 0);
+  src.ingest_raw(f);
+  EXPECT_TRUE(out.empty());
 }
 
 // Without PTP lock the LiDAR degrades to the software-offset path.

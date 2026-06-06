@@ -32,6 +32,17 @@ class ImuOnlyDeskew : public IDeskewProvider {
   // sample seeds the integration anchor at its own stamp.
   void pushImu(const ImuSample& s);
 
+  // Integrates a whole sweep's IMU set and bounds the trajectory's valid horizon to the
+  // sweep [t_begin, t_end], setting the anchor to t_end. The raw IMU grid rarely lines
+  // up with the sweep ends: the straddling sample lands at or before t_begin and the last
+  // in-interval sample at or before t_end, so without padding the sweep's first/last
+  // points fall microseconds outside the horizon and fail the containment check. This
+  // applies a zero-order hold on each end, bounded by one self-measured IMU period (the
+  // group's mean inter-sample gap), so the horizon covers the sweep while a genuine IMU
+  // hole (a gap beyond one period) is left to fail the check. Samples must be in
+  // non-decreasing stamp order.
+  void integrateSweep(const std::vector<ImuSample>& imu, Timestamp t_begin, Timestamp t_end);
+
   // Sets which time the warp compensates TO; defaults to the last integrated stamp.
   void setAnchor(Timestamp anchor) { anchor_ = anchor; }
 

@@ -95,13 +95,14 @@ class TelemetryHealthBridge final : public HealthSink {
       case HealthCode::LidarNoPointTime: return "lidar_no_point_time";
       case HealthCode::LidarHighNanRatio: return "lidar_high_nan_ratio";
       case HealthCode::EmptyScan: return "empty_scan";
+      case HealthCode::ImuNonFinite: return "imu_non_finite";
     }
     return "unknown";
   }
 
   static constexpr std::chrono::seconds kDegradeRepeatWindow{2};
   static constexpr std::size_t kCodeCount =
-      static_cast<std::size_t>(HealthCode::EmptyScan) + 1;
+      static_cast<std::size_t>(HealthCode::ImuNonFinite) + 1;
 
   TelemetrySink* sink_;  // borrowed
   std::mutex m_;

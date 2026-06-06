@@ -10,8 +10,38 @@ Visualization Manager:
       Enabled: true
       Name: Grid
       Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Name: TF
+      Show Names: true
+    - Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Name: Odometry
+      Topic:
+        Value: /meridian/odom
+        Depth: 100
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Keep: 100
+      Covariance:
+        Value: false
+      Position Tolerance: 0.05
+      Angle Tolerance: 0.05
     - Class: rviz_default_plugins/PointCloud2
       Enabled: true
+      Name: CloudRegistered
+      Topic:
+        Value: /meridian/cloud_registered
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Color Transformer: Intensity
+      Channel Name: intensity
+      Size (m): 0.03
+      Style: Points
+      Use rainbow: true
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: false
       Name: DeskewedBodyScan
       Topic:
         Value: /meridian/cloud_body
@@ -37,8 +67,16 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Volatile
         Reliability Policy: Best Effort
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: VisualPatches
+      Topic:
+        Value: /meridian/visual_patches
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
   Global Options:
-    Fixed Frame: body
+    Fixed Frame: odom
     Frame Rate: 30
   Tools:
     - Class: rviz_default_plugins/MoveCamera
