@@ -109,7 +109,6 @@ TEST(ConfigLoader, RoundTripsNewKeys) {
          "    assoc_shift_thresh_m: 0.03\n"
          "    assoc_shift_thresh_deg: 0.5\n"
          "    solver: { max_iterations: 6, epsi: 2.0e-3, time_limit_ms: 80, min_iterations: 3 }\n"
-         "    solve: { max_step_trans_m: 0.4, max_step_rot_deg: 8.0 }\n"
          "    bias: { gyr_max: 0.6, acc_max: 4.0 }\n"
          "    motion_reg: { enable: false, weight: 5.0e-3, excitation_floor: 0.2 }\n"
          "    spline:\n"
@@ -147,8 +146,6 @@ TEST(ConfigLoader, RoundTripsNewKeys) {
   EXPECT_DOUBLE_EQ(c.frontend.solver_epsi, 2.0e-3);
   EXPECT_DOUBLE_EQ(c.frontend.solver.time_limit_ms, 80.0);
   EXPECT_EQ(c.frontend.solver.min_iterations, 3);
-  EXPECT_DOUBLE_EQ(c.frontend.solve.max_step_trans_m, 0.4);
-  EXPECT_DOUBLE_EQ(c.frontend.solve.max_step_rot_deg, 8.0);
   EXPECT_DOUBLE_EQ(c.frontend.bias.gyr_max, 0.6);
   EXPECT_DOUBLE_EQ(c.frontend.bias.acc_max, 4.0);
   EXPECT_FALSE(c.frontend.motion_reg.enable);
@@ -287,14 +284,6 @@ TEST(Config, ZeroTimeLimitFails) {
   std::string err;
   EXPECT_FALSE(c.validate(&err));
   EXPECT_NE(err.find("time_limit_ms"), std::string::npos) << err;
-}
-
-TEST(Config, NonPositiveStepClampFails) {
-  Config c;
-  c.frontend.solve.max_step_trans_m = 0.0;
-  std::string err;
-  EXPECT_FALSE(c.validate(&err));
-  EXPECT_NE(err.find("max_step"), std::string::npos) << err;
 }
 
 TEST(Config, NonPositiveBiasBoundFails) {

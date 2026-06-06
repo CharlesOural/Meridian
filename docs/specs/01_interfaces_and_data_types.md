@@ -556,7 +556,9 @@ struct CalibrationSet {
   std::vector<Extrinsic>           extrinsics;             // all sensor->F_e transforms
   std::unordered_map<std::uint8_t, IntrinsicsCamera> cam_intrinsics;  // by camera sensor_id
   // IMU noise parameters (Allan-variance derived), feed the preintegration noise:
-  double imu_acc_noise, imu_gyr_noise;                     // continuous-time noise density
+  double imu_acc_noise, imu_gyr_noise;                     // continuous-time noise density (std, not variance)
+  // The configured sensors.imu.cov_acc/cov_gyr are the SQUARED densities (variance
+  // convention); calibration_from_config takes sqrt to fill these std-convention fields.
   double imu_acc_bias_rw, imu_gyr_bias_rw;                 // bias random-walk
   // (FAST-LIO sets these via set_gyr_cov/set_acc_cov; process_noise_cov(), use-ikfom.hpp:35-43)
 

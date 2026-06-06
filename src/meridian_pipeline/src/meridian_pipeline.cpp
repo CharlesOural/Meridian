@@ -1,5 +1,7 @@
 #include "meridian/pipeline/meridian_pipeline.hpp"
 
+#include <cmath>
+
 #include <cstdio>
 #include <span>
 #include <stdexcept>
@@ -72,7 +74,9 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
       clock_(std::make_unique<ClockModel>()),
       health_(std::make_unique<TelemetryHealthBridge>(sink_.get())),
       q_sensors_(kSensorQueueCapacity),
-      q_meas_(kMeasQueueCapacity) {
+      q_meas_(kMeasQueueCapacity),
+      lidar_offset_ns_(static_cast<Timestamp>(std::llround(cfg.sensors.lidar.time_offset_ms * 1e6))),
+      camera_offset_ns_(static_cast<Timestamp>(std::llround(cfg.sensors.camera.time_offset_ms * 1e6))) {
   const auto& s = cfg_.sensors;
   const auto& th = cfg_.time.health;
   const auto& vc = cfg_.time.validator;
@@ -97,6 +101,13 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
                 s.gnss.pps_disciplines_clock ? StampSource::HwPps
                                              : StampSource::SwOffset),
       s.gnss, clock_.get(), health_.get(), sink_.get(), th, vc);
+
+  // A defaulted (identity) LiDAR extrinsic is a valid-looking value the estimator
+  // will silently consume as a real calibration; surface it loudly once at startup.
+  if (!s.lidar.extrinsic_set) {
+    sink_->event(Level::Warn, "sensors/lidar/extrinsic_default",
+                 "lidar extrinsic not configured; using identity T_imu_lidar", 0);
+  }
 
   lidar_preprocessor_ = makeLidarPreprocessor(
       cfg_.preprocess, lidar_extrinsic(s.lidar), s.lidar.nominal_rate_hz, sink_.get());
@@ -148,9 +159,29 @@ void MeridianPipeline::stop() {
   running_.store(false);
 }
 
-void MeridianPipeline::ingest(const RawLidarFrame& f) { lidar_source_->ingest_raw(f); }
+void MeridianPipeline::ingest(const RawLidarFrame& f) {
+  // Constant per-sensor stamp correction onto the body-IMU timeline, applied here --
+  // before validation and aggregation -- so every stamp-driven decision (monotonicity,
+  // grouping, image-sweep matching) sees corrected time. Per-point offsets are
+  // relative to the sweep reference and ride along unchanged.
+  if (lidar_offset_ns_ != 0 && f.has_device_ns) {
+    RawLidarFrame shifted = f;
+    shifted.device_ns_first_column += lidar_offset_ns_;
+    lidar_source_->ingest_raw(shifted);
+    return;
+  }
+  lidar_source_->ingest_raw(f);
+}
 void MeridianPipeline::ingest(const RawImuFrame& f) { imu_source_->ingest_raw(f); }
-void MeridianPipeline::ingest(const RawCameraFrame& f) { camera_source_->ingest_raw(f); }
+void MeridianPipeline::ingest(const RawCameraFrame& f) {
+  if (camera_offset_ns_ != 0 && f.has_device_ns) {
+    RawCameraFrame shifted = f;
+    shifted.device_ns += camera_offset_ns_;
+    camera_source_->ingest_raw(shifted);
+    return;
+  }
+  camera_source_->ingest_raw(f);
+}
 void MeridianPipeline::ingest(const RawGnssFrame& f) { gnss_source_->ingest_raw(f); }
 
 void MeridianPipeline::set_group_sink(GroupSink sink) { group_sink_ = std::move(sink); }

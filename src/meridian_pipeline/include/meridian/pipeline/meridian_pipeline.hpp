@@ -154,6 +154,11 @@ class MeridianPipeline {
   // Front-end ingest edge: sweeps + live IMU. Lossy under overload, oldest dropped, so a
   // slow front-end never back-pressures the sensor stage.
   BoundedQueue<MeasSample> q_meas_;
+
+  // Constant per-sensor stamp corrections onto the body-IMU timeline [ns], applied
+  // once in ingest() before validation/aggregation. Zero means no correction.
+  Timestamp lidar_offset_ns_ = 0;
+  Timestamp camera_offset_ns_ = 0;
   // Sweeps held back until the IMU bootstrap converges; bounded, oldest dropped.
   std::deque<MeasureGroup> bootstrap_groups_;
 

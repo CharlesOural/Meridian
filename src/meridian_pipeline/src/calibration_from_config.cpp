@@ -42,13 +42,18 @@ std::shared_ptr<const CalibrationSet> calibrationFromConfig(const SensorsConfig&
   set->extrinsics.push_back(lidar);
 
   // T_imu_cam from the configured T_body_cam; the camera path needs this geometry to
-  // place visual map points into the camera frame.
-  Extrinsic cam;
-  cam.child = Frame::CamLink;
-  cam.parent = Frame::ImuLink;
-  cam.T_parent_child = sensors.camera.extrinsic;
-  cam.source = CalibSource::Manual;
-  set->extrinsics.push_back(cam);
+  // place visual map points into the camera frame. Published only when the config
+  // actually supplied it: a defaulted identity is not a calibration, and consuming
+  // one silently points the camera frustum along the wrong axis -- omitting the
+  // entry instead makes the front-end disable the visual stage loudly.
+  if (sensors.camera.extrinsic_set) {
+    Extrinsic cam;
+    cam.child = Frame::CamLink;
+    cam.parent = Frame::ImuLink;
+    cam.T_parent_child = sensors.camera.extrinsic;
+    cam.source = CalibSource::Manual;
+    set->extrinsics.push_back(cam);
+  }
 
   IntrinsicsCamera intr;
   intr.fx = sensors.camera.intrinsics[0];

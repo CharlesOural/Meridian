@@ -28,32 +28,49 @@ meridian:
       model: ouster_os1_128
       nominal_rate_hz: 10.0
       ptp: false            # no PTP servo during replay; recorded stamps are final
+      # Kalibr session reports -137.1 ms lidar<->body-IMU timeshift, but the recorded
+      # stamps are demonstrably consistent (LIO tracks at 3 cm with no correction):
+      # the session value does not transfer to this bag. Keep 0 unless an A/B on the
+      # actual recording shows otherwise.
+      time_offset_ms: 0.0
       extrinsic_T: [0.03740355034484978, -0.006940354329443638, 0.02005817278273524]
       extrinsic_R: [0.9999596987151436, 0.00742968282823724, 0.005039916526211045, -0.007470043373071442, 0.999939799204621, 0.008037189721961666, -0.00497989934876298, -0.008074514207936692, 0.9999550003989089]
     imu:
       topic: /stim300/imu/data_raw   # the 200 Hz body IMU (confirmed from the bags)
       rate_hz: 200.0
-      cov_acc: 1.3229e-06
-      cov_gyr: 2.585e-09
+      cov_acc: 1.3229405297008181e-06
+      cov_gyr: 2.585023791758004e-09
       b_acc_cov: 1.3911811376517125e-09
       b_gyr_cov: 4.237780086074025e-13
     camera:
-      # The frame cameras ship compressed-only in the bags; the DAVIS left camera is
-      # the raw-Image stream. The camera path is optional for this phase either way.
-      topic: /stereo/davis_left/image_raw
+      # FLIR frame camera (left), JPEG-compressed in the bags; decoded to mono8 at
+      # ingest. The DAVIS event camera (/stereo/davis_left/image_raw, raw mono8,
+      # 346x260, calib event_cam00) is the lower-resolution alternative.
+      topic: /stereo/frame_left/image_raw/compressed
+      compressed: true        # JPEG stream; decoded to mono8 at ingest
+      # Constant stamp correction onto the body-IMU timeline (t_corr = t + offset).
+      # Kalibr session reports +119.4 ms for this camera, but the bag A/B verdict is
+      # 0: the GPIO-triggered stamps are already disciplined (+119 ms degrades patch
+      # convergence and ATE; -119 ms unmatches every image). Session timeshifts do
+      # not automatically transfer to a recording.
+      time_offset_ms: 0.0
       model: pinhole
-      nominal_rate_hz: 40.0
+      nominal_rate_hz: 20.0
       shutter: global         # rolling-shutter path is designed but not built
       trigger: gpio
       exposure_from_meta: true
       # [fx, fy, cx, cy] — imported from the calib by tools/import_kalibr.py.
-      intrinsics: [291.047882, 291.041321, 162.948074, 133.054352]
+      intrinsics: [605.128601, 604.97406, 520.45343, 393.878479]
       # Lens distortion, also imported. plumb_bob in the source file is normalised to
       # radtan; coeffs are k1,k2,p1,p2[,k3]. width/height are the image size.
+      # T_imu_cam (body-IMU <- camera), inverted from the Kalibr
+      # quaternion/translation_sensor_bodyimu entry of event_cam00 (same stored
+      # convention as the LiDAR entry above). Camera +Z maps to body +X: forward.
+      extrinsic: [0.07965003395915711, 0.06632174497104337, -0.020645775846429185, -0.49018149546712775, 0.5084675139503246, -0.5008895062906032, 0.5002925056871654]
       distortion_model: radtan
-      distortion_coeffs: [-0.363157451, 0.146164939, -0.000412534573, -0.000807056727]
-      width: 346
-      height: 260
+      distortion_coeffs: [-0.0919851288, 0.0866983905, 0.00024862279, 0.000721565739]
+      width: 1024
+      height: 768
       photometric:
         exposure_comp: true
     gnss:
@@ -80,14 +97,12 @@ meridian:
     assoc_shift_thresh_m: 0.02
     assoc_shift_thresh_deg: 0.2
     solver:
-      time_limit_ms: 5000     # effectively unbounded for diagnosis
+      time_limit_ms: 90       # per-sweep wall budget (10 Hz cadence)
       min_iterations: 2
-    solve:
-      max_step_trans_m: 0.5   # per-iteration step clamp
-      max_step_rot_deg: 10.0
     bias:
       gyr_max: 0.5            # [rad/s] gyro bias box bound
       acc_max: 5.0            # [m/s^2] accel bias box bound
+      knot_dt_ms: 500         # bias random-walk knot cadence
     motion_reg:
       enable: true            # gated jerk / ang-accel regularizer on under-excited spans
       weight: 1.0e-3
@@ -95,7 +110,9 @@ meridian:
     spline:
       knot_dt_ms: 100         # one outer segment per 10 Hz sweep
       window_knots: 8
-      n_cp_max: 1   # diagnosis: disable adaptive density
+      n_cp_max: 1               # adaptive density (n_cp>1) is design-present but
+                                # unvalidated end-to-end; keep at 1 until the
+                                # non-uniform-grid campaign lands
       knot_omega_thresh: [0.5, 1.5]   # [rad/s] N_omega band edges raising n_cp to 2, 3
       knot_accel_thresh: [1.0, 3.0]   # [m/s^2] N_a band edges raising n_cp to 2, 3
       knot_density_hysteresis: 0.15
@@ -111,7 +128,7 @@ meridian:
     visual:
       # Sparse-direct photometric stage. Gated off automatically whenever the camera
       # intrinsics are zero/invalid; this is the operator master switch on top of that.
-      enable: false  # LIO-only baseline while debugging the CT drift
+      enable: true
       patch: 8
       levels: 3
       img_point_cov: 100.0

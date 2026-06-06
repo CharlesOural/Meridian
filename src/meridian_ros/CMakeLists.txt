@@ -19,6 +19,7 @@ find_package(meridian_common REQUIRED)
 find_package(meridian_config REQUIRED)
 find_package(meridian_debug REQUIRED)
 find_package(meridian_sensors REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgcodecs)
 
 # msg <-> core translation + the ROS telemetry sink. The only code that sees both
 # worlds; -Werror is relaxed here because middleware headers own their warnings.
@@ -28,7 +29,8 @@ add_library(meridian_ros_support
   src/debug/ros_telemetry_sink.cpp)
 target_include_directories(meridian_ros_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(meridian_ros_support PUBLIC cxx_std_20)
-target_link_libraries(meridian_ros_support meridian_pipeline::meridian_pipeline)
+target_link_libraries(meridian_ros_support meridian_pipeline::meridian_pipeline
+  opencv_core opencv_imgcodecs)
 ament_target_dependencies(meridian_ros_support
   rclcpp builtin_interfaces sensor_msgs nav_msgs geometry_msgs std_msgs
   visualization_msgs meridian_msgs)

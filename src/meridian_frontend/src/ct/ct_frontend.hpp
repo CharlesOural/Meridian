@@ -126,29 +126,11 @@ private:
   // the first accepted fix), floor its covariance by fix type, apply the Mahalanobis
   // innovation gate and re-acquisition persistence, and collect the survivors into
   // *ctx. Lazily allocates the anchor/gate the first time the active path runs, so a
-  // disabled or fix-free build never touches GNSS state. Emits the §3.4 telemetry.
+  // disabled or fix-free build never touches GNSS state. Emits the GNSS gating telemetry.
   void gateGnss(const PreprocessedGroup& group, Timestamp t_end, GnssContext* ctx);
 
-  // Saved value of one active control-point knot, used by the per-iteration step
-  // clamp to measure (and if needed scale back) the increment a solve pass applied.
-  struct KnotState {
-    double* ptr = nullptr;
-    bool is_so3 = false;   // true: quaternion (x,y,z,w) storage; false: 3-vector
-    Eigen::Quaterniond q;  // pre-solve rotation (so3 knots)
-    Eigen::Vector3d t;     // pre-solve translation (r3 knots)
-  };
-
-  // Snapshot every free SO(3)/R^3 control-point knot registered with the problem
-  // before a solve pass, so the increment can be clamped afterwards. Coverage must
-  // equal the solver's parameter set: any knot it can move, the clamp must see.
-  std::vector<KnotState> snapshotActiveKnots(ceres::Problem& problem) const;
-
-  // Per-iteration step clamp: if any snapshotted knot's increment exceeds the
-  // translation or rotation cap, scale EVERY active knot's increment uniformly by the
-  // tightest ratio (preserving the step direction) so the solve keeps progressing
-  // under a bad linearisation instead of taking a divergent leap. Returns true when
-  // the clamp engaged.
-  bool clampActiveKnots(const std::vector<KnotState>& pre, double max_trans, double max_rot_rad);
+  // Bias knot cadence from config, floored at one millisecond.
+  Duration biasKnotDt() const;
 
   // Warp the downsampled scan to world at each point's solved spline time and
   // insert it into the local map. `t0_scan` is the scan-start time the per-point
@@ -226,13 +208,6 @@ private:
   // last_n_cp_ and returns the count in [1, n_cp_max].
   int selectKnotDensity(const std::vector<ImuSample>& imu);
 
-  // The gyro-bias freeze seam: returns true (unfreeze the gyro bias, so its box bound
-  // becomes live) only when the window's peak bias-corrected body rate clears the top
-  // configured knot_omega_thresh band edge — the strong-rotation regime where a
-  // constant gyro bias is observable. With no band edge configured the seam stays
-  // closed and the bias is held. The accel bias is never unfrozen here (it needs the
-  // multi-knot random walk to separate from gravity, which a single bias knot lacks).
-  bool gyroBiasObservable(const std::vector<ImuSample>& imu) const;
 
   // Knot-midpoint times of the segments spanning [t_begin, t_end], the evaluation
   // points for the under-excitation regularizer.
@@ -311,8 +286,8 @@ private:
   Pose anchor_pose_;
   Eigen::Vector3d anchor_vel_ = Eigen::Vector3d::Zero();
   // Terminal velocity / body rate of the latest IMU-integrated seed, captured by
-  // buildSeed. They parameterize the tail anchors: the constant-extrapolation
-  // prediction the trailing (not yet measured) spline span is tied to.
+  // buildSeed; they parameterize the tail anchors (constant-extrapolation prediction
+  // for the not-yet-measured span).
   Eigen::Vector3d seed_vel_end_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d seed_omega_end_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d anchor_bg_ = Eigen::Vector3d::Zero();

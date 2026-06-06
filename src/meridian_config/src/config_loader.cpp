@@ -114,12 +114,14 @@ void load_sensors(const YAML::Node& root, SensorsConfig& c) {
   const YAML::Node l = n["lidar"];
   if (l) {
     get(l, "topic", c.lidar.topic);
+    get(l, "time_offset_ms", c.lidar.time_offset_ms);
     get(l, "model", c.lidar.model);
     get(l, "nominal_rate_hz", c.lidar.nominal_rate_hz);
     get(l, "ptp", c.lidar.ptp);
     get(l, "timestamp_mode", c.lidar.timestamp_mode);
     if (l["extrinsic_T"]) c.lidar.extrinsic_T = read_vec3(l["extrinsic_T"], "sensors.lidar.extrinsic_T");
     if (l["extrinsic_R"]) c.lidar.extrinsic_R = read_mat3(l["extrinsic_R"], "sensors.lidar.extrinsic_R");
+    c.lidar.extrinsic_set = static_cast<bool>(l["extrinsic_T"]) || static_cast<bool>(l["extrinsic_R"]);
   }
 
   const YAML::Node i = n["imu"];
@@ -136,6 +138,8 @@ void load_sensors(const YAML::Node& root, SensorsConfig& c) {
   const YAML::Node cam = n["camera"];
   if (cam) {
     get(cam, "topic", c.camera.topic);
+    get(cam, "time_offset_ms", c.camera.time_offset_ms);
+    get(cam, "compressed", c.camera.compressed);
     get(cam, "model", c.camera.model);
     get(cam, "nominal_rate_hz", c.camera.nominal_rate_hz);
     if (cam["intrinsics"]) {
@@ -173,6 +177,7 @@ void load_sensors(const YAML::Node& root, SensorsConfig& c) {
       const Eigen::Quaterniond q(ex[6].as<double>(), ex[3].as<double>(), ex[4].as<double>(),
                                  ex[5].as<double>());
       c.camera.extrinsic = Pose(q, t);
+      c.camera.extrinsic_set = true;
     }
     get(cam, "trigger", c.camera.trigger);
     get(cam, "exposure_from_meta", c.camera.exposure_from_meta);
@@ -244,12 +249,10 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   get(solver, "epsi", c.solver_epsi);
   get(solver, "time_limit_ms", c.solver.time_limit_ms);
   get(solver, "min_iterations", c.solver.min_iterations);
-  const YAML::Node solve = n["solve"];
-  get(solve, "max_step_trans_m", c.solve.max_step_trans_m);
-  get(solve, "max_step_rot_deg", c.solve.max_step_rot_deg);
   const YAML::Node bias = n["bias"];
   get(bias, "gyr_max", c.bias.gyr_max);
   get(bias, "acc_max", c.bias.acc_max);
+  get(bias, "knot_dt_ms", c.bias.knot_dt_ms);
   const YAML::Node mreg = n["motion_reg"];
   get(mreg, "enable", c.motion_reg.enable);
   get(mreg, "weight", c.motion_reg.weight);
@@ -449,11 +452,11 @@ bool Config::validate(std::string* error_out) const {
   if (frontend.assoc_shift_thresh_m < 0.0 || frontend.assoc_shift_thresh_deg < 0.0) {
     return fail("frontend.assoc_shift_thresh_{m,deg} must be >= 0");
   }
-  if (frontend.solve.max_step_trans_m <= 0.0 || frontend.solve.max_step_rot_deg <= 0.0) {
-    return fail("frontend.solve.max_step_{trans_m,rot_deg} must be > 0");
-  }
   if (frontend.bias.gyr_max <= 0.0 || frontend.bias.acc_max <= 0.0) {
     return fail("frontend.bias.{gyr_max,acc_max} must be > 0");
+  }
+  if (frontend.bias.knot_dt_ms <= 0.0) {
+    return fail("frontend.bias.knot_dt_ms must be > 0");
   }
   if (frontend.motion_reg.weight < 0.0) {
     return fail("frontend.motion_reg.weight must be >= 0");

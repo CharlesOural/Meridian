@@ -867,80 +867,6 @@ TEST(CtFrontEnd, DeadlineBoundedSolveHonoursBudget) {
   }
 }
 
-// (f) Step clamp on a poisoned seed: an outlier IMU acceleration burst in one sweep
-// would otherwise drive a large control-point increment. With a tight per-iteration
-// step cap the increment is scaled down (preserving direction), the step-clamp
-// telemetry engages, and the estimate stays bounded instead of leaping.
-TEST(CtFrontEnd, StepClampBoundsPoisonedSeed) {
-  const std::vector<Plane> walls = boxRoom(2.5);
-  const GtFn gt = circleGt();
-  const int sweeps = 8;
-  const int poison_sweep = 4;
-
-  auto runWithClamp = [&](double max_step_trans_m, double max_step_rot_deg,
-                          meridian::RecordingSink* sink) -> Pose {
-    std::mt19937 rng(7);
-    FrontendConfig cfg = ctCfg();
-    cfg.solve.max_step_trans_m = max_step_trans_m;
-    cfg.solve.max_step_rot_deg = max_step_rot_deg;
-    CtFrontEnd fe(cfg, identityCalib(), sink, /*deterministic=*/false);
-    auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
-    for (int k = 0; k < sweeps; ++k) {
-      if (k == poison_sweep) {
-        // Poison the seed: a large spurious acceleration on every IMU sample of this
-        // sweep, which the IMU-only seed integrates into a big jump the solve must
-        // start from. A tight clamp must keep the accepted step small.
-        for (auto& s : stream[k].group.imu) {
-          s.acc += Eigen::Vector3d(80.0, 0.0, 0.0);
-        }
-      }
-      fe.ingest(stream[k]);
-    }
-    return fe.live_state().T_world_body;
-  };
-
-  meridian::RecordingSink tight_sink;
-  const Pose tight = runWithClamp(0.05, 2.0, &tight_sink);
-
-  // Positive control: the SAME poisoned stream with an effectively-infinite clamp. The
-  // clamp is a no-op here, so the solve is free to follow the poisoned seed and excurse.
-  meridian::RecordingSink slack_sink;
-  const Pose slack = runWithClamp(1e9, 1e9, &slack_sink);
-
-  const auto clampFired = [](const meridian::RecordingSink& s) {
-    for (const auto& r : s.scalars) {
-      if (r.key == "frontend/step_clamped" && r.v > 0.5) return true;
-    }
-    return false;
-  };
-  // The clamp must engage under the tight cap and must NOT engage under the slack cap, so
-  // the telemetry flag is shown to track real clamping rather than always toggling.
-  EXPECT_TRUE(clampFired(tight_sink)) << "step clamp never engaged under a tight cap + poison";
-  EXPECT_FALSE(clampFired(slack_sink)) << "slack cap must not report any clamping";
-
-  // The clamped estimate stays finite; the unclamped one need not.
-  EXPECT_TRUE(tight.t.allFinite());
-
-  // The clamp must BITE: the tight-cap excursion is materially smaller than the slack-cap
-  // run's (or the slack run is non-finite/way out). A no-op clampActiveKnots() that only
-  // toggled telemetry would make these two excursions equal and fail this assertion.
-  // With the tail-anchored window the solve is healthy even from a poisoned seed, so
-  // the unclamped run RECOVERS rather than following the poison; the historic
-  // "tight excursion < slack excursion" ordering is no longer a property of a correct
-  // build (the tight cap now mostly limits how fast the solve can pull the iterate
-  // back off the poisoned seed). The remaining contract: the clamp engages and keeps
-  // the estimate finite and bounded, and the unclamped solve absorbs the poison.
-  const double tight_excursion = tight.t.norm();
-  EXPECT_TRUE(slack.t.allFinite());
-  EXPECT_LT(tight_excursion, 5.0) << "clamped estimate left the room: " << tight.t.transpose();
-  EXPECT_LT(slack.t.norm(), 5.0) << "unclamped solve failed to absorb the poisoned seed: "
-                                 << slack.t.transpose();
-}
-
-// (g) Outer-loop config respected: max_outer_iters=1 runs a single association pass,
-// so the total iteration count cannot exceed the inner-step cap, whereas a larger
-// max_outer_iters with the early-stop disabled (deterministic path) runs strictly
-// more total iterations on the same input.
 TEST(CtFrontEnd, OuterLoopConfigRespected) {
   const std::vector<Plane> walls = boxRoom(2.5);
   const GtFn gt = yawCrawlGt();
@@ -971,24 +897,14 @@ TEST(CtFrontEnd, OuterLoopConfigRespected) {
       << "more outer passes must accumulate more total iterations (det path, no early-stop)";
 }
 
-// (h) Bias box bound bites once the gyro-bias freeze seam opens. Bootstrap runs on a
-// static first window (so init recovers a near-zero gyro bias, not the motion rate),
-// then the body spins fast: the bias-corrected body rate clears the configured
-// knot_omega_thresh edge, opening the seam and freeing the gyro bias. A large constant
-// gyro offset on the spinning sweeps is what the solver wants the free bias to absorb;
-// the tight box bound pins it at bias.gyr_max instead, so frontend/bias_bounded fires
-// and the bias stays in its box. With the seam closed (no band edge) the gyro bias is
-// frozen, the bound is inert, and the telemetry never fires -- proving the guard is
-// live only once the seam opens, not before.
-TEST(CtFrontEnd, BiasBoxBoundBitesWhenSeamOpens) {
+TEST(CtFrontEnd, BiasBoxBoundsAndRecovery) {
   const std::vector<Plane> walls = boxRoom(2.5);
 
-  // A body that holds still for the first sweep (the init window) then spins about z at
-  // a high constant rate. The static start keeps the recovered gyro bias near zero so
-  // the later spin reads as genuine excitation rather than being absorbed at init.
-  const double spin_start_s = 0.1;  // one 100 ms sweep of stillness for init
-  const double spin_rate = 1.5;     // rad/s about z once spinning
-  const GtFn gt = [&](Timestamp t) {
+  // A body that holds still for the first sweep (the init window) then spins about z,
+  // so the gyro residual senses its bias against real rotation.
+  const double spin_start_s = 0.1;
+  const double spin_rate = 1.5;  // rad/s about z once spinning
+  const GtFn spin_gt = [&](Timestamp t) {
     const double ts = to_seconds(t);
     const double ang = ts <= spin_start_s ? 0.0 : spin_rate * (ts - spin_start_s);
     Pose p;
@@ -996,63 +912,61 @@ TEST(CtFrontEnd, BiasBoxBoundBitesWhenSeamOpens) {
     return p;
   };
 
-  const int sweeps = 10;
-  const Eigen::Vector3d gyro_offset(0.4, 0.0, 0.0);  // outlier the bias would absorb
-  const double gyr_max = 0.05;
-
-  auto run = [&](bool open_seam, meridian::RecordingSink* sink) {
+  auto run = [&](const GtFn& gt, int sweeps, const Eigen::Vector3d& gyro_offset,
+                 const Eigen::Vector3d& accel_offset, double gyr_max) {
     std::mt19937 rng(7);
     FrontendConfig cfg = ctCfg();
     cfg.bias.gyr_max = gyr_max;
-    if (open_seam) {
-      cfg.spline.knot_omega_thresh = {0.5};  // the 1.5 rad/s spin clears this
-    }
-    CtFrontEnd fe(cfg, identityCalib(), sink, /*deterministic=*/false);
+    // Weights consistent with the stream's actual sample noise (0.01 m/s^2 / 0.001
+    // rad/s): the default test calib is ~10x looser, which would make a physical
+    // offset a sub-sigma whisper and absorption artificially slow.
+    auto calib = std::make_shared<meridian::CalibrationSet>(*identityCalib());
+    calib->imu_acc_noise = 5e-3;
+    calib->imu_gyr_noise = 5e-4;
+    CtFrontEnd fe(cfg, calib, nullptr, /*deterministic=*/false);
     auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
     for (std::size_t k = 0; k < stream.size(); ++k) {
-      // Leave the static init sweep clean; add the offset only once spinning so the
-      // recovered bias is not contaminated by the outlier.
+      // Leave the static init sweep clean; inject only once moving so the error is
+      // not absorbed at initialization.
       if (k > 0) {
-        for (auto& s : stream[k].group.imu) s.gyro += gyro_offset;
+        for (auto& s : stream[k].group.imu) {
+          s.gyro += gyro_offset;
+          s.acc += accel_offset;
+        }
       }
       fe.ingest(stream[k]);
     }
     return fe.live_state();
   };
 
-  auto biasBounded = [](const meridian::RecordingSink& sink) {
-    bool fired = false;
-    for (const auto& r : sink.scalars) {
-      if (r.key == "frontend/bias_bounded" && r.v > 0.5) fired = true;
-    }
-    return fired;
-  };
+  // (a) Cap invariant: an outlier-sized gyro offset (far past the box) cannot drive
+  // the stored bias outside its bound, and the estimate stays finite.
+  {
+    const NavState st = run(spin_gt, 10, Eigen::Vector3d(0.4, 0.0, 0.0),
+                            Eigen::Vector3d::Zero(), /*gyr_max=*/0.05);
+    EXPECT_TRUE(st.T_world_body.t.allFinite());
+    EXPECT_LE(st.b_g.cwiseAbs().maxCoeff(), 0.05 + 1e-6)
+        << "gyro bias must stay inside its box: " << st.b_g.transpose();
+  }
 
-  // Seam open: the unfrozen gyro bias is driven into its box and the bound telemetry
-  // fires; the estimate stays finite.
-  meridian::RecordingSink open_sink;
-  const NavState open_state = run(/*open_seam=*/true, &open_sink);
-  EXPECT_TRUE(biasBounded(open_sink))
-      << "bias box bound must engage once the gyro-bias freeze seam opens";
-  EXPECT_TRUE(open_state.T_world_body.t.allFinite());
-  EXPECT_LE(open_state.b_g.cwiseAbs().maxCoeff(), gyr_max + 1e-6)
-      << "gyro bias must stay inside its box: " << open_state.b_g.transpose();
-
-  // Seam closed (no band edge): the gyro bias stays frozen, so the bound is inert and
-  // the bias_bounded telemetry never fires despite the same offset.
-  meridian::RecordingSink closed_sink;
-  run(/*open_seam=*/false, &closed_sink);
-  EXPECT_FALSE(biasBounded(closed_sink))
-      << "with the seam closed the gyro bias is frozen and the bound cannot bite";
+  // (b) Absorption: a physical-sized constant accel offset on a static body must flow
+  // into the free accel bias instead of integrating into a velocity creep -- with the
+  // spline LiDAR-pinned and gravity held, the bias is the only place it can go. This
+  // is exactly the real-data failure mode of a frozen accel bias.
+  {
+    const GtFn static_gt = [](Timestamp) { return Pose{}; };
+    const Eigen::Vector3d accel_offset(0.15, 0.0, 0.0);
+    const NavState st =
+        run(static_gt, 20, Eigen::Vector3d::Zero(), accel_offset, /*gyr_max=*/0.5);
+    EXPECT_TRUE(st.T_world_body.t.allFinite());
+    EXPECT_LT(st.T_world_body.t.norm(), 0.10)
+        << "static body crept under a constant accel offset: "
+        << st.T_world_body.t.transpose();
+    EXPECT_GT(st.b_a.x(), 0.5 * accel_offset.x())
+        << "free accel bias failed to absorb the offset: " << st.b_a.transpose();
+  }
 }
 
-// (i) Cold-start gate: bootstrap is deferred through the shared ImuInitializer until a
-// static window passes the motion gate. A shaky first group (variance far above
-// init_max_var) is rejected, so nothing is emitted and the live pose stays at its
-// default; a subsequent clean static run carrying an injected gyro bias initialises,
-// recovering gravity (pinned to |g|, pointing down) and the bias from the Welford mean.
-// A raw inline-mean bootstrap (the old behaviour) would seed gravity from the shaky
-// mean and emit immediately, leaving b_g far from the injected value.
 TEST(CtFrontEnd, ColdStartGatesMotionAndRecoversBias) {
   std::mt19937 rng(101);
   CtFrontEnd fe(ctCfg(), identityCalib(), nullptr);
@@ -1710,12 +1624,14 @@ TEST(CtFrontEnd, BootstrapDeskewedSeedMatchesRawFallbackSeed) {
       << "raw-fallback seed drifted from identity: " << p_raw.t.transpose();
   EXPECT_LT(rotErr(p_raw.q, T_id.q), 0.05) << "raw-fallback seed orientation drifted from identity";
 
-  // The two seed paths build identical map geometry, so with identical steady-state scans
-  // and RNG the trajectories are deterministically equal. A double-applied extrinsic
-  // perturbs only the deskewed seed, so the poses diverge far above this near-exact bound.
-  EXPECT_LT((p_dsk.t - p_raw.t).norm(), 1e-6)
+  // The two seed paths build identical map geometry, so with identical steady-state
+  // scans and RNG the trajectories agree to solver-path noise (the bias random-walk
+  // ties make the solves equivalent rather than bit-identical, hence micrometres,
+  // not machine epsilon). A double-applied extrinsic perturbs only the deskewed seed,
+  // so the poses diverge far above this bound.
+  EXPECT_LT((p_dsk.t - p_raw.t).norm(), 1e-4)
       << "deskewed seed pose " << p_dsk.t.transpose() << " disagrees with raw-fallback seed "
       << p_raw.t.transpose();
-  EXPECT_LT(rotErr(p_dsk.q, p_raw.q), 1e-6)
+  EXPECT_LT(rotErr(p_dsk.q, p_raw.q), 1e-4)
       << "deskewed seed orientation disagrees with the raw-fallback seed";
 }

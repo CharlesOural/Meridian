@@ -1,3 +1,4 @@
+#include <opencv2/imgcodecs.hpp>
 #include "conversions/ros2core.hpp"
 
 #include <algorithm>
@@ -55,6 +56,37 @@ std::uint32_t read_u32(const std::uint8_t* p, std::uint8_t datatype) {
 }
 
 }  // namespace
+
+std::optional<RawCameraFrame> to_raw_camera_compressed(
+    const sensor_msgs::msg::CompressedImage& msg, Timestamp host_arrival) {
+  // Decode straight to grayscale: the photometric stage consumes intensity only, so
+  // converting at the decode (where the JPEG luma plane already exists) is both the
+  // cheapest and the most faithful path. imdecode sniffs the container format from
+  // the payload, so msg.format is advisory only.
+  const cv::Mat raw(1, static_cast<int>(msg.data.size()), CV_8UC1,
+                    const_cast<std::uint8_t*>(msg.data.data()));
+  cv::Mat gray = cv::imdecode(raw, cv::IMREAD_GRAYSCALE);
+  if (gray.empty() || gray.type() != CV_8UC1) {
+    return std::nullopt;
+  }
+
+  RawCameraFrame f;
+  f.device_ns = from_ros(msg.header.stamp);
+  f.has_device_ns = true;
+  f.host_arrival = host_arrival;
+  f.width = gray.cols;
+  f.height = gray.rows;
+  f.encoding = CameraFrame::Encoding::Mono8;
+  auto buf = std::make_shared<std::vector<std::uint8_t>>(
+      static_cast<std::size_t>(gray.cols) * static_cast<std::size_t>(gray.rows));
+  // cv::Mat rows may be padded; copy row-by-row into the tightly packed core buffer.
+  for (int r = 0; r < gray.rows; ++r) {
+    std::memcpy(buf->data() + static_cast<std::size_t>(r) * gray.cols, gray.ptr(r),
+                static_cast<std::size_t>(gray.cols));
+  }
+  f.data = std::move(buf);
+  return f;
+}
 
 bool to_raw_lidar(const sensor_msgs::msg::PointCloud2& msg, Timestamp host_arrival,
                   std::vector<RawPoint>* scratch, RawLidarFrame* out) {

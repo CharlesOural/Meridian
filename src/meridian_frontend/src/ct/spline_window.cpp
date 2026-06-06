@@ -91,18 +91,6 @@ void SplineWindow::extendTo(Timestamp t, const std::function<Pose(Timestamp)>& s
   }
 }
 
-void SplineWindow::dumpTail(std::FILE* f, int n) const {
-  const int sz = static_cast<int>(kt_.size());
-  const int from = std::max(0, sz - n);
-  std::fprintf(f, "[DIAG] kt tail (size=%d, t_min=%ld, t_max=%ld):\n", sz,
-               static_cast<long>(t_min_), static_cast<long>(t_max_));
-  for (int i = from; i < sz; ++i) {
-    const Eigen::Vector3d p = r3_->getKnot(i);
-    std::fprintf(f, "[DIAG]   knot[%d] kt=%ld dt_prev=%ld r3=(%.3f %.3f %.3f)\n", i,
-                 static_cast<long>(kt_[i]),
-                 static_cast<long>(i > 0 ? kt_[i] - kt_[i - 1] : 0), p.x(), p.y(), p.z());
-  }
-}
 
 void SplineWindow::reseedFrom(int from_idx, const std::function<Pose(Timestamp)>& seed) {
   const int n = static_cast<int>(kt_.size());

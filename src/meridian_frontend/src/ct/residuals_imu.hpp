@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <vector>
 
 #include <Eigen/Core>
@@ -41,14 +42,31 @@ struct GravityBlock {
 // time is the linear interpolation between the bracketing knots. Consecutive knots
 // are tied by a continuous-time random-walk residual so the bias drifts smoothly.
 //
-// Knot count is fixed at construction and the backing storage is never resized, so
-// the pointers returned by gyroBlock()/accelBlock() stay stable for the lifetime of
-// the object — they may be held as Ceres parameter blocks across a solve.
+// The timeline grows via extendTo and slides via dropOldest; deque storage keeps
+// the pointers returned by gyroBlock()/accelBlock() stable for the lifetime of each
+// knot, so they may be held as Ceres parameter blocks and prior references.
 class BiasKnots {
  public:
   // Lays out `n_knots` (>= 1) knots uniformly over [t0, t0 + (n_knots-1)*dt_ns].
-  // With a single knot the bias is constant over the whole window.
+  // With a single knot the bias is constant over the whole window. Knot storage is a
+  // deque: push_back/pop_front never move surviving elements, so Ceres parameter
+  // blocks and marginalization-prior pointers into live knots stay valid as the
+  // timeline grows and slides.
   BiasKnots(Timestamp t0, Duration dt_ns, int n_knots);
+
+  // Appends knots (each copying the last knot's value -- the random-walk mean) until
+  // the final knot time is at or past t, so leftIndex(t)+1 is a real bracket.
+  void extendTo(Timestamp t);
+
+  // Drops the n oldest knots, advancing t0; clamped so at least two knots remain
+  // (one bracket). The caller must ensure no live parameter-block pointer references
+  // a dropped knot (see lowestKnotIndexOf).
+  void dropOldest(int n);
+
+  // Lowest knot index whose gyro or accel storage backs any of the given pointers
+  // (max int when none does); bounds dropOldest the same way the spline guards its
+  // front-trim against prior-held blocks.
+  int lowestKnotIndexOf(const std::vector<const double*>& ptrs) const;
 
   int numKnots() const { return static_cast<int>(gyro_.size()); }
   Duration knotDt() const { return dt_ns_; }
@@ -73,8 +91,8 @@ class BiasKnots {
  private:
   Timestamp t0_ = 0;
   Duration dt_ns_ = 0;
-  std::vector<Eigen::Vector3d> gyro_;
-  std::vector<Eigen::Vector3d> accel_;
+  std::deque<Eigen::Vector3d> gyro_;
+  std::deque<Eigen::Vector3d> accel_;
 };
 
 // Per-stream weights for the IMU residuals. The four values are the noise standard
@@ -126,18 +144,20 @@ int addImuResiduals(ceres::Problem& problem, SplineWindow& spline, BiasKnots& bi
                     GravityBlock& gravity, const std::vector<ImuSample>& samples,
                     Timestamp t_begin, Timestamp t_end, const ImuWeights& weights);
 
-// Adds only the bias random-walk ties (exposed separately for tests). Returns the
-// number of tie residuals added (numKnots()-1, gyro and accel counted as one each).
+// Adds the random-walk tie between every pair of consecutive resident bias knots at
+// full weight 1/(sigma*sqrt(knot_dt)). The tie is a model constraint re-stated per
+// problem (it never enters the marginalization prior from a live solve; a departing
+// knot's tie folds into the prior via the Schur drop in the window slide), so full
+// weight per problem counts it exactly once. Returns the number of ties added.
 int addBiasRandomWalk(ceres::Problem& problem, BiasKnots& bias,
                       const ImuWeights& weights);
 
 // Adds tail anchors at each covered time: a world-velocity residual on the R^3 spline
 // derivative toward v_pred and a body-rate residual on the SO(3) spline toward w_pred.
-// The trailing control points past the newest measurement have (near-)zero basis
-// weight over every measured time, so without these the solver may park arbitrary
-// values there at no cost; the anchors tie that span to the IMU-predicted constant
-// velocity / body rate with honest extrapolation sigmas, weak enough for the next
-// sweep's measurements to override. Returns the number of anchored times.
+// They brace the span past the newest measurement, where basis support fades to zero:
+// the pinning rule removes the strict null directions, and the anchors additionally
+// hold the velocity read-out to the IMU prediction when the seed carries model error
+// (e.g. an unconverged bias) -- weak enough for real measurements to override.
 int addTailAnchors(ceres::Problem& problem, SplineWindow& spline,
                    const std::vector<Timestamp>& times, const Eigen::Vector3d& v_pred,
                    const Eigen::Vector3d& w_pred, double sigma_vel, double sigma_rate);

@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <cstdio>
 #include <vector>
 
 #include "meridian/common/pose.hpp"
@@ -122,8 +121,6 @@ public:
   double* r3KnotData(int i);
 
   int numKnots() const;
-  // Diagnostic: prints the last n knots (grid time, spacing, position) to f.
-  void dumpTail(std::FILE* f, int n) const;
 
 private:
   // One outer real segment: its real start time, the virtual time at its first new

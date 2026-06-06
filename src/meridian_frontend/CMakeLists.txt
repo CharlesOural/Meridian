@@ -110,7 +110,9 @@ if(BUILD_TESTING)
   meridian_add_gtest(test_residuals_gnss test/test_residuals_gnss.cpp)
   meridian_add_gtest(test_marginalization test/test_marginalization.cpp)
   meridian_add_gtest(test_iekf_frontend test/test_iekf_frontend.cpp)
-  meridian_add_gtest(test_ct_frontend test/test_ct_frontend.cpp)
+  # The end-to-end suite runs whole synthetic streams per test; give it headroom
+# over ctest's 60 s default.
+meridian_add_gtest(test_ct_frontend test/test_ct_frontend.cpp TIMEOUT 180)
   foreach(t test_residuals_imu test_residuals_lidar test_residuals_gnss test_marginalization
             test_iekf_frontend test_ct_frontend)
     # OpenCV is linked too: the CT front-end test renders synthetic camera images to

@@ -214,9 +214,9 @@ namespace {
 // block (the reference exposure is a fixed constant). Image sampling is linearized at
 // the projected pixel: I_cur(u) ~= I0 + grad_I . (u - u0), so only the smooth spline
 // / projection / exposure chain runs through autodiff. Every patch pixel shares the
-// same projected-centre displacement (the patch grid is a fixed regular offset that
-// FAST-LIVO2 does not re-chain through the pose), so a single delta-pixel feeds all
-// kPatchArea residuals.
+// same projected-centre displacement (the patch grid is a fixed regular offset, not
+// re-chained through the pose), so a single delta-pixel feeds all kPatchArea
+// residuals.
 //
 // Parameter block layout (handed to DynamicAutoDiffCostFunction):
 //   [0..3]   SO(3) knots (quaternion, xyzw)

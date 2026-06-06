@@ -241,6 +241,10 @@ FrontEndDiagnostics CtFrontEnd::diagnostics() const {
   return diag_;
 }
 
+Duration CtFrontEnd::biasKnotDt() const {
+  return static_cast<Duration>(std::max(cfg_.bias.knot_dt_ms, 1.0) * 1e6);
+}
+
 ct::ImuWeights CtFrontEnd::imuWeights(double imu_dt_s) const {
   ct::ImuWeights w;
   // Calibration carries continuous-time noise DENSITIES (per sqrt-Hz). A single IMU
@@ -285,26 +289,6 @@ int CtFrontEnd::selectKnotDensity(const std::vector<ImuSample>& imu) {
   return n_cp;
 }
 
-bool CtFrontEnd::gyroBiasObservable(const std::vector<ImuSample>& imu) const {
-  // The gyro bias is held unless the body genuinely rotates: a constant gyro offset is
-  // separable from the spline rate only under rotation strong enough to exceed sensor
-  // noise. The gate is the top configured angular-rate band edge; with none configured
-  // (default) the seam stays closed and the bias stays frozen.
-  const std::vector<double>& edges = cfg_.spline.knot_omega_thresh;
-  if (edges.empty()) {
-    return false;
-  }
-  double top = 0.0;
-  for (double e : edges) {
-    top = std::max(top, e);
-  }
-  if (top <= 0.0) {
-    return false;
-  }
-  const ct::ImuExcitation exc =
-      ct::imuExcitation(imu, anchor_bg_, anchor_ba_, gravity_->magnitude());
-  return exc.n_omega >= top;
-}
 
 std::vector<Timestamp> CtFrontEnd::segmentMidpointTimes(Timestamp t_begin, Timestamp t_end) const {
   // One evaluation point per outer segment the sweep spans: the midpoint of each
@@ -449,6 +433,7 @@ void CtFrontEnd::reseedAfterGap(const PreprocessedGroup& group, Timestamp t_begi
   // next sweep solves on a fully extendable window.
   auto seed = buildSeed(mg.imu, t_begin, t_end);
   spline_->extendTo(t_end, seed, 1);
+  bias_->extendTo(t_end);
 
   const std::vector<LidarPoint> ds =
       ct::voxelDownsample(validReturns(mg.scan), std::max(cfg_.lidar.voxel_map_m, 1e-3));
@@ -484,9 +469,11 @@ void CtFrontEnd::restartWindow(Timestamp t_begin) {
   spline_->initialize(t_begin, anchor_pose_);
   traj_start_t_ = t_begin;
 
-  bias_ = std::make_unique<ct::BiasKnots>(t_begin, window_dt_ns_, 1);
-  bias_->setGyroKnot(0, anchor_bg_);
-  bias_->setAccelKnot(0, anchor_ba_);
+  bias_ = std::make_unique<ct::BiasKnots>(t_begin, biasKnotDt(), 2);
+  for (int k = 0; k < bias_->numKnots(); ++k) {
+    bias_->setGyroKnot(k, anchor_bg_);
+    bias_->setAccelKnot(k, anchor_ba_);
+  }
 
   // The prior's parameter blocks point into the now-discarded knots; keeping it would
   // alias freed storage on the next solve.
@@ -658,14 +645,11 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
       deterministic_ ? 0.0 : std::max(cfg_.solver.time_limit_ms, 0.0) * 1e-3;
   const auto solve_start = Clock::now();
 
-  // Per-iteration step clamp (translation/rotation caps preserving direction) and IMU
-  // bias box bound: the two pre-restart stability guards. The clamp is applied as a
-  // post-inner-solve delta check on the active pose knots; the gyro bound is a Ceres
-  // parameter bound applied while the gyro bias is unfrozen. The accel bias is always
-  // frozen at one bias knot, so its box bound would be inert and is not installed.
-  const double max_step_trans = std::max(cfg_.solve.max_step_trans_m, 1e-6);
-  const double max_step_rot = std::max(cfg_.solve.max_step_rot_deg, 1e-6) * M_PI / 180.0;
+  // IMU bias box bounds: Ceres parameter bounds holding each bias axis inside its
+  // physical range so an outlier burst cannot drive a bias to an absurd value that
+  // corrupts the IMU residual for the whole window.
   const double bias_gyr_max = std::max(cfg_.bias.gyr_max, 0.0);
+  const double bias_acc_max = std::max(cfg_.bias.acc_max, 0.0);
 
   // Each problem owns its cost functions and manifolds (default ceres ownership) and
   // frees them on destruction; the persistent prior_ object rebuilds its cost via
@@ -675,7 +659,6 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
   int accepted = 0;
   int total_iters = 0;
   bool deadline_hit = false;
-  bool clamp_engaged = false;
   bool bound_engaged = false;
   Pose prev_assoc_pose;
   bool have_prev_assoc = false;
@@ -706,26 +689,17 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
 
     // LiDAR point-to-plane residuals at the current spline (capped set).
     ct::addLidarResiduals(problem, *spline_, T_fe_lidar_, capped_hits, cfg_.lidar);
-    const int diag_n_lidar = problem.NumResidualBlocks();  // TEMP-DIAG
     // IMU derivative residuals over the new sweep span + bias random walk.
     ct::addImuResiduals(problem, *spline_, *bias_, *gravity_, group.group.imu, t_begin, t_end,
                         weights);
-    const int diag_n_imu = problem.NumResidualBlocks();  // TEMP-DIAG
     ct::addBiasRandomWalk(problem, *bias_, weights);
 
-    // Tail anchors over the span past the newest measurement. The trailing control
-    // points have (near-)zero basis weight at every measured time, so without an
-    // explicit constraint the solver may park arbitrary values there at zero cost --
-    // values the state read-out at t_end and the next sweep's evaluation then consume.
-    // Tie that span to the seed's constant-extrapolation velocity / body rate, with
-    // sigmas sized to a constant-velocity prediction over a couple hundred ms so real
-    // measurements override the anchors as soon as they arrive. These residuals never
-    // touch the marginalized (oldest) knot, so they cannot leak into the prior.
+    // Tail anchors over the span past the newest measurement: tie the spline's
+    // velocity and body rate there to the seed's constant extrapolation. The pinning
+    // rule removes the strict null directions; the anchors additionally hold the
+    // velocity read-out to the IMU prediction when the seed carries model error
+    // (an unconverged bias), at sigmas a real measurement immediately overrides.
     {
-      // Constant-extrapolation uncertainty over the <=300 ms tail span. The anchors
-      // must carry real weight: a tail knot's basis support over the data can be as
-      // small as u^3/6 ~ 1e-5, so the solver can trade radians of knot motion for
-      // millimetres of residual elsewhere unless the anchor cost is material.
       constexpr double kTailSigmaVel = 0.2;   // [m/s]
       constexpr double kTailSigmaRate = 0.1;  // [rad/s]
       const Timestamp stride = std::max<Timestamp>(window_dt_ns_ / 4, 1);
@@ -740,6 +714,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
       ct::addTailAnchors(problem, *spline_, tail_times, seed_vel_end_, seed_omega_end_,
                          kTailSigmaVel, kTailSigmaRate);
     }
+
 
     // Under-excitation regularizer (off by default, config-gated): a low-weight jerk /
     // angular-acceleration pull on the segment knot-midpoints, engaged only when the
@@ -852,39 +827,31 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     // bias knot spans the window). The gyro bias unfreezes under strong rotational
     // excitation, where the gyro residual senses it directly so its box bound becomes
     // live; otherwise it too is held to avoid solver jitter. The seam stays closed by
-    // default (no excitation band configured) and opens only when the measured body
-    // rate clears the top configured band edge.
-    const bool gyro_free = gyroBiasObservable(group.group.imu);
 
-    // Bias box bounds: hold each bias axis inside its physical box so a transient
-    // outlier burst cannot drive a bias to an absurd value that corrupts the IMU
-    // residual for the whole window. A free block's stored value is first projected
-    // into the box (Ceres requires the initial iterate to satisfy its bounds), so a
-    // value carried over the edge from a prior sweep restarts at the edge and the
-    // solver then sees the bound; a frozen block keeps its value and its bound is
-    // inert. The gyro block is bounded-and-free only when the seam is open; the accel
-    // block is always frozen. NOTE: a frozen accel bias means a residual init error
-    // b_a + R^T*(gravity error) has nowhere to be absorbed and integrates into a
-    // velocity creep; freeing it without a random-walk tie to its previous estimate
-    // is worse (the tail anchors then lock each co-drifted velocity increment in).
-    // Absorbing it correctly needs the multi-knot bias random walk, which is the
-    // documented not-yet-built seam.
+    // Both biases are free states: the gyro residual senses b_g directly, and with
+    // gravity pinned the accel residual's DC error is exactly what b_a must absorb
+    // (only the sum b_a + R^T*(gravity error) is observable, and for odometry the
+    // sum is all that matters). Wander is constrained by physics, not gating: the
+    // random-walk ties bound the increment per unit time, the marginalization prior
+    // carries the estimate across sweeps, and the box bounds cap the absolute value.
+    // A free block's stored value is first projected into its box (Ceres requires
+    // the initial iterate to satisfy the bounds).
     for (int k = 0; k < bias_->numKnots(); ++k) {
       double* gp = bias_->gyroBlock(k);
       double* ap = bias_->accelBlock(k);
-      if (problem.HasParameterBlock(gp)) {
-        if (gyro_free && bias_gyr_max > 0.0) {
-          for (int a = 0; a < 3; ++a) {
-            gp[a] = std::clamp(gp[a], -bias_gyr_max, bias_gyr_max);
-            problem.SetParameterLowerBound(gp, a, -bias_gyr_max);
-            problem.SetParameterUpperBound(gp, a, bias_gyr_max);
-          }
-        } else {
-          problem.SetParameterBlockConstant(gp);
+      if (problem.HasParameterBlock(gp) && bias_gyr_max > 0.0) {
+        for (int a = 0; a < 3; ++a) {
+          gp[a] = std::clamp(gp[a], -bias_gyr_max, bias_gyr_max);
+          problem.SetParameterLowerBound(gp, a, -bias_gyr_max);
+          problem.SetParameterUpperBound(gp, a, bias_gyr_max);
         }
       }
-      if (problem.HasParameterBlock(ap)) {
-        problem.SetParameterBlockConstant(ap);
+      if (problem.HasParameterBlock(ap) && bias_acc_max > 0.0) {
+        for (int a = 0; a < 3; ++a) {
+          ap[a] = std::clamp(ap[a], -bias_acc_max, bias_acc_max);
+          problem.SetParameterLowerBound(ap, a, -bias_acc_max);
+          problem.SetParameterUpperBound(ap, a, bias_acc_max);
+        }
       }
     }
 
@@ -914,47 +881,6 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
       }
     }
 
-    // Snapshot the active pose knots before this pass so a divergent inner step can be
-    // clamped back along its own direction afterwards.
-    const std::vector<KnotState> pre_solve = snapshotActiveKnots(problem);
-
-    // TEMP-DIAG: IMU cost at the PRE-solve iterate (round 0 only). A correct residual
-    // on a smooth near-static seed must be small; a huge value here means the residual
-    // evaluation itself disagrees with the seed trajectory.
-    if (round == 0) {
-      static int diag_pre_sweep = 0;
-      if (diag_pre_sweep++ < 25) {
-        std::vector<ceres::ResidualBlockId> ids;
-        problem.GetResidualBlocks(&ids);
-        ceres::Problem::EvaluateOptions eo;
-        eo.residual_blocks.assign(ids.begin() + diag_n_lidar, ids.begin() + diag_n_imu);
-        double c_imu_pre = 0.0;
-        problem.Evaluate(eo, &c_imu_pre, nullptr, nullptr, nullptr);
-        fprintf(stderr, "[DIAG-PRE] imu cost at seed = %.3e (n=%d)\n", c_imu_pre,
-                diag_n_imu - diag_n_lidar);
-        // Side-by-side at three sample times: spline prediction vs measurement.
-        const auto& imu = group.group.imu;
-        if (imu.size() >= 3) {
-          const Eigen::Vector3d g_w = gravity_->gravityWorld();
-          for (std::size_t k : {std::size_t{0}, imu.size() / 2, imu.size() - 1}) {
-            const ImuSample& s = imu[k];
-            if (!spline_->covers(s.stamp)) continue;
-            const Eigen::Vector3d w_sp = spline_->angularVelocityBody(s.stamp);
-            const Eigen::Vector3d a_sp = spline_->linearAccelWorld(s.stamp);
-            const Pose T = spline_->pose(s.stamp);
-            const Eigen::Vector3d w_ms = s.gyro - anchor_bg_;
-            const Eigen::Vector3d a_ms = T.q * (s.acc - anchor_ba_) + g_w;
-            fprintf(stderr,
-                    "[DIAG-PRE]   t+%.0fms w_sp=(%.3f %.3f %.3f) w_ms=(%.3f %.3f %.3f) "
-                    "a_sp=(%.2f %.2f %.2f) a_ms=(%.2f %.2f %.2f)\n",
-                    to_seconds(s.stamp - t_begin) * 1e3, w_sp.x(), w_sp.y(), w_sp.z(),
-                    w_ms.x(), w_ms.y(), w_ms.z(), a_sp.x(), a_sp.y(), a_sp.z(), a_ms.x(),
-                    a_ms.y(), a_ms.z());
-          }
-        }
-      }
-    }
-
     {
       MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.solve", t_end);
       // The deadline is suspended until the minimum-iterations floor is met: while
@@ -980,52 +906,20 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
       }
     }
 
-    // Clamp this pass's accepted update: scale every active pose knot's increment
-    // uniformly toward its pre-solve value if any knot moved past the translation or
-    // rotation cap, preserving the step direction.
-    if (clampActiveKnots(pre_solve, max_step_trans, max_step_rot)) {
-      clamp_engaged = true;
-    }
-
-    // TEMP-DIAG: per-category cost split at the post-solve iterate. The block id list
-    // is in insertion order, so [0, n_lidar) are LiDAR and [n_lidar, n_imu) are IMU.
+    // A bias the solve drove to its box edge means the bound bit this pass; record it
+    // so the bias_bounded telemetry reflects a live clamp, not just a pre-solve seed
+    // already at the edge.
     {
-      static int diag_cost_sweep = 0;
-      if (diag_cost_sweep < 25 * 4) {
-        ++diag_cost_sweep;
-        std::vector<ceres::ResidualBlockId> ids;
-        problem.GetResidualBlocks(&ids);
-        auto cost_of = [&](int lo, int hi) {
-          ceres::Problem::EvaluateOptions eo;
-          eo.residual_blocks.assign(ids.begin() + lo, ids.begin() + hi);
-          eo.apply_loss_function = true;
-          double c = 0.0;
-          problem.Evaluate(eo, &c, nullptr, nullptr, nullptr);
-          return c;
-        };
-        const int n_total = static_cast<int>(ids.size());
-        const double c_lidar = diag_n_lidar > 0 ? cost_of(0, diag_n_lidar) : 0.0;
-        const double c_imu = diag_n_imu > diag_n_lidar ? cost_of(diag_n_lidar, diag_n_imu) : 0.0;
-        const double c_rest = n_total > diag_n_imu ? cost_of(diag_n_imu, n_total) : 0.0;
-        fprintf(stderr,
-                "[DIAG-COST] round=%d lidar: n=%d cost=%.3e | imu: n=%d cost=%.3e | "
-                "rest: n=%d cost=%.3e | sig_a=%.4g sig_g=%.4g\n",
-                round, diag_n_lidar, c_lidar, diag_n_imu - diag_n_lidar, c_imu,
-                n_total - diag_n_imu, c_rest, weights.sigma_accel, weights.sigma_gyro);
-      }
-    }
-
-    // A free (unfrozen) gyro bias that the solve drove to its box edge means the bound
-    // bit this pass; record it so the bias_bounded telemetry reflects a live clamp,
-    // not just a pre-solve seed already at the edge.
-    if (gyro_free && bias_gyr_max > 0.0) {
       for (int k = 0; k < bias_->numKnots(); ++k) {
-        double* gp = bias_->gyroBlock(k);
-        if (!problem.HasParameterBlock(gp) || problem.IsParameterBlockConstant(gp)) {
-          continue;
-        }
-        for (int a = 0; a < 3; ++a) {
-          if (std::abs(gp[a]) >= bias_gyr_max - 1e-9) bound_engaged = true;
+        for (auto [bp, bmax] : {std::pair{bias_->gyroBlock(k), bias_gyr_max},
+                                std::pair{bias_->accelBlock(k), bias_acc_max}}) {
+          if (bmax <= 0.0 || !problem.HasParameterBlock(bp) ||
+              problem.IsParameterBlockConstant(bp)) {
+            continue;
+          }
+          for (int a = 0; a < 3; ++a) {
+            if (std::abs(bp[a]) >= bmax - 1e-9) bound_engaged = true;
+          }
         }
       }
     }
@@ -1076,85 +970,11 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     if (telemetry_->enabled("frontend/deadline_hit")) {
       telemetry_->scalar("frontend/deadline_hit", deadline_hit ? 1.0 : 0.0, t_end);
     }
-    if (telemetry_->enabled("frontend/step_clamped")) {
-      telemetry_->scalar("frontend/step_clamped", clamp_engaged ? 1.0 : 0.0, t_end);
-    }
     if (telemetry_->enabled("frontend/bias_bounded")) {
       telemetry_->scalar("frontend/bias_bounded", bound_engaged ? 1.0 : 0.0, t_end);
     }
   }
   return accepted;
-}
-
-std::vector<CtFrontEnd::KnotState> CtFrontEnd::snapshotActiveKnots(
-    ceres::Problem& problem) const {
-  // Every free knot the solver can move must be snapshotted, so the clamp's coverage
-  // must equal the problem's parameter set exactly. Enumerate ALL knots in the window
-  // and keep those registered with this problem and not held constant; any time-based
-  // subset risks missing a weakly-constrained tail knot, which the solver can then
-  // move arbitrarily far with no clamp to catch it.
-  std::vector<KnotState> out;
-  const int n = spline_->numKnots();
-  out.reserve(static_cast<std::size_t>(2 * n));
-  for (int i = 0; i < n; ++i) {
-    double* sp = spline_->so3KnotData(i);
-    if (problem.HasParameterBlock(sp) && !problem.IsParameterBlockConstant(sp)) {
-      KnotState ks;
-      ks.ptr = sp;
-      ks.is_so3 = true;
-      ks.q = Eigen::Map<const Eigen::Quaterniond>(sp);
-      out.push_back(ks);
-    }
-    double* rp = spline_->r3KnotData(i);
-    if (problem.HasParameterBlock(rp) && !problem.IsParameterBlockConstant(rp)) {
-      KnotState ks;
-      ks.ptr = rp;
-      ks.is_so3 = false;
-      ks.t = Eigen::Map<const Eigen::Vector3d>(rp);
-      out.push_back(ks);
-    }
-  }
-  return out;
-}
-
-bool CtFrontEnd::clampActiveKnots(const std::vector<KnotState>& pre, double max_trans,
-                                  double max_rot_rad) {
-  // Find the tightest ratio that brings every per-knot increment within its cap; a
-  // ratio < 1 means at least one knot overshot. Translation increments are measured in
-  // metres, rotation increments as the geodesic angle of the relative quaternion.
-  double ratio = 1.0;
-  for (const KnotState& ks : pre) {
-    if (ks.is_so3) {
-      const Eigen::Quaterniond q_new = Eigen::Map<const Eigen::Quaterniond>(ks.ptr);
-      const double angle = Sophus::SO3d((ks.q.conjugate() * q_new).normalized()).log().norm();
-      if (angle > max_rot_rad && angle > 1e-12) {
-        ratio = std::min(ratio, max_rot_rad / angle);
-      }
-    } else {
-      const Eigen::Vector3d t_new = Eigen::Map<const Eigen::Vector3d>(ks.ptr);
-      const double dist = (t_new - ks.t).norm();
-      if (dist > max_trans && dist > 1e-12) {
-        ratio = std::min(ratio, max_trans / dist);
-      }
-    }
-  }
-  if (ratio >= 1.0) {
-    return false;
-  }
-  // Scale every increment by the same ratio so the whole step shrinks along its own
-  // direction rather than distorting the relative geometry between knots.
-  for (const KnotState& ks : pre) {
-    if (ks.is_so3) {
-      Eigen::Map<Eigen::Quaterniond> q_new(ks.ptr);
-      const Eigen::Quaterniond rel = (ks.q.conjugate() * q_new).normalized();
-      const Eigen::Vector3d phi = Sophus::SO3d(rel).log();
-      q_new = (ks.q * Sophus::SO3d::exp(ratio * phi).unit_quaternion()).normalized();
-    } else {
-      Eigen::Map<Eigen::Vector3d> t_new(ks.ptr);
-      t_new = ks.t + ratio * (t_new - ks.t);
-    }
-  }
-  return true;
 }
 
 void CtFrontEnd::slideWindow(ceres::Problem& problem, Timestamp t_begin, Timestamp t_end) {
@@ -1188,6 +1008,19 @@ void CtFrontEnd::slideWindow(ceres::Problem& problem, Timestamp t_begin, Timesta
   // problem still references it as a parameter block of those residuals.
   const SplineWindow::SegmentRef seg = spline_->segmentFor(t_begin);
   std::vector<double*> drop_ptrs = {seg.so3_knots[0], seg.r3_knots[0]};
+
+  // Bias knots whose bracket lies wholly behind the current window front retire with
+  // this slide. They join the Schur drop so the random-walk tie linking them to the
+  // surviving knot folds into the prior instead of being discarded; their blocks are
+  // popped from the timeline after the prior is built. The decision tests the
+  // pre-trim front (one sweep of lag), so it precedes the prior build safely.
+  int bias_retire = 0;
+  while (bias_->numKnots() - bias_retire > 2 &&
+         bias_->knotTime(bias_retire + 1) <= spline_->minTime()) {
+    drop_ptrs.push_back(bias_->gyroBlock(bias_retire));
+    drop_ptrs.push_back(bias_->accelBlock(bias_retire));
+    ++bias_retire;
+  }
 
   // A gauge-pinned knot has no tangent freedom to eliminate; never marginalize it.
   for (double* p : drop_ptrs) {
@@ -1291,6 +1124,11 @@ void CtFrontEnd::slideWindow(ceres::Problem& problem, Timestamp t_begin, Timesta
     }
     const int min_kept = spline_->lowestKnotIndexOf(kept_ptrs);
     spline_->dropOldest(std::min(lead, min_kept));
+
+    // Pop the retired bias knots: they were Schur-dropped above, so the new prior
+    // cannot reference them; the lowestKnotIndexOf guard stays as a hard invariant.
+    const int bias_kept = bias_->lowestKnotIndexOf(kept_ptrs);
+    bias_->dropOldest(std::min(bias_retire, bias_kept));
   }
   window_floor_t_ = t_begin;
 }
@@ -1699,12 +1537,16 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
     const int n_cp_max = cfg_.spline.n_cp_max > 0 ? cfg_.spline.n_cp_max : 1;
     spline_ = std::make_unique<SplineWindow>(window_dt_ns_, n_cp_max);
     spline_->initialize(t_begin, anchor_pose_);
-    bias_ = std::make_unique<ct::BiasKnots>(t_begin, window_dt_ns_, 1);
-    bias_->setGyroKnot(0, anchor_bg_);
+    bias_ = std::make_unique<ct::BiasKnots>(t_begin, biasKnotDt(), 2);
+    for (int k = 0; k < bias_->numKnots(); ++k) {
+      bias_->setGyroKnot(k, anchor_bg_);
+      bias_->setAccelKnot(k, anchor_ba_);
+    }
     last_n_cp_ = 1;
 
     auto seed = buildSeed(mg.imu, t_begin, t_end);
     spline_->extendTo(t_end, seed, 1);
+    bias_->extendTo(t_end);
 
     // Insert the cold-start deskew product (or the raw scan as a fallback) at the
     // identity pose so the map anchors odom; this is the only map seed before the
@@ -1799,6 +1641,7 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   const int n_cp = selectKnotDensity(mg.imu);
   auto seed = buildSeed(mg.imu, last_solved_t_, t_end);
   spline_->extendTo(t_end, seed, n_cp);
+  bias_->extendTo(t_end);
   // Refresh the trailing knots the previous solve held constant (no real measurement
   // support; see the pinning rule in solveWindow): their stored values are pure
   // extrapolation, never entered the prior, and this sweep's IMU integration is a
@@ -1858,52 +1701,12 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   GnssContext gctx;
   gateGnss(group, t_end, &gctx);
 
-  // TEMP-DIAG: seed pose/velocity at the sweep end before the solve runs.
-  {
-    static int diag_sweep = 0;
-    if (diag_sweep++ < 25 && spline_->covers(t_end)) {
-      const Pose ps = spline_->pose(t_end);
-      const Eigen::Vector3d vs = spline_->linearVelocityWorld(t_end);
-      fprintf(stderr,
-              "[DIAG] sweep %d SEED  t_end=%.3f p=(%.3f %.3f %.3f) |v|=%.3f anchor=(%.3f %.3f %.3f) av=%.3f\n",
-              diag_sweep, to_seconds(t_end - traj_start_t_), ps.t.x(), ps.t.y(), ps.t.z(),
-              vs.norm(), anchor_pose_.t.x(), anchor_pose_.t.y(), anchor_pose_.t.z(),
-              anchor_vel_.norm());
-      if (ps.t.norm() > 100.0) {
-        spline_->dumpTail(stderr, 8);
-      }
-    }
-  }
-
   const auto t_solve = Clock::now();
   const int accepted =
       solveWindow(group, last_solved_t_, t_end, &scan_ds, &hits,
                   vctx.img != nullptr ? &vctx : nullptr, gctx.fixes.empty() ? nullptr : &gctx);
   diag_.solve_time_ms = ms_since(t_solve);
   have_solved_ = true;
-
-  // TEMP-DIAG: post-solve pose/velocity at the same time.
-  {
-    static int diag_sweep2 = 0;
-    if (diag_sweep2++ < 25 && spline_->covers(t_end)) {
-      const Pose pp = spline_->pose(t_end);
-      const Eigen::Vector3d vp = spline_->linearVelocityWorld(t_end);
-      // Edge-effect probe: velocity read at t_end vs one and two knot intervals
-      // inside the window. A sane interior with a wild edge indicts the trailing
-      // knots' weak data support.
-      const Timestamp t_in1 = t_end - 100 * 1000000LL;
-      const Timestamp t_in2 = t_end - 200 * 1000000LL;
-      const double v_in1 =
-          spline_->covers(t_in1) ? spline_->linearVelocityWorld(t_in1).norm() : -1.0;
-      const double v_in2 =
-          spline_->covers(t_in2) ? spline_->linearVelocityWorld(t_in2).norm() : -1.0;
-      fprintf(stderr,
-              "[DIAG] sweep %d POST  p=(%.3f %.3f %.3f) |v|=%.3f |v-100ms|=%.3f "
-              "|v-200ms|=%.3f accepted=%d iters=%d outer=%d\n",
-              diag_sweep2, pp.t.x(), pp.t.y(), pp.t.z(), vp.norm(), v_in1, v_in2, accepted,
-              diag_.iterations, diag_.outer_iters);
-    }
-  }
 
   // The body pose / velocity at the sweep end drive the live state and become the
   // next sweep's integration anchor (decoupled from the solver storage).
@@ -1933,7 +1736,7 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   live_stamp_ = t_end;
   last_solved_t_ = t_end;
 
-  // ---- Visual map lifecycle (§5.1 step 7): carry the solved exposure forward, then
+  // ---- Visual map lifecycle: carry the solved exposure forward, then
   // re-score / add observations against the now-solved pose, promote this sweep's
   // accepted hits to new visual points, and box-evict points that left the active box.
   // Promotion uses the accepted LiDAR hits (which carry world point + fitted plane
@@ -1967,6 +1770,16 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
     if (telemetry_->enabled("frontend/visual/n_tracked")) {
       telemetry_->scalar("frontend/visual/n_tracked", static_cast<double>(vctx.stats.warped),
                          t_end);
+    }
+    // Funnel observability: map population and per-frame candidate count localize a
+    // tracking dropout to promotion, candidacy gating, or the warp/NCC stages.
+    if (vmap_ && telemetry_->enabled("frontend/visual/map_points")) {
+      telemetry_->scalar("frontend/visual/map_points", static_cast<double>(vmap_->size()),
+                         t_end);
+    }
+    if (telemetry_->enabled("frontend/visual/n_candidates")) {
+      telemetry_->scalar("frontend/visual/n_candidates",
+                         static_cast<double>(vctx.stats.candidates), t_end);
     }
     if (telemetry_->enabled("frontend/visual/n_converged")) {
       telemetry_->scalar("frontend/visual/n_converged", static_cast<double>(vctx.stats.accepted),

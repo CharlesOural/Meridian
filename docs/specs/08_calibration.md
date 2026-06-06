@@ -303,6 +303,21 @@ densities) and `imu_acc_bias_rw`, `imu_gyr_bias_rw` (bias random-walk) — *are*
 the IMU's factory intrinsics. They feed the CT IMU-derivative residual noise and
 the restart-fallback preintegration noise (the analogue of FAST-LIO
 `set_gyr_cov` / `set_acc_cov` / `process_noise_cov`, `use-ikfom.hpp:35–43`).
+
+> **Units convention — the `CalibrationSet` fields carry standard deviations, the
+> config carries variances.** The `imu_acc_noise` / `imu_gyr_noise` /
+> `imu_acc_bias_rw` / `imu_gyr_bias_rw` fields on `CalibrationSet` are the
+> **continuous-time noise densities as standard deviations** (e.g.
+> $\mathrm{(m/s^2)}/\sqrt{\mathrm{Hz}}$, $\mathrm{(rad/s)}/\sqrt{\mathrm{Hz}}$),
+> because the residual assemblers weight by $1/\sigma$ and $1/(\sigma\sqrt{dt})$
+> directly. The runtime config (spec 02 §10) instead carries the **squared**
+> densities — `sensors.imu.cov_acc` / `cov_gyr` (and `b_acc_cov` / `b_gyr_cov`) are
+> **variances** ($\mathrm{(m/s^2)^2}$, $\mathrm{(rad/s)^2}$). The bootstrap importer
+> `calibrationFromConfig` therefore takes the **square root** of each configured
+> value when it populates the `CalibrationSet`. A config author writes variances; a
+> reader of `CalibrationSet` gets std-devs. Crossing the two (feeding a variance
+> where a std-dev is expected, or vice versa) silently mis-weights every IMU
+> residual — keep the convention straight by field, not by intuition.
 Source: an **Allan-variance** run (Kalibr's `imu_utils` / `kalibr_allan`),
 shipped by the evaluation datasets ([`DATASET.md`](../DATASET.md):
 "Kalibr-format … + IMU noise"). These are held **fixed** (online IMU-intrinsic
@@ -556,6 +571,15 @@ is L3.
 
 ---
 
+> **Identity-default guard on configured extrinsics.** A defaulted (identity)
+> extrinsic is a syntactically valid value, so absence is only knowable at parse
+> time: the loader records `extrinsic_set` per sensor. A missing camera extrinsic
+> withholds the CamLink entry from the `CalibrationSet`, which makes the front-end
+> disable the visual stage loudly (`frontend/visual/disabled`) instead of running
+> with a sideways frustum; a missing LiDAR extrinsic warns once at startup
+> (`sensors/lidar/extrinsic_default`) since LIO can legitimately run at identity on
+> a bench rig but must never mistake it for a calibration.
+
 ## 7. Temporal calibration (time offsets)
 
 Temporal calibration is the *time* twin of the geometric extrinsic: the
@@ -596,6 +620,25 @@ camera–IMU time offset (§8). For a hardware-synced rig
 is $t_d \approx 0$ with small $\sigma$; for a software-synced rig the prior is
 whatever L0's §7 estimator converged to, with its $\sigma_{o_s}$.
 
+> **Resolved — constant per-sensor stamp correction is wired through the intake.**
+> `sensors.camera.time_offset_ms` and `sensors.lidar.time_offset_ms` apply a
+> constant correction onto the body-IMU timeline ($t_{corr} = t_{sensor} +
+> \text{offset}$) once, in the pipeline's `ingest()` overloads — *before*
+> validation and aggregation, so every stamp-driven decision (monotonicity, group
+> assembly, image–sweep matching) sees corrected time, identically live and in
+> replay. Online $t_d$ refinement remains off by default (§7.3).
+>
+> **Calibration-session timeshifts do NOT automatically transfer to a recording**
+> — this is a hard rule, established twice on FusionPortable: the Kalibr session
+> reports −137 ms for the LiDAR and +119 ms for the frame camera, yet the bag A/B
+> verdict is **0 ms for both** (the GPIO-triggered streams are already stamp-
+> disciplined; applying +119 ms degrades patch convergence and ATE, −119 ms pushes
+> every image outside its sweep's matching window). Hardware sync paths differ per
+> sensor and per recording: set a `time_offset_ms` only after an empirical A/B on
+> the actual data (visual-funnel telemetry + ATE), never from the session value
+> alone. The importer therefore reports `timeshift_sensor_bodyimu` but does not
+> own the config key.
+
 ### 7.3 Online temporal refinement (optional)
 
 When `refine_time_online == true`, $t_d$ becomes a scalar graph variable. Its
@@ -635,7 +678,11 @@ a `CalibrationSet`:
   (`intrinsics: [fx, fy, cx, cy]`, `distortion_model`, `distortion_coeffs`,
   `resolution`), and `T_cam_imu` → inverted to `Extrinsic{parent=ImuLink,
   child=CamLink, T_parent_child = inv(T_cam_imu)}`; plus `timeshift_cam_imu` →
-  `time_offset_ns` (Kalibr reports seconds; convert to int64 ns).
+  `time_offset_ns` (Kalibr reports seconds; convert to int64 ns). The imported
+  `time_offset_ns` populates the prior, **but the front-end intake does not yet
+  apply it** (§7.2 known seam): FusionPortable's +79 ms camera offset
+  (`timeshift_sensor_bodyimu`) is imported into the prior and left uncompensated at
+  sample time until $t_d$ is threaded through the CT spline phase.
 * **`*-imu.yaml`** → `imu_acc_noise = accelerometer_noise_density`,
   `imu_gyr_noise = gyroscope_noise_density`,
   `imu_acc_bias_rw = accelerometer_random_walk`,
@@ -656,10 +703,18 @@ a `CalibrationSet`:
 | `cam0.resolution` | `IntrinsicsCamera{width,height}` | direct |
 | `cam0.T_cam_imu` (4×4) | `Extrinsic::T_parent_child = inv(·)` | Meridian parent=$F_e$=imu; Kalibr gives cam←imu |
 | `cam0.timeshift_cam_imu` (s) | `Extrinsic::time_offset_ns` | ×1e9, round to int64; `time_offset_std_ns` from config or Kalibr report |
-| `imu.accelerometer_noise_density` | `CalibrationSet::imu_acc_noise` | continuous-time |
-| `imu.gyroscope_noise_density` | `CalibrationSet::imu_gyr_noise` | continuous-time |
-| `imu.accelerometer_random_walk` | `CalibrationSet::imu_acc_bias_rw` | bias RW |
-| `imu.gyroscope_random_walk` | `CalibrationSet::imu_gyr_bias_rw` | bias RW |
+| `imu.accelerometer_noise_density` | `CalibrationSet::imu_acc_noise` | continuous-time **std-dev**; copied directly (Kalibr already reports a density) |
+| `imu.gyroscope_noise_density` | `CalibrationSet::imu_gyr_noise` | continuous-time **std-dev**; copied directly |
+| `imu.accelerometer_random_walk` | `CalibrationSet::imu_acc_bias_rw` | bias RW **std-dev**; copied directly |
+| `imu.gyroscope_random_walk` | `CalibrationSet::imu_gyr_bias_rw` | bias RW **std-dev**; copied directly |
+
+> **Kalibr vs. config-YAML path differ on the IMU-noise convention.** Kalibr's
+> `*-imu.yaml` reports the densities as **standard deviations**, so `load_kalibr`
+> copies them straight into the (std-dev) `CalibrationSet` fields — no square root.
+> The runtime config path is different: `sensors.imu.cov_acc` / `cov_gyr` (and the
+> bias-RW twins) are **variances**, and `calibrationFromConfig` takes their square
+> root before populating the same fields (§4.2). Same destination field, two source
+> conventions — Kalibr already-std, config-YAML squared.
 
 ### 8.3 Prior covariance and refine flags on import
 
@@ -782,6 +837,10 @@ calib:
       max_drift_trans_m: 0.05
       max_drift_rot_deg: 1.0
     - child: cam0                # the camera
+      # T_imu_cam, as [tx,ty,tz,qx,qy,qz,qw]. REQUIRED for the visual stage: with it
+      # absent the importer leaves an identity transform, which silently breaks
+      # promotion of map points into the camera frame and the visual map stays empty.
+      # validate() fails fast on a missing camera extrinsic rather than defaulting it.
       refine_online: true        # thermal/mounting drift is real
       prior_trans_std_m: 0.01
       prior_rot_std_deg: 0.3
@@ -815,6 +874,15 @@ calib:
   must have either a prior in `calib.extrinsics` or a default; a sensor with
   **no** extrinsic and `refine_online=false` fails fast (you cannot fuse a sensor
   you cannot place).
+* **The camera extrinsic (`T_imu_cam`, `[tx,ty,tz,qx,qy,qz,qw]`) is mandatory
+  whenever the visual stage is enabled — `validate()` must fail fast on its
+  absence, never silently default to identity.** An identity `T_imu_cam` does *not*
+  raise `have_cam_extrinsic_` to false (the importer still inserts a `CamLink`
+  `Extrinsic`, so the visual stage thinks it has a placement); instead it places
+  every map point at the IMU origin, which silently breaks promotion and leaves the
+  visual map empty for the whole run. A missing-but-defaulted extrinsic is the worst
+  failure class — it looks healthy and produces nothing — so the validator rejects
+  it up front rather than letting the default-constructed identity through.
 * `max_drift_*` must be ≥ a few prior σ (a box tighter than the prior is a
   configuration error).
 * A sensor may not be both `refine_online: true` here **and** flagged for the

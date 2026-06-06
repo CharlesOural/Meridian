@@ -4,6 +4,7 @@
 #include <vector>
 
 #include <builtin_interfaces/msg/time.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
@@ -34,6 +35,11 @@ RawImuFrame to_raw_imu(const sensor_msgs::msg::Imu& msg, Timestamp host_arrival)
 // nullopt for anything else.
 std::optional<RawCameraFrame> to_raw_camera(const sensor_msgs::msg::Image& msg,
                                             Timestamp host_arrival);
+
+// JPEG/PNG CompressedImage payloads, decoded straight to a mono8 frame. Returns
+// nullopt when the payload does not decode to an 8-bit image.
+std::optional<RawCameraFrame> to_raw_camera_compressed(
+    const sensor_msgs::msg::CompressedImage& msg, Timestamp host_arrival);
 
 RawGnssFrame to_raw_gnss(const sensor_msgs::msg::NavSatFix& msg, Timestamp host_arrival);
 

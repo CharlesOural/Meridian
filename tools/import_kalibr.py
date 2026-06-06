@@ -12,6 +12,7 @@ rewrites exactly six value tokens in the Meridian config:
     sensors.camera.intrinsics   sensors.camera.distortion_model
     sensors.camera.distortion_coeffs
     sensors.camera.width        sensors.camera.height
+    sensors.camera.extrinsic
 
 Conventions:
 
@@ -28,6 +29,14 @@ The active calibration is `ouster00.yaml` option 1 (uncommented); option 2 is a
 commented-out alternative and is ignored.
 
 Quaternion order is (qw, qx, qy, qz) as the file comments state.
+
+Camera extrinsic direction. Meridian's `sensors.camera.extrinsic` is T_imu_cam as
+[tx, ty, tz, qx, qy, qz, qw]: it maps a camera-frame point into the IMU
+(estimation) frame. The camera calib stores `quaternion_sensor_bodyimu`/
+`translation_sensor_bodyimu` = T_cam_bodyimu (same `*_sensor_X` = T_sensor_X
+convention as the LiDAR file), so this tool inverts it. Without this key the
+front-end falls back to an identity camera extrinsic, which silently breaks
+visual-point promotion -- the camera frustum faces the wrong way.
 
 IMU noise units. The source files give continuous-time noise *densities*
 (accelerometer m/s^2/sqrt(Hz), gyroscope rad/s/sqrt(Hz)) and bias random walks
@@ -110,6 +119,38 @@ def invert_rt(R, t):
     return Rt, ti
 
 
+def rotation_to_quat(R):
+    """(qx, qy, qz, qw) for a row-major 3x3 rotation, branching on the largest
+    diagonal term so the divisor stays well away from zero for any rotation."""
+    tr = R[0][0] + R[1][1] + R[2][2]
+    if tr > 0.0:
+        sq = math.sqrt(tr + 1.0) * 2.0
+        qw = 0.25 * sq
+        qx = (R[2][1] - R[1][2]) / sq
+        qy = (R[0][2] - R[2][0]) / sq
+        qz = (R[1][0] - R[0][1]) / sq
+    elif R[0][0] >= R[1][1] and R[0][0] >= R[2][2]:
+        sq = math.sqrt(1.0 + R[0][0] - R[1][1] - R[2][2]) * 2.0
+        qw = (R[2][1] - R[1][2]) / sq
+        qx = 0.25 * sq
+        qy = (R[0][1] + R[1][0]) / sq
+        qz = (R[0][2] + R[2][0]) / sq
+    elif R[1][1] >= R[2][2]:
+        sq = math.sqrt(1.0 + R[1][1] - R[0][0] - R[2][2]) * 2.0
+        qw = (R[0][2] - R[2][0]) / sq
+        qx = (R[0][1] + R[1][0]) / sq
+        qy = 0.25 * sq
+        qz = (R[1][2] + R[2][1]) / sq
+    else:
+        sq = math.sqrt(1.0 + R[2][2] - R[0][0] - R[1][1]) * 2.0
+        qw = (R[1][0] - R[0][1]) / sq
+        qx = (R[0][2] + R[2][0]) / sq
+        qy = (R[1][2] + R[2][1]) / sq
+        qz = 0.25 * sq
+    n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    return qx / n, qy / n, qz / n, qw / n
+
+
 def lidar_extrinsic(doc: dict, src: Path):
     """T_imu_lidar (R row-major 9-list, t 3-list) from the stored T_lidar_bodyimu."""
     q = require(doc, 'quaternion_sensor_bodyimu', src)
@@ -153,6 +194,18 @@ def camera_intrinsics(doc: dict, src: Path):
     width = int(doc.get('image_width', 0))
     height = int(doc.get('image_height', 0))
     return [fx, fy, cx, cy], model, dist, width, height
+
+
+def camera_extrinsic(doc: dict, src: Path):
+    """T_imu_cam as [tx, ty, tz, qx, qy, qz, qw] from the stored T_cam_bodyimu."""
+    q = require(doc, 'quaternion_sensor_bodyimu', src)
+    t = require(doc, 'translation_sensor_bodyimu', src)
+    if len(q) != 4 or len(t) != 3:
+        raise SystemExit(f'error: {src} body-imu extrinsic has wrong shape')
+    R_cam_imu = quat_to_rotation(*q)
+    R_imu_cam, t_imu_cam = invert_rt(R_cam_imu, list(t))
+    qx, qy, qz, qw = rotation_to_quat(R_imu_cam)
+    return list(t_imu_cam) + [qx, qy, qz, qw]
 
 
 def imu_noise(doc: dict, src: Path):
@@ -246,8 +299,9 @@ def main() -> int:
             raise SystemExit(f'error: {src} not found')
 
     R_flat, t_vec = lidar_extrinsic(load_calib(lidar_src), lidar_src)
-    intr, dist_model, dist_coeffs, cam_w, cam_h = camera_intrinsics(
-        load_calib(cam_src), cam_src)
+    cam_doc = load_calib(cam_src)
+    intr, dist_model, dist_coeffs, cam_w, cam_h = camera_intrinsics(cam_doc, cam_src)
+    cam_ext = camera_extrinsic(cam_doc, cam_src)
     cov_acc, cov_gyr, b_acc_cov, b_gyr_cov = imu_noise(load_calib(imu_src), imu_src)
 
     # Render the matrix on one line; the config's existing 3-row layout is replaced
@@ -255,6 +309,7 @@ def main() -> int:
     R_str = fmt_seq(R_flat)
     t_str = fmt_seq(t_vec)
     intr_str = fmt_seq(intr)
+    cam_ext_str = fmt_seq(cam_ext)
     coeffs_str = fmt_seq(dist_coeffs)
 
     text = args.config.read_text()
@@ -264,6 +319,7 @@ def main() -> int:
         ('seq',    '      ', 'intrinsics',        intr_str,          'camera.intrinsics'),
         ('scalar', '      ', 'distortion_model',  dist_model,        'camera.distortion_model'),
         ('seq',    '      ', 'distortion_coeffs', coeffs_str,        'camera.distortion_coeffs'),
+        ('seq',    '      ', 'extrinsic',         cam_ext_str,       'camera.extrinsic'),
         ('scalar', '      ', 'width',             str(cam_w),        'camera.width'),
         ('scalar', '      ', 'height',            str(cam_h),        'camera.height'),
         ('scalar', '      ', 'cov_acc',           fmt_num(cov_acc),  'imu.cov_acc'),
@@ -287,6 +343,7 @@ def main() -> int:
         ('camera.intrinsics',         cam_src.name,   intr_str),
         ('camera.distortion_model',   cam_src.name,   dist_model),
         ('camera.distortion_coeffs',  cam_src.name,   coeffs_str),
+        ('camera.extrinsic',          cam_src.name,   cam_ext_str),
         ('camera.width',              cam_src.name,   str(cam_w)),
         ('camera.height',             cam_src.name,   str(cam_h)),
         ('imu.cov_acc',               imu_src.name,   fmt_num(cov_acc)),
@@ -317,8 +374,8 @@ def main() -> int:
 
     # Round-trip: re-read and assert every owned value parses back to what we wrote.
     check = load_config_values(args.config)
-    assert_roundtrip(check, R_flat, t_vec, intr, dist_model, dist_coeffs, cam_w, cam_h,
-                     cov_acc, cov_gyr, b_acc_cov, b_gyr_cov)
+    assert_roundtrip(check, R_flat, t_vec, intr, dist_model, dist_coeffs, cam_ext,
+                     cam_w, cam_h, cov_acc, cov_gyr, b_acc_cov, b_gyr_cov)
     print()
     print(f'{args.config}: written and round-trip verified.')
     return 0
@@ -333,6 +390,7 @@ def load_config_values(path: Path) -> dict:
         'intrinsics': s['camera']['intrinsics'],
         'distortion_model': s['camera']['distortion_model'],
         'distortion_coeffs': s['camera']['distortion_coeffs'],
+        'cam_extrinsic': s['camera']['extrinsic'],
         'width': s['camera']['width'],
         'height': s['camera']['height'],
         'cov_acc': s['imu']['cov_acc'],
@@ -342,8 +400,8 @@ def load_config_values(path: Path) -> dict:
     }
 
 
-def assert_roundtrip(got, R_flat, t_vec, intr, dist_model, dist_coeffs, cam_w, cam_h,
-                     cov_acc, cov_gyr, b_acc_cov, b_gyr_cov):
+def assert_roundtrip(got, R_flat, t_vec, intr, dist_model, dist_coeffs, cam_ext,
+                     cam_w, cam_h, cov_acc, cov_gyr, b_acc_cov, b_gyr_cov):
     def close(a, b):
         return abs(float(a) - float(b)) <= 1e-12 + 1e-9 * abs(float(b))
 
@@ -352,6 +410,7 @@ def assert_roundtrip(got, R_flat, t_vec, intr, dist_model, dist_coeffs, cam_w, c
         ('extrinsic_T', t_vec, got['extrinsic_T']),
         ('intrinsics', intr, got['intrinsics']),
         ('distortion_coeffs', dist_coeffs, got['distortion_coeffs']),
+        ('camera.extrinsic', cam_ext, got['cam_extrinsic']),
     ):
         if len(have) != len(want) or not all(close(h, w) for h, w in zip(have, want)):
             raise SystemExit(f'error: round-trip mismatch on {name}: '

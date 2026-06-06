@@ -523,6 +523,23 @@ mid-exposure once, at L0, so every downstream consumer (the front-end residual, 
 module re-derives it. The `CameraFrame::stamp` contract (spec 01 §4.3 and the §2
 obligation table) means mid-exposure everywhere the field is read.
 
+> **Known seam — uncompensated camera↔body-IMU time offset (FusionPortable).**
+> The mid-exposure convention corrects the *intra-frame* exposure bias, but it
+> does not correct a residual *inter-sensor* offset between the camera shutter
+> timeline and the body-IMU timeline. On the FusionPortable rig that L0 currently
+> replays, Kalibr's calibration reports a **`timeshift_sensor_bodyimu` of
+> +79 ms** for the event camera relative to the body IMU — i.e. the camera stamp
+> trails the IMU instant it should align to by that amount. The front-end at
+> present consumes the image stamp as-is (the visual residual queries `T(t)` at
+> `CameraFrame::stamp` with no per-sensor time correction applied), so this 79 ms
+> is **not compensated**. At any non-trivial platform speed that is a systematic
+> reprojection bias on every photometric constraint (79 ms at 1 m/s ≈ 8 cm of
+> phantom translation), so the photometric stage runs degraded on this dataset
+> until the offset is folded in. The right place for the fix is the §7 estimator
+> path (carry a per-sensor camera offset into the stamp, the same way the IMU↔
+> LiDAR offset is handled) rather than a hand-tuned constant; it is recorded here
+> as an open seam, not a committed behaviour.
+
 **Stamping paths (priority):**
 
 1. **GPIO hardware trigger** (`HwTrigger`): the camera is triggered by a pulse
@@ -546,6 +563,14 @@ applied, and L2 falls back to robust photometric weighting).
 **Encoding.** L0 passes the raw encoding through (`Mono8`/`Bayer_RGGB8`/`RGB8`);
 debayering and pyramid construction are **L1** (spec 01 §7.2 note). L0 must not
 allocate a pyramid.
+
+**Compressed streams.** When `sensors.camera.compressed: true`, the wire payload
+is a JPEG/PNG `CompressedImage`; the transport wrapper decodes it straight to a
+tightly-packed `Mono8` frame at ingest (the photometric stage consumes intensity
+only, and the JPEG luma plane already exists at the decode). A payload that does
+not decode to an 8-bit image is dropped with a throttled warning, never forwarded
+malformed. This is how the high-resolution frame cameras (compressed-only in the
+FusionPortable bags) enter the same intake as a raw stream.
 
 ### 4.4 `GnssSource`
 
@@ -587,6 +612,18 @@ the offline path that makes "the same core runs on a bag and on the robot" true
 ---
 
 ## 5. The time model (`meridian_time`)
+
+> **Constant per-sensor stamp correction (`time_offset_ms`).**
+> `sensors.lidar.time_offset_ms` and `sensors.camera.time_offset_ms` apply a
+> constant shift onto the body-IMU timeline (t_corrected = t_sensor + offset) once,
+> in the pipeline `ingest()` overloads — BEFORE the validator and the aggregator,
+> so every stamp-driven decision (monotonicity clamps, rate estimation, group
+> assembly, image–sweep matching) operates on corrected time, identically live and
+> in replay. LiDAR per-point offsets are relative to the sweep reference and ride
+> along unchanged. Default 0 = bit-identical to the uncorrected path. A
+> calibration-session timeshift is NOT evidence for a recording (hardware sync
+> paths differ per sensor and per session — see spec 08 §7.2 for the FusionPortable
+> double-verdict): set the key only after an empirical A/B on the actual data.
 
 ### 5.1 Three timelines and the one we estimate
 
@@ -803,6 +840,15 @@ arbitrary-but-consistent reference):
 * **Offset std** $\sigma_{o_s}$ — fed to health (§9) *and* to L2 as a
   time-jitter measurement-noise inflation (a sensor we can only time to ±2 ms
   should contribute weaker constraints than one timed to ±50 µs).
+
+> **Camera offset is the unwired case.** The estimator is specified for every
+> `ClockId`, but the **camera** offset path is not yet folded into the stamp the
+> front-end consumes: on the FusionPortable rig the camera carries a known
+> +79 ms `timeshift_sensor_bodyimu` (Kalibr) relative to the body IMU that is
+> currently **not compensated** (see §4.3, *Known seam*). The intended fix lives
+> here — estimate (or load) `ClockId::Cam`'s offset against the body-IMU
+> reference and apply it through `to_meridian`, exactly as the IMU↔LiDAR offset
+> is — rather than as a separate one-off correction at the camera source.
 
 ### 7.2 The estimator: cross-correlation of motion signals + recursive filter
 

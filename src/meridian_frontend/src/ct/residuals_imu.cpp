@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 #include <basalt/spline/ceres_spline_helper.h>
@@ -257,6 +258,44 @@ BiasKnots::BiasKnots(Timestamp t0, Duration dt_ns, int n_knots)
   accel_.assign(static_cast<std::size_t>(n), Eigen::Vector3d::Zero());
 }
 
+void BiasKnots::extendTo(Timestamp t) {
+  if (dt_ns_ <= 0) {
+    return;
+  }
+  // Appended knots copy the last value: under the random-walk model the increment
+  // mean is zero, so the previous estimate is the correct warm start.
+  while (knotTime(numKnots() - 1) < t) {
+    gyro_.push_back(gyro_.back());
+    accel_.push_back(accel_.back());
+  }
+}
+
+void BiasKnots::dropOldest(int n) {
+  const int max_drop = numKnots() - 2;
+  const int drop = std::clamp(n, 0, std::max(0, max_drop));
+  for (int i = 0; i < drop; ++i) {
+    gyro_.pop_front();
+    accel_.pop_front();
+  }
+  t0_ += static_cast<Timestamp>(drop) * dt_ns_;
+}
+
+int BiasKnots::lowestKnotIndexOf(const std::vector<const double*>& ptrs) const {
+  if (ptrs.empty()) {
+    return std::numeric_limits<int>::max();
+  }
+  for (int k = 0; k < numKnots(); ++k) {
+    const double* g = gyro_[static_cast<std::size_t>(k)].data();
+    const double* a = accel_[static_cast<std::size_t>(k)].data();
+    for (const double* p : ptrs) {
+      if (p == g || p == a) {
+        return k;
+      }
+    }
+  }
+  return std::numeric_limits<int>::max();
+}
+
 int BiasKnots::leftIndex(Timestamp t) const {
   if (numKnots() <= 1 || dt_ns_ <= 0) {
     return 0;
@@ -492,8 +531,13 @@ int addBiasRandomWalk(ceres::Problem& problem, BiasKnots& bias,
     return 0;
   }
   const double dt_s = to_seconds(bias.knotDt());
-  // Continuous-time random walk: increment variance is sigma^2 * dt, so the
-  // sqrt-information weight is 1 / (sigma * sqrt(dt)) — longer gaps tie weaker.
+  // Continuous-time random walk: increment variance is sigma^2 * dt, so the tie's
+  // sqrt-information weight is 1 / (sigma * sqrt(dt)) -- longer gaps tie weaker. The
+  // tie is a MODEL constraint, not a data increment: it appears at full weight in
+  // every problem whose knots are resident, and it never enters the marginalization
+  // prior (it touches no dropped spline knot), so re-stating it per solve counts it
+  // exactly once per problem. A departing bias knot takes its tie into the prior via
+  // the Schur drop in slideWindow.
   const double sqrt_dt = std::sqrt(dt_s > 0.0 ? dt_s : 1.0);
   const double w_bg = 1.0 / (weights.sigma_bias_gyro * sqrt_dt);
   const double w_ba = 1.0 / (weights.sigma_bias_accel * sqrt_dt);

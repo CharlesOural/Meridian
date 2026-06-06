@@ -59,9 +59,8 @@ struct VisualPoint {
   std::int64_t id = 0;     // stable creation order, deterministic tie-break
 };
 
-// Tunables for the visual-point map, defaulted to the spec's visual.* keys. Built
-// from FrontendVisual where those fields exist; the remaining keys carry the spec
-// defaults until the config schema gains them.
+// Tunables for the visual-point map. Built from FrontendVisual where those fields
+// exist; the remaining knobs keep their defaults until the config schema gains them.
 struct VisualMapConfig {
   int patch = VisualObservation::kPatch;    // visual.patch_size
   int levels = VisualObservation::kLevels;  // visual.pyramid_levels
@@ -74,15 +73,15 @@ struct VisualMapConfig {
   double ref_converged_angle_deg = 30.0;    // visual.ref_converged_angle_deg
   double active_box_m = 60.0;               // visual.active_box_m
   double voxel_m = 0.5;                     // shared LiDAR voxel hash pitch
-  double depth_continuity_m = 0.5;          // §3.2 depth-continuity gate
+  double depth_continuity_m = 0.5;          // depth-continuity gate
   double min_score_keep = 0.0;              // score-evict floor (<=0 disables)
 
   VisualMapConfig() = default;
-  // Reads the fields FrontendVisual currently exposes; the rest keep spec defaults.
+  // Reads the fields FrontendVisual currently exposes; the rest keep their defaults.
   explicit VisualMapConfig(const FrontendVisual& v);
 };
 
-// The active visual-point map (§3.2 / §3.2.1): promotes LiDAR-map points to visual
+// The active visual-point map: promotes LiDAR-map points to visual
 // points one-best-per-grid-cell, serves frustum/grid/depth-gated candidates to the
 // photometric residual, runs the reference-patch lifecycle, and box-evicts points
 // that leave the active box so memory stays bounded.

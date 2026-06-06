@@ -55,7 +55,7 @@ public:
   // real time gap), and the first-frame prior pull when prior_std > 0 (fixing the
   // block when prior_std == 0). Idempotent given a fixed frame set; call once after
   // all frames are added and before the solve. prior / prior_std come from the
-  // camera intrinsics (spec 01 §5.1).
+  // camera calibration.
   void addTo(ceres::Problem& problem, double prior, double prior_std);
 
 private:
@@ -90,8 +90,8 @@ struct VisualUsedPoint {
 // Adds the sparse-direct photometric residuals for one camera frame. For each
 // visible candidate (one-best-per-grid-cell from the map), the reference patch is
 // affine-warped into the current view via the LiDAR-plane homography
-// H = R_cur_ref * (n.x_ref I - t n^T) (FAST-LIVO2 form; equivalent to R + t n^T/d up
-// to projective scale), the best pyramid level is chosen by the warp determinant,
+// H = R_cur_ref * (n.x_ref I - t n^T) -- equivalent to R + t n^T/d up to projective
+// scale -- the best pyramid level is chosen by the warp determinant,
 // and the candidate is run through the fixed gate order grid -> depth -> warp/level
 // -> NCC -> SSD before any residual is built. Survivors enter a DynamicAutoDiff cost
 // over the 4 SO(3) + 4 R^3 knot blocks of t_mid_expo's segment plus the frame's
@@ -131,7 +131,7 @@ bool warpMatrixAffineHomography(const CameraModel& cam, const Eigen::Vector2d& p
                                 int level_ref, Eigen::Matrix2d* A_cur_ref);
 
 // Picks the pyramid level whose warped patch is closest to unit pixel density:
-// climbs while det(A) > 3, capped at max_level. Mirrors FAST-LIVO2 getBestSearchLevel.
+// climbs while det(A) > 3, capped at max_level.
 int bestSearchLevel(const Eigen::Matrix2d& A_cur_ref, int max_level);
 
 // Degenerate-warp guard: |det A| in [det_min, det_max] and condition number (ratio of

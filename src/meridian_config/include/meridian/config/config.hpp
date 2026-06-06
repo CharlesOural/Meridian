@@ -107,6 +107,15 @@ struct LidarSensorConfig {
   // T_body_lidar: translation [m] and rotation of the LiDAR sensor frame in body.
   Eigen::Vector3d extrinsic_T = Eigen::Vector3d::Zero();
   Eigen::Matrix3d extrinsic_R = Eigen::Matrix3d::Identity();
+  // Whether the config supplied the extrinsic: an identity default is a valid-looking
+  // value, so absence can only be recorded at parse time. Consumers warn on default.
+  bool extrinsic_set = false;
+  // Constant stamp correction onto the body-IMU timeline, applied once at ingest
+  // (t_corrected = t_sensor + offset) BEFORE validation and aggregation, so every
+  // stamp-driven decision sees corrected time. Calibration-session timeshifts do not
+  // automatically transfer to a recording (hardware sync paths differ); set this only
+  // after an empirical check on the actual data.
+  double time_offset_ms = 0.0;
 };
 struct ImuSensorConfig {
   int id = 0;
@@ -142,8 +151,18 @@ struct CameraSensorConfig {
   std::string distortion_model = "none";
   std::array<double, 5> distortion_coeffs = {0, 0, 0, 0, 0};
   int width = 0, height = 0;
-  // T_body_cam: camera frame expressed in body.
+  // T_body_cam: camera frame expressed in body. extrinsic_set records whether the
+  // config supplied it: an identity default is indistinguishable from a real
+  // calibration by value, and consuming it silently aims the camera frustum along
+  // the wrong axis (the visual stage then runs but never promotes a point).
   Pose extrinsic{};
+  bool extrinsic_set = false;
+  // Constant stamp correction onto the body-IMU timeline (same semantics and caveat
+  // as the LiDAR key: t_corrected = t_sensor + offset, applied once at ingest).
+  double time_offset_ms = 0.0;
+  // The stream delivers JPEG/PNG CompressedImage payloads that the ingest layer must
+  // decode before conversion (the high-resolution frame cameras ship compressed).
+  bool compressed = false;
   CameraPhotometric photometric{};
   std::string trigger = "gpio";
   bool exposure_from_meta = true;
@@ -314,18 +333,16 @@ struct FrontendKeyframe {
 // cutoff so a starved step never publishes a barely-improved pose; the replay path
 // ignores time_limit_ms and runs the fixed schedule.
 struct FrontendSolver {
-  double time_limit_ms = 60.0;
+  double time_limit_ms = 90.0;
   int min_iterations = 2;
 };
-// Per-inner-iteration update clamp (scaled down preserving direction, not rejected).
-struct FrontendStep {
-  double max_step_trans_m = 0.5;
-  double max_step_rot_deg = 10.0;
-};
-// Physical box bounds on the IMU biases so an outlier burst cannot drive a bias absurd.
+// Physical box bounds on the IMU biases so an outlier burst cannot drive a bias
+// absurd, plus the cadence of the piecewise-linear bias timeline. Both biases are
+// free states tied by a continuous-time random walk between consecutive knots.
 struct FrontendBias {
-  double gyr_max = 0.5;  // [rad/s]
-  double acc_max = 5.0;  // [m/s^2]
+  double gyr_max = 0.5;     // [rad/s]
+  double acc_max = 5.0;     // [m/s^2]
+  double knot_dt_ms = 500;  // bias knot cadence [ms]
 };
 // Off-by-default low-weight jerk / angular-acceleration regularizer; engaged only on
 // under-excited spans (excitation below the floor and a degenerate eigenaxis).
@@ -350,7 +367,6 @@ struct FrontendConfig {
   double assoc_shift_thresh_m = 0.02;
   double assoc_shift_thresh_deg = 0.2;
   FrontendSolver solver{};
-  FrontendStep solve{};
   FrontendBias bias{};
   FrontendMotionReg motion_reg{};
   FrontendSpline spline{};

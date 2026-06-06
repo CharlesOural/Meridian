@@ -398,12 +398,21 @@ meridian:
                 extrinsic_T: [..], extrinsic_R: [..] }     # single LiDAR
     imu:      { topic: /os/imu, rate_hz: 200, cov_acc: .., cov_gyr: ..,
                 b_acc_cov: .., b_gyr_cov: .. }              # single IMU (estimation frame)
+              # cov_acc/cov_gyr and b_acc_cov/b_gyr_cov are SQUARED continuous-time
+              # noise densities — i.e. variances ((m/s^2)^2, (rad/s)^2, and the bias
+              # random-walk variances), NOT standard deviations. calibration_from_config
+              # takes the sqrt of each to fill the CalibrationSet noise-density fields.
     camera:   { topic: /cam0, model: pinhole, intrinsics: [..], extrinsic: [..],
                 photometric: { exposure_comp: true } }      # single camera, sparse-direct
+              # extrinsic is [tx,ty,tz,qx,qy,qz,qw] = T_imu_cam (camera optical frame
+              # -> body/IMU). It is REQUIRED for the visual stage: the front-end gates
+              # photometric fusion on a present camera extrinsic, so if the key is
+              # absent the visual map stays empty and the system silently runs LIO-only.
     gnss:     { topic: /gnss/fix, enable: true }
   preprocess: { blind: 0.5, point_filter_num: 3, voxel_surf_m: 0.5 }
   frontend:   { kind: ct_livo,                              # production CT estimator
                 spline: { order: cubic, knot_dt_ms: 25, window_knots: 8 },
+                bias: { gyr_max: 0.5, acc_max: 5.0, knot_dt_ms: 500 },  # multi-knot bias timeline
                 lidar: { voxel_map_m: 0.5 }, visual: { patch: 8, levels: 3 },
                 gnss: { use: true }, extrinsic_refine: true,
                 keyframe: { dist_m: 1.0, rot_deg: 10, time_s: 1.0 } }

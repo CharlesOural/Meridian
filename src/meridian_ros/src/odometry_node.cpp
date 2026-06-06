@@ -12,6 +12,7 @@
 #include <meridian_msgs/srv/set_debug_key.hpp>
 #include <meridian_msgs/srv/set_log_level.hpp>
 #include <meridian_msgs/srv/set_telemetry_rate.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
@@ -86,18 +87,36 @@ class OdometryNode : public rclcpp::Node {
           pipeline_->ingest(to_raw_imu(*msg, now_ns()));
         });
 
-    sub_image_ = create_subscription<sensor_msgs::msg::Image>(
-        cfg_.sensors.camera.topic, qos_small,
-        [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
-          auto f = to_raw_camera(*msg, now_ns());
-          if (!f) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
-                                 "dropping image: unsupported encoding '%s'",
-                                 msg->encoding.c_str());
-            return;
-          }
-          pipeline_->ingest(*f);
-        });
+    if (cfg_.sensors.camera.compressed) {
+      // JPEG/PNG-compressed stream (the high-resolution frame cameras ship this
+      // way): decode straight to grayscale here so the rest of the ingest chain
+      // sees the same mono8 frames a raw stream would deliver.
+      sub_image_compressed_ = create_subscription<sensor_msgs::msg::CompressedImage>(
+          cfg_.sensors.camera.topic, qos_small,
+          [this](sensor_msgs::msg::CompressedImage::ConstSharedPtr msg) {
+            auto f = to_raw_camera_compressed(*msg, now_ns());
+            if (!f) {
+              RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                                   "dropping compressed image: decode failed (format '%s')",
+                                   msg->format.c_str());
+              return;
+            }
+            pipeline_->ingest(*f);
+          });
+    } else {
+      sub_image_ = create_subscription<sensor_msgs::msg::Image>(
+          cfg_.sensors.camera.topic, qos_small,
+          [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
+            auto f = to_raw_camera(*msg, now_ns());
+            if (!f) {
+              RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                                   "dropping image: unsupported encoding '%s'",
+                                   msg->encoding.c_str());
+              return;
+            }
+            pipeline_->ingest(*f);
+          });
+    }
 
     if (cfg_.sensors.gnss.enable) {
       sub_gnss_ = create_subscription<sensor_msgs::msg::NavSatFix>(
@@ -191,6 +210,7 @@ class OdometryNode : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_cloud_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_image_;
+  rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_image_compressed_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr sub_gnss_;
 
   rclcpp::Service<meridian_msgs::srv::SetDebugKey>::SharedPtr srv_set_key_;
