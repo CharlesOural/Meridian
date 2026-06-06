@@ -68,14 +68,18 @@ private:
   std::function<Pose(Timestamp)> buildSeed(const std::vector<ImuSample>& imu, Timestamp t_begin,
                                            Timestamp t_end);
 
-  // Re-seed the trajectory at `t_begin` after a sweep gap that the current group's IMU
-  // cannot bridge. The spline and bias knots are rebuilt opening at t_begin, anchored
-  // at the last solved pose/velocity/bias (still the best estimate -- only time has
-  // advanced), the stale marginalization prior (whose blocks point into the discarded
-  // knots) is dropped, and the window bookkeeping is reset so the next seed integrates
-  // only this group's IMU. Gravity and the local map are preserved, so odom continuity
-  // and map registration survive the gap.
+  // Rebuilds the window state at `t_begin`: spline and bias knots reopened at the
+  // current anchor, the stale marginalization prior (whose blocks point into the
+  // discarded knots) dropped, bookkeeping reset. Gravity and the local map are
+  // preserved. The anchor itself is the caller's responsibility.
   void restartWindow(Timestamp t_begin);
+
+  // Unbridgeable-gap recovery: predicts the anchor across the data hole on constant
+  // velocity, rebuilds the window there, and re-seeds spline + map from this sweep
+  // WITHOUT solving it — directly after a reseed the gauge pins hold most of the only
+  // evaluable segment, so a solve would warp the sweep; the next sweep solves on a
+  // fully extendable window instead.
+  void reseedAfterGap(const PreprocessedGroup& group, Timestamp t_begin, Timestamp t_end);
 
   // Per-sweep visual context handed to solveWindow so the photometric residuals enter
   // the same Ceres problem as LiDAR/IMU. Null fields mean the visual stage is off this
@@ -134,10 +138,10 @@ private:
     Eigen::Vector3d t;     // pre-solve translation (r3 knots)
   };
 
-  // Snapshot the unique, non-constant SO(3)/R^3 control-point knots active over
-  // [t_begin, t_end] before a solve pass, so the increment can be clamped afterwards.
-  std::vector<KnotState> snapshotActiveKnots(ceres::Problem& problem, Timestamp t_begin,
-                                             Timestamp t_end) const;
+  // Snapshot every free SO(3)/R^3 control-point knot registered with the problem
+  // before a solve pass, so the increment can be clamped afterwards. Coverage must
+  // equal the solver's parameter set: any knot it can move, the clamp must see.
+  std::vector<KnotState> snapshotActiveKnots(ceres::Problem& problem) const;
 
   // Per-iteration step clamp: if any snapshotted knot's increment exceeds the
   // translation or rotation cap, scale EVERY active knot's increment uniformly by the
@@ -306,6 +310,11 @@ private:
   // forward from (decoupled from the spline so a failed solve cannot corrupt it).
   Pose anchor_pose_;
   Eigen::Vector3d anchor_vel_ = Eigen::Vector3d::Zero();
+  // Terminal velocity / body rate of the latest IMU-integrated seed, captured by
+  // buildSeed. They parameterize the tail anchors: the constant-extrapolation
+  // prediction the trailing (not yet measured) spline span is tied to.
+  Eigen::Vector3d seed_vel_end_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d seed_omega_end_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d anchor_bg_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d anchor_ba_ = Eigen::Vector3d::Zero();
 

@@ -131,6 +131,17 @@ int addImuResiduals(ceres::Problem& problem, SplineWindow& spline, BiasKnots& bi
 int addBiasRandomWalk(ceres::Problem& problem, BiasKnots& bias,
                       const ImuWeights& weights);
 
+// Adds tail anchors at each covered time: a world-velocity residual on the R^3 spline
+// derivative toward v_pred and a body-rate residual on the SO(3) spline toward w_pred.
+// The trailing control points past the newest measurement have (near-)zero basis
+// weight over every measured time, so without these the solver may park arbitrary
+// values there at no cost; the anchors tie that span to the IMU-predicted constant
+// velocity / body rate with honest extrapolation sigmas, weak enough for the next
+// sweep's measurements to override. Returns the number of anchored times.
+int addTailAnchors(ceres::Problem& problem, SplineWindow& spline,
+                   const std::vector<Timestamp>& times, const Eigen::Vector3d& v_pred,
+                   const Eigen::Vector3d& w_pred, double sigma_vel, double sigma_rate);
+
 // Adds the low-weight under-excitation regularizer at each supplied time: a jerk
 // residual (third virtual-time derivative of the R^3 spline, scaled to real time) and
 // a body angular-acceleration residual (second derivative of the SO(3) spline), each

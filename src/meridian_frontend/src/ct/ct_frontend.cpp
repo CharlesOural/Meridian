@@ -403,6 +403,11 @@ std::function<Pose(Timestamp)> CtFrontEnd::buildSeed(const std::vector<ImuSample
     }
   }
 
+  // Terminal velocity / body rate of the integration: the constant-extrapolation
+  // prediction past t_end, consumed by the tail anchors of the upcoming solve.
+  seed_vel_end_ = trail->empty() ? anchor_vel_ : trail->back().vel;
+  seed_omega_end_ = trail->empty() ? Eigen::Vector3d::Zero() : trail->back().omega;
+
   const Pose anchor = anchor_pose_;
   return [trail, anchor](Timestamp t) -> Pose {
     if (trail->empty()) {
@@ -424,6 +429,53 @@ std::function<Pose(Timestamp)> CtFrontEnd::buildSeed(const std::vector<ImuSample
     p.t = h.T.t + h.vel * dt + 0.5 * h.acc_world * dt * dt;
     return p;
   };
+}
+
+void CtFrontEnd::reseedAfterGap(const PreprocessedGroup& group, Timestamp t_begin,
+                                Timestamp t_end) {
+  const MeasureGroup& mg = group.group;
+
+  // Carry the anchor across the data hole on a constant-velocity prediction; with no
+  // IMU for the span there is nothing better, and the orientation is held. The map is
+  // kept — the predicted anchor keeps trajectory and map in one frame to within the
+  // prediction error, which the next solves absorb.
+  anchor_pose_.t += anchor_vel_ * to_seconds(t_begin - last_solved_t_);
+  restartWindow(t_begin);
+
+  // Cover the reseed sweep and seed the map from it WITHOUT solving: directly after a
+  // reseed the gauge pins hold most of the only evaluable segment's control points, so
+  // a solve here would crush the whole residual budget into the one free knot and warp
+  // the sweep. Inserting at the predicted poses instead mirrors the bootstrap, and the
+  // next sweep solves on a fully extendable window.
+  auto seed = buildSeed(mg.imu, t_begin, t_end);
+  spline_->extendTo(t_end, seed, 1);
+
+  const std::vector<LidarPoint> ds =
+      ct::voxelDownsample(validReturns(mg.scan), std::max(cfg_.lidar.voxel_map_m, 1e-3));
+  std::vector<Eigen::Vector3d> world;
+  world.reserve(ds.size());
+  const Timestamp t0 = mg.scan.stamp_start;
+  for (const LidarPoint& p : ds) {
+    const Timestamp t = t0 + p.t_offset_ns;
+    if (spline_->covers(t)) {
+      world.push_back(spline_->pose(t) * (T_fe_lidar_ * p.xyz.cast<double>()));
+    }
+  }
+  if (!world.empty()) {
+    map_->insert(world);
+  }
+
+  const Pose T_world_end = spline_->covers(t_end) ? spline_->pose(t_end) : anchor_pose_;
+  anchor_pose_ = T_world_end;
+  last_solved_t_ = t_end;
+
+  live_state_.T_world_body = T_world_end;
+  live_state_.v_world = anchor_vel_;
+  live_state_.b_g = anchor_bg_;
+  live_state_.b_a = anchor_ba_;
+  live_state_.g_world = gravity_->gravityWorld();
+  live_state_.stamp = t_end;
+  live_stamp_ = t_end;
 }
 
 void CtFrontEnd::restartWindow(Timestamp t_begin) {
@@ -654,10 +706,40 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
 
     // LiDAR point-to-plane residuals at the current spline (capped set).
     ct::addLidarResiduals(problem, *spline_, T_fe_lidar_, capped_hits, cfg_.lidar);
+    const int diag_n_lidar = problem.NumResidualBlocks();  // TEMP-DIAG
     // IMU derivative residuals over the new sweep span + bias random walk.
     ct::addImuResiduals(problem, *spline_, *bias_, *gravity_, group.group.imu, t_begin, t_end,
                         weights);
+    const int diag_n_imu = problem.NumResidualBlocks();  // TEMP-DIAG
     ct::addBiasRandomWalk(problem, *bias_, weights);
+
+    // Tail anchors over the span past the newest measurement. The trailing control
+    // points have (near-)zero basis weight at every measured time, so without an
+    // explicit constraint the solver may park arbitrary values there at zero cost --
+    // values the state read-out at t_end and the next sweep's evaluation then consume.
+    // Tie that span to the seed's constant-extrapolation velocity / body rate, with
+    // sigmas sized to a constant-velocity prediction over a couple hundred ms so real
+    // measurements override the anchors as soon as they arrive. These residuals never
+    // touch the marginalized (oldest) knot, so they cannot leak into the prior.
+    {
+      // Constant-extrapolation uncertainty over the <=300 ms tail span. The anchors
+      // must carry real weight: a tail knot's basis support over the data can be as
+      // small as u^3/6 ~ 1e-5, so the solver can trade radians of knot motion for
+      // millimetres of residual elsewhere unless the anchor cost is material.
+      constexpr double kTailSigmaVel = 0.2;   // [m/s]
+      constexpr double kTailSigmaRate = 0.1;  // [rad/s]
+      const Timestamp stride = std::max<Timestamp>(window_dt_ns_ / 4, 1);
+      std::vector<Timestamp> tail_times;
+      for (int k = 1; k <= 8; ++k) {
+        const Timestamp t = t_end + k * stride;
+        if (!spline_->covers(t)) {
+          break;
+        }
+        tail_times.push_back(t);
+      }
+      ct::addTailAnchors(problem, *spline_, tail_times, seed_vel_end_, seed_omega_end_,
+                         kTailSigmaVel, kTailSigmaRate);
+    }
 
     // Under-excitation regularizer (off by default, config-gated): a low-weight jerk /
     // angular-acceleration pull on the segment knot-midpoints, engaged only when the
@@ -732,6 +814,29 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
       }
       problem.SetParameterBlockConstant(gravity_->data());
     }
+
+    // Hold the unsupported tail knots constant. A knot at index >= interval(t_end)+4
+    // has exactly zero basis weight at every t <= t_end; the one at interval(t_end)+3
+    // peaks at u_end^3/6, which for a sweep ending just past a knot boundary is ~1e-5
+    // -- not "weakly observed" but a pure lever arm: the solver can move it radians to
+    // chase millimetres of residual elsewhere. Both classes hold their IMU warm-start
+    // values (extendTo / reseedFrom) and unfreeze naturally on a later sweep once data
+    // genuinely covers them -- the leading edge is dead-reckoning until corrected,
+    // matching the filter's predict-then-update causality.
+    {
+      constexpr double kMinSupportWeight = 0.02;
+      const SplineWindow::SegmentRef seg_end = spline_->segmentFor(t_end);
+      const double tail_weight = seg_end.u * seg_end.u * seg_end.u / 6.0;
+      const int lead_end = spline_->leadingKnotIndex(t_end);
+      const int first_pinned = lead_end + (tail_weight < kMinSupportWeight ? 3 : 4);
+      for (int j = first_pinned; j < spline_->numKnots(); ++j) {
+        for (double* p : {spline_->so3KnotData(j), spline_->r3KnotData(j)}) {
+          if (problem.HasParameterBlock(p)) {
+            problem.SetParameterBlockConstant(p);
+          }
+        }
+      }
+    }
     std::vector<double*> params;
     problem.GetParameterBlocks(&params);
     for (double* p : params) {
@@ -758,7 +863,12 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     // value carried over the edge from a prior sweep restarts at the edge and the
     // solver then sees the bound; a frozen block keeps its value and its bound is
     // inert. The gyro block is bounded-and-free only when the seam is open; the accel
-    // block is always frozen.
+    // block is always frozen. NOTE: a frozen accel bias means a residual init error
+    // b_a + R^T*(gravity error) has nowhere to be absorbed and integrates into a
+    // velocity creep; freeing it without a random-walk tie to its previous estimate
+    // is worse (the tail anchors then lock each co-drifted velocity increment in).
+    // Absorbing it correctly needs the multi-knot bias random walk, which is the
+    // documented not-yet-built seam.
     for (int k = 0; k < bias_->numKnots(); ++k) {
       double* gp = bias_->gyroBlock(k);
       double* ap = bias_->accelBlock(k);
@@ -806,7 +916,44 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
 
     // Snapshot the active pose knots before this pass so a divergent inner step can be
     // clamped back along its own direction afterwards.
-    const std::vector<KnotState> pre_solve = snapshotActiveKnots(problem, t_begin, t_end);
+    const std::vector<KnotState> pre_solve = snapshotActiveKnots(problem);
+
+    // TEMP-DIAG: IMU cost at the PRE-solve iterate (round 0 only). A correct residual
+    // on a smooth near-static seed must be small; a huge value here means the residual
+    // evaluation itself disagrees with the seed trajectory.
+    if (round == 0) {
+      static int diag_pre_sweep = 0;
+      if (diag_pre_sweep++ < 25) {
+        std::vector<ceres::ResidualBlockId> ids;
+        problem.GetResidualBlocks(&ids);
+        ceres::Problem::EvaluateOptions eo;
+        eo.residual_blocks.assign(ids.begin() + diag_n_lidar, ids.begin() + diag_n_imu);
+        double c_imu_pre = 0.0;
+        problem.Evaluate(eo, &c_imu_pre, nullptr, nullptr, nullptr);
+        fprintf(stderr, "[DIAG-PRE] imu cost at seed = %.3e (n=%d)\n", c_imu_pre,
+                diag_n_imu - diag_n_lidar);
+        // Side-by-side at three sample times: spline prediction vs measurement.
+        const auto& imu = group.group.imu;
+        if (imu.size() >= 3) {
+          const Eigen::Vector3d g_w = gravity_->gravityWorld();
+          for (std::size_t k : {std::size_t{0}, imu.size() / 2, imu.size() - 1}) {
+            const ImuSample& s = imu[k];
+            if (!spline_->covers(s.stamp)) continue;
+            const Eigen::Vector3d w_sp = spline_->angularVelocityBody(s.stamp);
+            const Eigen::Vector3d a_sp = spline_->linearAccelWorld(s.stamp);
+            const Pose T = spline_->pose(s.stamp);
+            const Eigen::Vector3d w_ms = s.gyro - anchor_bg_;
+            const Eigen::Vector3d a_ms = T.q * (s.acc - anchor_ba_) + g_w;
+            fprintf(stderr,
+                    "[DIAG-PRE]   t+%.0fms w_sp=(%.3f %.3f %.3f) w_ms=(%.3f %.3f %.3f) "
+                    "a_sp=(%.2f %.2f %.2f) a_ms=(%.2f %.2f %.2f)\n",
+                    to_seconds(s.stamp - t_begin) * 1e3, w_sp.x(), w_sp.y(), w_sp.z(),
+                    w_ms.x(), w_ms.y(), w_ms.z(), a_sp.x(), a_sp.y(), a_sp.z(), a_ms.x(),
+                    a_ms.y(), a_ms.z());
+          }
+        }
+      }
+    }
 
     {
       MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.solve", t_end);
@@ -838,6 +985,34 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     // rotation cap, preserving the step direction.
     if (clampActiveKnots(pre_solve, max_step_trans, max_step_rot)) {
       clamp_engaged = true;
+    }
+
+    // TEMP-DIAG: per-category cost split at the post-solve iterate. The block id list
+    // is in insertion order, so [0, n_lidar) are LiDAR and [n_lidar, n_imu) are IMU.
+    {
+      static int diag_cost_sweep = 0;
+      if (diag_cost_sweep < 25 * 4) {
+        ++diag_cost_sweep;
+        std::vector<ceres::ResidualBlockId> ids;
+        problem.GetResidualBlocks(&ids);
+        auto cost_of = [&](int lo, int hi) {
+          ceres::Problem::EvaluateOptions eo;
+          eo.residual_blocks.assign(ids.begin() + lo, ids.begin() + hi);
+          eo.apply_loss_function = true;
+          double c = 0.0;
+          problem.Evaluate(eo, &c, nullptr, nullptr, nullptr);
+          return c;
+        };
+        const int n_total = static_cast<int>(ids.size());
+        const double c_lidar = diag_n_lidar > 0 ? cost_of(0, diag_n_lidar) : 0.0;
+        const double c_imu = diag_n_imu > diag_n_lidar ? cost_of(diag_n_lidar, diag_n_imu) : 0.0;
+        const double c_rest = n_total > diag_n_imu ? cost_of(diag_n_imu, n_total) : 0.0;
+        fprintf(stderr,
+                "[DIAG-COST] round=%d lidar: n=%d cost=%.3e | imu: n=%d cost=%.3e | "
+                "rest: n=%d cost=%.3e | sig_a=%.4g sig_g=%.4g\n",
+                round, diag_n_lidar, c_lidar, diag_n_imu - diag_n_lidar, c_imu,
+                n_total - diag_n_imu, c_rest, weights.sigma_accel, weights.sigma_gyro);
+      }
     }
 
     // A free (unfrozen) gyro bias that the solve drove to its box edge means the bound
@@ -911,39 +1086,32 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
   return accepted;
 }
 
-std::vector<CtFrontEnd::KnotState> CtFrontEnd::snapshotActiveKnots(ceres::Problem& problem,
-                                                                   Timestamp t_begin,
-                                                                   Timestamp t_end) const {
-  // Walk the segments spanning the sweep at a sub-segment stride so every active
-  // segment's 4+4 support knots are visited; dedupe by pointer. Only free (non-pinned)
-  // knots are saved — a gauge-pinned knot does not move and needs no clamp.
+std::vector<CtFrontEnd::KnotState> CtFrontEnd::snapshotActiveKnots(
+    ceres::Problem& problem) const {
+  // Every free knot the solver can move must be snapshotted, so the clamp's coverage
+  // must equal the problem's parameter set exactly. Enumerate ALL knots in the window
+  // and keep those registered with this problem and not held constant; any time-based
+  // subset risks missing a weakly-constrained tail knot, which the solver can then
+  // move arbitrarily far with no clamp to catch it.
   std::vector<KnotState> out;
-  std::unordered_set<double*> seen;
-  const Timestamp stride = std::max<Timestamp>(window_dt_ns_ / 2, 1);
-  for (Timestamp t = t_begin; t <= t_end; t += stride) {
-    if (!spline_->covers(t)) {
-      continue;
+  const int n = spline_->numKnots();
+  out.reserve(static_cast<std::size_t>(2 * n));
+  for (int i = 0; i < n; ++i) {
+    double* sp = spline_->so3KnotData(i);
+    if (problem.HasParameterBlock(sp) && !problem.IsParameterBlockConstant(sp)) {
+      KnotState ks;
+      ks.ptr = sp;
+      ks.is_so3 = true;
+      ks.q = Eigen::Map<const Eigen::Quaterniond>(sp);
+      out.push_back(ks);
     }
-    const SplineWindow::SegmentRef seg = spline_->segmentFor(t);
-    for (int j = 0; j < kSplineOrder; ++j) {
-      double* sp = seg.so3_knots[j];
-      if (problem.HasParameterBlock(sp) && !problem.IsParameterBlockConstant(sp) &&
-          seen.insert(sp).second) {
-        KnotState ks;
-        ks.ptr = sp;
-        ks.is_so3 = true;
-        ks.q = Eigen::Map<const Eigen::Quaterniond>(sp);
-        out.push_back(ks);
-      }
-      double* rp = seg.r3_knots[j];
-      if (problem.HasParameterBlock(rp) && !problem.IsParameterBlockConstant(rp) &&
-          seen.insert(rp).second) {
-        KnotState ks;
-        ks.ptr = rp;
-        ks.is_so3 = false;
-        ks.t = Eigen::Map<const Eigen::Vector3d>(rp);
-        out.push_back(ks);
-      }
+    double* rp = spline_->r3KnotData(i);
+    if (problem.HasParameterBlock(rp) && !problem.IsParameterBlockConstant(rp)) {
+      KnotState ks;
+      ks.ptr = rp;
+      ks.is_so3 = false;
+      ks.t = Eigen::Map<const Eigen::Vector3d>(rp);
+      out.push_back(ks);
     }
   }
   return out;
@@ -1109,29 +1277,50 @@ void CtFrontEnd::slideWindow(ceres::Problem& problem, Timestamp t_begin, Timesta
     diag_.knots_marginalized += static_cast<int>(dropped.size());
     diag_.prior_residual_dim = prior_->residualDim();
 
-    // Physically drop the dead front knots strictly before the segment at t_begin (deque
-    // indices 0..lead-1): no residual of this or a later sweep reaches them (the cubic
-    // support of t_begin starts at lead) and the new prior's lowest kept block is lead+1.
-    // The marginalized leading knot itself (index lead) is kept resident so coverage
-    // still extends back to t_begin -- the next sweep, whose window opens at the current
-    // t_end, drops it once it too falls behind. pop_front keeps the surviving knots'
-    // addresses, so the prior's stored pointers stay valid.
-    spline_->dropOldest(lead);
+    // Physically drop dead front knots — but never one the new prior still points at.
+    // On a sweep that bridged an upstream gap, the residual span reaches back before
+    // t_begin, so the Markov blanket (and hence the prior's kept blocks) can include
+    // knots BEHIND the leading index; freeing those would leave the prior's parameter
+    // blocks dangling and the next solve reading freed memory. The drop bound is the
+    // minimum of the leading index and the lowest knot index any kept block references;
+    // later sweeps trim the remainder once the prior no longer reaches it.
+    std::vector<const double*> kept_ptrs;
+    kept_ptrs.reserve(prior_->blocks().size());
+    for (const auto& b : prior_->blocks()) {
+      kept_ptrs.push_back(b.ptr);
+    }
+    const int min_kept = spline_->lowestKnotIndexOf(kept_ptrs);
+    spline_->dropOldest(std::min(lead, min_kept));
   }
   window_floor_t_ = t_begin;
 }
 
 void CtFrontEnd::updateMap(const std::vector<LidarPoint>& scan_ds, Timestamp t0_scan) {
   MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.map", last_solved_t_);
+  // The validity filter caps point range well below this, so a world point farther
+  // than the bound from the sweep-end body position can only come from a pathological
+  // trajectory warp. Keeping it out of the map stops one bad solve from poisoning
+  // every later association.
+  constexpr double kMaxInsertRangeM = 200.0;
   std::vector<Eigen::Vector3d> world;
   world.reserve(scan_ds.size());
+  int rejected = 0;
   for (const LidarPoint& p : scan_ds) {
     const Timestamp t = t0_scan + p.t_offset_ns;
     if (!spline_->covers(t)) {
       continue;
     }
     const Eigen::Vector3d p_fe = T_fe_lidar_ * p.xyz.cast<double>();
-    world.push_back(spline_->pose(t) * p_fe);
+    const Eigen::Vector3d p_w = spline_->pose(t) * p_fe;
+    if ((p_w - anchor_pose_.t).norm() > kMaxInsertRangeM) {
+      ++rejected;
+      continue;
+    }
+    world.push_back(p_w);
+  }
+  if (rejected > 0 && telemetry_) {
+    telemetry_->scalar("frontend/map/insert_rejected", static_cast<double>(rejected),
+                       last_solved_t_);
   }
   if (!world.empty()) {
     map_->insert(world);
@@ -1563,26 +1752,44 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   diag_.restarted = false;
 
   // ---- Gap guard: the steady-state seed integrates this group's IMU forward from
-  // last_solved_t_, which holds only when consecutive sweeps abut. If an upstream sweep
-  // was dropped, this group's t_begin jumps a whole sweep past last_solved_t_ and the
-  // IMU bridging the hole was in the dropped group, so the seed would extrapolate across
-  // a span it has no data for and extendTo would append many segments at once -- a
-  // divergence trigger. A single dropped sweep jumps t_begin forward by exactly one
-  // sweep span, while abutting sweeps jump by ~0; a half-sweep threshold separates the
-  // two with room for stamp jitter. Restart the trajectory at this sweep instead of
-  // extrapolating into it.
+  // last_solved_t_, which holds only when the IMU reaches back that far. A sweep
+  // dropped upstream of the aggregation leaves no IMU hole: the next group's window
+  // opens at the previous DELIVERED sweep's end, so its samples span the gap and the
+  // seed integrates straight across it — the trajectory simply extends over the hole.
+  // Only when the IMU itself starts after last_solved_t_ (a genuine data hole) is the
+  // window reseeded; integrating across a span with no samples would extrapolate
+  // garbage knots into the solve.
   const Duration sweep_span = t_end > t_begin ? t_end - t_begin : window_dt_ns_;
   const bool sweep_gap = t_begin > last_solved_t_ + sweep_span / 2;
   if (sweep_gap) {
-    if (telemetry_) {
-      const double gap_ms = static_cast<double>(t_begin - last_solved_t_) / 1e6;
-      char msg[96];
-      std::snprintf(msg, sizeof(msg),
-                    "sweep gap %.0f ms exceeds IMU horizon; window restarted", gap_ms);
-      telemetry_->event(Level::Warn, "frontend/window_restart", msg, t_begin);
+    Duration imu_period = window_dt_ns_ / 20;
+    if (mg.imu.size() >= 2) {
+      imu_period = (mg.imu.back().stamp - mg.imu.front().stamp) /
+                   static_cast<Duration>(mg.imu.size() - 1);
     }
-    restartWindow(t_begin);
-    diag_.restarted = true;
+    const bool imu_bridges =
+        !mg.imu.empty() && mg.imu.front().stamp <= last_solved_t_ + 2 * imu_period;
+    const double gap_ms = static_cast<double>(t_begin - last_solved_t_) / 1e6;
+    if (imu_bridges) {
+      if (telemetry_) {
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), "sweep gap %.0f ms bridged by IMU", gap_ms);
+        telemetry_->event(Level::Info, "frontend/sweep_gap_bridged", msg, t_begin);
+      }
+      // Fall through: buildSeed integrates from last_solved_t_ across the hole and
+      // extendTo appends the missing segments from the integrated trail.
+    } else {
+      if (telemetry_) {
+        char msg[96];
+        std::snprintf(msg, sizeof(msg),
+                      "sweep gap %.0f ms exceeds IMU horizon; window reseeded", gap_ms);
+        telemetry_->event(Level::Warn, "frontend/window_restart", msg, t_begin);
+      }
+      reseedAfterGap(group, t_begin, t_end);
+      diag_.restarted = true;
+      diag_.scan_time_ms = ms_since(t_start);
+      return;
+    }
   }
 
   // ---- Steady state: extend, associate, solve, map, slide, keyframe.
@@ -1592,6 +1799,18 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   const int n_cp = selectKnotDensity(mg.imu);
   auto seed = buildSeed(mg.imu, last_solved_t_, t_end);
   spline_->extendTo(t_end, seed, n_cp);
+  // Refresh the trailing knots the previous solve held constant (no real measurement
+  // support; see the pinning rule in solveWindow): their stored values are pure
+  // extrapolation, never entered the prior, and this sweep's IMU integration is a
+  // strictly fresher prediction for that span.
+  if (spline_->covers(last_solved_t_)) {
+    constexpr double kMinSupportWeight = 0.02;
+    const SplineWindow::SegmentRef seg_prev = spline_->segmentFor(last_solved_t_);
+    const double tail_weight = seg_prev.u * seg_prev.u * seg_prev.u / 6.0;
+    const int from =
+        spline_->leadingKnotIndex(last_solved_t_) + (tail_weight < kMinSupportWeight ? 3 : 4);
+    spline_->reseedFrom(from, seed);
+  }
 
   const Timestamp t0_scan = mg.scan.stamp_start;
   std::vector<LidarPoint> scan_ds;
@@ -1639,12 +1858,52 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   GnssContext gctx;
   gateGnss(group, t_end, &gctx);
 
+  // TEMP-DIAG: seed pose/velocity at the sweep end before the solve runs.
+  {
+    static int diag_sweep = 0;
+    if (diag_sweep++ < 25 && spline_->covers(t_end)) {
+      const Pose ps = spline_->pose(t_end);
+      const Eigen::Vector3d vs = spline_->linearVelocityWorld(t_end);
+      fprintf(stderr,
+              "[DIAG] sweep %d SEED  t_end=%.3f p=(%.3f %.3f %.3f) |v|=%.3f anchor=(%.3f %.3f %.3f) av=%.3f\n",
+              diag_sweep, to_seconds(t_end - traj_start_t_), ps.t.x(), ps.t.y(), ps.t.z(),
+              vs.norm(), anchor_pose_.t.x(), anchor_pose_.t.y(), anchor_pose_.t.z(),
+              anchor_vel_.norm());
+      if (ps.t.norm() > 100.0) {
+        spline_->dumpTail(stderr, 8);
+      }
+    }
+  }
+
   const auto t_solve = Clock::now();
   const int accepted =
       solveWindow(group, last_solved_t_, t_end, &scan_ds, &hits,
                   vctx.img != nullptr ? &vctx : nullptr, gctx.fixes.empty() ? nullptr : &gctx);
   diag_.solve_time_ms = ms_since(t_solve);
   have_solved_ = true;
+
+  // TEMP-DIAG: post-solve pose/velocity at the same time.
+  {
+    static int diag_sweep2 = 0;
+    if (diag_sweep2++ < 25 && spline_->covers(t_end)) {
+      const Pose pp = spline_->pose(t_end);
+      const Eigen::Vector3d vp = spline_->linearVelocityWorld(t_end);
+      // Edge-effect probe: velocity read at t_end vs one and two knot intervals
+      // inside the window. A sane interior with a wild edge indicts the trailing
+      // knots' weak data support.
+      const Timestamp t_in1 = t_end - 100 * 1000000LL;
+      const Timestamp t_in2 = t_end - 200 * 1000000LL;
+      const double v_in1 =
+          spline_->covers(t_in1) ? spline_->linearVelocityWorld(t_in1).norm() : -1.0;
+      const double v_in2 =
+          spline_->covers(t_in2) ? spline_->linearVelocityWorld(t_in2).norm() : -1.0;
+      fprintf(stderr,
+              "[DIAG] sweep %d POST  p=(%.3f %.3f %.3f) |v|=%.3f |v-100ms|=%.3f "
+              "|v-200ms|=%.3f accepted=%d iters=%d outer=%d\n",
+              diag_sweep2, pp.t.x(), pp.t.y(), pp.t.z(), vp.norm(), v_in1, v_in2, accepted,
+              diag_.iterations, diag_.outer_iters);
+    }
+  }
 
   // The body pose / velocity at the sweep end drive the live state and become the
   // next sweep's integration anchor (decoupled from the solver storage).

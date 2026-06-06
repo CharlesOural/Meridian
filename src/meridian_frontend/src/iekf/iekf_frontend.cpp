@@ -943,6 +943,9 @@ void IekfFrontEnd::ingest(const PreprocessedGroup& group) {
   if (telemetry_ && telemetry_->enabled("frontend/solve_ms")) {
     telemetry_->scalar("frontend/solve_ms", diag_.solve_time_ms, last_stamp_);
   }
+  if (telemetry_ && telemetry_->enabled("odom/body")) {
+    telemetry_->pose("odom/body", state_.T_world_body, Frame::Body, last_stamp_);
+  }
   if (telemetry_ && telemetry_->enabled("frontend/visual/n_converged")) {
     telemetry_->scalar("frontend/visual/n_converged", static_cast<double>(eff_vis), last_stamp_);
   }

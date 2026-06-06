@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <unordered_set>
+#include <vector>
 #include <sophus/so3.hpp>
 
 namespace meridian {
@@ -86,6 +89,50 @@ void SplineWindow::extendTo(Timestamp t, const std::function<Pose(Timestamp)>& s
 
     t_max_ = kt_[kt_.size() - kOrder + 1] - 1;
   }
+}
+
+void SplineWindow::dumpTail(std::FILE* f, int n) const {
+  const int sz = static_cast<int>(kt_.size());
+  const int from = std::max(0, sz - n);
+  std::fprintf(f, "[DIAG] kt tail (size=%d, t_min=%ld, t_max=%ld):\n", sz,
+               static_cast<long>(t_min_), static_cast<long>(t_max_));
+  for (int i = from; i < sz; ++i) {
+    const Eigen::Vector3d p = r3_->getKnot(i);
+    std::fprintf(f, "[DIAG]   knot[%d] kt=%ld dt_prev=%ld r3=(%.3f %.3f %.3f)\n", i,
+                 static_cast<long>(kt_[i]),
+                 static_cast<long>(i > 0 ? kt_[i] - kt_[i - 1] : 0), p.x(), p.y(), p.z());
+  }
+}
+
+void SplineWindow::reseedFrom(int from_idx, const std::function<Pose(Timestamp)>& seed) {
+  const int n = static_cast<int>(kt_.size());
+  for (int j = std::max(from_idx, 1); j < n; ++j) {
+    // Same placement rule as extendTo: a control point dominates the curve one local
+    // knot step before its grid time, so sample the seed there to land on it.
+    const Timestamp step =
+        kt_[static_cast<std::size_t>(j)] - kt_[static_cast<std::size_t>(j - 1)];
+    const Pose p = seed(kt_[static_cast<std::size_t>(j)] - step);
+    so3_->getKnot(j) = toSophus(p.q);
+    r3_->getKnot(j) = p.t;
+  }
+}
+
+int SplineWindow::lowestKnotIndexOf(const std::vector<const double*>& ptrs) const {
+  // Identify the lowest deque index whose SO(3) or R^3 knot storage backs any of the
+  // given parameter-block pointers. Non-knot blocks (bias, gravity, exposure) match
+  // nothing and are ignored. Callers use this to bound front-trimming so externally
+  // held knot pointers (marginalization-prior blocks) are never freed.
+  if (ptrs.empty()) {
+    return std::numeric_limits<int>::max();
+  }
+  const std::unordered_set<const double*> wanted(ptrs.begin(), ptrs.end());
+  const int n = static_cast<int>(kt_.size());
+  for (int i = 0; i < n; ++i) {
+    if (wanted.count(so3_->getKnot(i).data()) || wanted.count(r3_->getKnot(i).data())) {
+      return i;
+    }
+  }
+  return std::numeric_limits<int>::max();
 }
 
 void SplineWindow::dropOldest(int n) {

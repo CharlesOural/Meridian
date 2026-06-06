@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <cstdio>
 #include <vector>
 
 #include "meridian/common/pose.hpp"
@@ -59,6 +60,12 @@ public:
   // with the predicted pose at their knot time is the standard IMU warm start.
   void extendTo(Timestamp t, const std::function<Pose(Timestamp)>& seed, int n_cp);
 
+  // Overwrites every knot from deque index `from_idx` onward with `seed` evaluated one
+  // local knot step back (the same warm-start placement rule extendTo uses). Used to
+  // refresh trailing knots that carry no measurement support yet: their stored values
+  // are pure extrapolation, so each new sweep's IMU prediction supersedes them.
+  void reseedFrom(int from_idx, const std::function<Pose(Timestamp)>& seed);
+
   // Drops the n oldest knots from the front of the trajectory, advancing minTime to
   // the new front knot's real time. Pointers to surviving knots stay valid (deque
   // pop_front invalidates only the erased element), so Ceres parameter blocks and the
@@ -66,6 +73,10 @@ public:
   // so at least four knots (the cubic support) remain; dropping more than that is the
   // caller's responsibility (it must have marginalized the dropped knots first).
   void dropOldest(int n);
+  // Lowest deque index whose knot storage backs any of the given parameter-block
+  // pointers (max int when none does). Bounds front-trimming so externally held
+  // knot pointers stay valid.
+  int lowestKnotIndexOf(const std::vector<const double*>& ptrs) const;
 
   Timestamp minTime() const;
   Timestamp maxTime() const;
@@ -111,6 +122,8 @@ public:
   double* r3KnotData(int i);
 
   int numKnots() const;
+  // Diagnostic: prints the last n knots (grid time, spacing, position) to f.
+  void dumpTail(std::FILE* f, int n) const;
 
 private:
   // One outer real segment: its real start time, the virtual time at its first new

@@ -156,6 +156,61 @@ struct AngularAccelResidual {
   double weight_;
 };
 
+// Tail velocity anchor: ties the R^3 spline's first derivative at one time to a
+// predicted world velocity. Applied only over the span past the newest measurement,
+// where the trailing control points would otherwise sit in the cost's null space: a
+// solver-chosen wiggle there is invisible to every measurement residual but corrupts
+// the state read-out and the next sweep's evaluation. The weight is an honest
+// constant-velocity extrapolation uncertainty, weak enough for real measurements to
+// override it as soon as they arrive.
+struct VelocityAnchorResidual {
+  VelocityAnchorResidual(const Eigen::Vector3d& v_pred, double u, double inv_dt,
+                         double weight)
+      : v_pred_(v_pred), u_(u), inv_dt_(inv_dt), weight_(weight) {}
+
+  template <class T>
+  bool operator()(T const* const* params, T* residual_ptr) const {
+    using Vec3T = Eigen::Matrix<T, 3, 1>;
+    Vec3T vel;
+    basalt::CeresSplineHelper<kSplineOrder>::template evaluate<T, 3, 1>(params, u_, inv_dt_,
+                                                                        &vel);
+    Eigen::Map<Vec3T> residual(residual_ptr);
+    residual = T(weight_) * (vel - v_pred_.cast<T>());
+    return true;
+  }
+
+  Eigen::Vector3d v_pred_;
+  double u_;
+  double inv_dt_;
+  double weight_;
+};
+
+// Tail angular-rate anchor: same role as the velocity anchor for the SO(3) spline,
+// tying the body rate to the constant-rate extrapolation of the last gyro sample.
+struct RateAnchorResidual {
+  RateAnchorResidual(const Eigen::Vector3d& w_pred, double u, double inv_dt, double weight)
+      : w_pred_(w_pred), u_(u), inv_dt_(inv_dt), weight_(weight) {}
+
+  template <class T>
+  bool operator()(T const* const* params, T* residual_ptr) const {
+    using Vec3T = Eigen::Matrix<T, 3, 1>;
+    using SO3T = Sophus::SO3<T>;
+    using Tangent = typename Sophus::SO3<T>::Tangent;
+    SO3T R;
+    Tangent omega;
+    basalt::CeresSplineHelper<kSplineOrder>::template evaluate_lie<T, Sophus::SO3>(
+        params, u_, inv_dt_, &R, &omega, nullptr);
+    Eigen::Map<Vec3T> residual(residual_ptr);
+    residual = T(weight_) * (omega - w_pred_.cast<T>());
+    return true;
+  }
+
+  Eigen::Vector3d w_pred_;
+  double u_;
+  double inv_dt_;
+  double weight_;
+};
+
 // Random-walk tie between two consecutive bias knots, weighted so the cost equals
 // the squared increment divided by the continuous-time variance sigma^2 * dt: the
 // sqrt-information weight is 1 / (sigma * sqrt(dt)), shared by the gyro and accel
@@ -387,6 +442,45 @@ int addImuResiduals(ceres::Problem& problem, SplineWindow& spline, BiasKnots& bi
   if (added > 0 && problem.HasParameterBlock(gravity.data()) &&
       problem.GetManifold(gravity.data()) == nullptr) {
     problem.SetManifold(gravity.data(), makeGravityManifold());
+  }
+  return added;
+}
+
+int addTailAnchors(ceres::Problem& problem, SplineWindow& spline,
+                   const std::vector<Timestamp>& times, const Eigen::Vector3d& v_pred,
+                   const Eigen::Vector3d& w_pred, double sigma_vel, double sigma_rate) {
+  const double w_vel = 1.0 / std::max(sigma_vel, 1e-9);
+  const double w_rate = 1.0 / std::max(sigma_rate, 1e-9);
+
+  int added = 0;
+  for (Timestamp t : times) {
+    if (!spline.covers(t)) {
+      continue;
+    }
+    const SplineWindow::SegmentRef seg = spline.segmentFor(t);
+    const double inv_dt = 1.0 / seg.dt_s;
+
+    {
+      auto* cost = new ceres::DynamicAutoDiffCostFunction<VelocityAnchorResidual, 4>(
+          new VelocityAnchorResidual(v_pred, seg.u, inv_dt, w_vel));
+      for (int i = 0; i < kSplineOrder; ++i) {
+        cost->AddParameterBlock(3);
+      }
+      cost->SetNumResiduals(3);
+      std::vector<double*> blocks(seg.r3_knots.begin(), seg.r3_knots.end());
+      problem.AddResidualBlock(cost, nullptr, blocks);
+    }
+    {
+      auto* cost = new ceres::DynamicAutoDiffCostFunction<RateAnchorResidual, 4>(
+          new RateAnchorResidual(w_pred, seg.u, inv_dt, w_rate));
+      for (int i = 0; i < kSplineOrder; ++i) {
+        cost->AddParameterBlock(4);
+      }
+      cost->SetNumResiduals(3);
+      std::vector<double*> blocks(seg.so3_knots.begin(), seg.so3_knots.end());
+      problem.AddResidualBlock(cost, nullptr, blocks);
+    }
+    ++added;
   }
   return added;
 }

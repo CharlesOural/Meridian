@@ -33,8 +33,8 @@ meridian:
     imu:
       topic: /stim300/imu/data_raw   # the 200 Hz body IMU (confirmed from the bags)
       rate_hz: 200.0
-      cov_acc: 1.3229405297008181e-06
-      cov_gyr: 2.585023791758004e-09
+      cov_acc: 1.3229e-06
+      cov_gyr: 2.585e-09
       b_acc_cov: 1.3911811376517125e-09
       b_gyr_cov: 4.237780086074025e-13
     camera:
@@ -69,7 +69,9 @@ meridian:
     surf_seed: 0              # only used when surf_max_pts > 1
   frontend:
     kind: ct_livo
-    init_time_s: 0.1          # static-start window before the first solve
+    init_time_s: 1.0          # static-start window; a longer window tightens the
+                              # gravity/bias init whose residual error the frozen
+                              # accel bias cannot absorb
     solver_max_iterations: 5
     solver_epsi: 1.0e-3
     degeneracy_thresh: 10.0   # eigenvalue floor for the per-axis degeneracy score
@@ -78,7 +80,7 @@ meridian:
     assoc_shift_thresh_m: 0.02
     assoc_shift_thresh_deg: 0.2
     solver:
-      time_limit_ms: 60       # wall-clock deadline; the replay path ignores it
+      time_limit_ms: 5000     # effectively unbounded for diagnosis
       min_iterations: 2
     solve:
       max_step_trans_m: 0.5   # per-iteration step clamp
@@ -93,7 +95,7 @@ meridian:
     spline:
       knot_dt_ms: 100         # one outer segment per 10 Hz sweep
       window_knots: 8
-      n_cp_max: 3             # adaptive cap: up to 3 control points per segment
+      n_cp_max: 1   # diagnosis: disable adaptive density
       knot_omega_thresh: [0.5, 1.5]   # [rad/s] N_omega band edges raising n_cp to 2, 3
       knot_accel_thresh: [1.0, 3.0]   # [m/s^2] N_a band edges raising n_cp to 2, 3
       knot_density_hysteresis: 0.15
@@ -103,13 +105,13 @@ meridian:
       max_match_dist_sq: 5.0
       plane_thresh: 0.1
       point_cov: 1.0e-3
-      max_lidar_factors: 1500 # bounded factor count
+      max_lidar_factors: 1500
       min_factors_per_normal: 50
       normal_strata: 7
     visual:
       # Sparse-direct photometric stage. Gated off automatically whenever the camera
       # intrinsics are zero/invalid; this is the operator master switch on top of that.
-      enable: true
+      enable: false  # LIO-only baseline while debugging the CT drift
       patch: 8
       levels: 3
       img_point_cov: 100.0
