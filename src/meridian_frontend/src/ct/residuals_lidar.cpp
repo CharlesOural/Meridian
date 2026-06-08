@@ -7,7 +7,13 @@
 #include <vector>
 
 #include <Eigen/Eigenvalues>
+#include <array>
+
 #include <basalt/spline/ceres_spline_helper.h>
+#include <basalt/utils/sophus_utils.hpp>
+
+#include "ct/spline_analytic.hpp"
+#include <ceres/cost_function.h>
 #include <ceres/autodiff_cost_function.h>
 #include <ceres/dynamic_autodiff_cost_function.h>
 #include <ceres/loss_function.h>
@@ -600,6 +606,120 @@ std::vector<Eigen::Vector3d> weakTranslationAxes(const std::vector<LidarHit>& hi
   return weak;
 }
 
+
+// Analytic point-to-plane cost over the cumulative-form cubic SO(3) spline and the
+// R^3 spline. Residual (identical to the autodiff LidarResidual):
+//
+//   r = w * ( n . ( R(u) * q_fe + p(u) ) + d ),   q_fe = R_fe_l * p_lidar + t_fe_l
+//
+// with R(u) = R_0 * prod_{j=1..3} exp( lambda_R[j] * delta_j ),
+//      delta_j = Log( R_{j-1}^{-1} R_j ),   p(u) = sum_j lambda_P[j] * P_j.
+//
+// SO(3) knot Jacobians use the chain rule on the cumulative form. For a RIGHT
+// perturbation R_j -> R_j * exp(theta^):
+//
+//   d r / d theta_j = ddis_dRt * dRt_dR_j,
+//   ddis_dRt        = -w * n^T * R(u) * [q_fe]_x
+//   dRt_dR_j        =  lambda_j   * P_j   * Jr(lambda_j   delta_j)   * Jr^-1(delta_j)
+//                    - lambda_j+1 * P_j+1 * Jr(lambda_j+1 delta_j+1) * Jr^-1(delta_j+1)^T
+//
+// where P_j = A_3^-1 ... A_{j+1}^-1 (A_k = exp(lambda_k delta_k)) and the second
+// term is absent for the last knot. d delta_j / d theta_j = Jr^-1(delta_j) and
+// d delta_{j+1} / d theta_j = -Jr^-1(-delta_{j+1}) = -Jr^-1(delta_{j+1})^T account
+// for knot j appearing on the right of delta_j and (inverted) on the left of
+// delta_{j+1}. The R^3 knot Jacobians are the scalar blending weights:
+// d r / d P_j = w * lambda_P[j] * n^T.
+//
+// Ceres consumes ambient-quaternion Jacobians on manifold blocks (the knots carry
+// EigenQuaternionManifold), so the right-tangent rows are mapped to quaternion
+// coordinates with d theta / d q~ at q~ = q for theta = Log(q^-1 q~):
+//
+//   J_q = J_theta * 2 * [ q_w I - [q_v]_x  |  -q_v ]        (3x4, (x,y,z,w) order)
+//
+// (vec(q^-1 (x) q~) = q_w q~_v - q~_w q_v - q_v x q~_v, so the skew enters negated)
+//
+// which is exact along the unit sphere's tangent; the off-manifold component is
+// annihilated by the manifold's PlusJacobian.
+class AnalyticLidarPlaneCost final : public ceres::CostFunction {
+ public:
+  AnalyticLidarPlaneCost(const Eigen::Vector3d& p_lidar, const Eigen::Vector3d& n, double d,
+                         const Eigen::Quaterniond& q_fe_l, const Eigen::Vector3d& t_fe_l,
+                         double u, double weight)
+      : n_(n), d_(d), q_fe_(q_fe_l * p_lidar + t_fe_l), weight_(weight) {
+    set_num_residuals(1);
+    for (int j = 0; j < kSplineOrder; ++j) {
+      mutable_parameter_block_sizes()->push_back(4);
+    }
+    for (int j = 0; j < kSplineOrder; ++j) {
+      mutable_parameter_block_sizes()->push_back(3);
+    }
+    const Eigen::Vector4d up(1.0, u, u * u, u * u * u);
+    lambda_r_ = basalt::CeresSplineHelper<kSplineOrder>::cumulative_blending_matrix_ * up;
+    lambda_p_ = basalt::CeresSplineHelper<kSplineOrder>::blending_matrix_ * up;
+  }
+
+  bool Evaluate(double const* const* parameters, double* residuals,
+                double** jacobians) const override {
+    using SO3 = Sophus::SO3d;
+    std::array<SO3, kSplineOrder> R;
+    for (int j = 0; j < kSplineOrder; ++j) {
+      R[static_cast<std::size_t>(j)] = SO3(Eigen::Map<const Eigen::Quaterniond>(parameters[j]));
+    }
+    const So3SplineJac sj = evaluateSo3CumulativeJac(R, lambda_r_);
+    const SO3& R_w_fe = sj.R;
+
+    Eigen::Vector3d p_w_fe = Eigen::Vector3d::Zero();
+    for (int j = 0; j < kSplineOrder; ++j) {
+      p_w_fe += lambda_p_[j] * Eigen::Map<const Eigen::Vector3d>(parameters[kSplineOrder + j]);
+    }
+
+    residuals[0] = weight_ * (n_.dot(R_w_fe * q_fe_ + p_w_fe) + d_);
+
+    if (jacobians == nullptr) {
+      return true;
+    }
+
+    // d r / d theta_t for a right perturbation of the evaluated rotation.
+    const Eigen::Matrix<double, 1, 3> ddis_dRt =
+        -weight_ * n_.transpose() * R_w_fe.matrix() * SO3::hat(q_fe_);
+
+    for (int j = 0; j < kSplineOrder; ++j) {
+      if (jacobians[j] == nullptr) {
+        continue;
+      }
+      const std::size_t k = static_cast<std::size_t>(j);
+      const Eigen::Matrix<double, 1, 3> j_theta = ddis_dRt * sj.dRt_dR[k];
+      Eigen::Map<Eigen::Matrix<double, 1, 4, Eigen::RowMajor>> J(jacobians[j]);
+      J = j_theta * tangentToQuatJac(R[k].unit_quaternion());
+    }
+
+    for (int j = 0; j < kSplineOrder; ++j) {
+      if (jacobians[kSplineOrder + j] == nullptr) {
+        continue;
+      }
+      Eigen::Map<Eigen::Matrix<double, 1, 3, Eigen::RowMajor>> J(jacobians[kSplineOrder + j]);
+      J = weight_ * lambda_p_[j] * n_.transpose();
+    }
+    return true;
+  }
+
+ private:
+  Eigen::Vector3d n_;
+  double d_;
+  Eigen::Vector3d q_fe_;  // lidar point pre-composed with the extrinsic, body frame
+  double weight_;
+  Eigen::Vector4d lambda_r_;
+  Eigen::Vector4d lambda_p_;
+};
+
+ceres::CostFunction* makeLidarPlaneCost(const Eigen::Vector3d& p_lidar,
+                                        const Eigen::Vector3d& n, double d,
+                                        const Eigen::Quaterniond& q_fe_l,
+                                        const Eigen::Vector3d& t_fe_l, double u,
+                                        double weight) {
+  return new AnalyticLidarPlaneCost(p_lidar, n, d, q_fe_l, t_fe_l, u, weight);
+}
+
 int addLidarResiduals(ceres::Problem& problem, SplineWindow& spline,
                       const Pose& T_fe_lidar, const std::vector<LidarHit>& hits,
                       const FrontendLidar& cfg) {
@@ -619,15 +739,9 @@ int addLidarResiduals(ceres::Problem& problem, SplineWindow& spline,
     }
     const SplineWindow::SegmentRef seg = spline.segmentFor(hit.t);
 
-    auto* functor = new LidarResidual(hit.p_lidar, hit.plane.n, hit.plane.d,
-                                      T_fe_lidar.q, T_fe_lidar.t, seg.u,
-                                      1.0 / seg.dt_s, hit.weight);
-    auto* cost =
-        new ceres::DynamicAutoDiffCostFunction<LidarResidual, 4>(functor);
-    for (int i = 0; i < 2 * kSplineOrder; ++i) {
-      cost->AddParameterBlock(i < kSplineOrder ? 4 : 3);
-    }
-    cost->SetNumResiduals(1);
+    ceres::CostFunction* cost = makeLidarPlaneCost(hit.p_lidar, hit.plane.n, hit.plane.d,
+                                                   T_fe_lidar.q, T_fe_lidar.t, seg.u,
+                                                   hit.weight);
 
     std::vector<double*> blocks;
     blocks.reserve(2 * kSplineOrder);

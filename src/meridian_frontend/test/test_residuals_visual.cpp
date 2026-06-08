@@ -558,3 +558,111 @@ TEST(ResidualsVisual, JacobianMatchesNumericOnSmoothChain) {
     EXPECT_NEAR(analytic, numeric, 1e-2 * (1.0 + std::abs(numeric))) << "coord " << c;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Analytic photometric patch cost: autodiff-parity of residual and Jacobians.
+// ---------------------------------------------------------------------------
+namespace {
+
+meridian::ct::VisualPatchParams randomVisualProbe(std::mt19937& rng, double rot_scale) {
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  auto rv = [&] { return Eigen::Vector3d(uni(rng), uni(rng), uni(rng)); };
+  meridian::ct::VisualPatchParams p;
+  // 4 knots a bounded rotation/translation apart, like a warm-started window.
+  // (Knots themselves are passed as parameter blocks at Evaluate time.)
+  p.q_fe_c = Eigen::Quaterniond(uni(rng) + 1.5, uni(rng), uni(rng), uni(rng)).normalized();
+  p.t_fe_c = 0.2 * rv();
+  p.p_world = 3.0 * rv() + Eigen::Vector3d(0, 0, 5);
+  // A plausible pinhole projection Jacobian at the linearization point.
+  Eigen::Vector3d pc0 = Eigen::Vector3d(uni(rng), uni(rng), 4.0 + std::abs(uni(rng)));
+  const double fx = 300.0, fy = 300.0;
+  p.Jpi << fx / pc0.z(), 0.0, -fx * pc0.x() / (pc0.z() * pc0.z()),
+      0.0, fy / pc0.z(), -fy * pc0.y() / (pc0.z() * pc0.z());
+  p.p_c0 = pc0;
+  p.u = 0.5 * (uni(rng) + 1.0) * 0.999;
+  p.tau_ref = 0.8 + 0.2 * (uni(rng) + 1.0);
+  p.weight = 0.5 + 0.5 * (uni(rng) + 1.0);
+  const int area = 64;  // kPatch^2
+  p.ref_patch.resize(area);
+  p.cur_I0.resize(area);
+  p.cur_grad.resize(area);
+  for (int i = 0; i < area; ++i) {
+    p.ref_patch[i] = 128.0 + 40.0 * uni(rng);
+    p.cur_I0[i] = 128.0 + 40.0 * uni(rng);
+    p.cur_grad[i] = Eigen::Vector2d(20.0 * uni(rng), 20.0 * uni(rng));
+  }
+  (void)rot_scale;
+  return p;
+}
+
+}  // namespace
+
+TEST(AnalyticVisualCost, JacobiansMatchAutodiffTangentProjected) {
+  std::mt19937 rng(101);
+  ceres::EigenQuaternionManifold quat_manifold;
+  for (int trial = 0; trial < 50; ++trial) {
+    const double rot_scale = (trial % 2 == 0) ? 1e-4 : 0.4;
+    meridian::ct::VisualPatchParams vp = randomVisualProbe(rng, rot_scale);
+    if (trial % 5 == 0) vp.u = 1e-6;
+    if (trial % 7 == 0) vp.u = 1.0 - 1e-6;
+
+    // Random knots + exposure as the parameter blocks.
+    std::array<Eigen::Quaterniond, 4> q;
+    std::array<Eigen::Vector3d, 4> pr;
+    std::uniform_real_distribution<double> uni(-1.0, 1.0);
+    Eigen::Quaterniond q0(uni(rng) + 1.5, uni(rng), uni(rng), uni(rng));
+    q0.normalize();
+    for (int j = 0; j < 4; ++j) {
+      q[j] = q0;
+      q0 = (q0 * Sophus::SO3d::exp(rot_scale * Eigen::Vector3d(uni(rng), uni(rng), uni(rng)))
+                     .unit_quaternion())
+               .normalized();
+      pr[j] = 0.5 * Eigen::Vector3d(uni(rng), uni(rng), uni(rng));
+    }
+    double tau = 0.9 + 0.1 * uni(rng);
+
+    std::unique_ptr<ceres::CostFunction> analytic(meridian::ct::makeVisualPatchCost(vp));
+    std::unique_ptr<ceres::CostFunction> reference(meridian::ct::makeVisualPatchCostAutodiff(vp));
+
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(q[j].coeffs().data());
+    for (int j = 0; j < 4; ++j) params.push_back(pr[j].data());
+    params.push_back(&tau);
+
+    const int A = 64;
+    std::vector<double> ra(A), rr(A);
+    std::vector<std::vector<double>> ja(9), jr(9);
+    std::vector<double*> jap(9), jrp(9);
+    for (int b = 0; b < 9; ++b) {
+      const int cols = (b < 4) ? 4 : (b < 8 ? 3 : 1);
+      ja[b].resize(A * cols);
+      jr[b].resize(A * cols);
+      jap[b] = ja[b].data();
+      jrp[b] = jr[b].data();
+    }
+    ASSERT_TRUE(analytic->Evaluate(params.data(), ra.data(), jap.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), rr.data(), jrp.data()));
+
+    for (int i = 0; i < A; ++i) EXPECT_NEAR(ra[i], rr[i], 1e-9) << "resid " << i << " trial " << trial;
+
+    for (int j = 0; j < 4; ++j) {
+      Eigen::Matrix<double, 4, 3, Eigen::RowMajor> plus;
+      quat_manifold.PlusJacobian(params[j], plus.data());
+      Eigen::Map<Eigen::Matrix<double, 64, 4, Eigen::RowMajor>> Ja(ja[j].data());
+      Eigen::Map<Eigen::Matrix<double, 64, 4, Eigen::RowMajor>> Jr(jr[j].data());
+      const Eigen::Matrix<double, 64, 3> la = Ja * plus;
+      const Eigen::Matrix<double, 64, 3> lr = Jr * plus;
+      const double err = (la - lr).cwiseAbs().maxCoeff();
+      EXPECT_LT(err, 1e-7 + 1e-7 * lr.cwiseAbs().maxCoeff())
+          << "so3 knot " << j << " trial " << trial << " err " << err;
+    }
+    for (int j = 0; j < 4; ++j) {
+      Eigen::Map<Eigen::Matrix<double, 64, 3, Eigen::RowMajor>> Ja(ja[4 + j].data());
+      Eigen::Map<Eigen::Matrix<double, 64, 3, Eigen::RowMajor>> Jr(jr[4 + j].data());
+      EXPECT_LT((Ja - Jr).cwiseAbs().maxCoeff(), 1e-9) << "r3 knot " << j << " trial " << trial;
+    }
+    Eigen::Map<Eigen::Matrix<double, 64, 1>> Ja(ja[8].data());
+    Eigen::Map<Eigen::Matrix<double, 64, 1>> Jr(jr[8].data());
+    EXPECT_LT((Ja - Jr).cwiseAbs().maxCoeff(), 1e-9) << "tau trial " << trial;
+  }
+}

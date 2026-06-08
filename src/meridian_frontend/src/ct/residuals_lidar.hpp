@@ -16,6 +16,7 @@
 #include "spline_window.hpp"
 
 namespace ceres {
+class CostFunction;
 class Problem;
 }  // namespace ceres
 
@@ -145,6 +146,20 @@ LidarAssocStats associate(const SplineWindow& spline, const Pose& T_fe_lidar,
 // autodiff over the 4 SO(3) + 4 R^3 knot blocks of t's segment, with a Huber loss
 // whose scale is derived from the weight model. Returns the number of residuals
 // added (one per hit whose time the spline still covers).
+// Builds one analytic point-to-plane cost (1 residual; parameter blocks: 4 SO(3)
+// knots stored as Eigen quaternions, then 4 R^3 knots). Mathematically identical to
+// the autodiff LidarResidual but with closed-form Jacobians via the cumulative-form
+// chain rule, cutting the per-factor evaluation cost that dominates the solve.
+// Exposed for the derivative-correctness tests; addLidarResiduals uses it
+// internally. `u` is the normalized segment position; the SO(3) knot Jacobians are
+// returned in ambient quaternion coordinates, compatible with
+// ceres::EigenQuaternionManifold on the knot blocks.
+ceres::CostFunction* makeLidarPlaneCost(const Eigen::Vector3d& p_lidar,
+                                        const Eigen::Vector3d& n, double d,
+                                        const Eigen::Quaterniond& q_fe_l,
+                                        const Eigen::Vector3d& t_fe_l, double u,
+                                        double weight);
+
 int addLidarResiduals(ceres::Problem& problem, SplineWindow& spline,
                       const Pose& T_fe_lidar, const std::vector<LidarHit>& hits,
                       const FrontendLidar& cfg);

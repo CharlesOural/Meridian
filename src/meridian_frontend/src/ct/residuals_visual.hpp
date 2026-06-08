@@ -14,6 +14,7 @@
 #include "meridian/config/config.hpp"
 
 namespace ceres {
+class CostFunction;
 class Problem;
 }  // namespace ceres
 
@@ -111,6 +112,36 @@ struct VisualUsedPoint {
 // degenerate, or which fail a gate are skipped (never warped against a guessed
 // plane). Accepted candidates are appended to *used when non-null, each carrying its
 // projection pixel, depth, chosen level, and per-patch residual for the overlay.
+// Bundles the per-patch quantities both photometric-cost factories consume. The
+// pose dependence enters only through du = Jpi * (p_c(spline) - p_c0); the patch
+// arrays and exposures are fixed at build time (the image model is linearized at the
+// projected centre, so every pixel shares the same du).
+struct VisualPatchParams {
+  Eigen::Quaterniond q_fe_c;          // T_fe_cam rotation
+  Eigen::Vector3d t_fe_c;             // T_fe_cam translation
+  Eigen::Vector3d p_world;            // tracked 3-D point (world frame)
+  Eigen::Matrix<double, 2, 3> Jpi;    // projection Jacobian at p_c0
+  Eigen::Vector3d p_c0;               // linearization point in the current camera frame
+  double u = 0.0;                     // normalized segment position
+  double tau_ref = 1.0;               // reference-frame inverse exposure (fixed)
+  double weight = 1.0;                // photometric whitening weight
+  std::vector<double> ref_patch;      // exposure-folded warped reference patch
+  std::vector<double> cur_I0;         // current patch intensities at the centre tap
+  std::vector<Eigen::Vector2d> cur_grad;  // current patch image gradients
+};
+
+// Analytic photometric patch cost: kPatchArea residuals over 4 SO(3) + 4 R^3 knots
+// and the current-frame inverse exposure. Closed-form Jacobians via the shared
+// cumulative-spline chain (ct/spline_analytic.hpp); mathematically identical to the
+// autodiff functor but with the per-factor chain computed once and reused across all
+// patch pixels. SO(3) knot Jacobians are returned in ambient quaternion coordinates,
+// compatible with ceres::EigenQuaternionManifold on the knot blocks.
+ceres::CostFunction* makeVisualPatchCost(const VisualPatchParams& p);
+
+// The autodiff equivalent (linearized-intensity functor), exposed for the
+// derivative-correctness tests as the parity reference.
+ceres::CostFunction* makeVisualPatchCostAutodiff(const VisualPatchParams& p);
+
 VisualAssocStats addVisualResiduals(ceres::Problem& problem, SplineWindow& spline,
                                     const CameraModel& cam, const Pose& T_fe_cam,
                                     const ImagePyramidView& img, Timestamp t_mid_expo,

@@ -9,8 +9,10 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <basalt/spline/ceres_spline_helper.h>
 #include <Eigen/Geometry>
 #include <ceres/ceres.h>
+#include <ceres/gradient_checker.h>
 #include <gtest/gtest.h>
 #include <sophus/so3.hpp>
 
@@ -832,4 +834,165 @@ TEST(WeakTranslationAxes, DetectedAxisSurvivesCap) {
   // walls are still decimated: the cap genuinely bit on the non-weak strata.
   EXPECT_GT(static_cast<int>(hits.size()) - static_cast<int>(out.size()), 0)
       << "cap must still drop abundant wall points";
+}
+
+// ---------------------------------------------------------------------------
+// Analytic point-to-plane cost: derivative correctness and autodiff parity.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One randomized factor configuration: 4 SO(3) knots (quaternions), 4 R^3 knots,
+// plus a random plane, point, extrinsic, and segment position.
+struct AnalyticProbe {
+  std::array<Eigen::Quaterniond, 4> q;
+  std::array<Eigen::Vector3d, 4> p;
+  Eigen::Vector3d point;
+  Eigen::Vector3d n;
+  double d = 0.0;
+  Eigen::Quaterniond q_ext;
+  Eigen::Vector3d t_ext;
+  double u = 0.0;
+  double weight = 1.0;
+};
+
+AnalyticProbe randomProbe(std::mt19937& rng, double rot_scale) {
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  auto randVec = [&] { return Eigen::Vector3d(uni(rng), uni(rng), uni(rng)); };
+  AnalyticProbe pr;
+  Eigen::Quaterniond q0 = Eigen::Quaterniond(uni(rng) + 1.5, uni(rng), uni(rng), uni(rng));
+  q0.normalize();
+  for (int j = 0; j < 4; ++j) {
+    // Consecutive knots a bounded rotation apart, like a real warm-started window.
+    pr.q[static_cast<std::size_t>(j)] = q0;
+    q0 = (q0 * Sophus::SO3d::exp(rot_scale * randVec()).unit_quaternion()).normalized();
+    pr.p[static_cast<std::size_t>(j)] = 2.0 * randVec();
+  }
+  pr.point = 3.0 * randVec();
+  pr.n = randVec().normalized();
+  pr.d = uni(rng);
+  pr.q_ext = Eigen::Quaterniond(uni(rng) + 1.5, uni(rng), uni(rng), uni(rng)).normalized();
+  pr.t_ext = 0.2 * randVec();
+  pr.u = 0.5 * (uni(rng) + 1.0) * 0.999;
+  pr.weight = 0.5 + 0.5 * (uni(rng) + 1.0);
+  return pr;
+}
+
+}  // namespace
+
+// Reference autodiff functor: the exact math the analytic cost replaces, evaluated
+// through the same basalt helper. Autodiff Jacobians are exact (no finite-difference
+// noise), so parity is checked at near-machine precision -- but only after projecting
+// both ambient quaternion Jacobians through the manifold's PlusJacobian: the two
+// formulations extend the function differently OFF the unit sphere, and only the
+// tangent projection is the well-defined object the solver consumes.
+namespace {
+
+struct RefLidarFunctor {
+  RefLidarFunctor(const AnalyticProbe& pr) : pr_(pr) {}
+  template <class T>
+  bool operator()(T const* const* params, T* residual) const {
+    Sophus::SO3<T> R_w_fe;
+    basalt::CeresSplineHelper<4>::evaluate_lie<T, Sophus::SO3>(params, pr_.u, 10.0, &R_w_fe);
+    Eigen::Matrix<T, 3, 1> p_w_fe;
+    basalt::CeresSplineHelper<4>::evaluate<T, 3, 0>(params + 4, pr_.u, 10.0, &p_w_fe);
+    const Eigen::Matrix<T, 3, 1> q_fe = (pr_.q_ext * pr_.point + pr_.t_ext).cast<T>();
+    residual[0] =
+        T(pr_.weight) * (pr_.n.cast<T>().dot(R_w_fe * q_fe + p_w_fe) + T(pr_.d));
+    return true;
+  }
+  AnalyticProbe pr_;
+};
+
+}  // namespace
+
+// Analytic Jacobians must match autodiff exactly (tangent-projected), across random
+// configurations including near-identity and large inter-knot rotations and the
+// segment edges u ~ 0 / u ~ 1.
+TEST(AnalyticLidarCost, JacobiansMatchAutodiffTangentProjected) {
+  std::mt19937 rng(23);
+  ceres::EigenQuaternionManifold quat_manifold;
+  for (int trial = 0; trial < 60; ++trial) {
+    const double rot_scale = (trial % 2 == 0) ? 1e-4 : 0.4;
+    AnalyticProbe pr = randomProbe(rng, rot_scale);
+    if (trial % 5 == 0) pr.u = 1e-6;
+    if (trial % 7 == 0) pr.u = 1.0 - 1e-6;
+
+    std::unique_ptr<ceres::CostFunction> analytic(meridian::ct::makeLidarPlaneCost(
+        pr.point, pr.n, pr.d, pr.q_ext, pr.t_ext, pr.u, pr.weight));
+    auto* ref = new ceres::DynamicAutoDiffCostFunction<RefLidarFunctor, 4>(
+        new RefLidarFunctor(pr));
+    for (int i = 0; i < 8; ++i) ref->AddParameterBlock(i < 4 ? 4 : 3);
+    ref->SetNumResiduals(1);
+    std::unique_ptr<ceres::CostFunction> reference(ref);
+
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(pr.q[static_cast<std::size_t>(j)].coeffs().data());
+    for (int j = 0; j < 4; ++j) params.push_back(pr.p[static_cast<std::size_t>(j)].data());
+
+    double ja_store[4][4];
+    double jr_store[4][4];
+    double ja_p[4][3];
+    double jr_p[4][3];
+    std::vector<double*> ja_ptrs;
+    std::vector<double*> jr_ptrs;
+    for (int j = 0; j < 4; ++j) ja_ptrs.push_back(ja_store[j]);
+    for (int j = 0; j < 4; ++j) ja_ptrs.push_back(ja_p[j]);
+    for (int j = 0; j < 4; ++j) jr_ptrs.push_back(jr_store[j]);
+    for (int j = 0; j < 4; ++j) jr_ptrs.push_back(jr_p[j]);
+
+    double r_a = 0.0;
+    double r_r = 0.0;
+    ASSERT_TRUE(analytic->Evaluate(params.data(), &r_a, ja_ptrs.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), &r_r, jr_ptrs.data()));
+    EXPECT_NEAR(r_a, r_r, 1e-12);
+
+    for (int j = 0; j < 4; ++j) {
+      // Tangent-project the quaternion-block rows through the manifold.
+      Eigen::Matrix<double, 4, 3, Eigen::RowMajor> plus_jac;
+      quat_manifold.PlusJacobian(params[j], plus_jac.data());
+      const Eigen::Map<Eigen::Matrix<double, 1, 4, Eigen::RowMajor>> Ja(ja_store[j]);
+      const Eigen::Map<Eigen::Matrix<double, 1, 4, Eigen::RowMajor>> Jr(jr_store[j]);
+      const Eigen::Matrix<double, 1, 3> la = Ja * plus_jac;
+      const Eigen::Matrix<double, 1, 3> lr = Jr * plus_jac;
+      for (int c = 0; c < 3; ++c) {
+        EXPECT_NEAR(la(0, c), lr(0, c), 1e-9 + 1e-9 * std::abs(lr(0, c)))
+            << "trial " << trial << " so3 knot " << j << " col " << c;
+      }
+      for (int c = 0; c < 3; ++c) {
+        EXPECT_NEAR(ja_p[j][c], jr_p[j][c], 1e-12)
+            << "trial " << trial << " r3 knot " << j << " col " << c;
+      }
+    }
+  }
+}
+
+// The analytic cost is the same function as the autodiff functor: residuals agree
+// to machine precision on random inputs.
+TEST(AnalyticLidarCost, ResidualMatchesAutodiffFunctor) {
+  std::mt19937 rng(29);
+  for (int trial = 0; trial < 20; ++trial) {
+    AnalyticProbe pr = randomProbe(rng, 0.3);
+
+    std::unique_ptr<ceres::CostFunction> analytic(meridian::ct::makeLidarPlaneCost(
+        pr.point, pr.n, pr.d, pr.q_ext, pr.t_ext, pr.u, pr.weight));
+
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(pr.q[static_cast<std::size_t>(j)].coeffs().data());
+    for (int j = 0; j < 4; ++j) params.push_back(pr.p[static_cast<std::size_t>(j)].data());
+
+    double r_analytic = 0.0;
+    ASSERT_TRUE(analytic->Evaluate(params.data(), &r_analytic, nullptr));
+
+    // Forward evaluation through the same basalt helper the autodiff path uses.
+    Sophus::SO3d R_w_fe;
+    basalt::CeresSplineHelper<4>::evaluate_lie<double, Sophus::SO3>(params.data(), pr.u, 10.0,
+                                                                    &R_w_fe);
+    Eigen::Vector3d p_w_fe;
+    basalt::CeresSplineHelper<4>::evaluate<double, 3, 0>(params.data() + 4, pr.u, 10.0, &p_w_fe);
+    const Eigen::Vector3d q_fe = pr.q_ext * pr.point + pr.t_ext;
+    const double r_ref = pr.weight * (pr.n.dot(R_w_fe * q_fe + p_w_fe) + pr.d);
+
+    EXPECT_NEAR(r_analytic, r_ref, 1e-12) << "trial " << trial;
+  }
 }

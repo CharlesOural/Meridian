@@ -1,5 +1,9 @@
 #include "ct/residuals_visual.hpp"
 
+#include <ceres/cost_function.h>
+
+#include "ct/spline_analytic.hpp"
+
 #include <basalt/spline/ceres_spline_helper.h>
 #include <ceres/autodiff_cost_function.h>
 #include <ceres/dynamic_autodiff_cost_function.h>
@@ -294,6 +298,137 @@ struct VisualPatchResidual {
 
 }  // namespace
 
+namespace {
+
+// Analytic photometric patch cost. Residual identical to VisualPatchResidual:
+//   r_i = w * ( tau_cur * (I0_i + grad_i . du) - tau_ref * ref_i ),
+//   du  = Jpi * (p_c - p_c0),
+//   p_c = R_fe_c^-1 ( R_w_fe^-1 (p_world - p_w_fe) - t_fe_c ).
+//
+// The pose enters only through du, and du is shared by all patch pixels, so the
+// per-knot 2x3 sensitivity du/dknot is formed once and each pixel row is just
+// grad_i^T applied to it. With a RIGHT perturbation R_w_fe <- R_w_fe exp(theta^),
+// p_fe = R_w_fe^-1 d transforms as p_fe + [p_fe]_x theta, so
+//   dp_c/dtheta_j = R_c_fe [p_fe]_x dRt_dR[j],
+//   dp_c/dP_j     = -lambda_P[j] R_c_fe R_fe_w   (split spline: rotation knots do not
+//                                                 move p_w_fe, translation knots do).
+// d r_i/dtau = w * i_cur_i. Knot rotation rows are mapped to ambient quaternion
+// coordinates via tangentToQuatJac for the EigenQuaternionManifold blocks.
+class AnalyticVisualPatchCost final : public ceres::CostFunction {
+ public:
+  explicit AnalyticVisualPatchCost(const VisualPatchParams& p) : p_(p) {
+    set_num_residuals(kPatchArea);
+    for (int j = 0; j < kSplineOrder; ++j) {
+      mutable_parameter_block_sizes()->push_back(4);
+    }
+    for (int j = 0; j < kSplineOrder; ++j) {
+      mutable_parameter_block_sizes()->push_back(3);
+    }
+    mutable_parameter_block_sizes()->push_back(1);  // tau_cur
+    const Eigen::Vector4d up(1.0, p.u, p.u * p.u, p.u * p.u * p.u);
+    lambda_r_ = basalt::CeresSplineHelper<kSplineOrder>::cumulative_blending_matrix_ * up;
+    lambda_p_ = basalt::CeresSplineHelper<kSplineOrder>::blending_matrix_ * up;
+  }
+
+  bool Evaluate(double const* const* parameters, double* residuals,
+                double** jacobians) const override {
+    using SO3 = Sophus::SO3d;
+    std::array<SO3, kSplineOrder> R;
+    for (int j = 0; j < kSplineOrder; ++j) {
+      R[static_cast<std::size_t>(j)] = SO3(Eigen::Map<const Eigen::Quaterniond>(parameters[j]));
+    }
+    const So3SplineJac sj = evaluateSo3CumulativeJac(R, lambda_r_);
+    const SO3& R_w_fe = sj.R;
+
+    Eigen::Vector3d p_w_fe = Eigen::Vector3d::Zero();
+    for (int j = 0; j < kSplineOrder; ++j) {
+      p_w_fe += lambda_p_[j] * Eigen::Map<const Eigen::Vector3d>(parameters[kSplineOrder + j]);
+    }
+
+    const SO3 R_fe_c(p_.q_fe_c);
+    const Eigen::Vector3d p_fe = R_w_fe.inverse() * (p_.p_world - p_w_fe);
+    const Eigen::Vector3d p_c = R_fe_c.inverse() * (p_fe - p_.t_fe_c);
+    const Eigen::Vector2d du = p_.Jpi * (p_c - p_.p_c0);
+
+    const double tau_cur = parameters[2 * kSplineOrder][0];
+    std::array<double, kPatchArea> i_cur{};
+    for (int i = 0; i < kPatchArea; ++i) {
+      const std::size_t si = static_cast<std::size_t>(i);
+      i_cur[si] = p_.cur_I0[si] + p_.cur_grad[si].dot(du);
+      residuals[i] = p_.weight * (tau_cur * i_cur[si] - p_.tau_ref * p_.ref_patch[si]);
+    }
+
+    if (jacobians == nullptr) {
+      return true;
+    }
+
+    const Eigen::Matrix3d R_c_fe = R_fe_c.inverse().matrix();
+    const Eigen::Matrix3d R_fe_w = R_w_fe.inverse().matrix();
+    const double wt = p_.weight * tau_cur;
+
+    // Per-knot shared 2x3 pixel sensitivities du/dknot (rotation in knot tangent).
+    std::array<Eigen::Matrix<double, 2, 3>, kSplineOrder> Br;  // du / d theta_j
+    std::array<Eigen::Matrix<double, 2, 3>, kSplineOrder> Bp;  // du / d P_j
+    const Eigen::Matrix3d RcfHat = R_c_fe * SO3::hat(p_fe);
+    for (int j = 0; j < kSplineOrder; ++j) {
+      const std::size_t k = static_cast<std::size_t>(j);
+      Br[k] = p_.Jpi * (RcfHat * sj.dRt_dR[k]);
+      Bp[k] = (-lambda_p_[j]) * (p_.Jpi * (R_c_fe * R_fe_w));
+    }
+
+    for (int j = 0; j < kSplineOrder; ++j) {
+      if (jacobians[j] != nullptr) {
+        const Eigen::Matrix<double, 3, 4> dqdtheta = tangentToQuatJac(R[static_cast<std::size_t>(j)].unit_quaternion());
+        Eigen::Map<Eigen::Matrix<double, kPatchArea, 4, Eigen::RowMajor>> J(jacobians[j]);
+        for (int i = 0; i < kPatchArea; ++i) {
+          const Eigen::RowVector3d row =
+              wt * (p_.cur_grad[static_cast<std::size_t>(i)].transpose() * Br[static_cast<std::size_t>(j)]);
+          J.row(i) = row * dqdtheta;
+        }
+      }
+      if (jacobians[kSplineOrder + j] != nullptr) {
+        Eigen::Map<Eigen::Matrix<double, kPatchArea, 3, Eigen::RowMajor>> J(jacobians[kSplineOrder + j]);
+        for (int i = 0; i < kPatchArea; ++i) {
+          J.row(i) =
+              wt * (p_.cur_grad[static_cast<std::size_t>(i)].transpose() * Bp[static_cast<std::size_t>(j)]);
+        }
+      }
+    }
+    if (jacobians[2 * kSplineOrder] != nullptr) {
+      Eigen::Map<Eigen::Matrix<double, kPatchArea, 1>> J(jacobians[2 * kSplineOrder]);
+      for (int i = 0; i < kPatchArea; ++i) {
+        J(i) = p_.weight * i_cur[static_cast<std::size_t>(i)];
+      }
+    }
+    return true;
+  }
+
+ private:
+  VisualPatchParams p_;
+  Eigen::Vector4d lambda_r_;
+  Eigen::Vector4d lambda_p_;
+};
+
+}  // namespace
+
+ceres::CostFunction* makeVisualPatchCost(const VisualPatchParams& p) {
+  return new AnalyticVisualPatchCost(p);
+}
+
+ceres::CostFunction* makeVisualPatchCostAutodiff(const VisualPatchParams& p) {
+  auto* functor = new VisualPatchResidual(p.q_fe_c, p.t_fe_c, p.p_world, p.Jpi, p.u,
+                                          /*inv_dt=*/1.0, p.tau_ref, p.weight, p.ref_patch,
+                                          p.cur_I0, p.cur_grad);
+  functor->p_c0_ = p.p_c0;
+  auto* cost = new ceres::DynamicAutoDiffCostFunction<VisualPatchResidual, 4>(functor);
+  for (int i = 0; i < 2 * kSplineOrder; ++i) {
+    cost->AddParameterBlock(i < kSplineOrder ? 4 : 3);
+  }
+  cost->AddParameterBlock(1);
+  cost->SetNumResiduals(kPatchArea);
+  return cost;
+}
+
 VisualAssocStats addVisualResiduals(ceres::Problem& problem, SplineWindow& spline,
                                     const CameraModel& cam, const Pose& T_fe_cam,
                                     const ImagePyramidView& img, Timestamp t_mid_expo,
@@ -452,19 +587,19 @@ VisualAssocStats addVisualResiduals(ceres::Problem& problem, SplineWindow& splin
 
     // Build the residual. The projection Jacobian is taken at the linearization
     // point; the reference patch is folded with the reference exposure into ref_warp.
-    const Eigen::Matrix<double, 2, 3> Jpi = cam.projectJacobian(p_c0);
-
-    auto* functor =
-        new VisualPatchResidual(T_fe_cam.q, T_fe_cam.t, pt->p_world, Jpi, seg.u, 1.0 / seg.dt_s,
-                                pt->inv_expo_ref, weight, ref_warp, cur_I0, cur_grad);
-    functor->p_c0_ = p_c0;
-
-    auto* cost = new ceres::DynamicAutoDiffCostFunction<VisualPatchResidual, 4>(functor);
-    for (int i = 0; i < 2 * kSplineOrder; ++i) {
-      cost->AddParameterBlock(i < kSplineOrder ? 4 : 3);
-    }
-    cost->AddParameterBlock(1);  // tau_cur
-    cost->SetNumResiduals(kPatchArea);
+    VisualPatchParams vp;
+    vp.q_fe_c = T_fe_cam.q;
+    vp.t_fe_c = T_fe_cam.t;
+    vp.p_world = pt->p_world;
+    vp.Jpi = cam.projectJacobian(p_c0);
+    vp.p_c0 = p_c0;
+    vp.u = seg.u;
+    vp.tau_ref = pt->inv_expo_ref;
+    vp.weight = weight;
+    vp.ref_patch = ref_warp;
+    vp.cur_I0 = cur_I0;
+    vp.cur_grad = cur_grad;
+    ceres::CostFunction* cost = makeVisualPatchCost(vp);
 
     std::vector<double*> blocks;
     blocks.reserve(2 * kSplineOrder + 1);
