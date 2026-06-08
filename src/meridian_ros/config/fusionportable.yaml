@@ -120,12 +120,12 @@ meridian:
       knot_accel_thresh: [1.0, 3.0]   # [m/s^2] N_a band edges raising n_cp to 2, 3
       knot_density_hysteresis: 0.15
     lidar:
-      voxel_map_m: 0.5
+      voxel_map_m: 0.6
       num_match_points: 5
       max_match_dist_sq: 5.0
       plane_thresh: 0.1
       point_cov: 1.0e-3
-      max_lidar_factors: 1500
+      max_lidar_factors: 1000
       min_factors_per_normal: 50
       normal_strata: 7
     visual:
