@@ -110,6 +110,17 @@ public:
   std::vector<const VisualPoint*> visibleCandidates(const CameraModel& cam,
                                                     const Pose& T_w_c) const;
 
+  // Per-sweep visible-set cache for the CT hot loop. The visible selection (the
+  // O(map) projection scan) is the per-sweep cost driver; computing it once at the
+  // seed pose and reusing it across every outer re-association round AND
+  // updateAfterSolve replaces up to (max_outer + 1) full scans with one. The warp /
+  // gate / residual still use the current per-round pose -- only the selection of
+  // WHICH points is fixed, the standard direct-method choice. Caller must
+  // refreshVisibleCache() once before using cachedVisibleCandidates() /
+  // updateAfterSolve() each sweep.
+  void refreshVisibleCache(const CameraModel& cam, const Pose& T_w_c);
+  std::vector<const VisualPoint*> cachedVisibleCandidates() const;
+
   // Reference-patch lifecycle after a solve: re-score observations against the
   // current view, recompute the medoid, append a new observation through the add
   // gate (respecting the obs cap with min-score eviction), and latch convergence.
@@ -173,6 +184,8 @@ private:
   std::map<std::int64_t, std::unique_ptr<VisualPoint>> points_;
   std::map<VoxelKey, std::vector<std::int64_t>> index_;  // voxel -> sorted ids
   std::int64_t next_id_ = 0;
+  // Visible-candidate ids selected at this sweep's seed pose (refreshVisibleCache).
+  std::vector<std::int64_t> visible_cache_ids_;
 };
 
 }  // namespace meridian::ct

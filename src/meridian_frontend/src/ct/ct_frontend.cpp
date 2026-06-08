@@ -663,6 +663,16 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
   Pose prev_assoc_pose;
   bool have_prev_assoc = false;
   std::vector<ct::LidarHit> capped_hits;  // factor-cap survivors, refilled each round
+
+  // Select the visible visual-map points once, at the seed pose: the O(map)
+  // projection scan is the per-sweep cost driver, and the per-cell winners are stable
+  // across cm-level pose refinement. Every outer round's residual build and the
+  // post-solve map update then reuse this cache instead of re-scanning the map.
+  if (vis != nullptr && vis->img != nullptr && vmap_ && spline_->covers(vis->t_image)) {
+    const Pose T_w_c_seed = spline_->pose(vis->t_image) * T_fe_cam_;
+    vmap_->refreshVisibleCache(cam_model_, T_w_c_seed);
+  }
+
   int outer_passes = 0;
   for (int round = 0; round < max_outer; ++round) {
     ++outer_passes;

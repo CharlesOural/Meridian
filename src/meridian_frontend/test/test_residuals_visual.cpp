@@ -285,6 +285,7 @@ TEST(ResidualsVisual, ExposureRecovery) {
   // Pin the trajectory so only exposure moves.
   SplineWindow::SegmentRef seg = spline.segmentFor(t_mid);
   std::vector<VisualUsedPoint> used;
+  vmap.refreshVisibleCache(cam, spline.pose(t_mid));
   const VisualAssocStats stats = addVisualResiduals(problem, spline, cam, Pose{}, cur_view, t_mid,
                                                     expo, idx, vmap, cfg, &used);
   ASSERT_GT(stats.accepted, 0);
@@ -345,6 +346,7 @@ TEST(ResidualsVisual, ZeroAtGroundTruthAndNonzeroUnderPerturbation) {
     const std::size_t idx = expo.addFrame(t_mid, tau);
     ceres::Problem problem;
     std::vector<VisualUsedPoint> used;
+    vmap.refreshVisibleCache(cam, spline.pose(t_mid));
     const VisualAssocStats stats = addVisualResiduals(problem, spline, cam, Pose{}, cur_view, t_mid,
                                                       expo, idx, vmap, cfg, &used);
     EXPECT_GT(stats.accepted, 0);
@@ -404,6 +406,7 @@ TEST(ResidualsVisual, GatesRejectDecorrelatedAndInvalid) {
   // NCC threshold 0.5 against pure noise rejects (almost) everything.
   FrontendVisual strict = cfg;
   strict.ncc_thre = 0.8;
+  vmap.refreshVisibleCache(cam, spline.pose(t_mid));
   const VisualAssocStats stats = addVisualResiduals(problem, spline, cam, Pose{}, noise_view, t_mid,
                                                     expo, idx, vmap, strict, &used);
   EXPECT_GT(stats.candidates, 0);
@@ -448,6 +451,7 @@ TEST(ResidualsVisual, SsdGateRejectsBrightnessOutlier) {
     std::vector<VisualUsedPoint> used;
     FrontendVisual c = cfg;
     c.outlier_threshold = outlier_thresh;
+    vmap.refreshVisibleCache(cam, spline.pose(t_mid));
     return addVisualResiduals(problem, spline, cam, Pose{}, bright_view, t_mid, expo, idx, vmap, c,
                               &used);
   };
@@ -481,6 +485,7 @@ TEST(ResidualsVisual, InvalidCameraIsHarmless) {
 
   ceres::Problem problem;
   std::vector<VisualUsedPoint> used;
+  vmap.refreshVisibleCache(cam, spline.pose(t_mid));
   const VisualAssocStats stats =
       addVisualResiduals(problem, spline, cam, Pose{}, view, t_mid, expo, idx, vmap, cfg, &used);
   EXPECT_EQ(stats.candidates, 0);
@@ -522,6 +527,7 @@ TEST(ResidualsVisual, JacobianMatchesNumericOnSmoothChain) {
 
   ceres::Problem problem;
   std::vector<VisualUsedPoint> used;
+  vmap.refreshVisibleCache(cam, spline.pose(t_mid));
   const VisualAssocStats stats = addVisualResiduals(problem, spline, cam, Pose{}, cur_view, t_mid,
                                                     expo, idx, vmap, cfg, &used);
   ASSERT_GT(stats.accepted, 0);

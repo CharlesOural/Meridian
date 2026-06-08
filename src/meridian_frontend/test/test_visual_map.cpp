@@ -250,6 +250,7 @@ TEST(VisualMap, ObservationCapIsRespected) {
     Pose T;
     // Move the camera on a small arc keeping the point in view near image centre.
     T.t = Eigen::Vector3d(std::sin(ang) * 0.5, 0.0, 0.0);
+    map.refreshVisibleCache(cam, T);
     map.updateAfterSolve(img, cam, T, 1.0);
   }
   const auto cands = map.visibleCandidates(cam, T0);
@@ -279,6 +280,7 @@ TEST(VisualMap, ConvergedLatchFreezesObservations) {
   for (int i = 0; i < 10; ++i) {
     Pose T;
     T.t = Eigen::Vector3d(0.3 * static_cast<double>(i + 1), 0.0, 0.0);
+    map.refreshVisibleCache(cam, T);
     map.updateAfterSolve(img, cam, T, 1.0);
     const auto cands = map.visibleCandidates(cam, T0);
     ASSERT_EQ(cands.size(), 1u);
@@ -318,6 +320,7 @@ TEST(VisualMap, DeterministicStateAcrossIdenticalRuns) {
         }
       }
       map.promote(img, cam, T, 1.0, hits);
+      map.refreshVisibleCache(cam, T);
       map.updateAfterSolve(img, cam, T, 1.0);
       map.evict(T.t);
     }

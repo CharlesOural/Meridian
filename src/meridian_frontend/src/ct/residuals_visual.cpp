@@ -442,7 +442,7 @@ VisualAssocStats addVisualResiduals(ceres::Problem& problem, SplineWindow& splin
 
   const Pose T_w_fe = spline.pose(t_mid_expo);
   const Pose T_w_c = T_w_fe * T_fe_cam;
-  const std::vector<const VisualPoint*> candidates = vmap.visibleCandidates(cam, T_w_c);
+  const std::vector<const VisualPoint*> candidates = vmap.cachedVisibleCandidates();
   stats.candidates = static_cast<int>(candidates.size());
 
   const double tau_cur = expo.value(expo_index);

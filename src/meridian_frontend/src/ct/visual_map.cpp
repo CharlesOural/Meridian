@@ -381,15 +381,29 @@ std::vector<const VisualPoint*> VisualMap::visibleCandidates(const CameraModel& 
   return out;
 }
 
+void VisualMap::refreshVisibleCache(const CameraModel& cam, const Pose& T_w_c) {
+  visible_cache_ids_ = selectVisibleIds(cam, T_w_c);
+}
+
+std::vector<const VisualPoint*> VisualMap::cachedVisibleCandidates() const {
+  std::vector<const VisualPoint*> out;
+  out.reserve(visible_cache_ids_.size());
+  for (std::int64_t id : visible_cache_ids_) {
+    const VisualPoint* pt = pointById(id);
+    if (pt != nullptr) out.push_back(pt);
+  }
+  return out;
+}
+
 void VisualMap::updateAfterSolve(const ImagePyramidView& img, const CameraModel& cam,
                                  const Pose& T_w_c, double inv_expo) {
   if (!cam.valid()) return;
   const double cos_obs_add = cos_add_angle_;
-  // Refine only the points the camera can actually use this frame (the per-cell
-  // visible winners), not every in-frustum point: the heavy per-point work
-  // (extractPatches over the pyramid, NCC, medoid re-score) must be bounded by the
-  // visible set, or it grows with the whole explored map and blows the sweep budget.
-  for (std::int64_t vid : selectVisibleIds(cam, T_w_c)) {
+  // Refine only the points the camera used this frame (the seed-pose visible cache,
+  // shared with the residual build), not every in-frustum point: the heavy per-point
+  // work (extractPatches, NCC, medoid re-score) must be bounded by the visible set,
+  // and reusing the cache avoids a second O(map) selection scan this sweep.
+  for (std::int64_t vid : visible_cache_ids_) {
     VisualPoint* pt = pointByIdMutable(vid);
     if (pt == nullptr || !pt->normal_initialized) continue;
     Eigen::Vector3d pc;
