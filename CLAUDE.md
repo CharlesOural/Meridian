@@ -72,6 +72,11 @@ dependency lint, no CUDA outside `meridian_map`, clang-tidy/clang-format `-Werro
   memory — consult spec 01 §3.1/§3.4 and §6 (and the per-type comment) before
   touching any covariance, information matrix, or Jacobian.
 - Validation datasets and the replay==live harness: see `docs/DATASET.md` and spec 10.
+- **Tuning constants** (perf/accuracy trade-offs — config numbers or hardcoded
+  constants like factor caps, voxel sizes, gate thresholds, anchor weights): when you
+  change one, add/update a one-line row in `docs/OPTIMIZE.md` (value, what it trades,
+  measured effect). It is the ledger for retuning on the Jetson; a constant changed
+  without an entry is a future mystery.
 
 ## Comment discipline
 
