@@ -21,8 +21,10 @@ fi
 OUT=${1:-/tmp/meridian_bagrun}
 mkdir -p "$OUT"
 
-BAG=bags/canteen_day_fixed
-echo "bag: $BAG" | tee "$OUT/run_info.txt"
+# $2 (optional): seconds of the bag to play; empty = whole bag.
+PLAY_SECS=${2:-}
+BAG=${BAG:-bags/canteen_day_fixed}
+echo "bag: $BAG  play_secs: ${PLAY_SECS:-all}" | tee "$OUT/run_info.txt"
 
 # Exec the binary directly (no ros2-run wrapper) so $NODE_PID is the node itself.
 "$HOME/Meridian/install/meridian_ros/lib/meridian_ros/odometry_node" --ros-args \
@@ -41,7 +43,13 @@ TM_PID=$!
 ros2 topic echo /meridian/telemetry > "$OUT/telemetry.yaml" 2>&1 &
 TL_PID=$!
 
-ros2 bag play "$BAG" --clock > "$OUT/bagplay.log" 2>&1
+# Cap playback with a wall-clock timeout (bag plays ~real-time under --clock); this
+# Humble build lacks --playback-duration. Empty PLAY_SECS plays the whole bag.
+if [ -n "$PLAY_SECS" ]; then
+  timeout --signal=INT "$PLAY_SECS" ros2 bag play "$BAG" --clock > "$OUT/bagplay.log" 2>&1
+else
+  ros2 bag play "$BAG" --clock > "$OUT/bagplay.log" 2>&1
+fi
 sleep 3
 
 kill $TUM_PID $EV_PID $TM_PID $TL_PID 2>/dev/null

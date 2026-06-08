@@ -22,6 +22,7 @@ VisualMapConfig::VisualMapConfig(const FrontendVisual& v) {
   if (v.patch > 0) patch = v.patch;
   if (v.levels > 0) levels = v.levels;
   if (v.grid_cell_px > 0) grid_cell_px = v.grid_cell_px;
+  if (v.active_box_m > 0) active_box_m = v.active_box_m;
 }
 
 VisualMap::VisualMap(const VisualMapConfig& cfg) : cfg_(cfg) {
@@ -61,6 +62,11 @@ bool VisualMap::inBoundsCam(const Eigen::Vector2d& uv, int w, int h) const {
   const double mar = static_cast<double>(patch_margin_);
   return uv.x() >= mar && uv.y() >= mar && uv.x() <= static_cast<double>(w - 1) - mar &&
          uv.y() <= static_cast<double>(h - 1) - mar;
+}
+
+VisualPoint* VisualMap::pointByIdMutable(std::int64_t id) {
+  auto it = points_.find(id);
+  return it == points_.end() ? nullptr : it->second.get();
 }
 
 const VisualPoint* VisualMap::pointById(std::int64_t id) const {
@@ -276,9 +282,9 @@ int VisualMap::promote(const ImagePyramidView& img, const CameraModel& cam, cons
   return added;
 }
 
-std::vector<const VisualPoint*> VisualMap::visibleCandidates(const CameraModel& cam,
-                                                             const Pose& T_w_c) const {
-  std::vector<const VisualPoint*> out;
+std::vector<std::int64_t> VisualMap::selectVisibleIds(const CameraModel& cam,
+                                                      const Pose& T_w_c) const {
+  std::vector<std::int64_t> out;
   if (!cam.valid()) return out;
   const int cw = cam.width();
   const int ch = cam.height();
@@ -360,7 +366,16 @@ std::vector<const VisualPoint*> VisualMap::visibleCandidates(const CameraModel& 
       }
     }
     if (occluded) continue;
-    const VisualPoint* pt = pointById(grid[i].id);
+    out.push_back(grid[i].id);
+  }
+  return out;
+}
+
+std::vector<const VisualPoint*> VisualMap::visibleCandidates(const CameraModel& cam,
+                                                             const Pose& T_w_c) const {
+  std::vector<const VisualPoint*> out;
+  for (std::int64_t id : selectVisibleIds(cam, T_w_c)) {
+    const VisualPoint* pt = pointById(id);
     if (pt != nullptr) out.push_back(pt);
   }
   return out;
@@ -370,9 +385,13 @@ void VisualMap::updateAfterSolve(const ImagePyramidView& img, const CameraModel&
                                  const Pose& T_w_c, double inv_expo) {
   if (!cam.valid()) return;
   const double cos_obs_add = cos_add_angle_;
-  for (const auto& [id, uptr] : points_) {
-    VisualPoint* pt = uptr.get();
-    if (!pt->normal_initialized) continue;
+  // Refine only the points the camera can actually use this frame (the per-cell
+  // visible winners), not every in-frustum point: the heavy per-point work
+  // (extractPatches over the pyramid, NCC, medoid re-score) must be bounded by the
+  // visible set, or it grows with the whole explored map and blows the sweep budget.
+  for (std::int64_t vid : selectVisibleIds(cam, T_w_c)) {
+    VisualPoint* pt = pointByIdMutable(vid);
+    if (pt == nullptr || !pt->normal_initialized) continue;
     Eigen::Vector3d pc;
     Eigen::Vector2d uv;
     if (!projectWorld(cam, T_w_c, pt->p_world, &pc, &uv)) continue;

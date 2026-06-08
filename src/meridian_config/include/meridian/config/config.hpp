@@ -303,6 +303,13 @@ struct FrontendVisual {
   double warp_det_min = 0.1;
   double warp_det_max = 10.0;
   double warp_cond_max = 50.0;
+  // Half-extent [m] of the active visual-map box: points farther than this from the
+  // current pose are evicted. Bounds the per-sweep map-maintenance cost to O(local
+  // points), independent of trajectory length. Must be near the camera's
+  // re-observability range, NOT the LiDAR map scale -- the visual map re-scores its
+  // resident points every sweep, so an over-large box makes per-sweep cost grow with
+  // distance travelled and starves the real-time budget.
+  double active_box_m = 20.0;
 };
 // Conservative absolute-position GNSS residual. `use` is the master gate: with it off
 // (or with no fixes present) the GNSS code path is never entered and the trajectory is

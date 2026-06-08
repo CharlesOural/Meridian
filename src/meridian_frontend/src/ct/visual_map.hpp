@@ -143,6 +143,12 @@ private:
   bool inBoundsCam(const Eigen::Vector2d& uv, int w, int h) const;
   // Live point with the given id, or nullptr if it was evicted.
   const VisualPoint* pointById(std::int64_t id) const;
+  VisualPoint* pointByIdMutable(std::int64_t id);
+  // Ids of the per-cell nearest in-frustum points that pass the depth-continuity
+  // gate -- the points the camera can actually use this frame. Shared by
+  // visibleCandidates() and updateAfterSolve() so both bound their work to the
+  // visible set (<= grid cells) instead of scanning the whole map.
+  std::vector<std::int64_t> selectVisibleIds(const CameraModel& cam, const Pose& T_w_c) const;
   // Shi-Tomasi-like corner score from the local gradient structure tensor at `uv`.
   float gradientScore(const ImagePyramidView& img, const Eigen::Vector2d& uv) const;
   // Extract the kLevels reference patches centred at level-0 pixel `uv`.

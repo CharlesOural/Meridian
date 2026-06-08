@@ -897,6 +897,85 @@ TEST(CtFrontEnd, OuterLoopConfigRespected) {
       << "more outer passes must accumulate more total iterations (det path, no early-stop)";
 }
 
+// End-to-end adaptive knot density: a yaw-rate profile that ramps through both
+// excitation band edges must raise the per-segment control-point count 1 -> 2 -> 3
+// and step back down, while the estimator keeps tracking through every density
+// transition -- in particular the window slide must marginalize whole knot groups
+// (a multi-knot segment trimmed one-knot-at-a-time destroys information and
+// misaligns the prior against the window boundary).
+TEST(CtFrontEnd, AdaptiveKnotDensityTracksThroughTransitions) {
+  const std::vector<Plane> walls = boxRoom(2.5);
+
+  // Piecewise-constant yaw rate crossing both band edges; the angle is the running
+  // integral so the GT orientation is continuous through the steps.
+  auto yawRate = [](double ts) {
+    if (ts < 0.8) return 0.2;
+    if (ts < 1.6) return 0.9;
+    if (ts < 2.4) return 2.0;
+    return 0.2;
+  };
+  auto yawAngle = [&](double ts) {
+    static const double edges[] = {0.8, 1.6, 2.4};
+    double a = 0.0;
+    double t0 = 0.0;
+    for (double e : edges) {
+      const double hi = std::min(ts, e);
+      if (hi > t0) a += yawRate(0.5 * (t0 + hi)) * (hi - t0);
+      if (ts <= e) return a;
+      t0 = e;
+    }
+    return a + 0.2 * (ts - 2.4);
+  };
+  const GtFn gt = [&](Timestamp t) {
+    const double ts = to_seconds(t);
+    Pose p;
+    p.q = Eigen::Quaterniond(Eigen::AngleAxisd(yawAngle(ts), Eigen::Vector3d::UnitZ()))
+              .normalized();
+    p.t = Eigen::Vector3d(0.25 * ts, 0.0, 0.0);
+    return p;
+  };
+
+  std::mt19937 rng(11);
+  FrontendConfig cfg = ctCfg();
+  cfg.spline.n_cp_max = 3;
+  cfg.spline.knot_omega_thresh = {0.5, 1.5};
+  cfg.spline.knot_accel_thresh = {1.0, 3.0};
+  meridian::RecordingSink sink;
+  CtFrontEnd fe(cfg, identityCalib(), &sink, /*deterministic=*/false);
+
+  const int sweeps = 32;
+  auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+  double max_err = 0.0;
+  for (int k = 0; k < sweeps; ++k) {
+    fe.ingest(stream[k]);
+    const double err =
+        (fe.live_state().T_world_body.t - gtAtSweepEnd(gt, k).t).norm();
+    max_err = std::max(max_err, err);
+  }
+
+  // The density actually transitioned: both bands were entered and the count
+  // returned to 1 once calm (downward hysteresis included).
+  std::vector<double> ncp;
+  for (const auto& r : sink.scalars) {
+    if (r.key == "frontend/spline/n_cp") ncp.push_back(r.v);
+  }
+  ASSERT_FALSE(ncp.empty()) << "n_cp telemetry never emitted";
+  const double peak = *std::max_element(ncp.begin(), ncp.end());
+  EXPECT_GE(peak, 3.0) << "the 2.0 rad/s band never raised the density to 3";
+  EXPECT_TRUE(std::find(ncp.begin(), ncp.end(), 2.0) != ncp.end())
+      << "the 0.9 rad/s band never raised the density to 2";
+  EXPECT_DOUBLE_EQ(ncp.back(), 1.0) << "density failed to step back down once calm";
+
+  // Tracking holds through every transition.
+  EXPECT_LT(max_err, 0.30) << "tracking excursion through a density transition";
+  // Bound pinned just above the measured ~0.21 m (the fixed-cadence solve schedule
+  // trades steady-state depth for robustness; see MarginalizationKeepsTrajectory-
+  // Continuous for the same characteristic).
+  const double final_err =
+      (fe.live_state().T_world_body.t - gtAtSweepEnd(gt, sweeps - 1).t).norm();
+  EXPECT_LT(final_err, 0.25) << "final error after the density ramp: " << final_err;
+}
+
 TEST(CtFrontEnd, BiasBoxBoundsAndRecovery) {
   const std::vector<Plane> walls = boxRoom(2.5);
 

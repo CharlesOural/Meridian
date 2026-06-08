@@ -1042,9 +1042,13 @@ function of the input and is bit-reproducible.
 ██   but NOT FREE: a starved solve is a shallower solve.                    ██
 ██                                                                          ██
 ██   THE KNOWN, MECHANICAL FIX IS ANALYTIC JACOBIANS for the spline         ██
-██   residuals (every reference CT system ships them: CLINS, Coco-LIC,      ██
-██   SLICT). This is the single highest-leverage performance item in the    ██
-██   front-end and MUST land before any real-time claim on the Orin.        ██
+██   residuals (SLICT ships the reference implementation; CLINS is          ██
+██   autodiff-only). STATUS: the LiDAR point-to-plane factor is ANALYTIC    ██
+██   (autodiff-parity certified to 1e-9 tangent-projected; solve max        ██
+██   halved 277->132 ms, mean -20%). STILL AUTODIFF: the IMU factor and     ██
+██   the visual photometric patches -- now the dominant cost; deadline_hit  ██
+██   0.92 at 90 ms with the FLIR stream. MUST finish before any real-time   ██
+██   claim on the Orin.                                                     ██
 ██   Watch: frontend/deadline_hit, frontend/solve_ms (spec 09).             ██
 ██                                                                          ██
 ██████████████████████████████████████████████████████████████████████████████
@@ -1171,17 +1175,20 @@ needed, cheap when not. The default thresholds are tuned against the released
 Coco-LIC code (Appendix R.1) but the gating *quantity* is fixed normatively as the
 peak per-sample form above.
 
-> **Shipped gated at `n_cp = 1` pending a non-uniform-grid validation campaign.** The
-> adaptive-density machinery above (`n_cp > 1`) is **design-present but currently
-> shipped disabled** — `ct.n_cp_max` defaults to **1**, the uniform-spline special
-> case — because it is **not yet validated end-to-end and is measurably wrong** in
-> interaction with the current tail machinery (§1.3.1): on the validation bag a run
-> with adaptive density enabled regressed ATE to **2.5 m** versus **0.029 m** for the
-> uniform spline. The likely culprit is that a knot-density change shifts the
-> virtual→real slope (and so the tail-knot index arithmetic and the
-> $u_{\text{end}}^3/6$ support test) in a way the pinning/anchor code has not yet been
-> validated against. Until a dedicated non-uniform-grid campaign clears it, `n_cp_max`
-> stays at 1; the design and code remain in place behind that gate.
+> **Adaptive density is mathematically validated; shipped at `n_cp = 1` for solver
+> budget only.** The original 2.5 m regression was root-caused to the window slide
+> marginalizing **one knot per sweep** — correct only for the uniform spline. The
+> slide now Schur-marginalizes the departing outer segment's **whole knot group**
+> (1..`n_cp` knots; each is inside the 4-knot support of the `t_begin` residuals,
+> so each has a live Markov blanket), and the front-trim removes the group with the
+> same one-sweep lag as the uniform case. Validation: an end-to-end density-ramp
+> test (yaw rate crossing both band edges, asserting `n_cp` 1→2→3→1 with hysteresis
+> and bounded tracking through every transition, via the `frontend/spline/n_cp`
+> telemetry), plus the validation bag at **parity with the uniform spline when the
+> solver is unbounded** (0.039 m vs 0.029–0.046 m run band). The remaining gate is
+> wall-clock, not math: density-2 segments inflate the autodiff problem past the
+> 90 ms budget (0.123 m starved vs 0.039 m unbounded), so `n_cp_max` ships at 1
+> until analytic Jacobians (§5.2 banner) buy the headroom — then flip to 3.
 
 > **Continuity across a knot-density transition.** The virtual→real time map is a
 > monotone piecewise-linear stretch whose slope $\mathrm dv/\mathrm dt$ is constant
@@ -1559,7 +1566,7 @@ never calls `RCLCPP_*`.
 | `ct.spline_order` | 4 (cubic, $C^2$) | App. R.1 |
 | `ct.representation` | split SO(3)×ℝ³ | App. R.1 (consensus best) |
 | `ct.knot_dt_s` | 0.1 (outer cadence) | Coco-LIC; App. R.1 |
-| `ct.n_cp_max` | 1 | adaptive knot cap; **shipped gated at 1** (uniform spline) pending non-uniform-grid validation (§5.5); App. R.1 |
+| `ct.n_cp_max` | 1 | adaptive knot cap; math validated (§5.5), **shipped at 1 for solver budget** until analytic Jacobians land; App. R.1 |
 | `ct.window_seconds` | 0.3–1.0 | fixed-lag window; App. R.1 |
 | `ct.time_offset_estimate` | false | per-sensor $t_d$ hook; App. R.1 |
 | `knot_omega_thresh[]` | tune (rad/s) | adaptive-knot $N_\omega$ band edges (§5.5) |

@@ -121,6 +121,8 @@ public:
   double* r3KnotData(int i);
 
   int numKnots() const;
+  // Real time of knot i (the kt_ table entry). Valid for i in [0, numKnots()).
+  Timestamp knotTime(int i) const;
 
 private:
   // One outer real segment: its real start time, the virtual time at its first new

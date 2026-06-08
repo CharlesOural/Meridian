@@ -307,4 +307,8 @@ int SplineWindow::numKnots() const {
   return static_cast<int>(kt_.size());
 }
 
+Timestamp SplineWindow::knotTime(int i) const {
+  return kt_[static_cast<std::size_t>(i)];
+}
+
 }  // namespace meridian

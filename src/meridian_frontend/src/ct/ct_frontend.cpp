@@ -995,19 +995,27 @@ void CtFrontEnd::slideWindow(ceres::Problem& problem, Timestamp t_begin, Timesta
   // dropped knot is genuinely exiting rather than still needed to keep the active set
   // full. The horizon is measured against the FIXED trajectory start (front-trimming
   // advances minTime() each sweep, so minTime() can no longer stand in for it). Also
-  // require t_begin to have advanced past the last slide so a knot is dropped at most
-  // once (consecutive sweeps advance t_begin by one knot interval).
+  // require t_begin to have advanced past the last slide so a segment's knot group is
+  // dropped at most once (consecutive sweeps advance t_begin by one outer segment).
   const Timestamp horizon = t_end - static_cast<Timestamp>(window_knots) * window_dt_ns_;
   if (horizon <= traj_start_t_ || t_begin <= window_floor_t_) {
     return;
   }
+  // The knots leaving the window this sweep: every control point of the outer
+  // segment that opens at t_begin. With adaptive density that segment carries
+  // 1..n_cp knots, and ALL of them must be Schur-marginalized together -- the next
+  // sweep's front-trim removes the whole group, and a knot trimmed without
+  // marginalization silently destroys its information and misaligns the prior
+  // against the window boundary. Each knot in the group is referenced by this
+  // sweep's residuals (the group spans one knot_dt, inside the 4-knot support of
+  // the t_begin segment), so each has a live Markov blanket.
   const int lead = spline_->leadingKnotIndex(t_begin);
-
-  // The oldest knot still touched by this sweep's residuals: the leading knot of the
-  // segment covering t_begin. It is marginalizable precisely because the just-solved
-  // problem still references it as a parameter block of those residuals.
-  const SplineWindow::SegmentRef seg = spline_->segmentFor(t_begin);
-  std::vector<double*> drop_ptrs = {seg.so3_knots[0], seg.r3_knots[0]};
+  const Timestamp seg_end_t = spline_->knotTime(lead) + window_dt_ns_;
+  std::vector<double*> drop_ptrs;
+  for (int j = lead; j < spline_->numKnots() && spline_->knotTime(j) < seg_end_t; ++j) {
+    drop_ptrs.push_back(spline_->so3KnotData(j));
+    drop_ptrs.push_back(spline_->r3KnotData(j));
+  }
 
   // Bias knots whose bracket lies wholly behind the current window front retire with
   // this slide. They join the Schur drop so the random-walk tie linking them to the
@@ -1639,6 +1647,9 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   // excitation (with hysteresis) so aggressive motion gets denser knots and smooth
   // motion stays cheap; the constant-1 case is recovered when n_cp_max <= 1.
   const int n_cp = selectKnotDensity(mg.imu);
+  if (telemetry_ && telemetry_->enabled("frontend/spline/n_cp")) {
+    telemetry_->scalar("frontend/spline/n_cp", static_cast<double>(n_cp), t_end);
+  }
   auto seed = buildSeed(mg.imu, last_solved_t_, t_end);
   spline_->extendTo(t_end, seed, n_cp);
   bias_->extendTo(t_end);

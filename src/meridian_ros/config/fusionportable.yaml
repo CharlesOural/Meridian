@@ -110,9 +110,12 @@ meridian:
     spline:
       knot_dt_ms: 100         # one outer segment per 10 Hz sweep
       window_knots: 8
-      n_cp_max: 1               # adaptive density (n_cp>1) is design-present but
-                                # unvalidated end-to-end; keep at 1 until the
-                                # non-uniform-grid campaign lands
+      # Adaptive density is mathematically validated (transition test + bag at
+      # parity with unbounded solve time), but density-2 segments inflate the
+      # autodiff problem past the 90 ms budget (0.123 m starved vs 0.039 m
+      # unbounded). Ship 1 until analytic Jacobians buy the headroom, then flip
+      # to 3.
+      n_cp_max: 1
       knot_omega_thresh: [0.5, 1.5]   # [rad/s] N_omega band edges raising n_cp to 2, 3
       knot_accel_thresh: [1.0, 3.0]   # [m/s^2] N_a band edges raising n_cp to 2, 3
       knot_density_hysteresis: 0.15
@@ -141,6 +144,10 @@ meridian:
       warp_det_min: 0.1
       warp_det_max: 10.0
       warp_cond_max: 50.0
+      # Active visual-map half-extent [m]. Bounds per-sweep map maintenance to the
+      # local point set; sized to the camera's indoor re-observability range, not the
+      # LiDAR map scale (60 m here grew the map to ~69k points and blew the budget).
+      active_box_m: 20.0
     gnss:
       # Conservative absolute-position residual. Off => the GNSS code path is never
       # entered and the trajectory is bit-identical to a build without it. Floors are
