@@ -13,7 +13,7 @@ Meridian/                       # this repo IS the colcon workspace (mounted at 
 ├── compose.yaml                # cross-platform base (CPU, no X11) — what the Mac runs
 ├── compose.linux-gpu.yaml      # Linux override: NVIDIA GPU + X11/RViz + USB sensors
 ├── setup-distrobox.sh          # Linux: build GPU image + create the Distrobox
-├── dependencies.repos          # vcs deps built in-workspace (nvblox GPU, ouster-ros)
+├── dependencies.repos          # vcs deps built in-workspace (nvblox GPU)
 ├── src/                        # the colcon source space (meridian_* packages go here)
 └── bags/                       # rosbag recordings (FusionPortable / M2DGR — see docs/DATASET.md)
 ```
@@ -45,8 +45,7 @@ Then, one-time workspace bring-up from the repo root:
 
 ```bash
 git submodule update --init          # vendor/ (basalt, ikd-Tree, scancontext)
-vcs import src < dependencies.repos              # nvblox (GPU) + ouster-ros
-vcs custom src --git --args submodule update --init --recursive   # nested submodules (ouster-sdk)
+vcs import src < dependencies.repos              # nvblox (GPU)
 rosdep install --from-paths src --ignore-src -y
 CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install \
     --parallel-workers 1 \
@@ -123,7 +122,7 @@ is defined; both Dockerfiles run it. Add a library by editing that script (or
 Version pins live in `install-deps.sh` (source builds) and follow spec 11 §3.
 
 > **Pinning TODO.** A few refs are not yet locked to a SHA (`small_gicp`,
-> `nvblox`, `ouster-ros`, and the `vendor/` submodules). Pin them per spec 11 §3
+> `nvblox`, and the `vendor/` submodules). Pin them per spec 11 §3
 > before any release/air-gapped build so nothing floats on a moving branch.
 
 ---
