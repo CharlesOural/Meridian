@@ -20,7 +20,7 @@ Meridian/                       # this repo IS the colcon workspace (mounted at 
 
 **What the image contains** (the dependency canon from
 [`docs/specs/11_build_system_libraries.md`](docs/specs/11_build_system_libraries.md)):
-ROS 2 Humble (desktop-full), C++20 toolchain (GCC 11), colcon/rosdep/vcstool,
+ROS 2 Humble (perception variant), C++20 toolchain (GCC 11), colcon/rosdep/vcstool,
 Eigen 3.4, Sophus 1.22.10, **Ceres 2.1**, **GTSAM 4.2**, PCL 1.12, OpenCV 4,
 small_gicp, yaml-cpp, linuxptp, evo, and the Foxglove bridge. The GPU image adds
 the **CUDA 12 toolkit**; **nvblox** is built in the workspace from
@@ -77,34 +77,33 @@ docker compose -f compose.yaml -f compose.linux-gpu.yaml down -v   # destroy
 
 ---
 
-## Mac (Apple Silicon)
+## Mac (Apple Silicon) / any CPU-only host
 
 Distrobox is Linux-only, so on Mac use **plain Docker** + **Foxglove Studio** for
-viz. The CPU image builds natively as `arm64` (fast). No NVIDIA/CUDA on Mac.
+viz. The CPU image's base is multi-arch, so it builds **native arm64** — no
+emulation. There is no NVIDIA/CUDA on Apple Silicon, so `meridian_map` (L4,
+nvblox) never builds here; it is not yet in `src/`, so today the whole workspace
+builds.
 
 ```bash
 docker compose up -d                        # base file only (CPU, no GPU)
 docker compose exec meridian bash
 ```
 
-Workspace bring-up (note: **skip the GPU layer**):
+One-time workspace bring-up:
 
 ```bash
-git submodule update --init
-# do NOT `vcs import` nvblox on Mac — it needs CUDA.
-CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install \
-    --parallel-workers 1 \
-    --packages-skip meridian_map meridian_pipeline meridian_ros meridian_tools
+git submodule update --init                 # vendor/ (basalt, ikd-Tree, scancontext)
+# do NOT `vcs import` nvblox — it needs CUDA.
+CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install --parallel-workers 1
+colcon test --parallel-workers 1 && colcon test-result --verbose
 ```
 
-This builds and unit-tests every **CPU layer** — L0 sensors, L1 preprocessing,
-**L2 the CT front-end**, **L3 the iSAM2 back-end**, and L5 place recognition —
-in isolation. The integrated pipeline + replay harness link `meridian_map` (L4),
-so those run on the Linux/GPU box. (A future test-only `NullMapLayer` behind
-`IMapLayer` could let the pipeline link GPU-free for integration tests — noted,
-not built.)
+When L4 lands, add `--packages-skip meridian_map` (plus any package that links it)
+on CPU-only hosts. A future test-only `NullMapLayer` behind `IMapLayer` could let
+the pipeline link GPU-free for integration tests — noted, not built.
 
-Visualization on Mac (and Linux too — the shared viz tool):
+Visualization (both platforms — the shared viz tool):
 
 ```bash
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml
