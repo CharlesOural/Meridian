@@ -1,19 +1,18 @@
 #pragma once
 
+#include <Eigen/Core>
 #include <array>
 #include <deque>
 #include <vector>
 
-#include <Eigen/Core>
-
 #include "meridian/common/sample.hpp"
 #include "meridian/common/time.hpp"
-
 #include "spline_window.hpp"
 
 namespace ceres {
 class Problem;
 class Manifold;
+class CostFunction;
 }  // namespace ceres
 
 namespace meridian::ct {
@@ -46,13 +45,18 @@ struct GravityBlock {
 // the pointers returned by gyroBlock()/accelBlock() stable for the lifetime of each
 // knot, so they may be held as Ceres parameter blocks and prior references.
 class BiasKnots {
- public:
+public:
   // Lays out `n_knots` (>= 1) knots uniformly over [t0, t0 + (n_knots-1)*dt_ns].
   // With a single knot the bias is constant over the whole window. Knot storage is a
   // deque: push_back/pop_front never move surviving elements, so Ceres parameter
   // blocks and marginalization-prior pointers into live knots stay valid as the
   // timeline grows and slides.
   BiasKnots(Timestamp t0, Duration dt_ns, int n_knots);
+
+  // Deep copy of the knot timeline and every knot value into independent deque
+  // storage, so a rebuilt residual set points at copy-owned blocks. Index i in the
+  // copy matches index i in the original.
+  BiasKnots clone() const;
 
   // Appends knots (each copying the last knot's value -- the random-walk mean) until
   // the final knot time is at or past t, so leftIndex(t)+1 is a real bracket.
@@ -88,7 +92,7 @@ class BiasKnots {
   void setGyroKnot(int k, const Eigen::Vector3d& b) { gyro_[k] = b; }
   void setAccelKnot(int k, const Eigen::Vector3d& b) { accel_[k] = b; }
 
- private:
+private:
   Timestamp t0_ = 0;
   Duration dt_ns_ = 0;
   std::deque<Eigen::Vector3d> gyro_;
@@ -98,8 +102,8 @@ class BiasKnots {
 // Per-stream weights for the IMU residuals. The four values are the noise standard
 // deviations; the assembler converts them to sqrt-information weights internally.
 struct ImuWeights {
-  double sigma_gyro = 1.0;      // gyro white-noise std [rad/s]
-  double sigma_accel = 1.0;     // accel white-noise std [m/s^2]
+  double sigma_gyro = 1.0;        // gyro white-noise std [rad/s]
+  double sigma_accel = 1.0;       // accel white-noise std [m/s^2]
   double sigma_bias_gyro = 1.0;   // gyro bias random-walk density [rad/(s*sqrt(s))]
   double sigma_bias_accel = 1.0;  // accel bias random-walk density [m/(s^2*sqrt(s))]
 };
@@ -117,9 +121,8 @@ struct ImuExcitation {
   double n_omega = 0.0;  // [rad/s]
   double n_accel = 0.0;  // [m/s^2]
 };
-ImuExcitation imuExcitation(const std::vector<ImuSample>& samples,
-                            const Eigen::Vector3d& b_g, const Eigen::Vector3d& b_a,
-                            double gravity_mag);
+ImuExcitation imuExcitation(const std::vector<ImuSample>& samples, const Eigen::Vector3d& b_g,
+                            const Eigen::Vector3d& b_a, double gravity_mag);
 
 // Maps the excitation statistics to a control-point count in [1, n_cp_max] with
 // hysteresis. Each rising threshold crossed in omega_thresh / accel_thresh adds one
@@ -128,10 +131,40 @@ ImuExcitation imuExcitation(const std::vector<ImuSample>& samples,
 // requires the statistic to fall below that band edge by `hysteresis` (fractional), so
 // density does not chatter at a threshold. `prev_n_cp` is the previous segment's count
 // (1 on the first segment). Same inputs always yield the same output.
-int knotDensityFromExcitation(const ImuExcitation& exc,
-                              const std::vector<double>& omega_thresh,
+int knotDensityFromExcitation(const ImuExcitation& exc, const std::vector<double>& omega_thresh,
                               const std::vector<double>& accel_thresh, double hysteresis,
                               int n_cp_max, int prev_n_cp);
+
+// Analytic cost-function factories for the IMU factor family. Each returns a freshly
+// allocated ceres::CostFunction whose ownership transfers to the AddResidualBlock
+// caller. The `*Autodiff` twins build the equivalent autodiff functor and exist for
+// the analytic-vs-autodiff derivative-correctness tests. Parameter-block order matches
+// the assemblers: 4 SO(3) knots (size 4), 4 R^3 knots (size 3), then bias blocks, then
+// the gravity direction (size 3). kSharedBias selects 2 bias blocks (b_g, b_a) vs 4
+// (bg_left, bg_right, ba_left, ba_right) interpolated by alpha.
+template <bool kSharedBias>
+ceres::CostFunction* makeImuCost(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel,
+                                 double u, double inv_dt, double alpha, double gravity_mag,
+                                 double w_gyro, double w_accel);
+template <bool kSharedBias>
+ceres::CostFunction* makeImuCostAutodiff(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel,
+                                         double u, double inv_dt, double alpha, double gravity_mag,
+                                         double w_gyro, double w_accel);
+
+ceres::CostFunction* makeJerkCost(double u, double inv_dt, double weight);
+ceres::CostFunction* makeJerkCostAutodiff(double u, double inv_dt, double weight);
+ceres::CostFunction* makeVelocityAnchorCost(const Eigen::Vector3d& v_pred, double u, double inv_dt,
+                                            double weight);
+ceres::CostFunction* makeVelocityAnchorCostAutodiff(const Eigen::Vector3d& v_pred, double u,
+                                                    double inv_dt, double weight);
+ceres::CostFunction* makeAngularAccelCost(double u, double inv_dt, double weight);
+ceres::CostFunction* makeAngularAccelCostAutodiff(double u, double inv_dt, double weight);
+ceres::CostFunction* makeRateAnchorCost(const Eigen::Vector3d& w_pred, double u, double inv_dt,
+                                        double weight);
+ceres::CostFunction* makeRateAnchorCostAutodiff(const Eigen::Vector3d& w_pred, double u,
+                                                double inv_dt, double weight);
+ceres::CostFunction* makeBiasTieCost(double w_gyro, double w_accel);
+ceres::CostFunction* makeBiasTieCostAutodiff(double w_gyro, double w_accel);
 
 // Adds one combined gyro+accel residual per IMU sample whose stamp lies inside the
 // span, plus the random-walk ties between consecutive bias knots, to `problem`.
@@ -141,16 +174,15 @@ int knotDensityFromExcitation(const ImuExcitation& exc,
 // it has none yet) so its magnitude stays fixed across solves. Returns the number
 // of IMU residuals added.
 int addImuResiduals(ceres::Problem& problem, SplineWindow& spline, BiasKnots& bias,
-                    GravityBlock& gravity, const std::vector<ImuSample>& samples,
-                    Timestamp t_begin, Timestamp t_end, const ImuWeights& weights);
+                    GravityBlock& gravity, const std::vector<ImuSample>& samples, Timestamp t_begin,
+                    Timestamp t_end, const ImuWeights& weights);
 
 // Adds the random-walk tie between every pair of consecutive resident bias knots at
 // full weight 1/(sigma*sqrt(knot_dt)). The tie is a model constraint re-stated per
 // problem (it never enters the marginalization prior from a live solve; a departing
 // knot's tie folds into the prior via the Schur drop in the window slide), so full
 // weight per problem counts it exactly once. Returns the number of ties added.
-int addBiasRandomWalk(ceres::Problem& problem, BiasKnots& bias,
-                      const ImuWeights& weights);
+int addBiasRandomWalk(ceres::Problem& problem, BiasKnots& bias, const ImuWeights& weights);
 
 // Adds tail anchors at each covered time: a world-velocity residual on the R^3 spline
 // derivative toward v_pred and a body-rate residual on the SO(3) spline toward w_pred.
@@ -172,7 +204,7 @@ int addTailAnchors(ceres::Problem& problem, SplineWindow& spline,
 // jerk + one angular-accel per covered time). The caller gates engagement (excitation
 // below floor AND a degenerate axis) and supplies the knot-midpoint times.
 int addMotionRegularizer(ceres::Problem& problem, SplineWindow& spline,
-                         const std::vector<Timestamp>& times, double weight,
-                         double accel_weight, double gyro_weight);
+                         const std::vector<Timestamp>& times, double weight, double accel_weight,
+                         double gyro_weight);
 
 }  // namespace meridian::ct

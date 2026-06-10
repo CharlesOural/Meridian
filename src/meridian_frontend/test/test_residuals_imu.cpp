@@ -6,7 +6,10 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <basalt/spline/ceres_spline_helper.h>
 #include <ceres/ceres.h>
+#include <ceres/manifold.h>
+#include <ceres/sphere_manifold.h>
 #include <gtest/gtest.h>
 #include <sophus/so3.hpp>
 
@@ -29,6 +32,18 @@ using meridian::ct::ImuExcitation;
 using meridian::ct::imuExcitation;
 using meridian::ct::ImuWeights;
 using meridian::ct::knotDensityFromExcitation;
+using meridian::ct::makeAngularAccelCost;
+using meridian::ct::makeAngularAccelCostAutodiff;
+using meridian::ct::makeBiasTieCost;
+using meridian::ct::makeBiasTieCostAutodiff;
+using meridian::ct::makeImuCost;
+using meridian::ct::makeImuCostAutodiff;
+using meridian::ct::makeJerkCost;
+using meridian::ct::makeJerkCostAutodiff;
+using meridian::ct::makeRateAnchorCost;
+using meridian::ct::makeRateAnchorCostAutodiff;
+using meridian::ct::makeVelocityAnchorCost;
+using meridian::ct::makeVelocityAnchorCostAutodiff;
 
 namespace {
 
@@ -735,4 +750,412 @@ TEST(MotionRegularizer, UnderExcitedSpanStaysBounded) {
   const Eigen::Vector3d after = floated;
   EXPECT_LT((after - before).norm(), 1.0)
       << "floated knot was not reined in: " << after.transpose();
+}
+
+// --- Analytic-vs-autodiff parity for the IMU factor family -----------------------
+//
+// The analytic costs are the exact same functions as the kept autodiff functors;
+// their Jacobians must agree at near-machine precision once SO(3) and gravity blocks
+// are projected through their manifold's PlusJacobian (the two formulations extend the
+// function differently OFF the unit sphere, and only the tangent projection is the
+// well-defined object the solver consumes). R^3 and bias blocks are unconstrained, so
+// they are compared directly.
+
+namespace {
+
+// A random IMU-factor configuration: four bounded-rotation SO(3) knots, four R^3
+// knots, biases, a unit gravity direction, and the per-sample inputs.
+struct ImuProbe {
+  std::array<Eigen::Quaterniond, 4> q;
+  std::array<Eigen::Vector3d, 4> p;
+  Eigen::Vector3d bg_l, bg_r, ba_l, ba_r;  // non-shared bias blocks
+  Eigen::Vector3d g_dir;                   // unit
+  Eigen::Vector3d gyro, accel;
+  double u = 0.5;
+  double inv_dt = 10.0;
+  double alpha = 0.5;
+  double gravity_mag = 9.81;
+  double w_gyro = 1.0;
+  double w_accel = 1.0;
+};
+
+ImuProbe randomImuProbe(std::mt19937& rng, double rot_scale) {
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  auto randVec = [&] { return Eigen::Vector3d(uni(rng), uni(rng), uni(rng)); };
+  ImuProbe pr;
+  Eigen::Quaterniond q0(uni(rng) + 1.5, uni(rng), uni(rng), uni(rng));
+  q0.normalize();
+  for (int j = 0; j < 4; ++j) {
+    pr.q[static_cast<std::size_t>(j)] = q0;
+    q0 = (q0 * Sophus::SO3d::exp(rot_scale * randVec()).unit_quaternion()).normalized();
+    pr.p[static_cast<std::size_t>(j)] = 2.0 * randVec();
+  }
+  pr.bg_l = 0.1 * randVec();
+  pr.bg_r = 0.1 * randVec();
+  pr.ba_l = 0.2 * randVec();
+  pr.ba_r = 0.2 * randVec();
+  pr.g_dir = randVec().normalized();
+  pr.gyro = randVec();
+  pr.accel = 3.0 * randVec();
+  const double dt = 0.005 + 0.045 * 0.5 * (uni(rng) + 1.0);
+  pr.inv_dt = 1.0 / dt;
+  pr.alpha = 0.5 * (uni(rng) + 1.0);
+  pr.u = 0.5 * (uni(rng) + 1.0) * 0.999;
+  pr.gravity_mag = 9.81;
+  pr.w_gyro = 0.5 + 0.5 * (uni(rng) + 1.0);
+  pr.w_accel = 0.5 + 0.5 * (uni(rng) + 1.0);
+  return pr;
+}
+
+// Compares two ambient SO(3) (Rows by 4) Jacobian blocks after projecting both through
+// the EigenQuaternionManifold PlusJacobian at the knot quaternion. The tolerance is
+// scaled by the block's largest entry: an individual projected entry that cancels to
+// near zero still carries a floor proportional to the BLOCK's natural magnitude, not its
+// own cancelled value, so a fixed absolute floor would be meaningless there. The
+// autodiff reference itself loses precision in its log/exp dual-number chain when the
+// inter-knot rotation is near identity (verified against central finite differences:
+// analytic and autodiff track FD to the SAME ~1e-5 floor there), so the SO(3) blocks are
+// the autodiff-reference-limited 1e-5; the R^3/bias blocks, which are exact in autodiff,
+// stay at the machine floor.
+template <int Rows>
+void expectSo3BlockMatch(const double* q, const double* ja, const double* jr,
+                         ceres::EigenQuaternionManifold& manifold, double tol,
+                         int trial, int knot) {
+  Eigen::Matrix<double, 4, 3, Eigen::RowMajor> plus_jac;
+  manifold.PlusJacobian(q, plus_jac.data());
+  const Eigen::Map<const Eigen::Matrix<double, Rows, 4, Eigen::RowMajor>> Ja(ja);
+  const Eigen::Map<const Eigen::Matrix<double, Rows, 4, Eigen::RowMajor>> Jr(jr);
+  const Eigen::Matrix<double, Rows, 3> la = Ja * plus_jac;
+  const Eigen::Matrix<double, Rows, 3> lr = Jr * plus_jac;
+  const double scale = std::max(1.0, lr.cwiseAbs().maxCoeff());
+  for (int row = 0; row < Rows; ++row)
+    for (int c = 0; c < 3; ++c)
+      EXPECT_NEAR(la(row, c), lr(row, c), tol * scale)
+          << "trial " << trial << " so3 knot " << knot << " row " << row << " col " << c;
+}
+
+// Relative+absolute tolerance: the R^3 derivative blocks carry inv_dt^Deriv scaling, so
+// a jerk Jacobian can reach 1e5 in magnitude and an absolute-only floor would demand
+// sub-ULP agreement. The blocks are analytically identical, so the residual after
+// machine rounding is bounded by tol*(1+|value|).
+void expectR3BlockMatch(const double* ja, const double* jr, int rows, double tol,
+                        int trial, int knot, const char* tag) {
+  for (int i = 0; i < rows * 3; ++i)
+    EXPECT_NEAR(ja[i], jr[i], tol + tol * std::abs(jr[i]))
+        << "trial " << trial << " " << tag << " block " << knot << " entry " << i;
+}
+
+// Relative+absolute residual comparison; the accel rows carry inv_dt^2-scaled world
+// acceleration and the jerk inv_dt^3, so the same machine-precision argument as the
+// Jacobian blocks applies.
+void expectResMatch(const double* a, const double* r, int n, double tol, int trial) {
+  for (int i = 0; i < n; ++i)
+    EXPECT_NEAR(a[i], r[i], tol + tol * std::abs(r[i])) << "trial " << trial << " res " << i;
+}
+
+}  // namespace
+
+// Main combined gyro+accel factor, single-bias-knot layout: analytic Jacobians match
+// the autodiff functor (tangent-projected on SO(3) and gravity).
+TEST(AnalyticImuCost, JacobiansMatchAutodiff_Shared) {
+  std::mt19937 rng(101);
+  ceres::EigenQuaternionManifold quat_manifold;
+  ceres::SphereManifold<3> sphere_manifold;
+  for (int trial = 0; trial < 60; ++trial) {
+    const double rot_scale = (trial % 2 == 0) ? 1e-4 : 0.4;
+    ImuProbe pr = randomImuProbe(rng, rot_scale);
+    if (trial % 5 == 0) pr.u = 1e-6;
+    if (trial % 7 == 0) pr.u = 1.0 - 1e-6;
+
+    std::unique_ptr<ceres::CostFunction> analytic(
+        makeImuCost<true>(pr.gyro, pr.accel, pr.u, pr.inv_dt, pr.alpha, pr.gravity_mag,
+                          pr.w_gyro, pr.w_accel));
+    std::unique_ptr<ceres::CostFunction> reference(makeImuCostAutodiff<true>(
+        pr.gyro, pr.accel, pr.u, pr.inv_dt, pr.alpha, pr.gravity_mag, pr.w_gyro,
+        pr.w_accel));
+
+    Eigen::Vector3d b_g = 0.1 * pr.bg_l;
+    Eigen::Vector3d b_a = 0.2 * pr.ba_l;
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(pr.q[static_cast<std::size_t>(j)].coeffs().data());
+    for (int j = 0; j < 4; ++j) params.push_back(pr.p[static_cast<std::size_t>(j)].data());
+    params.push_back(b_g.data());
+    params.push_back(b_a.data());
+    params.push_back(pr.g_dir.data());
+    const int g_index = 10;
+
+    double ja_so3[4][24], jr_so3[4][24];
+    double ja_r3[4][18], jr_r3[4][18];
+    double ja_bg[18], jr_bg[18], ja_ba[18], jr_ba[18], ja_g[18], jr_g[18];
+    std::vector<double*> ja, jr;
+    for (int j = 0; j < 4; ++j) { ja.push_back(ja_so3[j]); jr.push_back(jr_so3[j]); }
+    for (int j = 0; j < 4; ++j) { ja.push_back(ja_r3[j]); jr.push_back(jr_r3[j]); }
+    ja.push_back(ja_bg); jr.push_back(jr_bg);
+    ja.push_back(ja_ba); jr.push_back(jr_ba);
+    ja.push_back(ja_g); jr.push_back(jr_g);
+
+    double r_a[6], r_r[6];
+    ASSERT_TRUE(analytic->Evaluate(params.data(), r_a, ja.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), r_r, jr.data()));
+    expectResMatch(r_a, r_r, 6, 1e-12, trial);
+
+    // Well-conditioned (large-rotation, interior) trials must match the autodiff
+    // reference tightly; near-identity or segment-edge trials are limited by the
+    // reference's own small-angle precision (see expectSo3BlockMatch).
+    const bool well_conditioned = (rot_scale > 1e-2) && (trial % 5 != 0) && (trial % 7 != 0);
+    const double so3_tol = well_conditioned ? 1e-7 : 1e-5;
+    for (int j = 0; j < 4; ++j)
+      expectSo3BlockMatch<6>(params[j], ja_so3[j], jr_so3[j], quat_manifold,
+                             so3_tol, trial, j);
+    for (int j = 0; j < 4; ++j)
+      expectR3BlockMatch(ja_r3[j], jr_r3[j], 6, 1e-9, trial, j, "r3");
+    expectR3BlockMatch(ja_bg, jr_bg, 6, 1e-9, trial, 0, "bg");
+    expectR3BlockMatch(ja_ba, jr_ba, 6, 1e-9, trial, 0, "ba");
+    // Gravity: ambient block matches directly, and also after the sphere projection.
+    expectR3BlockMatch(ja_g, jr_g, 6, 1e-9, trial, 0, "g_ambient");
+    Eigen::Matrix<double, 3, 2, Eigen::RowMajor> sphere_jac;
+    sphere_manifold.PlusJacobian(params[g_index], sphere_jac.data());
+    const Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> Jga(ja_g);
+    const Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> Jgr(jr_g);
+    const Eigen::Matrix<double, 6, 2> lga = Jga * sphere_jac;
+    const Eigen::Matrix<double, 6, 2> lgr = Jgr * sphere_jac;
+    for (int row = 0; row < 6; ++row)
+      for (int c = 0; c < 2; ++c)
+        EXPECT_NEAR(lga(row, c), lgr(row, c), 1e-9 + 1e-9 * std::abs(lgr(row, c)))
+            << "trial " << trial << " gravity sphere row " << row << " col " << c;
+  }
+}
+
+// Main factor, two-bias-knot interpolated layout (random alpha): four bias blocks plus
+// gravity at index 12.
+TEST(AnalyticImuCost, JacobiansMatchAutodiff_NonShared) {
+  std::mt19937 rng(202);
+  ceres::EigenQuaternionManifold quat_manifold;
+  ceres::SphereManifold<3> sphere_manifold;
+  for (int trial = 0; trial < 60; ++trial) {
+    const double rot_scale = (trial % 2 == 0) ? 1e-4 : 0.4;
+    ImuProbe pr = randomImuProbe(rng, rot_scale);
+    if (trial % 5 == 0) pr.u = 1e-6;
+    if (trial % 7 == 0) pr.u = 1.0 - 1e-6;
+
+    std::unique_ptr<ceres::CostFunction> analytic(
+        makeImuCost<false>(pr.gyro, pr.accel, pr.u, pr.inv_dt, pr.alpha, pr.gravity_mag,
+                           pr.w_gyro, pr.w_accel));
+    std::unique_ptr<ceres::CostFunction> reference(makeImuCostAutodiff<false>(
+        pr.gyro, pr.accel, pr.u, pr.inv_dt, pr.alpha, pr.gravity_mag, pr.w_gyro,
+        pr.w_accel));
+
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(pr.q[static_cast<std::size_t>(j)].coeffs().data());
+    for (int j = 0; j < 4; ++j) params.push_back(pr.p[static_cast<std::size_t>(j)].data());
+    params.push_back(pr.bg_l.data());
+    params.push_back(pr.bg_r.data());
+    params.push_back(pr.ba_l.data());
+    params.push_back(pr.ba_r.data());
+    params.push_back(pr.g_dir.data());
+    const int g_index = 12;
+
+    double ja_so3[4][24], jr_so3[4][24];
+    double ja_r3[4][18], jr_r3[4][18];
+    double ja_bias[4][18], jr_bias[4][18];
+    double ja_g[18], jr_g[18];
+    std::vector<double*> ja, jr;
+    for (int j = 0; j < 4; ++j) { ja.push_back(ja_so3[j]); jr.push_back(jr_so3[j]); }
+    for (int j = 0; j < 4; ++j) { ja.push_back(ja_r3[j]); jr.push_back(jr_r3[j]); }
+    for (int j = 0; j < 4; ++j) { ja.push_back(ja_bias[j]); jr.push_back(jr_bias[j]); }
+    ja.push_back(ja_g); jr.push_back(jr_g);
+
+    double r_a[6], r_r[6];
+    ASSERT_TRUE(analytic->Evaluate(params.data(), r_a, ja.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), r_r, jr.data()));
+    expectResMatch(r_a, r_r, 6, 1e-12, trial);
+
+    const bool well_conditioned = (rot_scale > 1e-2) && (trial % 5 != 0) && (trial % 7 != 0);
+    const double so3_tol = well_conditioned ? 1e-7 : 1e-5;
+    for (int j = 0; j < 4; ++j)
+      expectSo3BlockMatch<6>(params[j], ja_so3[j], jr_so3[j], quat_manifold,
+                             so3_tol, trial, j);
+    for (int j = 0; j < 4; ++j)
+      expectR3BlockMatch(ja_r3[j], jr_r3[j], 6, 1e-9, trial, j, "r3");
+    for (int j = 0; j < 4; ++j)
+      expectR3BlockMatch(ja_bias[j], jr_bias[j], 6, 1e-9, trial, j, "bias");
+    expectR3BlockMatch(ja_g, jr_g, 6, 1e-9, trial, 0, "g_ambient");
+    Eigen::Matrix<double, 3, 2, Eigen::RowMajor> sphere_jac;
+    sphere_manifold.PlusJacobian(params[g_index], sphere_jac.data());
+    const Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> Jga(ja_g);
+    const Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> Jgr(jr_g);
+    const Eigen::Matrix<double, 6, 2> lga = Jga * sphere_jac;
+    const Eigen::Matrix<double, 6, 2> lgr = Jgr * sphere_jac;
+    for (int row = 0; row < 6; ++row)
+      for (int c = 0; c < 2; ++c)
+        EXPECT_NEAR(lga(row, c), lgr(row, c), 1e-9 + 1e-9 * std::abs(lgr(row, c)))
+            << "trial " << trial << " gravity sphere row " << row << " col " << c;
+  }
+}
+
+// Residual-only path of the main factor matches a direct basalt forward evaluation
+// (evaluate_lie for omega, evaluate<3,2> for a_world) at machine precision.
+TEST(AnalyticImuCost, ResidualMatchesForwardEval) {
+  std::mt19937 rng(303);
+  for (int trial = 0; trial < 30; ++trial) {
+    ImuProbe pr = randomImuProbe(rng, 0.3);
+    Eigen::Vector3d b_g = 0.1 * pr.bg_l;
+    Eigen::Vector3d b_a = 0.2 * pr.ba_l;
+
+    std::unique_ptr<ceres::CostFunction> analytic(
+        makeImuCost<true>(pr.gyro, pr.accel, pr.u, pr.inv_dt, pr.alpha, pr.gravity_mag,
+                          pr.w_gyro, pr.w_accel));
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(pr.q[static_cast<std::size_t>(j)].coeffs().data());
+    for (int j = 0; j < 4; ++j) params.push_back(pr.p[static_cast<std::size_t>(j)].data());
+    params.push_back(b_g.data());
+    params.push_back(b_a.data());
+    params.push_back(pr.g_dir.data());
+
+    double r_a[6];
+    ASSERT_TRUE(analytic->Evaluate(params.data(), r_a, nullptr));
+
+    Sophus::SO3d R_w_fe;
+    Sophus::SO3d::Tangent omega;
+    basalt::CeresSplineHelper<4>::evaluate_lie<double, Sophus::SO3>(
+        params.data(), pr.u, pr.inv_dt, &R_w_fe, &omega, nullptr);
+    Eigen::Vector3d a_world;
+    basalt::CeresSplineHelper<4>::evaluate<double, 3, 2>(params.data() + 4, pr.u,
+                                                         pr.inv_dt, &a_world);
+    const Eigen::Vector3d g_world = pr.g_dir * pr.gravity_mag;
+    Eigen::Matrix<double, 6, 1> r_ref;
+    r_ref.head<3>() = pr.w_gyro * (omega + b_g - pr.gyro);
+    r_ref.tail<3>() =
+        pr.w_accel * (R_w_fe.inverse() * (a_world - g_world) + b_a - pr.accel);
+    expectResMatch(r_a, r_ref.data(), 6, 1e-12, trial);
+  }
+}
+
+// Jerk regularizer: purely linear in R^3 knots, so analytic and autodiff agree exactly.
+TEST(AnalyticImuCompanions, JerkMatchesAutodiff) {
+  std::mt19937 rng(404);
+  for (int trial = 0; trial < 60; ++trial) {
+    ImuProbe pr = randomImuProbe(rng, 0.3);
+    if (trial % 5 == 0) pr.u = 1e-6;
+    if (trial % 7 == 0) pr.u = 1.0 - 1e-6;
+    const double w = pr.w_accel;
+    std::unique_ptr<ceres::CostFunction> analytic(makeJerkCost(pr.u, pr.inv_dt, w));
+    std::unique_ptr<ceres::CostFunction> reference(makeJerkCostAutodiff(pr.u, pr.inv_dt, w));
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(pr.p[static_cast<std::size_t>(j)].data());
+    double ja[4][9], jr[4][9];
+    std::vector<double*> jap, jrp;
+    for (int j = 0; j < 4; ++j) { jap.push_back(ja[j]); jrp.push_back(jr[j]); }
+    double r_a[3], r_r[3];
+    ASSERT_TRUE(analytic->Evaluate(params.data(), r_a, jap.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), r_r, jrp.data()));
+    expectResMatch(r_a, r_r, 3, 1e-12, trial);
+    for (int j = 0; j < 4; ++j) expectR3BlockMatch(ja[j], jr[j], 3, 1e-12, trial, j, "jerk");
+  }
+}
+
+// Velocity anchor: linear in R^3 knots, exact match.
+TEST(AnalyticImuCompanions, VelocityAnchorMatchesAutodiff) {
+  std::mt19937 rng(505);
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  for (int trial = 0; trial < 60; ++trial) {
+    ImuProbe pr = randomImuProbe(rng, 0.3);
+    if (trial % 5 == 0) pr.u = 1e-6;
+    if (trial % 7 == 0) pr.u = 1.0 - 1e-6;
+    const Eigen::Vector3d v_pred(uni(rng), uni(rng), uni(rng));
+    const double w = pr.w_accel;
+    std::unique_ptr<ceres::CostFunction> analytic(
+        makeVelocityAnchorCost(v_pred, pr.u, pr.inv_dt, w));
+    std::unique_ptr<ceres::CostFunction> reference(
+        makeVelocityAnchorCostAutodiff(v_pred, pr.u, pr.inv_dt, w));
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(pr.p[static_cast<std::size_t>(j)].data());
+    double ja[4][9], jr[4][9];
+    std::vector<double*> jap, jrp;
+    for (int j = 0; j < 4; ++j) { jap.push_back(ja[j]); jrp.push_back(jr[j]); }
+    double r_a[3], r_r[3];
+    ASSERT_TRUE(analytic->Evaluate(params.data(), r_a, jap.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), r_r, jrp.data()));
+    expectResMatch(r_a, r_r, 3, 1e-12, trial);
+    for (int j = 0; j < 4; ++j) expectR3BlockMatch(ja[j], jr[j], 3, 1e-12, trial, j, "vanchor");
+  }
+}
+
+// Bias tie: constant Jacobians, exact match.
+TEST(AnalyticImuCompanions, BiasTieMatchesAutodiff) {
+  std::mt19937 rng(606);
+  for (int trial = 0; trial < 30; ++trial) {
+    ImuProbe pr = randomImuProbe(rng, 0.3);
+    const double w_g = pr.w_gyro, w_a = pr.w_accel;
+    std::unique_ptr<ceres::CostFunction> analytic(makeBiasTieCost(w_g, w_a));
+    std::unique_ptr<ceres::CostFunction> reference(makeBiasTieCostAutodiff(w_g, w_a));
+    std::vector<const double*> params{pr.bg_l.data(), pr.bg_r.data(), pr.ba_l.data(),
+                                      pr.ba_r.data()};
+    double ja[4][18], jr[4][18];
+    std::vector<double*> jap, jrp;
+    for (int j = 0; j < 4; ++j) { jap.push_back(ja[j]); jrp.push_back(jr[j]); }
+    double r_a[6], r_r[6];
+    ASSERT_TRUE(analytic->Evaluate(params.data(), r_a, jap.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), r_r, jrp.data()));
+    expectResMatch(r_a, r_r, 6, 1e-12, trial);
+    for (int j = 0; j < 4; ++j) expectR3BlockMatch(ja[j], jr[j], 6, 1e-12, trial, j, "biastie");
+  }
+}
+
+// Rate anchor: body angular velocity, SO(3) tangent-projected.
+TEST(AnalyticImuCompanions, RateAnchorMatchesAutodiff) {
+  std::mt19937 rng(707);
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  ceres::EigenQuaternionManifold quat_manifold;
+  for (int trial = 0; trial < 60; ++trial) {
+    const double rot_scale = (trial % 2 == 0) ? 1e-4 : 0.4;
+    ImuProbe pr = randomImuProbe(rng, rot_scale);
+    if (trial % 5 == 0) pr.u = 1e-6;
+    if (trial % 7 == 0) pr.u = 1.0 - 1e-6;
+    const Eigen::Vector3d w_pred(uni(rng), uni(rng), uni(rng));
+    const double w = pr.w_gyro;
+    std::unique_ptr<ceres::CostFunction> analytic(
+        makeRateAnchorCost(w_pred, pr.u, pr.inv_dt, w));
+    std::unique_ptr<ceres::CostFunction> reference(
+        makeRateAnchorCostAutodiff(w_pred, pr.u, pr.inv_dt, w));
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(pr.q[static_cast<std::size_t>(j)].coeffs().data());
+    double ja[4][12], jr[4][12];
+    std::vector<double*> jap, jrp;
+    for (int j = 0; j < 4; ++j) { jap.push_back(ja[j]); jrp.push_back(jr[j]); }
+    double r_a[3], r_r[3];
+    ASSERT_TRUE(analytic->Evaluate(params.data(), r_a, jap.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), r_r, jrp.data()));
+    expectResMatch(r_a, r_r, 3, 1e-12, trial);
+    for (int j = 0; j < 4; ++j)
+      expectSo3BlockMatch<3>(params[j], ja[j], jr[j], quat_manifold, 1e-9, trial, j);
+  }
+}
+
+// Angular-acceleration regularizer: second SO(3) derivative, tangent-projected. Looser
+// tolerance accommodates the lie-bracket / large-rotation series conditioning.
+TEST(AnalyticImuCompanions, AngularAccelMatchesAutodiff) {
+  std::mt19937 rng(808);
+  ceres::EigenQuaternionManifold quat_manifold;
+  for (int trial = 0; trial < 60; ++trial) {
+    const double rot_scale = (trial % 2 == 0) ? 1e-4 : 0.4;
+    ImuProbe pr = randomImuProbe(rng, rot_scale);
+    if (trial % 5 == 0) pr.u = 1e-6;
+    if (trial % 7 == 0) pr.u = 1.0 - 1e-6;
+    const double w = pr.w_gyro;
+    std::unique_ptr<ceres::CostFunction> analytic(makeAngularAccelCost(pr.u, pr.inv_dt, w));
+    std::unique_ptr<ceres::CostFunction> reference(
+        makeAngularAccelCostAutodiff(pr.u, pr.inv_dt, w));
+    std::vector<const double*> params;
+    for (int j = 0; j < 4; ++j) params.push_back(pr.q[static_cast<std::size_t>(j)].coeffs().data());
+    double ja[4][12], jr[4][12];
+    std::vector<double*> jap, jrp;
+    for (int j = 0; j < 4; ++j) { jap.push_back(ja[j]); jrp.push_back(jr[j]); }
+    double r_a[3], r_r[3];
+    ASSERT_TRUE(analytic->Evaluate(params.data(), r_a, jap.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), r_r, jrp.data()));
+    expectResMatch(r_a, r_r, 3, 1e-9, trial);
+    for (int j = 0; j < 4; ++j)
+      expectSo3BlockMatch<3>(params[j], ja[j], jr[j], quat_manifold, 1e-9, trial, j);
+  }
 }
