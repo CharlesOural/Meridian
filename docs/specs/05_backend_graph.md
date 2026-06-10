@@ -1,38 +1,28 @@
 # 05 — L3 Keyframe Factor-Graph Back-End (iSAM2)
 
 > **Spec status:** normative implementation spec for layer **L3**. It implements
-> the `IBackEnd` interface defined in `01_interfaces_and_data_types.md §7.4` and
-> consumes the `KeyframePacket` (`01 §6`), `LoopConstraint` (`01 §7.6`), and
-> `GnssFix` (`01 §4.4`) value types defined there. It emits the `GraphUpdate`
-> (`01 §7.4`), the `corrected_trajectory()` (`01 §7.4`, `StampedPose`), and the
-> refined `CalibrationSet` snapshot (`01 §5.3`). **This document does not
-> redefine any boundary type** — if it needs a new field on a boundary type it
+> `IBackEnd` (`01 §7.4`) and consumes the boundary types `KeyframePacket`
+> (`01 §6`), `LoopConstraint` (`01 §7.6`), and `GnssFix` (`01 §4.4`). It emits the
+> `GraphUpdate` (`01 §7.4`), the `corrected_trajectory()` (`01 §7.4`,
+> `StampedPose`), and the refined `CalibrationSet` snapshot (`01 §5.3`). **This
+> document does not redefine any boundary type** — a new field on a boundary type
 > amends spec 01, per spec 01's own rule. Everything below is *internal* to
 > `meridian_backend` except where it names a spec-01 type.
 >
-> **Where L3 sits.** Meridian is one complete system: a continuous-time (CT),
-> tightly-coupled LiDAR-Inertial-Visual-GNSS estimator (`00 §0`). The **L2 CT
-> LIVO+GNSS front-end** fuses a single LiDAR, a single IMU, a single camera, and
-> GNSS inside a sliding B-spline window and summarises each keyframe interval as
-> **one** `KeyframePacket`. **L3 is the global, drift-free layer:** it stitches
-> those packets, loop closures, and GNSS into a single iSAM2 factor graph in the
-> `map` frame and broadcasts corrections to the live front-end (L2) and the
+> **Where L3 sits.** The **L2 CT LIVO+GNSS front-end** fuses a single LiDAR, IMU,
+> camera, and GNSS inside a sliding B-spline window and summarises each keyframe
+> interval as **one** `KeyframePacket`. **L3 is the global, drift-free layer:** it
+> stitches those packets, loop closures, and GNSS into a single iSAM2 factor graph
+> in the `map` frame and broadcasts corrections to the live front-end (L2) and the
 > nvblox map (L4). L3 does not estimate the trajectory inside a window — that is
 > L2's job; L3 estimates the *globally consistent* keyframe poses, the GNSS-datum
 > alignment, and the online extrinsics.
 >
-> **Engine:** GTSAM's `ISAM2` (incremental smoothing and mapping). Familiarity
-> with the GTSAM factor-graph API and the iSAM2 / Bayes-tree algorithm is
-> assumed: a SLAM back-end solves a MAP estimate that, under Gaussian noise,
-> reduces to nonlinear least squares over an information-form factor graph
-> ($X^\* = \arg\min_X \sum_i \lVert h_i(X) \ominus z_i\rVert^2_{\Sigma_i}$);
-> iSAM2 solves it *incrementally* by representing the square-root information
-> matrix as a Bayes tree, re-eliminating only the cliques on the path to the root
-> when factors are added, relinearizing fluidly, and recovering only the requested
-> variables. This document specifies only how Meridian *uses* that engine; every
-> GTSAM knob below is verified against the pinned GTSAM **4.2** source and the
-> GTSAM-4.2-using reference systems (Appendix R). Reference digests and the
-> bibliography for the underlying algorithms live in **Appendix R**.
+> **Engine:** GTSAM **4.2** `ISAM2` (Bayes tree, fluid relinearization, partial
+> variable recovery); familiarity with the GTSAM API and the iSAM2 algorithm is
+> assumed. This document specifies only how Meridian *uses* the engine; every
+> GTSAM knob below is verified against the pinned GTSAM 4.2 source and the
+> reference systems digested in **Appendix R** (which also holds the bibliography).
 >
 > **The single most important rule.** Between any two consecutive keyframes the
 > back-end adds the L2 information **exactly once**: one relative `BetweenFactor`
@@ -41,9 +31,9 @@
 > that edge. The IMU factor (`CombinedImuFactor`) appears **only** on the
 > window-restart fallback (`constraint_kind == ImuPreintegration`), where it
 > *replaces* the between-factor. The two are mutually exclusive *by construction*
-> because `KeyframePacket::constraint_kind` is a single enum (`01 §6.4`); this
+> because `KeyframePacket::constraint_kind` is a single enum (`01 §6.4`). This
 > L2→L3 hand-off rule (Appendix R.2) is the most load-bearing part of the
-> back-end. §4 and §5 make this airtight.
+> back-end; §4 and §5 make it airtight.
 
 ---
 
@@ -78,39 +68,37 @@
 1. Own a single GTSAM `ISAM2` instance and the canonical **`map`-frame** estimate
    of every keyframe pose (and, where they cross the boundary, velocity/bias).
 2. Translate each `KeyframePacket` into graph variables + exactly **one**
-   odometry factor (§4/§5), respecting the no-double-counting contract
-   (Appendix R.2).
+   odometry factor (§4/§5), respecting the no-double-counting contract (§3.1).
 3. Fold in **switchable** constraints: loop closures (`LoopConstraint`, L5) and
-   GNSS (`GnssFix`, L0), each guarded by a robust kernel (GNC, §8) and an outlier
+   GNSS (`GnssFix`, L0), each guarded by a robust kernel (§8) and an outlier
    pre-filter (PCM for loops, §7).
 4. Estimate the **GNSS-origin** alignment (`map ← ENU`) and, when enabled
    per-platform, the **online extrinsics** (off by default, §10) as graph variables,
-   publishing refined calibration back to L2 as a versioned `CalibrationSet` snapshot
-   (`01 §5.3`).
+   publishing refined calibration back to L2 as a versioned `CalibrationSet`
+   snapshot (`01 §5.3`).
 5. Run incremental `ISAM2::update` on a batched cadence decoupled from keyframe
    insertion (§9.2/§17); relinearize fluidly; marginalize transient inertial
    variables to keep the steady-state graph pose-only (§11).
-6. Produce the outputs `IBackEnd` promises: `optimize()` returns a `GraphUpdate`
-   (which keyframes moved and to what), `corrected_trajectory()` returns the
-   `map`-frame `StampedPose` list, `refined_calibration()` returns the snapshot.
+6. Produce the `IBackEnd` outputs: `optimize()` → `GraphUpdate`,
+   `corrected_trajectory()` → the `map`-frame `StampedPose` list,
+   `refined_calibration()` → the snapshot.
 7. Serve the latest pose marginal covariance to L5's place-recognition gate (§13).
-8. Emit rich debug (`BackEndDiagnostics` plus dedicated telemetry keys): graph
-   summary, per-axis observability inflation, loop/GNSS accept/reject, chi-square,
+8. Emit rich debug (`BackEndDiagnostics` + telemetry keys, §14): graph summary,
+   per-axis observability inflation, loop/GNSS accept/reject, chi-square,
    relinearization counts, timing.
 
 ### 1.2 Out of scope (handled elsewhere)
 
 - Front-end estimation, deskew, keyframe *emission policy*, and the construction
   of `RelativeBetween` / `ImuPreintegration` constraints — **L2**
-  (`04_frontend_estimation.md`; the boundary types are fixed in `01 §6`).
-- Loop-candidate *generation* and geometric verification (Scan Context++ →
-  STD/BTC → GICP) — **L5** (`ILoopDetector`, `01 §7.6`; `07_loop_closure.md`).
-  L3 only *consumes* a verified `LoopConstraint` and decides accept/reject via PCM
-  (§7) + GNC (§8).
+  (`04_frontend_estimation.md`; boundary types fixed in `01 §6`).
+- Loop-candidate *generation* and geometric verification — **L5** (`ILoopDetector`,
+  `01 §7.6`; `07_loop_closure.md`). L3 only *consumes* a verified `LoopConstraint`
+  and decides accept/reject via PCM (§7) + the robust kernel (§8).
 - TSDF / colour / mesh and the clear-and-rebuild **re-integration** itself — **L4**
-  (`IMapLayer::apply_graph_update`, `01 §7.5`; `06_mapping.md`). L4 is **nvblox on
-  the GPU** — the one and only map backend, no CPU path. L3 *triggers* a region
-  rebuild by emitting a `GraphUpdate`; it never touches voxels.
+  (`IMapLayer::apply_graph_update`, `01 §7.5`; `06_mapping.md`). L4 is nvblox on
+  the GPU, the only map backend. L3 *triggers* a region rebuild by emitting a
+  `GraphUpdate`; it never touches voxels.
 - Cloud storage — the `KeyframeStore` (`01 §7.5`). L3 forwards the packet's
   Shared-immutable `cloud_body` / `image` handles to the store and to L5; it does
   not copy or own clouds.
@@ -135,19 +123,82 @@
 ```
 
 Every keyframe carries exactly **one** `obs[6]` observability report (`01 §3.4`),
-because there is exactly **one** LiDAR in the system; there is no per-sensor merge
-of observability streams to perform. (Multi-LiDAR would be a future extension
-behind the same `KeyframePacket` interface; it is not designed here.)
+because there is exactly one LiDAR in the system; there is no per-sensor merge of
+observability streams. (Multi-LiDAR would be a future extension behind the same
+`KeyframePacket` interface; it is not designed here.)
 
 > **Note on the `PoseCorrection` / `map→odom` concept.** Spec 00 §3 sketches a
-> "`PoseCorrection` broadcast to L4/L2." In the *normative* type system (spec 01
-> §7.4) that broadcast is realized concretely as: (a) the `GraphUpdate` to L4, and
-> (b) the refined `CalibrationSet` + the corrected trajectory the live front-end
-> rebases against. The front-end keeps publishing smooth `odom`-frame `NavState`
-> (`01 §7.3`); L3 owns `map` and the `map`-relative correction is *implicit* in
-> the difference between `corrected_trajectory()` and the front-end's odom poses
-> at the same keyframe stamps. §9.3 specifies how a consumer computes the
-> `map→odom` transform from these outputs without L3 minting a new boundary type.
+> "`PoseCorrection` broadcast to L4/L2." In the normative type system (`01 §7.4`)
+> that broadcast is realized as: (a) the `GraphUpdate` to L4, and (b) the refined
+> `CalibrationSet` + the corrected trajectory the live front-end rebases against.
+> The front-end keeps publishing smooth `odom`-frame `NavState` (`01 §7.3`); L3
+> owns `map`, and §9.3 specifies how a consumer computes the `map→odom` transform
+> from L3's outputs without a new boundary type.
+
+### 1.4 Current L2 emission state (implementation status — read before building L3)
+
+> **Implementation status, not design.** This records what the L2 CT front-end
+> **actually emits today**, so an L3 implementer knows which factor paths can be
+> exercised against the live system and which are spec-complete but dormant. The
+> normative contract above is unchanged. Verify against
+> `meridian_frontend/src/ct/ct_frontend.cpp::emitKeyframe` (and
+> `src/ct/keyframe_finalizer.cpp`) before relying on it.
+>
+> The boundary type is real: `KeyframePacket` is defined in
+> `meridian_common/include/meridian/common/keyframe_packet.hpp` and is emitted on a
+> live `keyframe_sink` callback. `meridian_backend` does **not** exist yet — L3 is
+> greenfield. The pipeline already forwards every packet through
+> `MeridianPipeline::on_keyframe` (counts it, raises `frontend/keyframe`
+> telemetry) and re-emits it on the pipeline's own outgoing `keyframe_sink`, which
+> **nothing currently consumes** — that callback is the L3 insertion point.
+
+What L2 populates per packet today:
+
+| Field | Emitted today | Notes for L3 |
+|-------|---------------|--------------|
+| `constraint_kind` | `AbsolutePrior` (first keyframe **and** the first keyframe after a hard reseed — the chain break of `01 §6.4`); `RelativeBetween` (all others) | **`ImuPreintegration` is never emitted** — see GAP-A. A mid-stream `AbsolutePrior` in `Frame::Odom` opens a new relative segment: anchor it value-free like the first keyframe (§3), do not read it as an absolute measurement |
+| `kinematics_included` | always `false` | `V`/`B` never cross the boundary today (§2.2 steady state) |
+| `constraint_cov` | populated, `Covariance` form, **rotation-first** (`01 §6.1`) | normal edge: the **conservative sum** of the two endpoints' absolute pose marginals (upper-bounds the true relative marginal, which would subtract their cross-covariance); anchor keyframes ship the absolute pose marginal. Source is the **exact window-posterior marginal** (LiDAR+IMU+prior), LiDAR-only marginal as rank-deficiency fallback |
+| `observability` | populated every sweep (`computeObservability` over the LiDAR hit set) | §4.3 inflation has real per-axis scores to act on |
+| `cloud_body` | populated (downsampled scan deskewed to the body frame at `stamp`) | ready for L5 / the `KeyframeStore` |
+| `calib_version` | populated | |
+| `image`, `T_body_cam` | **not yet populated** (`image` stays null even when the visual path is active) | no live input for colourisation / visual loop verification yet |
+
+**Async covariance, complete stream.** On the live path `constraint_cov` is filled
+by an **async finalizer worker** (`KeyframeFinalizer`): the hot thread captures the
+final solve round's build inputs, the worker rebuilds a bit-identical window
+problem off-thread, recovers the exact window-posterior pose marginal, chains the
+relative covariance, fills the packet, and forwards it to the sink. The worker is
+FIFO over a bounded **blocking** queue: packets are never dropped or reordered, so
+the L3 input stream is **complete and in order** — only delayed by up to one
+keyframe interval. The deterministic/replay path computes the same marginal inline
+so replay stays bit-exact against live.
+
+**GAP-A — the restart edge (§5) is spec-complete but FE-dormant.** A data hole up
+to five spline-knot intervals is *bridged*: the FE integrates IMU across it and
+solves normally, so the chain stays contiguous and the packet is an ordinary
+`RelativeBetween`. The FE therefore **never** emits
+`constraint_kind == ImuPreintegration` and never populates `imu_summary`. Build §5
+(`CombinedImuFactor`) to spec, but cover it with synthetic `ImuPreintegration`
+packets in unit tests — it has no live trigger today.
+
+**Hard reseed (the chain break; closes the old GAP-B).** Beyond the bridge
+horizon the FE *reseeds*: it carries the anchor across the hole on a
+constant-velocity prediction, restarts the window, and emits **no** keyframe for
+the reseed sweep. There is no data inside the hole, so an `ImuPreintegration`
+summary is not constructible; instead the **next** keyframe is emitted as
+`AbsolutePrior` (window-posterior absolute marginal — the chain-break form of
+`01 §6.4`) and the relative chain resumes off it. No relative edge ever spans the
+predicted discontinuity. L3 anchors the new segment value-free (§3); the
+trajectory becomes two relatively-constrained segments that only loops/GNSS can
+stitch in `map` — the honest representation of an unobserved hole.
+
+**Covariance-honesty note (bridged sweeps).** A sweep whose hole was IMU-bridged
+carries more real uncertainty than its window-posterior marginal reflects (the
+marginal sees only the factors that were present, not the missing LiDAR). The
+effect is second-order and largely absorbed by the conservative-sum relative
+covariance; a future FE improvement is to inflate `constraint_cov` on sweeps
+flagged `frontend/sweep_gap_bridged`. Flagged here so the contract stays honest.
 
 ---
 
@@ -179,36 +230,27 @@ into a factor.
 
 ### 2.2 Velocity & bias: do they cross the boundary?
 
-**Steady state: NO** — and this is fixed by the contract, not a local choice.
-Spec 01 §6.4 states the decision explicitly: in the normal path
-`kinematics_included = false`, velocity and biases stay *inside* the front-end and
-their effect is folded into the relative covariance `constraint_cov`. L3 therefore
-creates **no** `V`/`B` variables for a normal keyframe; the keyframe is a pure pose
-node. The packet's `v_ref`/`b_a`/`b_g` fields, when present, are recorded for
-debug/seeding only. This keeps `V`/`B` **transient** — introduced only on fallback
-intervals, so they are naturally short-lived and never accumulate in a multi-hour
-graph (the transient-inertial design of Appendix R.2/R.5).
+**Steady state: NO** — fixed by the contract, not a local choice. Spec 01 §6.4:
+in the normal path `kinematics_included = false`, velocity and biases stay
+*inside* the front-end and their effect is folded into `constraint_cov`. L3
+therefore creates **no** `V`/`B` variables for a normal keyframe; the keyframe is
+a pure pose node. The packet's `v_ref`/`b_a`/`b_g` fields, when present, are
+recorded for debug/seeding only.
 
 **Exception — restart edges.** When `constraint_kind == ImuPreintegration`
 (`kinematics_included == true`, `01 §6.4/§6.5`), L3 creates `V`/`B` on **both
 endpoints of that one edge** and links them with a `CombinedImuFactor` built from
 the packet's `ImuPreintegrationSummary` (§5). These inertial variables are *local
 to the restart bridge*; they are marginalized at the next normal keyframe unless
-`backend.keep_inertial` is set (default `false`). This keeps the steady-state
-graph pose-only — the cheap, well-conditioned regime: full iSAM2 for the pose
-graph, transient `V`/`B` (Appendix R.5).
+`backend.keep_inertial` is set (default `false`). The steady-state graph stays
+pose-only — the cheap, well-conditioned regime (Appendix R.5).
 
-> **Grounding.** The full inertial state (pos, rot, vel, `b_g`, `b_a`, gravity,
-> plus the LiDAR-IMU extrinsic) is what a FAST-LIO2-style filter keeps live in one
-> state — `state_ikfom` in `FAST_LIO/include/use-ikfom.hpp:12–21`
-> (`pos, rot, offset_R_L_I, offset_T_L_I, vel, bg, ba, grav`). Meridian's L2
-> CT front-end carries the equivalent inside its window; L3 deliberately keeps
-> only what is needed *at the keyframe-graph level*. The front-end already
-> estimated vel/bias, and the relative `BetweenFactor` already carries that
-> information through its marginal covariance (`01 §6.4`; Appendix R.2).
-> Carrying `V`/`B` on every edge **and** a relative factor would re-inject the same
-> IMU evidence twice — the double-count the hand-off contract forbids
-> (Appendix R.2).
+> **Grounding.** A FAST-LIO2-style filter keeps the full inertial state (pose,
+> vel, biases, gravity, extrinsic) live in one filter state; Meridian's L2 carries
+> the equivalent inside its window. The relative `BetweenFactor` already carries
+> the vel/bias information through its marginal covariance (`01 §6.4`). Carrying
+> `V`/`B` on every edge **and** a relative factor would re-inject the same IMU
+> evidence twice — the double-count the hand-off contract forbids (Appendix R.2).
 
 ### 2.3 ID → key mapping
 
@@ -222,10 +264,10 @@ inline constexpr gtsam::Key keyG = gtsam::Symbol('g', 0);
 }
 ```
 
-The mapping `id → X(id)` is identity on the integer payload, so the GTSAM symbol
-index *is* the `KeyframePacket::id`. No side table is required for poses; a small
-`std::unordered_map<std::uint64_t, KfRecord>` holds per-keyframe bookkeeping
-(stamp, cloud/image handles, observability, the stored odom hint — §4).
+The GTSAM symbol index *is* the `KeyframePacket::id`; no side table is required
+for poses. A small `std::unordered_map<std::uint64_t, KfRecord>` holds
+per-keyframe bookkeeping (stamp, cloud/image handles, observability, the stored
+odom hint — §4).
 
 ---
 
@@ -233,8 +275,7 @@ index *is* the `KeyframePacket::id`. No side table is required for poses; a smal
 
 Every factor is a negative-log-likelihood term: the squared Mahalanobis residual
 $\lVert h_i(X)\ominus z_i\rVert^2_{\Sigma_i}$ whose sum is the graph's MAP cost.
-Meridian uses these and **only** these factor classes (the canonical set of
-Appendix R.2):
+Meridian uses these and **only** these factor classes:
 
 | Factor | GTSAM class | Connects | Source | Switchable | Robust |
 |--------|-------------|----------|--------|-----------|--------|
@@ -248,33 +289,29 @@ Appendix R.2):
 | Extrinsic prior | `PriorFactor<Pose3>` | `E(s)` | calibration | no | tight (§10) |
 
 The gauge anchor fixes the gauge: a relative-only graph has a 6-DoF null space, so
-without it iSAM2 throws `IndeterminantLinearSystemException` (an unconstrained
-gauge on the first pose is the canonical cause — Appendix R.5). The anchor is a
-`gtsam::LinearDampingFactor` on `X(first)`, **not** a `PriorFactor<Pose3>` toward a
-fixed pose value. A hard `PriorFactor` with a tight σ pulls `X(first)` toward its
-bootstrap value with real information, biasing every globally consistent estimate
-toward that arbitrary seed and fighting loop/GNSS corrections that should be free
-to translate and rotate the whole trajectory rigidly. `LinearDampingFactor` instead
-adds an isotropic damping term `λ I₆` to the first pose's block of the linearised
-Hessian — it removes the null space (so elimination is well-posed) without
-contributing a residual, so the MAP estimate is unbiased and the gauge floats with
-the global corrections. The damping magnitude is `λ = 1 / backend.anchor_sigma²`
-(default `anchor_sigma = 1e-4`, i.e. a strong but value-free regulariser). It is
-added once, at the first keyframe, and **never** re-added. The first keyframe
-normally arrives with `constraint_kind == AbsolutePrior` (`01 §6.4`: "Used for the
-first keyframe … to fix the gauge"); L3 maps that to this damping anchor.
+without it iSAM2 throws `IndeterminantLinearSystemException`. The anchor is a
+`gtsam::LinearDampingFactor` on `X(first)`, **not** a `PriorFactor<Pose3>` toward
+a fixed pose value: a hard prior with a tight σ pulls `X(first)` toward its
+arbitrary bootstrap value with real information, biasing the global estimate and
+fighting loop/GNSS corrections that should be free to translate/rotate the whole
+trajectory rigidly. `LinearDampingFactor` adds an isotropic damping term `λ I₆` to
+the first pose's block of the linearised Hessian — it removes the null space
+without contributing a residual, so the MAP estimate is unbiased and the gauge
+floats with global corrections. `λ = 1 / backend.anchor_sigma²` (default
+`anchor_sigma = 1e-4`: strong but value-free). Added once, at the first keyframe,
+**never** re-added. The first keyframe normally arrives with
+`constraint_kind == AbsolutePrior` (`01 §6.4`); L3 maps that to this damping
+anchor.
 
 ### 3.1 Why exactly one odometry factor per edge
 
-The hand-off contract (Appendix R.2) is precise about the failure it
-prevents: an absolute marginal prior per keyframe, a relative between-factor,
-**and** an IMU-preintegration factor — all derived from the **same** LiDAR+IMU(+
-camera) measurements the L2 window already fused — would triple-count the
-evidence. Summing their information shrinks covariances unrealistically, the graph
-becomes over-confident, and loop/GNSS corrections are rejected because the
-optimiser trusts odometry too much. The same over-confidence also collapses the
-marginal-covariance search radius and silently *misses loop closures*
-(Appendix R.6).
+The failure the hand-off contract prevents: an absolute marginal prior per
+keyframe, a relative between-factor, **and** an IMU-preintegration factor — all
+derived from the **same** measurements the L2 window already fused — would
+triple-count the evidence. Summing their information shrinks covariances
+unrealistically; the over-confident graph rejects loop/GNSS corrections and
+collapses the marginal-covariance search radius, silently *missing loop closures*
+(§13).
 
 Meridian's contract, keyed off the single `KeyframePacket::constraint_kind` enum:
 
@@ -287,8 +324,7 @@ switch (kf.constraint_kind) {
 ```
 
 Because the source is a single enum, you *cannot* ship two odometry factors for
-one edge — no overlap, ever (Appendix R.2). The information crosses L2→L3 exactly
-once, audited at one site.
+one edge. The information crosses L2→L3 exactly once, audited at one site.
 
 ### 3.2 The canonical squared-Mahalanobis / chi-square convention (binding)
 
@@ -372,7 +408,7 @@ add_between_edge(kf):
   X_init    = T_map_ref * kf.T_ref_body           # Pose (Meridian), then ->Pose3
   new_values.insert(Xk, to_gtsam(X_init))
 
-  # 2. The SINGLE odometry factor (the hand-off contract, Appendix R.2).
+  # 2. The SINGLE odometry factor (the hand-off contract, §3.1).
   Sigma6_gt = inflate_by_observability(kf.constraint_cov, kf.observability)  # §4.3, GTSAM order
   noise     = noiseModel::Gaussian::Covariance(Sigma6_gt)
   new_graph.add( BetweenFactor<Pose3>( keyX(kf.rel_to_id), Xk,
@@ -388,27 +424,26 @@ add_between_edge(kf):
 ```
 
 `optimize()` (the `IBackEnd` method) is what actually runs `ISAM2::update`; the
-pipeline calls it after `add_keyframe` (§9, §17). Contiguity (`rel_to_id ==
-last_kf_id`) is asserted: a gap means L2 dropped a keyframe, a fatal contract
-violation (FM-1) — L3 does **not** fabricate a bridging factor.
+back-end thread calls it on its own cadence (§9.2, §17). Contiguity
+(`rel_to_id == last_kf_id`) is asserted: a gap means L2 dropped a keyframe, a
+fatal contract violation (FM-1) — L3 does **not** fabricate a bridging factor.
 
 The noise model is `Gaussian::Covariance(Σ_ij)` fed the front-end's marginal
-covariance directly (Appendix R.2): we ship `Σ` (not an information matrix), tagged
-`Covariance` by the `GaussianBlock` form (`01 §3.3`), so the conversion is explicit
-and auditable at this one site.
+covariance directly: we ship `Σ` (not an information matrix), tagged `Covariance`
+by the `GaussianBlock` form (`01 §3.3`), so the conversion is explicit and
+auditable at this one site.
 
 ### 4.3 Observability → noise inflation (the degeneracy contract)
 
-The packet's single `ObservabilityReport` (`01 §3.4`) carries per-axis scores
-`score[k] ∈ [0,1]` (1 = fully observable) in a **named frame** `observability.frame`,
-ordering `[tx,ty,tz,rx,ry,rz]`. L3 maps a low score to an **inflated covariance**
-along that axis of the between-factor, so the optimiser does not trust a direction
-the front-end could not constrain (e.g. translation along a featureless corridor).
-This is the X-ICP / D²-LIO-style signal flowing into back-end noise that spec 01
-§3.4 promises would be defined for L3 — defined here. The reference response to
-degeneracy is the same: never silently drop a factor — inflate its covariance,
-rotating `Σ` into the degenerate eigenbasis, raising the bad-axis variance, then
-rotating back (Appendix R.7, Zhang et al. degeneracy).
+The packet's `ObservabilityReport` (`01 §3.4`) carries per-axis scores
+`score[k] ∈ [0,1]` (1 = fully observable) in a **named frame**
+`observability.frame`, ordering `[tx,ty,tz,rx,ry,rz]`. L3 maps a low score to an
+**inflated covariance** along that axis of the between-factor, so the optimiser
+does not trust a direction the front-end could not constrain (e.g. translation
+along a featureless corridor). This is the degeneracy signal spec 01 §3.4
+promises would be defined for L3 — defined here. Never silently drop a factor —
+inflate its covariance: rotate `Σ` into the degenerate eigenbasis, raise the
+bad-axis variance, rotate back (Appendix R.7, Zhang et al.).
 
 Per-axis multiplier:
 
@@ -418,27 +453,27 @@ $$
 
 with `ρ_max = backend.obs_inflation_max` (default `1e4`) and shape exponent
 `γ = backend.obs_inflation_gamma` (default `2.0`). A fully observable axis
-(`s_k=1`) gives `λ_k=1` (no change); a fully degenerate axis (`s_k=0`) inflates
-that variance by `ρ_max`.
+(`s_k=1`) gives `λ_k=1`; a fully degenerate axis (`s_k=0`) inflates that variance
+by `ρ_max`.
 
-**Frame handling.** The scores are expressed in `observability.frame`. The
+**Frame handling.** The scores are expressed in `observability.frame`; the
 covariance lives in the factor's body tangent. Build a 6×6 block-diagonal
 rotation `R6` that maps the observability frame's axes to the factor frame, on
-`constraint_cov`'s **rotation-first** axes `[rx,ry,rz,tx,ty,tz]` (`eigvecs`, stored
-translation-first per `01 §3.4`, are permuted onto them via `to_rotfirst`). If
-`eigvecs` is present (non-axis-aligned degeneracy,
-e.g. a tunnel at 30°), use it directly as the rotation of the degenerate
-sub-space instead of an axis-aligned `R6`:
+`constraint_cov`'s **rotation-first** axes `[rx,ry,rz,tx,ty,tz]` (`eigvecs`,
+stored translation-first per `01 §3.4`, are permuted onto them via `to_rotfirst`).
+If `eigvecs` is present (non-axis-aligned degeneracy, e.g. a tunnel at 30°), use
+it directly as the rotation of the degenerate sub-space instead of an
+axis-aligned `R6`:
 
 $$
 \Sigma'_{\text{meridian}} \;=\; R_6\,\Lambda^{1/2}\,(R_6^\top\, \Sigma_{\text{meridian}}\, R_6)\,\Lambda^{1/2}\,R_6^\top,
 \quad \Lambda = \mathrm{diag}(\lambda_{tx},\lambda_{ty},\lambda_{tz},\lambda_{rx},\lambda_{ry},\lambda_{rz}).
 $$
 
-`constraint_cov` is already rotation-first (GTSAM order, `01 §6.1`), so the matrix is
-**not** reordered here — only the translation-first `observability` score (and any
-`eigvecs`) are permuted onto its axes. (`LoopConstraint.cov`, a translation-first
-`PoseCov6`, still goes through `reorder_meridian_to_gtsam`, §12.)
+`constraint_cov` is already rotation-first (GTSAM order, `01 §6.1`), so the matrix
+is **not** reordered here — only the translation-first `observability` score (and
+any `eigvecs`) are permuted onto its axes. (`LoopConstraint.cov`, a
+translation-first `PoseCov6`, still goes through `reorder_meridian_to_gtsam`, §12.)
 
 ```cpp
 // Returns a 6x6 covariance in GTSAM order [rx,ry,rz, tx,ty,tz], ready for noiseModel.
@@ -464,33 +499,30 @@ Eigen::Matrix<double,6,6> inflate_by_observability(const GaussianBlock<6>& cov, 
 ```
 
 If a degenerate axis is detected (`s_k` below `backend.degenerate_thresh`, default
-`0.05`) and `backend.degenerate_lock` is set, L3 hard-sets that axis's `λ_k =
-ρ_max` regardless of the smooth law — a belt-and-braces guard against near-zero
-eigenvalues the smooth curve might under-inflate (the defensive re-inflation of
-Appendix R.4/R.7) — and emits a degeneracy marker (§14).
+`0.05`) and `backend.degenerate_lock` is set, L3 hard-sets that axis's
+`λ_k = ρ_max` regardless of the smooth law — a guard against near-zero eigenvalues
+the smooth curve might under-inflate — and emits a degeneracy marker (§14).
 
 ---
 
 ## 5. The restart edge (the only IMU factor)
 
-When the front-end restarts its sliding window (divergence, observability
-collapse, IMU saturation; the window-restart fallback of `00 §7.4`, `01 §6.4`), it
-cannot summarise a trustworthy relative-motion marginal across the gap. It instead
-emits a packet with `constraint_kind == ImuPreintegration` and a populated
+When the front-end restarts its sliding window and can summarise IMU across the
+gap (`00 §7.4`, `01 §6.4`), it emits a packet with
+`constraint_kind == ImuPreintegration` and a populated
 `imu_summary : ImuPreintegrationSummary` (`01 §6.5`). L3 turns this into a single
 `gtsam::CombinedImuFactor` — the **only** place in the entire system an IMU factor
-enters the graph (the fallback edge of Appendix R.2).
+enters the graph. (Currently FE-dormant — see §1.4 GAP-A; today's hard reseeds
+break the chain with `AbsolutePrior` instead.)
 
 ### 5.1 The summary (already a boundary type — `01 §6.5`)
 
 `ImuPreintegrationSummary` carries `delta_R / delta_v / delta_p`, the bias
 linearization point (`bias_g_lin`, `bias_a_lin`), the first-order bias Jacobians
 (`dR_dbg`, `dv_dbg`, `dv_dba`, `dp_dbg`, `dp_dba`), a 9-DoF `preint_cov`, and
-`gravity_mag`. This is exactly what GTSAM's preintegration needs (the on-manifold
-preintegration GTSAM's `Preintegrated(Combined)Measurements` implements —
-Appendix R.3). L3 rebuilds a `PreintegratedCombinedMeasurements` (PIM) from
-these fields rather than re-integrating raw IMU (which never crosses the boundary
-— `01 §6.5`).
+`gravity_mag` — exactly what GTSAM's preintegration needs (Appendix R.3). L3
+rebuilds a `PreintegratedCombinedMeasurements` (PIM) from these fields rather than
+re-integrating raw IMU (which never crosses the boundary — `01 §6.5`).
 
 ```cpp
 namespace meridian::backend {
@@ -533,119 +565,106 @@ add_restart_imu_edge(kf):
 
 ### 5.3 Bias / noise defaults (restart edges)
 
-The `CombinedImuFactor` includes the between-bias random-walk term. Defaults are
-grounded in the references and overridable per-platform via `CalibrationSet`
-(`01 §5.3` carries `imu_acc_noise`, `imu_gyr_noise`, `imu_acc_bias_rw`,
-`imu_gyr_bias_rw`; these feed `PreintegrationCombinedParams`, Appendix R.3):
+The `CombinedImuFactor` includes the between-bias random-walk term. Defaults
+follow the FAST-LIO reference configuration (`IMU_Processing.hpp`,
+`config/ouster64.yaml`); per-platform overrides flow in via `CalibrationSet`
+(`01 §5.3`: `imu_acc_noise`, `imu_gyr_noise`, `imu_acc_bias_rw`,
+`imu_gyr_bias_rw` → `PreintegrationCombinedParams`):
 
-| Quantity | Default | Grounding |
-|----------|---------|-----------|
-| accel noise `σ_a` | 0.1 m/s²/√Hz | `FAST_LIO/include/IMU_Processing.hpp` (`cov_acc` init), `config/ouster64.yaml` (`acc_cov: 0.1`) |
-| gyro noise `σ_g` | 0.1 rad/s/√Hz | `IMU_Processing.hpp` (`cov_gyr` init), `ouster64.yaml` (`gyr_cov: 0.1`) |
-| accel bias RW `σ_ba` | 1e-4 m/s³/√Hz | `IMU_Processing.hpp` (`cov_bias_acc`), `ouster64.yaml` (`b_acc_cov: 0.0001`) |
-| gyro bias RW `σ_bg` | 1e-4 rad/s²/√Hz | `IMU_Processing.hpp` (`cov_bias_gyr`), `ouster64.yaml` (`b_gyr_cov: 0.0001`) |
+| Quantity | Default |
+|----------|---------|
+| accel noise `σ_a` | 0.1 m/s²/√Hz |
+| gyro noise `σ_g` | 0.1 rad/s/√Hz |
+| accel bias RW `σ_ba` | 1e-4 m/s³/√Hz |
+| gyro bias RW `σ_bg` | 1e-4 rad/s²/√Hz |
 
-The gravity vector for the PIM is ENU `(0,0,-9.81)` consistent with the `map`
-frame (`n_gravity` sign/axis is world-frame dependent — Appendix R.3 — and
-Meridian's `map` is gravity-aligned ENU, `00 §2.2`).
-
-> Verify the exact line numbers when implementing; `IMU_Processing.hpp` sets these
-> in the `ImuProcess` constructor and `ouster64.yaml` lists them under the IMU
-> covariance keys. FusionPortable / M2DGR IMU datasheets (`Meridian/docs/DATASET.md`)
-> provide the per-platform overrides that flow in via `CalibrationSet`.
+The gravity vector for the PIM is ENU `(0,0,-9.81)`, consistent with the `map`
+frame (gravity-aligned ENU, `00 §2.2`).
 
 ### 5.4 Returning to normal
 
-The restart edge is a **bridge, not a mode**. The next keyframe (assuming the
-window recovered) carries a clean `RelativeBetween` and is added as a normal
-`BetweenFactor` (§4). The local `V`/`B` introduced for the bridge become
-candidates for marginalization at the next update (§11) unless
-`backend.keep_inertial` is true — keeping the steady-state graph pose-only, the
-transient-`V`/`B` design of Appendix R.5.
+The restart edge is a **bridge, not a mode**. The next keyframe carries a clean
+`RelativeBetween` and is added as a normal `BetweenFactor` (§4). The bridge's
+local `V`/`B` become candidates for marginalization at the next update (§11)
+unless `backend.keep_inertial` is true — keeping the steady-state graph pose-only.
 
 ---
 
 ## 6. GNSS factors & the GNSS-origin variable
 
 `GnssFix` (`01 §4.4`) carries WGS84 `lat/lon/alt`, an ENU `cov_enu` (3×3 m²), a
-`fix` quality enum, and `num_sats`. It reaches L3 via `IBackEnd::add_absolute(fix,
-nearest_kf_id)` (`01 §7.4`); the front-end/pipeline supplies the nearest keyframe id,
-which L3 uses only as a **hint** to locate the bracketing keyframe pair for the
-fix-time interpolation (§6.3) — the fix is never bound directly to that keyframe's
-pose. (Spec 01 also allows GNSS folded into an `AbsolutePrior` packet; when that
-happens L3 routes it through the same machinery below using `constraint_cov` as the
-position covariance.)
+`fix` quality enum, and `num_sats`. It reaches L3 via
+`IBackEnd::add_absolute(fix, nearest_kf_id)` (`01 §7.4`); the supplied keyframe id
+is only a **hint** to locate the bracketing keyframe pair for the fix-time
+interpolation (§6.3) — the fix is never bound directly to that keyframe's pose.
+(Spec 01 also allows GNSS folded into an `AbsolutePrior` packet; L3 routes that
+through the same machinery using `constraint_cov` as the position covariance.)
 
 ### 6.1 The origin variable `G`
 
-GNSS arrives in a local-ENU tangent plane whose origin is the first valid fix
-(`00 §2.2`: `map` is global, gravity-aligned, ENU-ish). The transform
-`G = T_map_enu` is a graph variable so the residual misalignment between the SLAM
-`map` frame and the GNSS datum is *estimated*, not assumed. `G` is seeded by a
-weak `PriorFactor<Pose3>` near identity (translation prior tight, yaw prior loose
-— yaw between `map` and ENU is least observable until motion accrues). Modelling
-the datum alignment as a variable rather than baking GNSS into a unary world prior
-is the cleaner of the two GTSAM patterns (GNSS via `PriorFactor`/`GPSFactor`,
-Appendix R.3; here promoted to an estimated origin so the residual misalignment is
-observable and correctable).
+GNSS arrives in a local-ENU tangent plane whose origin is the first valid fix.
+The transform `G = T_map_enu` is a graph variable so the residual misalignment
+between the SLAM `map` frame and the GNSS datum is *estimated*, not assumed. `G`
+is seeded by a weak `PriorFactor<Pose3>` near identity (translation prior tight,
+yaw prior loose — yaw between `map` and ENU is least observable until motion
+accrues). Modelling the datum as a variable (rather than baking GNSS into a unary
+world prior) makes the residual misalignment observable and correctable.
 
 ### 6.2 Datum initialization (the `G` seed)
 
-`G` cannot be seeded from a single fix: a lone fix fixes translation but leaves yaw
-(the rotation between `map` and ENU) entirely unobserved, and a wrong yaw bakes a
-fixed heading error into every subsequent GNSS residual — the dominant long-run
-GNSS failure. L3 therefore **defers** activating `G` and its first prior until a
-spread of buffered fixes can determine the alignment, then seeds `G` by a 4-DOF
-Umeyama fit gated on observability.
+`G` cannot be seeded from a single fix: a lone fix fixes translation but leaves
+yaw entirely unobserved, and a wrong yaw bakes a fixed heading error into every
+subsequent GNSS residual — the dominant long-run GNSS failure. L3 therefore
+**defers** activating `G` until a spread of buffered fixes can determine the
+alignment, then seeds `G` by a 4-DOF Umeyama fit gated on observability.
 
 Buffer each accepted fix as a correspondence `(p_enu, X(i)·l)` — the projected ENU
-position paired with the current `map`-frame antenna position at the keyframe whose
-interpolated pose carries it (§6.3). Datum init runs only when **all** pre-gates pass:
+position paired with the current `map`-frame antenna position at the fix-time
+interpolated pose (§6.3). Datum init runs only when **all** pre-gates pass:
 
 - **Min-baseline pre-gate.** Cumulative travelled baseline since the first buffered
   fix exceeds `backend.gnss_min_baseline` (default `5 m`). A short baseline cannot
   separate yaw from translation.
-- **Velocity-excitation pre-gate.** The buffered fixes contain genuine planar motion,
-  not jitter-in-place: the span of the de-meaned ENU positions along its dominant
-  horizontal axis exceeds `backend.gnss_min_excitation` (default `3 m`), and the
-  platform speed over the window exceeded `backend.gnss_min_speed` (default
-  `0.5 m/s`) for at least `backend.gnss_min_moving_fixes` (default `5`) fixes. This
-  rejects a datum fit from a stationary rig whose apparent "baseline" is multipath
-  wander.
+- **Velocity-excitation pre-gate.** The buffered fixes contain genuine planar
+  motion, not jitter-in-place: the span of the de-meaned ENU positions along the
+  dominant horizontal axis exceeds `backend.gnss_min_excitation` (default `3 m`),
+  and the platform speed exceeded `backend.gnss_min_speed` (default `0.5 m/s`) for
+  at least `backend.gnss_min_moving_fixes` (default `5`) fixes. This rejects a
+  datum fit from a stationary rig whose apparent "baseline" is multipath wander.
 
 When the pre-gates pass, fit the 4-DOF similarity (yaw + 3-translation; roll/pitch
-are fixed to gravity, scale fixed to 1) between the `map` antenna track and the ENU
+fixed to gravity, scale fixed to 1) between the `map` antenna track and the ENU
 track by **Umeyama** alignment restricted to the horizontal yaw rotation. The fit
-also yields its information: form the Gauss-Newton Hessian of the yaw parameter from
-the same correspondences, and accept the datum only if its **yaw uncertainty**
-$\sigma_{\text{yaw}} = 1/\sqrt{H_{\text{yaw}}}$ is below
-`backend.gnss_datum_yaw_sigma_max` (default `5°`). This Hessian gate is what makes
-"enough baseline" precise: a near-collinear track (driving in a straight line) leaves
-yaw weakly observable and inflates $\sigma_{\text{yaw}}$ even when the baseline is
-long, so the fit is rejected and buffering continues. On acceptance, seed `G` from
-the Umeyama transform and add the weak `PriorFactor<Pose3>` (§6.1) with the
-translation block tight and the yaw block set from the fitted $\sigma_{\text{yaw}}$;
-the datum is then **locked** (telemetry marks `datum_locked`) and subsequent fixes
-flow as factors (§6.3). Until acceptance, buffered fixes hold their correspondences
-and do **not** enter the graph.
+also yields its information: form the Gauss-Newton Hessian of the yaw parameter
+from the same correspondences, and accept the datum only if its **yaw
+uncertainty** $\sigma_{\text{yaw}} = 1/\sqrt{H_{\text{yaw}}}$ is below
+`backend.gnss_datum_yaw_sigma_max` (default `5°`). This Hessian gate makes
+"enough baseline" precise: a near-collinear track (driving in a straight line)
+leaves yaw weakly observable and inflates $\sigma_{\text{yaw}}$ even when the
+baseline is long, so the fit is rejected and buffering continues. On acceptance,
+seed `G` from the Umeyama transform and add the weak `PriorFactor<Pose3>` (§6.1)
+with the translation block tight and the yaw block set from the fitted
+$\sigma_{\text{yaw}}$; the datum is then **locked** (telemetry `datum_locked`) and
+subsequent fixes flow as factors (§6.3). Until acceptance, buffered fixes do
+**not** enter the graph.
 
-If the pre-gates never pass within a long mission (e.g. a purely stationary GNSS
-session), `G` stays unlocked and GNSS contributes nothing — loop closure and odometry
-carry the global estimate, which is the correct degenerate behaviour.
+If the pre-gates never pass (e.g. a purely stationary GNSS session), `G` stays
+unlocked and GNSS contributes nothing — loop closure and odometry carry the global
+estimate, the correct degenerate behaviour.
 
 ### 6.3 The GNSS factor (bound to the interpolated pose at fix time)
 
-A `GnssFix` is stamped at its own time, which almost never coincides with a keyframe.
-Binding the fix to the *nearest* keyframe pose injects that keyframe's residual
-motion (up to the keyframe interval of travel) straight into the GNSS residual as a
-latent, silent error. L3 instead binds the fix to the pose **interpolated to the fix
+A `GnssFix` is stamped at its own time, which almost never coincides with a
+keyframe. Binding the fix to the *nearest* keyframe pose injects that keyframe's
+residual motion (up to a keyframe interval of travel) into the GNSS residual as a
+silent error. L3 instead binds the fix to the pose **interpolated to the fix
 timestamp** between the two bracketing keyframes.
 
 `add_absolute(fix, hint_kf_id)` locates the keyframe pair `(i, j)` with
-`stamp(i) ≤ fix.stamp ≤ stamp(j)` (`hint_kf_id` seeds the search; the pipeline
-supplies the nearest keyframe id, `01 §7.4`). It first geodetic-projects `fix` into
-the ENU datum (the L3 adapter owns the datum, `01 §4.4`), yielding `p_enu ∈ ℝ³` with
-covariance `cov_enu`. With interpolation weight
+`stamp(i) ≤ fix.stamp ≤ stamp(j)` (`hint_kf_id` seeds the search). It first
+geodetic-projects `fix` into the ENU datum (the L3 adapter owns the datum,
+`01 §4.4`), yielding `p_enu ∈ ℝ³` with covariance `cov_enu`. With interpolation
+weight
 $\beta = (\texttt{fix.stamp} - \texttt{stamp}(i)) / (\texttt{stamp}(j) - \texttt{stamp}(i)) \in [0,1]$,
 the antenna position at fix time uses the constant-velocity body interpolant
 $\hat X(\beta) = X(i)\cdot \mathrm{Exp}\!\bigl(\beta\,\mathrm{Log}(X(i)^{-1}X(j))\bigr)$
@@ -656,15 +675,13 @@ r_{\text{gnss}} \;=\; G^{-1}\bigl(\hat X(\beta)\cdot l\bigr) \;-\; p_{\text{enu}
 $$
 
 This is a custom `NoiseModelFactor3<Pose3, Pose3, Pose3>` over `X(i)`, `X(j)`, and
-`G` (the lever-arm + datum + on-edge-interpolation variant of GTSAM's `GPSFactor`,
-Appendix R.3); `β` is a fixed factor parameter, not a variable. Its analytic
-Jacobians are the standard `Pose3`-action Jacobians composed with the interpolation
-Jacobians of $\mathrm{Exp}/\mathrm{Log}$ (`gtsam::interpolate(Pose3,Pose3,t,H1,H2)`
-returns the two pose blocks; chain `transformFrom`/`transformTo` and `G^{-1}` onto
-them). When a fix coincides with a keyframe ($\beta \in \{0,1\}$, or the fix lands
-exactly at the latest keyframe with no successor yet) the factor degenerates to the
-two-variable `NoiseModelFactor2<Pose3,Pose3>` over the single endpoint and `G` — the
-interpolation contributes nothing and is dropped.
+`G` (a lever-arm + datum + on-edge-interpolation variant of GTSAM's `GPSFactor`);
+`β` is a fixed factor parameter, not a variable. Its analytic Jacobians chain the
+standard `Pose3`-action Jacobians with the interpolation Jacobians
+(`gtsam::interpolate(Pose3,Pose3,t,H1,H2)` returns the two pose blocks; chain
+`transformFrom`/`transformTo` and `G^{-1}` onto them). When a fix coincides with a
+keyframe ($\beta \in \{0,1\}$, or no successor keyframe yet) the factor
+degenerates to a `NoiseModelFactor2<Pose3,Pose3>` over the single endpoint and `G`.
 
 ```cpp
 // β-interpolated antenna position; H1,H2 are the two bracketing-pose blocks, H3 the G block.
@@ -692,86 +709,72 @@ class GnssFactor : public gtsam::NoiseModelFactor3<gtsam::Pose3, gtsam::Pose3, g
 ### 6.4 Switchable, gated, decimated & robust
 
 GNSS is **switchable** (`backend.gnss_enabled`, `[hot]`) and **robustified**:
-multipath / NLOS produce gross outliers. GNSS uses a **Huber** robust kernel inside
-iSAM2 by default — Huber is convex and therefore safe inside the incremental IRLS
-solve (Appendix R.4); the heavier redescending machinery is reserved for the loop
-sub-graph's off-thread consolidation (§8.3). Gating and decimation before a fix
-becomes a factor:
+multipath / NLOS produce gross outliers. GNSS uses a **Huber** kernel inside iSAM2
+by default — convex, therefore safe inside the incremental IRLS solve; the heavier
+redescending machinery is reserved for the loop sub-graph's off-thread
+consolidation (§8.3). Gating and decimation before a fix becomes a factor:
 
 - **Quality gate.** Drop a fix with `trace(cov_enu) > backend.gnss_max_cov`, or
   `fix == None`. The `fix` enum and `cov_enu` together let the kernel weight an
-  `SPP` fix far below an `RTK_Fixed` one (`01 §4.4`; gate by GNSS quality before
-  the factor enters the graph, Appendix R.4).
+  `SPP` fix far below an `RTK_Fixed` one (`01 §4.4`).
 - **Confidence gate (skip-if-confident).** When `backend.gnss_skip_if_confident` is
-  set (default `true`), skip a fix whose ENU position covariance is *no better than*
-  the back-end's own marginal at that pose — i.e. drop it when
+  set (default `true`), skip a fix whose ENU position covariance is no better than
+  the back-end's own marginal at that pose — drop when
   $\mathrm{trace}(\texttt{cov\_enu}) \ge \kappa^2\cdot\mathrm{trace}(\Sigma^{\text{pos}}_{X(i)})$
-  with $\kappa = $ `backend.gnss_skip_confidence_k` (default `1.0`). A fix that is
-  less certain than the existing estimate cannot improve it and only adds churn; the
-  marginal $\Sigma^{\text{pos}}_{X(i)}$ is the cheap §13 query. This keeps GNSS
-  contributing where it helps (re-anchoring after drift) and silent where the SLAM
-  estimate is already tighter (e.g. mid-corridor with fresh loops).
+  with $\kappa = $ `backend.gnss_skip_confidence_k` (default `1.0`). A fix less
+  certain than the existing estimate cannot improve it and only adds churn; the
+  marginal is the cheap §13 query. GNSS contributes where it helps (re-anchoring
+  after drift) and stays silent where the SLAM estimate is tighter.
 - **Min-spacing decimation.** Admit at most one fix per `backend.gnss_min_spacing`
-  (default `1.0 m`) of travelled baseline. Raw GNSS at 5–10 Hz over slow motion
-  produces near-duplicate, strongly-correlated fixes whose independent-noise
-  assumption is false; decimating by spacing keeps the factors statistically
-  independent and bounds GNSS factor growth. Decimation is by distance, not time, so
-  a stationary platform contributes a single fix rather than a redundant stream.
+  (default `1.0 m`) of travelled baseline. Raw 5–10 Hz GNSS over slow motion
+  produces near-duplicate, strongly correlated fixes whose independent-noise
+  assumption is false; distance (not time) decimation keeps factors statistically
+  independent, bounds factor growth, and means a stationary platform contributes a
+  single fix.
 - **Deferred datum.** Until `G` is locked (§6.2) fixes are buffered, not added.
 
 ### 6.5 Yaw observability & origin locking
 
-Until the platform moves enough, `G`'s yaw is weakly observable and can wander; the
-datum-init Hessian gate (§6.2) is the primary defence. Additionally:
+Until the platform moves enough, `G`'s yaw is weakly observable; the datum-init
+Hessian gate (§6.2) is the primary defence. Additionally:
 
 - **Heading lock.** If `backend.gnss_lock_yaw` is set (e.g. dual-antenna heading
   available), pin `G`'s roll/pitch to gravity and fix yaw by a tight prior,
-  effectively reducing `G` to translation + yaw, bypassing the Umeyama yaw fit.
-- The deferred, Hessian-gated datum activation (§6.2) is the default safeguard when
-  no external heading exists.
+  bypassing the Umeyama yaw fit.
+- Otherwise the deferred, Hessian-gated datum activation (§6.2) is the safeguard.
 
 ### 6.6 Drift redistribution on GNSS re-acquisition (designed; deferred)
 
-> **Status: designed-but-deferred (post-MVP).** The interface and behaviour are
-> specified here; the implementation lands after MVP. Until then, a re-acquired GNSS
-> stream simply re-enters as ordinary §6.4 factors and iSAM2 absorbs the correction
-> through relinearisation — correct, but the correction concentrates near the
-> re-acquisition keyframe rather than being spread along the drifted span.
+> **Status: designed-but-deferred (post-MVP).** Until implemented, a re-acquired
+> GNSS stream re-enters as ordinary §6.4 factors and iSAM2 absorbs the correction
+> through relinearisation — correct, but concentrated near the re-acquisition
+> keyframe rather than spread along the drifted span.
 
-When GNSS is lost (tunnel, urban canyon) and re-acquired, the SLAM estimate has
-drifted from the datum across the no-GNSS span. The first strong post-outage fix
-implies a large `map`↔ENU mismatch that, applied as a single factor, snaps the latest
-poses while leaving the intervening trajectory bent. **Drift redistribution** instead
-spreads the accumulated error smoothly along the no-GNSS span proportional to each
-keyframe's contribution to it.
-
-Design: on re-acquisition (`fix` returns to `>= backend.gnss_reacq_fix` for
+When GNSS is lost (tunnel, urban canyon) and re-acquired, the first strong
+post-outage fix implies a large `map`↔ENU mismatch that, applied as a single
+factor, snaps the latest poses while leaving the intervening trajectory bent.
+**Drift redistribution** instead spreads the accumulated error along the no-GNSS
+span. Design: on re-acquisition (`fix ≥ backend.gnss_reacq_fix` for
 `backend.gnss_reacq_persist` consecutive accepted fixes), L3 computes the closing
-error between the re-acquired ENU position and the predicted antenna position, and
-distributes it as a sequence of weak relative-pose corrections across the keyframes
-spanning the outage — weighted by inter-keyframe arc length so longer segments absorb
-more — rather than as one unary factor at the re-acquisition keyframe. The mechanism
-is a set of soft `BetweenFactor<Pose3>` adjustments on the span (not a hard re-warp),
-so iSAM2 still balances them against odometry and any loops crossing the span. The
-governing parameters (`gnss_reacq_fix`, `gnss_reacq_persist`, and a
-`gnss_redistribute_span_max` cap on how many keyframes back the redistribution reaches)
-are specified in §16 and default to the conservative values that reproduce today's
-"single re-entry factor" behaviour when redistribution is disabled
-(`backend.gnss_redistribute = false`, the MVP default).
+error between the re-acquired ENU position and the predicted antenna position and
+distributes it as a set of **soft `BetweenFactor<Pose3>` adjustments** across the
+keyframes spanning the outage, weighted by inter-keyframe arc length (not a hard
+re-warp), so iSAM2 still balances them against odometry and any loops crossing the
+span. Parameters (`gnss_reacq_fix`, `gnss_reacq_persist`,
+`gnss_redistribute_span_max`) are in §16; `backend.gnss_redistribute = false` (the
+MVP default) reproduces today's single-re-entry-factor behaviour.
 
 ---
 
 ## 7. PCM pre-filter (loop outlier rejection)
 
 Loop closures are the highest-stakes factors: one wrong loop welds two unrelated
-places and ruins the map. L5 already runs Scan Context++ → STD/BTC → GICP and hands
-L3 a verified `LoopConstraint` (`01 §7.6`: `from_id`, `to_id`, `T_from_to`, `cov`,
-`fitness`). L3 gates every loop through **Pairwise Consistent Measurement (PCM)**
-maximisation *before* it enters the graph, then a committed convex robust kernel
-inside the graph as a second line of defence, with optional off-thread batch-GNC
-consolidation as the heavy safety net (§8). PCM and the robust kernel are
-complementary — PCM picks a mutually consistent set, the kernel adds graceful
-residual robustness (Appendix R.4).
+places and ruins the map. L5 hands L3 a verified `LoopConstraint` (`01 §7.6`:
+`from_id`, `to_id`, `T_from_to`, `cov`, `fitness`). L3 gates every loop through
+**Pairwise Consistent Measurement (PCM)** maximisation *before* it enters the
+graph, then a committed convex robust kernel inside the graph as a second line of
+defence, with optional off-thread batch-GNC consolidation as the heavy safety net
+(§8).
 
 ### 7.1 Pairwise consistency
 
@@ -788,14 +791,13 @@ $$
 with $\Omega = \Sigma^{-1}$ the combined information of the two loop covariances
 plus the odometry-chain covariance, composed and PSD-guarded per the §3.2
 convention (`cov.M` are `PoseCov6` in Meridian order; combine as covariances, then
-invert). The test $d^2 \le \chi^2_{6,\alpha}$ uses the canonical squared-Mahalanobis
-form of **§3.2** with $\alpha = $ `backend.pcm_chi2_alpha` (default 0.99 → quantile
-$\chi^2_{6,0.99}\approx16.81$ at $n=6$).
+invert). The test $d^2 \le \chi^2_{6,\alpha}$ uses the canonical form of **§3.2**
+with $\alpha = $ `backend.pcm_chi2_alpha` (default 0.99 → $\chi^2_{6,0.99}\approx16.81$).
 
 ### 7.2 Maximum-clique consistent set
 
-Build a consistency graph: nodes = pending loops, edge = pairwise consistent. The
-largest mutually consistent subset is the **maximum clique**; only its members are
+Build a consistency graph: nodes = pending loops, edge = pairwise consistent. Only
+the members of the **maximum clique** (largest mutually consistent subset) are
 admitted to iSAM2. Maintain the graph incrementally; run a bounded max-clique
 (exact Bron–Kerbosch up to `backend.pcm_max_nodes`, default 64; greedy fallback
 above the cap, FM-4).
@@ -818,41 +820,39 @@ on LoopConstraint lc (from ILoopDetector::detect, 01 §7.6):
 ```
 
 This maps to `IBackEnd::add_loop_constraint` (`01 §7.4`): the method enqueues the
-constraint; the back-end thread runs the PCM step above on the next iteration.
+constraint; the back-end thread runs the PCM step on the next iteration.
 
 > **Why PCM *and* a robust kernel.** PCM is a *combinatorial set-level* pre-filter
-> (which loops are mutually consistent, using current estimates); the committed
-> convex kernel (§8.1) is a *continuous factor-level* robustifier (per-factor weights
-> during optimisation). PCM stops a wrong loop from ever distorting the linearisation
-> point; the kernel handles residual mis-weighting and borderline fixes; the
-> off-thread batch-GNC consolidation (§8.3) re-judges the admitted set with the full
-> redescending machinery without touching the live solve (Appendix R.4).
+> (which loops are mutually consistent); the committed convex kernel (§8.1) is a
+> *continuous factor-level* robustifier. PCM stops a wrong loop from ever
+> distorting the linearisation point; the kernel absorbs residual mis-weighting;
+> the off-thread batch-GNC consolidation (§8.3) re-judges the admitted set with
+> the full redescending machinery without touching the live solve.
 
 ---
 
 ## 8. Robust kernels (loops + GNSS)
 
-Loop factors are wrapped in a GTSAM `noiseModel::Robust` kernel. The robustness of
-the back-end is layered in **series**: PCM pre-admission (§7) picks a mutually
-consistent loop set; a **committed convex M-estimator** in the incremental path is
-the per-factor robustifier; and an **off-thread batch-GNC consolidation** (§8.3,
-optional) is the heavy safety net that re-judges the loop sub-graph without
-destabilising the live `ISAM2`. GNSS uses the same convex Huber kernel in the
-incremental path (§6.4).
+The robustness of the back-end is layered in **series**: PCM pre-admission (§7)
+picks a mutually consistent loop set; a **committed convex M-estimator** in the
+incremental path is the per-factor robustifier; an **off-thread batch-GNC
+consolidation** (§8.3, optional) is the heavy safety net that re-judges the loop
+sub-graph without destabilising the live `ISAM2`. GNSS uses the same convex Huber
+kernel in the incremental path (§6.4).
 
 ### 8.1 The incremental loop kernel (default: committed Huber)
 
 A loop factor admitted by PCM enters iSAM2 wrapped in a **committed convex
 M-estimator** — **Huber** by default (`backend.robust_kernel = "huber"`, tuning
-`backend.loop_huber_k`, default `1.345`). Huber is convex, so its IRLS reweighting is
-well-behaved inside a single-shot `ISAM2::update` and does not introduce the
-non-convex churn a redescending kernel would; the loop is *committed* — its kernel
-is fixed at admission, not annealed step-to-step. PCM has already removed the
-mutually inconsistent loops upstream, so the incremental kernel only has to absorb a
-borderline residual, not perform global outlier rejection. The kernel is selectable
-to Cauchy / Geman–McClure / Truncated-Least-Squares via `backend.robust_kernel` for
-experiments, but only Huber is a *known-safe* incremental choice; the redescending
-options are non-convex and should be paired with the batch consolidation of §8.3.
+`backend.loop_huber_k`, default `1.345`). Huber is convex, so its IRLS reweighting
+is well-behaved inside a single-shot `ISAM2::update`; the loop is *committed* —
+its kernel is fixed at admission, not annealed step-to-step. PCM has already
+removed the mutually inconsistent loops upstream, so the incremental kernel only
+has to absorb a borderline residual, not perform global outlier rejection. The
+kernel is selectable to Cauchy / Geman–McClure / Truncated-Least-Squares via
+`backend.robust_kernel` for experiments, but only Huber is a *known-safe*
+incremental choice; the redescending options are non-convex and should be paired
+with the batch consolidation of §8.3.
 
 The inlier cost threshold $\bar c^2$ for any kernel is set from the chi-square
 quantile for the factor dimension (`setInlierCostThresholds` — for 6-DoF at 99%,
@@ -864,18 +864,15 @@ inliers* and are never reweighted.
 
 Full Graduated Non-Convexity anneals a control parameter `μ` from a near-convex
 surrogate toward a redescending robust cost, recovering per-factor weights
-`w ∈ [0,1]` via the closed-form GM/TLS weight update (Appendix R.4). GTSAM's batch
-`GncOptimizer` re-runs the whole schedule per solve, which is **batch, not
-incremental** — it cannot run inside a single-shot `ISAM2::update` (Appendix R.4).
-Meridian *can* amortise the schedule across iSAM2 steps, but this path is
-**experimental** and **off by default** (`backend.gnc_enabled = false`): annealing
-`μ` re-linearises a growing, deliberately non-convex region of the Bayes tree every
-step, which is exactly the relinearisation churn the incremental solver should avoid,
-and a mid-anneal weight can transiently destabilise the live estimate. When
-explicitly enabled for experiments:
+`w ∈ [0,1]` via the closed-form GM/TLS weight update (Appendix R.4). GTSAM's
+`GncOptimizer` re-runs the whole schedule per solve — **batch, not incremental**;
+it cannot run inside a single-shot `ISAM2::update`. Meridian *can* amortise the
+schedule across iSAM2 steps, but this path is **experimental and off by default**
+(`backend.gnc_enabled = false`): annealing `μ` re-linearises a growing,
+deliberately non-convex region of the Bayes tree every step, and a mid-anneal
+weight can transiently destabilise the live estimate. When explicitly enabled:
 
-- A new loop factor enters with a **conservative** kernel (high `μ`, near-convex)
-  so it cannot immediately dominate.
+- A new loop factor enters with a **conservative** kernel (high `μ`, near-convex).
 - Over the next `backend.gnc_anneal_steps` (default 5) iSAM2 updates, step `μ` on
   the schedule (`muStep`, direction per loss type — Appendix R.4), recompute each
   factor's weight from its current whitened residual, and re-insert the factor with
@@ -884,35 +881,31 @@ explicitly enabled for experiments:
   **removed**; if it is a loop, it returns to the PCM pending buffer marked
   "GNC-rejected" so it is not retried immediately (FM-6).
 
-> **Why this is not the default.** The committed convex kernel (§8.1) plus PCM (§7)
-> already deliver robust loop handling on the live thread without re-linearising a
-> non-convex sub-tree every step. The amortised in-graph GNC adds incremental
-> instability for a benefit the off-thread batch consolidation (§8.3) captures more
-> safely.
+The committed convex kernel (§8.1) plus PCM (§7) already deliver robust loop
+handling on the live thread; the off-thread batch consolidation (§8.3) captures
+the redescending benefit more safely, which is why this stays off.
 
 ### 8.3 Batch-GNC consolidation (off-thread)
 
 The heavy GNC machinery runs where it is statistically correct — as a **batch**
-optimisation — but off the live solve so it never stalls or destabilises the
-incremental path. Periodically (every `backend.gnc_consolidate_interval` admitted
-loops, or on request) a worker extracts the **loop sub-graph** — the loop
-`BetweenFactor`s plus the odometry chain spanning their endpoints, with the rest of
-the trajectory held as fixed priors at the current estimate — and runs a full GTSAM
-`GncOptimizer` (TLS/GM, `setInlierCostThresholds(barc2 = χ²₆,₀.₉₉)` per §3.2,
-`setKnownInliers(odometry)`) to convergence on a **copy**. The result is a hardened
-verdict per loop: factors GNC drives to `w < backend.gnc_reject_w` are scheduled for
-removal from the live graph (§9.5) and returned to the PCM pending buffer marked
-"GNC-rejected" (FM-6); survivors keep their committed kernel. The consolidation
-mutates only the live graph's *factor membership* (a small, well-defined remove-set
-applied on the back-end thread under §9.5), never the live linearisation point, so it
-cannot inject the churn §8.2 warns about. This runs on the back-end worker, not the
-odometry path (FM-7).
+optimisation — but off the live solve. Periodically (every
+`backend.gnc_consolidate_interval` admitted loops, or on request) a worker
+extracts the **loop sub-graph** — the loop `BetweenFactor`s plus the odometry
+chain spanning their endpoints, with the rest of the trajectory held as fixed
+priors at the current estimate — and runs a full GTSAM `GncOptimizer` (TLS/GM,
+`setInlierCostThresholds(barc2 = χ²₆,₀.₉₉)` per §3.2, `setKnownInliers(odometry)`)
+to convergence on a **copy**. The hardened verdict per loop: factors GNC drives to
+`w < backend.gnc_reject_w` are scheduled for removal from the live graph (§9.5)
+and returned to the PCM pending buffer marked "GNC-rejected" (FM-6); survivors
+keep their committed kernel. The consolidation mutates only the live graph's
+*factor membership* (a small remove-set applied on the back-end thread under
+§9.5), never the live linearisation point, so it cannot inject the churn §8.2
+warns about. It runs on the back-end worker, not the odometry path (FM-7).
 
-> **Why not in-graph switch variables.** Sünderhauf-style switchable constraints add
-> one real switch variable per loop. In an incremental graph that grows the Bayes
-> tree and makes that region non-convex → more relinearization churn (Appendix R.4).
-> The committed-convex-kernel + PCM + off-thread-batch-GNC layering above gets the
-> outlier rejection without the extra variable, so Meridian uses it.
+Sünderhauf-style in-graph **switch variables are not used**: one real switch
+variable per loop grows the Bayes tree and makes that region non-convex (more
+relinearization churn). The PCM + committed-kernel + off-thread-batch-GNC layering
+gets the outlier rejection without the extra variable.
 
 ---
 
@@ -943,20 +936,16 @@ p.factorization          = cfg.isam2_use_qr ? gtsam::ISAM2Params::QR
 isam2_ = std::make_unique<gtsam::ISAM2>(p);
 ```
 
-These follow the reference iSAM2 configuration (Appendix R.1): **Dogleg** rather
-than Gauss-Newton, because the visual + GNSS factors can sit far from their
-linearisation point at init and a trust region bounds the step (and bounds
+Rationale (deltas vs GTSAM defaults tabulated in Appendix R.1): **Dogleg** rather
+than Gauss-Newton because visual + GNSS factors can sit far from their
+linearisation point at init and a trust region bounds the step (also bounds
 loop-closure relinearization spikes, FM-7). **`relinearizeSkip = 1`** so every
-update checks deltas (LIO back-ends want this; matches LIO-SAM). **`findUnusedFactorSlots
-= true`** keeps the factor index compact under loop/GNSS churn.
-**`evaluateNonlinearError`** feeds the chi-square health alarm.
-
-`factorization` defaults to **CHOLESKY** (CHOLESKY normally, QR only on
-indeterminate-matrix exceptions from degeneracy — Appendix R.1). Observability
-inflation (§4.3) already keeps degenerate axes from going rank-deficient; if a
-corridor still trips `IndeterminantLinearSystemException`, FM-3 flips to QR and
-retries. The `g` (GNSS-origin) threshold is tighter so it relinearizes eagerly
-while still settling.
+update checks deltas. **`findUnusedFactorSlots = true`** keeps the factor index
+compact under loop/GNSS churn. **`evaluateNonlinearError`** feeds the chi-square
+health alarm. `factorization` defaults to **CHOLESKY**; observability inflation
+(§4.3) keeps degenerate axes from going rank-deficient, and if a corridor still
+trips `IndeterminantLinearSystemException`, FM-3 flips to QR and retries. The `g`
+threshold is tighter so the GNSS origin relinearizes eagerly while settling.
 
 ### 9.2 The update step (`IBackEnd::optimize`)
 
@@ -977,35 +966,30 @@ optimize() -> GraphUpdate:
 ```
 
 iSAM2 re-eliminates only the part of the Bayes tree touched by the new factors and
-any variable whose linearisation point moved past its `relinearizeThreshold` (fluid
-relinearization). Steady-state per-batch cost is near-constant; a loop touches
-the cycle's variables (a larger sub-tree) but not the whole graph — the iSAM2 win
-over batch.
+any variable whose linearisation point moved past its `relinearizeThreshold`.
+Steady-state per-batch cost is near-constant; a loop touches the cycle's variables
+(a larger sub-tree) but not the whole graph.
 
-**Cadence is decoupled from keyframe insertion.** `add_keyframe`, `add_loop_constraint`,
-and `add_absolute` only *stage* graph mutations into `new_graph`/`new_values`; they do
-not call `ISAM2::update`. The back-end thread (§17) calls `optimize()` on its own
-cadence — at most once per `backend.optimize_interval_ms` (default `100 ms`) — so a
-burst of keyframes (or a keyframe arriving simultaneously with a loop and a GNSS fix)
-collapses into a **single** batched `ISAM2::update` instead of one elimination per
-item. This bounds back-end load independent of L2's keyframe rate and lets the
-optimiser amortise relinearisation over a batch. A loop closure or a GNSS datum lock
-forces an immediate `optimize()` regardless of the timer, so corrections are not
-held back by the cadence. Queue depth and per-batch size are published as telemetry
-(`backend/queue_depth`, `backend/optimize_lag`, §14) so back-pressure is visible.
+**Cadence is decoupled from keyframe insertion.** `add_keyframe`,
+`add_loop_constraint`, and `add_absolute` only *stage* graph mutations into
+`new_graph`/`new_values`; they do not call `ISAM2::update`. The back-end thread
+(§17) calls `optimize()` on its own cadence — at most once per
+`backend.optimize_interval_ms` (default `100 ms`) — so a burst of keyframes (or a
+keyframe arriving with a loop and a GNSS fix) collapses into a **single** batched
+`ISAM2::update`. This bounds back-end load independent of L2's keyframe rate and
+amortises relinearisation over a batch. A loop closure or a GNSS datum lock forces
+an immediate `optimize()` regardless of the timer. Queue depth and per-batch size
+are published as telemetry (`backend/queue_depth`, `backend/optimize_lag`, §14).
 
-**Event-conditional extra iterations.** Because iSAM2 does only **one**
-Gauss-Newton/Dogleg step per `update`, a large rigid correction needs extra passes to
-converge, but a steady-state batch does not. The count is therefore conditioned on the
-event: `backend.extra_iters_normal` (default `0` — a normal batch is already at its
-linearisation point and an empty re-pass only burns time) versus
-`backend.extra_iters_loop` (default `4`; range 4–5) when the batch admitted a loop
-factor and many poses moved (the extra-`update()`-passes pattern of Appendix R.1).
+**Event-conditional extra iterations.** iSAM2 does only **one** Dogleg step per
+`update`; a large rigid correction needs extra passes, a steady-state batch does
+not. `backend.extra_iters_normal` (default `0`) versus `backend.extra_iters_loop`
+(default `4`; range 4–5) when the batch admitted a loop factor.
 
 In the hot path, publishing the latest pose only needs
-`calculateEstimate<Pose3>(latestKey)` (cheap partial back-substitution, recovering
-one variable rather than the whole state); the full `calculateEstimate()` is
-reserved for when L4 must re-integrate after a loop moved many poses.
+`calculateEstimate<Pose3>(latestKey)` (cheap partial back-substitution); the full
+`calculateEstimate()` is reserved for when L4 must re-integrate after a loop moved
+many poses.
 
 ### 9.3 Building `GraphUpdate` and the implicit `map→odom` correction
 
@@ -1022,14 +1006,13 @@ struct GraphUpdate {            // 01 §7.4 — do not redefine; shown for refer
 `build_graph_update` compares each affected keyframe's new estimate to its
 last-emitted pose and includes it in `moved` if it shifted by more than
 `backend.reintegrate_thresh` (translation) or the rotational analogue. `cov` is
-filled from the iSAM2 marginal when `backend.emit_moved_cov` is set (it is
-moderately expensive). `loop_closed` is set when this update admitted a loop
-factor. L4 consumes `moved` to clear-and-rebuild the affected nvblox TSDF region
-from the `KeyframeStore` clouds at the corrected poses (`01 §7.5`) — L3 names the
-moved keyframes; it never touches voxels.
+filled from the iSAM2 marginal when `backend.emit_moved_cov` is set (moderately
+expensive). `loop_closed` is set when this update admitted a loop factor. L4
+consumes `moved` to clear-and-rebuild the affected nvblox TSDF region from the
+`KeyframeStore` clouds at the corrected poses (`01 §7.5`).
 
-**The `map→odom` correction** spec 00 §3 calls a "`PoseCorrection`" is recovered
-by any consumer from L3's outputs without a new boundary type. For the latest
+**The `map→odom` correction** (spec 00 §3's "`PoseCorrection`") is recovered by
+any consumer from L3's outputs without a new boundary type. For the latest
 keyframe `n`, with the stored odom hint `T_odom_body(n) = kf_record[n].T_ref_body`
 and the optimised `X(n) = T_map_body(n)`:
 
@@ -1038,82 +1021,73 @@ T_{\text{map}\,\text{odom}} \;=\; X(n)\cdot \bigl(T_{\text{odom}\,\text{body}}(n
 $$
 
 The live front-end stays smooth in `odom` (`01 §7.3`); the global correction is
-this transform, refreshed each keyframe. (`current_map_to_ref` in §4.2 returns
-exactly this, cached.) The refined extrinsics travel separately as the versioned
+this transform, refreshed each keyframe (`current_map_to_ref` in §4.2 returns
+exactly this, cached). The refined extrinsics travel separately as the versioned
 `CalibrationSet` snapshot via `refined_calibration()` (§10, `01 §5.3`).
 
 ### 9.4 `corrected_trajectory()`
 
 Returns the `map`-frame `StampedPose` list (`01 §7.4`, `01 Appendix A`:
-`{stamp, kf_id, T_map_body}`) for every keyframe still represented in the estimate.
-Used by L6 / evaluation / TF publication in the wrapper.
+`{stamp, kf_id, T_map_body}`) for every keyframe still represented in the
+estimate. Used by L6 / evaluation / TF publication in the wrapper.
 
 ### 9.5 Factor removal
 
 iSAM2 removes factors by internal index (`ISAM2::update(..., removeFactorIndices)`).
 With `findUnusedFactorSlots = true` (§9.1) the freed slots are reused so the index
-stays compact under churn (Appendix R.1). L3 tracks `factor → internal
-index` for every removable factor (loops, GNSS) so PCM eviction (§7.2) and GNC
-rejection (§8) can pull a factor cleanly. **Odometry between-factors, restart IMU
-factors, and the gauge anchor are never removed.**
+stays compact under churn. L3 tracks `factor → internal index` for every removable
+factor (loops, GNSS) so PCM eviction (§7.2) and GNC rejection (§8) can pull a
+factor cleanly. **Odometry between-factors, restart IMU factors, and the gauge
+anchor are never removed.**
 
 ---
 
 ## 10. Online extrinsic refinement
 
 Online extrinsic refinement is **off by default** (`backend.extrinsic_refine = false`)
-and enabled per-platform. L3 is the **authority** on refined extrinsics (`01 §5.3`):
-when enabled it holds them as graph variables and publishes refined values to L2.
+and enabled per-platform. L3 is the **authority** on refined extrinsics
+(`01 §5.3`): when enabled it holds them as graph variables and publishes refined
+values to L2.
 
-The default is off because an extrinsic is **weakly observable without excitation**:
-the platform must both rotate and translate to separate `E(s)` from the pose, and an
-extrinsic left free under stationary or pure-translation motion is a canonical
-indeterminate-system cause (Appendix R.5). Defaulting it on therefore risks adding a
-near-null DoF to every graph and slowly biasing a well-calibrated rig away from a
-trustworthy offline calibration for no benefit. Refinement should be turned on only
-per-platform, when **both** conditions hold: (a) the offline calibration is *trusted
-but suspected to drift* (e.g. a field rig whose mounts flex with temperature), and
-(b) the mission is expected to deliver the rotational **and** translational excitation
-the §10.2 gate requires. When neither holds, the offline `CalibrationSet` (`01 §5.2`)
-is the better estimate and the variable only adds indeterminacy. The per-sensor
-`Extrinsic::refine_online` flag (`01 §5.2`) still selects *which* sensors are refined
-once the master `extrinsic_refine` switch is on.
+The default is off because an extrinsic is **weakly observable without
+excitation**: the platform must both rotate and translate to separate `E(s)` from
+the pose, and an extrinsic left free under stationary or pure-translation motion
+is a canonical indeterminate-system cause. Defaulting it on would add a near-null
+DoF to every graph and slowly bias a well-calibrated rig away from a trustworthy
+offline calibration. Turn it on per-platform only when **both** hold: (a) the
+offline calibration is *trusted but suspected to drift* (e.g. mounts that flex
+with temperature), and (b) the mission is expected to deliver the rotational
+**and** translational excitation the §10.2 gate requires. The per-sensor
+`Extrinsic::refine_online` flag (`01 §5.2`) selects *which* sensors are refined
+once the master switch is on.
 
 ### 10.1 Model
 
-Each refinable sensor `s` (those whose `Extrinsic::refine_online == true`,
-`01 §5.2`) gets an `E(s) = T_body_sensor(s)` `Pose3` variable, seeded by the
-offline calibration prior with a tight `PriorFactor<Pose3>` (sigma
-`backend.extrinsic_prior_sigma`, default 1e-3 m / 1e-3 rad — itself derived from
-`Extrinsic::prior_cov` when available; a weak prior holds each `E(s)` until it
-becomes observable, Appendix R.5). When refinement is active the prior is *loosened* to
-`extrinsic_refine_sigma` (default 1e-2) and the relevant sensor factors are made
-to depend on `E(s)` (a GNSS lever arm can likewise be promoted from a constant to
-`E(gnss).translation()`).
+Each refinable sensor `s` gets an `E(s) = T_body_sensor(s)` `Pose3` variable,
+seeded by the offline calibration with a tight `PriorFactor<Pose3>` (sigma
+`backend.extrinsic_prior_sigma`, default 1e-3 m / 1e-3 rad — derived from
+`Extrinsic::prior_cov` when available). When refinement is active the prior is
+*loosened* to `extrinsic_refine_sigma` (default 1e-2) and the relevant sensor
+factors are made to depend on `E(s)` (a GNSS lever arm can likewise be promoted
+from a constant to `E(gnss).translation()`).
 
-L3 holds the refined extrinsics as graph variables and publishes updated values as
-a versioned `CalibrationSet` snapshot that the front-end picks up at keyframe
-boundaries via `IFrontEnd::set_calibration`. The version counter lets L2 detect
-"calibration changed, reset linearization" (`01 §5.3`). The snapshot crosses L3→L2
-as Shared-immutable, never as live shared mutable — no data race.
+L3 publishes updated values as a versioned `CalibrationSet` snapshot that the
+front-end picks up at keyframe boundaries via `IFrontEnd::set_calibration`. The
+version counter lets L2 detect "calibration changed, reset linearization"
+(`01 §5.3`). The snapshot crosses L3→L2 as Shared-immutable — no data race.
 
 ### 10.2 Observability & safeguards
 
-Extrinsics are weakly observable without excitation (the platform must rotate
-*and* translate to separate `E` from pose; an extrinsic with no excitation is a
-canonical indeterminate-system cause, Appendix R.5):
-
 - **Excitation gate.** Update/relinearize `E(s)` only once cumulative rotation and
   translation since enabling exceed `extrinsic_excite_rot` / `extrinsic_excite_trans`;
-  before that the tight prior dominates and `E` stays pinned. (A FAST-LIO2-style
-  filter keeps the LiDAR-IMU extrinsic in-state but pinned by default for the same
-  reason — `extrinsic_est_en`, `config/ouster64.yaml`; carried in `state_ikfom`,
-  `use-ikfom.hpp:15–16`.)
-- **Convergence freeze.** Once `E(s)`'s marginal covariance (queried via
+  before that the tight prior dominates and `E` stays pinned. (FAST-LIO2 keeps the
+  LiDAR-IMU extrinsic in-state but pinned by default for the same reason —
+  `extrinsic_est_en`.)
+- **Convergence freeze.** Once `E(s)`'s marginal covariance (via
   `ISAM2::marginalCovariance`, §13) falls below `extrinsic_freeze_cov`, re-tighten
-  its prior to the converged value and stop treating it as free, removing it from
-  future relinearization to save cost — and publish the frozen value in the next
-  calibration snapshot.
+  its prior to the converged value, stop treating it as free (removing it from
+  future relinearization), and publish the frozen value in the next calibration
+  snapshot.
 - **Sanity clamp.** If `E(s)` strays from the offline prior by more than
   `extrinsic_max_dev`, reject the update, re-pin to the prior, and warn (FM-5).
 
@@ -1121,18 +1095,16 @@ canonical indeterminate-system cause, Appendix R.5):
 
 ## 11. Marginalization for long sessions
 
-Unbounded graphs grow without limit; tactical sessions run for hours. Meridian
-follows the reference recommendation for bounded multi-hour graphs (Appendix R.5):
-**keep a full `ISAM2` pose graph** — poses are cheap (one `Pose3` per ~1 m; even
-multi-km missions are
-only tens of thousands of poses, well within iSAM2, and loop closures must be able
-to attach to old keyframes, which a fixed-lag smoother would have marginalized
-away) — and **marginalize only the transient inertial variables** (`V`/`B`), which
-are needed only locally for the restart bridge (§5).
+Meridian's bounded-graph strategy (Appendix R.5): **keep the full `ISAM2` pose
+graph** — poses are cheap (one `Pose3` per ~1 m; multi-km missions are tens of
+thousands of poses, well within iSAM2) and loop closures must be able to attach to
+old keyframes, which a fixed-lag smoother would have marginalized away — and
+**marginalize only the transient inertial variables** (`V`/`B`) introduced by the
+restart bridge (§5).
 
 ### 11.1 What stays active
 
-- The full keyframe **pose graph** stays in iSAM2 (so any past keyframe can still
+- The full keyframe **pose graph** stays in iSAM2 (any past keyframe can still
   receive a loop closure). The anchor keyframe, the GNSS-origin `G`, and any
   non-frozen extrinsic `E(s)` are likewise never marginalized.
 - Transient `V`/`B` from a restart bridge (§5) are marginalized once the next
@@ -1140,53 +1112,46 @@ are needed only locally for the restart bridge (§5).
 
 ### 11.2 Mechanism
 
-Marginalizing variable set $M$ (the restart bridge's local `V`/`B`) yields, via the
-Schur complement on the linearised system, a dense Gaussian factor on the
+Marginalizing variable set $M$ (the restart bridge's local `V`/`B`) yields, via
+the Schur complement on the linearised system, a dense Gaussian factor on the
 **separator** $S$ (retained variables that shared a factor with $M$):
 
 $$
 \Lambda_S^{+} \;=\; \Lambda_{SS} - \Lambda_{SM}\,\Lambda_{MM}^{-1}\,\Lambda_{MS},
 $$
 
-re-added as a `gtsam::LinearContainerFactor` at the current linearisation point
-(marginalization = Schur-complement leaving a dense linear prior; exact for the
-linearisation at marginalization time, but frozen there — Appendix R.5).
-Meridian marginalizes `V`/`B` by **simply not retaining them past the restart
-window** — they are introduced only on fallback intervals (§5), so they are
-naturally transient and need no fixed-lag smoother for the pose graph
-(Appendix R.5). This avoids the documented sharp edges of `gtsam_unstable`'s
-`IncrementalFixedLagSmoother` (one `update` per timestamp, segfaults marginalizing
-a prior-only variable, key/timestamp drift — Appendix R.5).
+re-added as a `gtsam::LinearContainerFactor` at the current linearisation point —
+exact for the linearisation at marginalization time, but frozen there. Because
+`V`/`B` are introduced only on fallback intervals (§5), they are naturally
+transient: no fixed-lag smoother is needed for the pose graph, which sidesteps the
+documented sharp edges of `gtsam_unstable`'s `IncrementalFixedLagSmoother`
+(Appendix R.5).
 
 If a *very* long mission makes even the pose graph too large, the escalation is
 **keyframe culling / graph sparsification** (drop redundant keyframes in
 overlapping-view regions, merging their constraints) rather than fixed-lag
-marginalization of poses (Appendix R.5) — a deferred utility, not a normal path.
+marginalization of poses — a deferred utility, not a normal path.
 
 ### 11.3 Caveats
 
-- The marginal prior is computed at a fixed linearisation point and cannot be
-  relinearized later (Appendix R.5). Because only transient `V`/`B` are
-  marginalized — never poses a future loop might move — this freezing is harmless:
-  the persistent pose graph stays fully relinearizable.
+- The marginal prior cannot be relinearized later. Because only transient `V`/`B`
+  are marginalized — never poses a future loop might move — this freezing is
+  harmless: the persistent pose graph stays fully relinearizable.
 - The `KeyframeStore` (`01 §7.5`) is **independent** of graph variable lifetime:
   clouds are kept (for final meshing and possible future loop verification)
-  regardless of whether any transient inertial variable was marginalized. Their
-  poses track the live pose-graph estimate.
+  regardless of marginalization. Their poses track the live pose-graph estimate.
 
 ---
 
 ## 12. Tangent-ordering adapter (Meridian ↔ GTSAM)
 
-This is a correctness-critical detail — the **highest-risk silent bug** in the
-whole back-end, to be pinned by a unit test (Appendix R.2/R.3). **Meridian orders
-the 6-DoF tangent translation-first: `[ρ(trans); φ(rot)]`** (`01 §3.1`: "orders
-translation first, rotation second; $\xi=[\rho;\phi]$"), and `PoseCov6` /
+This is the **highest-risk silent bug** in the whole back-end, to be pinned by a
+unit test. **Meridian orders the 6-DoF tangent translation-first:
+`[ρ(trans); φ(rot)]`** (`01 §3.1`), and `PoseCov6` /
 `ObservabilityReport.score` follow that. **GTSAM `Pose3` orders rotation-first:
-`[rx,ry,rz, tx,ty,tz]`** (Appendix R.3). Every covariance and Jacobian
-crossing into GTSAM must be reordered, or the noise model is silently wrong (a
-classic block-swap bug; spec 01 §3.1's "pitfall fixed here" warns about exactly
-this).
+`[rx,ry,rz, tx,ty,tz]`**. Every covariance and Jacobian crossing into GTSAM must
+be reordered, or the noise model is silently wrong (a classic block-swap bug;
+`01 §3.1`'s "pitfall fixed here").
 
 ```cpp
 // Permutation P swapping [rho; phi] (Meridian) <-> [phi; rho] (GTSAM Pose3 order).
@@ -1210,12 +1175,11 @@ translation-first spec-01 covariances (`PoseCov6` — loop, GNSS, prior) enterin
 GTSAM noise model pass through `reorder_meridian_to_gtsam` exactly once** (e.g.
 §7.2). The `KeyframePacket.constraint_cov` block is the exception: it is already
 rotation-first (`01 §6.1`) and enters the noise model directly (§4.3). The adapter
-at the boundary converts conventions; the core math never does (`01 §3.1` mandate).
+at the boundary converts conventions; the core math never does (`01 §3.1`).
 
-> **Mandatory regression test** (Appendix R.2): perturb `T_j` along one
-> tangent axis and assert the between-factor error grows along the *expected*
-> covariance axis. This catches a swapped/rotated covariance the moment it
-> appears.
+> **Mandatory regression test:** perturb `T_j` along one tangent axis and assert
+> the between-factor error grows along the *expected* covariance axis. This
+> catches a swapped/rotated covariance the moment it appears.
 
 ---
 
@@ -1223,42 +1187,38 @@ at the boundary converts conventions; the core math never does (`01 §3.1` manda
 
 L5's place-recognition gate should only attempt expensive GICP verification
 against keyframes within the search radius implied by the current pose
-uncertainty (Appendix R.6). L3 serves that covariance cheaply.
+uncertainty. L3 serves that covariance cheaply:
 
-- **Cheap, from the live graph:** `ISAM2::marginalCovariance(keyX(latest))` returns
-  the 6×6 marginal of the latest pose (GTSAM tangent order rot-then-trans; reorder
-  to Meridian via §12 before handing out). It reuses the Bayes tree — far cheaper than
-  building a `Marginals` object from scratch (Appendix R.6). Call it at
-  keyframe rate, not per scan.
+- `ISAM2::marginalCovariance(keyX(latest))` returns the 6×6 marginal of the latest
+  pose (GTSAM tangent order; reorder to Meridian via §12 before handing out). It
+  reuses the Bayes tree — far cheaper than building a `Marginals` object. Call it
+  at keyframe rate, not per scan.
 - The positional 1σ is $\sqrt{\lambda_{\max}}$ of the translation block; L5's gate
-  radius is `k_gate · σ_pos` (Appendix R.6). The same call serves the
-  extrinsic convergence-freeze test (§10.2).
+  radius is `k_gate · σ_pos`. The same call serves the extrinsic
+  convergence-freeze test (§10.2).
 
-This is the third reason the no-double-counting contract is load-bearing: an
-over-confident marginal (from a double-counted hand-off) shrinks the search radius
-and **misses loop closures**, causing unbounded drift (Appendix R.6).
-Keeping the hand-off honest (§3.1) keeps loop closure working.
+This is the third reason the no-double-counting contract (§3.1) is load-bearing:
+an over-confident marginal shrinks the search radius and **misses loop closures**,
+causing unbounded drift.
 
 ---
 
 ## 14. Debug & introspection
 
-Per the introspection pillar (`00 §10`, "debug in the right places"), L3 makes its
-reasoning visible. The structured channel is `BackEndDiagnostics` (`01 Appendix A`:
-`num_keyframes`, `num_loops`, `isam_update_ms`, `last_optimize_diverged`); L3
-additionally writes the richer telemetry below through the `TelemetrySink`
-abstraction (`00 §10.1`) so the wrapper maps it to ROS topics / rviz markers. L3
-core emits typed telemetry; it never calls `rclcpp` (`00 §1.1`). The health
-signals follow the reference iSAM2 monitoring set: `errorBefore/After`,
+The structured channel is `BackEndDiagnostics` (`01 Appendix A`: `num_keyframes`,
+`num_loops`, `isam_update_ms`, `last_optimize_diverged`); L3 additionally writes
+the telemetry below through the `TelemetrySink` abstraction (`00 §10.1`) so the
+wrapper maps it to ROS topics / rviz markers. L3 core never calls `rclcpp`
+(`00 §1.1`). Health signals follow the iSAM2 monitoring set: `errorBefore/After`,
 `variablesRelinearized`, `variablesReeliminated`, chi-square spikes,
-indeterminate-system alarms (Appendix R.1).
+indeterminate-system alarms.
 
 ### 14.1 Telemetry keys (wrapper-bound, `00 §10.2`)
 
 | Telemetry key | Channel | Cadence | Contents |
 |---------------|---------|---------|----------|
 | `pose("map/keyframe/<id>")` | pose | kf rate | optimised `X(id)` for path/TF |
-| `scalar("backend/chi2")` | scalar | kf rate | total graph χ² from `errorAfter` (graph health, `00 §10.2`; Appendix R.1) |
+| `scalar("backend/chi2")` | scalar | kf rate | total graph χ² from `errorAfter` (graph health, `00 §10.2`) |
 | `scalar("backend/n_factors")` | scalar | kf rate | factor count by type (between/imu/loop/gnss) |
 | `scalar("backend/update_ms")` | timing | per update | `ISAM2::update` time → `BackEndDiagnostics.isam_update_ms` |
 | `scalar("backend/relin_count")` | scalar | per update | `variablesRelinearized` / `variablesReeliminated` (loop-thrash detector) |
@@ -1274,9 +1234,8 @@ indeterminate-system alarms (Appendix R.1).
 | `scalar("backend/optimize_lag")` | scalar | per optimize | number of queued items folded into the last `optimize()` (§9.2/§17), spec 09 §5.3's canonical key for the cadence/batch-size signal |
 | `scalar("backend/fallback_count")` | scalar | on event | cumulative count of FM-3b iSAM2 rebuilds (last-resort recovery); a nonzero value is a field-survival alarm |
 
-These align one-to-one with the FAST-LIO-grounded debug map in `00 §10.2 / App. C`
-(back-end health, loop markers, per-stage timing) and the principle that
-observability and residuals must be *plottable*, not just printed.
+These align with the debug map in `00 §10.2 / App. C`: observability and residuals
+must be *plottable*, not just printed.
 
 ### 14.2 Snapshot dump
 
@@ -1293,12 +1252,12 @@ regression testing. The pipeline can trigger it through the debug control path
 |----|---------|-----------|----------|
 | FM-1 | Keyframe gap (`rel_to_id != last_kf_id`) | contiguity assert (§4.2) | log fatal; request L2 resync; do **not** fabricate a bridging factor |
 | FM-2 | Indefinite / non-PSD `constraint_cov` | eigen-check on `cov.M` | clamp eigenvalues to `[σ_min², ∞)`; warn; re-check PSD before building the noise model |
-| FM-3 | iSAM2 `IndeterminantLinearSystemException` | GTSAM throw caught in `optimize` | identify the near-null variable from the exception key (Appendix R.5); regularise it with a `LinearDampingFactor` (the same value-free gauge-damping the anchor uses, §3) and/or inflate its connected edges (degeneracy lock §4.3); if it persists, switch `factorization` to QR and retry once; if it still recurs, escalate to FM-3b |
-| FM-3b | FM-3 unrecoverable (QR + damping retry still throws) | second `IndeterminantLinearSystemException` after FM-3 escalation | rebuild a fresh `ISAM2` from `isam2_.getFactorsUnsafe()` re-linearised at the last good `calculateEstimate()` (the surviving factors and a known-good linearisation point), dropping the offending pending batch; if the rebuild also throws, freeze the near-null variable, alert (`last_optimize_diverged = true`), and `++fallback_count` (§14) |
+| FM-3 | iSAM2 `IndeterminantLinearSystemException` | GTSAM throw caught in `optimize` | identify the near-null variable from the exception key; regularise it with a `LinearDampingFactor` (the same value-free gauge-damping the anchor uses, §3) and/or inflate its connected edges (degeneracy lock §4.3); if it persists, switch `factorization` to QR and retry once; if it still recurs, escalate to FM-3b |
+| FM-3b | FM-3 unrecoverable (QR + damping retry still throws) | second `IndeterminantLinearSystemException` after FM-3 escalation | rebuild a fresh `ISAM2` from `isam2_.getFactorsUnsafe()` re-linearised at the last good `calculateEstimate()`, dropping the offending pending batch; if the rebuild also throws, freeze the near-null variable, alert (`last_optimize_diverged = true`), and `++fallback_count` (§14) |
 | FM-4 | Loop storm (PCM thrash) | `pending.size() > pcm_max_nodes` | switch to greedy max-clique; back-pressure L5; newest-fitness-first |
 | FM-5 | Extrinsic divergence | `‖E(s) ⊟ prior‖ > extrinsic_max_dev` (§10.2) | reject update; re-pin `E(s)`; disable refine for `s`; warn |
 | FM-6 | GNSS jump / multipath | per-fix χ² > gate, or robust `w < reject_w` | drop fix; if sustained, auto-disable GNSS and continue loop-only |
-| FM-7 | Loop relinearization spike | `relin_count` / `update_ms` spike after a loop | Dogleg already bounds the step; accept one-frame latency; commit big loops on the back-end thread off the odometry path (Appendix R.1) |
+| FM-7 | Loop relinearization spike | `relin_count` / `update_ms` spike after a loop | Dogleg already bounds the step; accept one-frame latency; commit big loops on the back-end thread off the odometry path |
 | FM-8 | Real-time overrun (`update_ms` over budget) | timing telemetry (§14) | raise `optimize_interval_ms` so more keyframes batch per `ISAM2::update` (§9.2); raise `relinearizeSkip`; request larger keyframe spacing from L2; shed debug topics |
 | FM-9 | Back-end input queue saturating (producers outrun the optimise cadence) | `queue_depth` over `backend.queue_warn_depth` (§14) | the queue is bounded and drops oldest non-essential items with a logged count; loops/GNSS/restart edges are never dropped; if depth stays high, fall back to FM-8 (raise cadence interval) |
 
@@ -1311,16 +1270,13 @@ information the back-end must preserve.
 
 ## 16. Configuration (BackendConfig)
 
-This is the typed sub-tree of `meridian::Config` (`00 §8`) for `meridian_backend`. It
-expands spec 00 §8.2's `backend: { kind: isam2, relinearize_thresh: 0.1, robust:
-huber }`. The `robust` key there names the back-end's robust *strategy family*,
-which §8 realises as the layered PCM + committed-Huber-incremental + off-thread-GNC
-pipeline: the live incremental kernel defaults to **Huber** (`robust_kernel`,
-known-safe inside `ISAM2::update`, §8.1) while the redescending GNC machinery runs as
-the off-thread batch consolidation (§8.3); amortised in-graph GNC is experimental and
-off by default (§8.2). `[hot]` = runtime-reconfigurable via the debug-control path
-(`00 §10.5`); `[cold]` = restart required. `Config::validate()` (`00 §8.3`) range-
-checks these on load.
+The typed sub-tree of `meridian::Config` (`00 §8`) for `meridian_backend`,
+expanding spec 00 §8.2's `backend:` block. The `robust` key there names the robust
+*strategy family*, realised in §8 as PCM + committed-Huber-incremental +
+off-thread-GNC; amortised in-graph GNC is experimental and off by default (§8.2).
+`[hot]` = runtime-reconfigurable via the debug-control path (`00 §10.5`);
+`[cold]` = restart required. `Config::validate()` (`00 §8.3`) range-checks these
+on load.
 
 ```cpp
 namespace meridian {
@@ -1422,15 +1378,13 @@ struct BackendConfig {
 
 ## 17. The back-end thread loop
 
-The back-end runs on its own thread (`01 §2.4`: "a back-end thread (L3 + L5)").
-It owns the `ISAM2` instance exclusively; every graph mutation flows through this
-single loop, the invariant that makes the no-double-counting contract (§3.1)
-enforceable in one place.
-
-The thread *stages* graph mutations as items arrive but *optimises* on a separate
-cadence (§9.2): it drains every queued item into the pending batch, then calls
-`optimize()` at most once per `optimize_interval_ms` — or immediately when the batch
-admitted a loop or a GNSS datum lock, so corrections are never held back by the timer.
+The back-end runs on its own thread (`01 §2.4`: "a back-end thread (L3 + L5)") and
+owns the `ISAM2` instance exclusively; every graph mutation flows through this
+single loop — the invariant that makes the no-double-counting contract (§3.1)
+enforceable in one place. The thread *stages* mutations as items arrive but
+*optimises* on the §9.2 cadence: it drains every queued item into the pending
+batch, then calls `optimize()` at most once per `optimize_interval_ms` — or
+immediately when the batch admitted a loop or a GNSS datum lock.
 
 ```text
 backend_thread():
@@ -1463,11 +1417,12 @@ backend_thread():
     publish_debug()                                      # §14
 ```
 
-The input `backend_queue` is the bounded primitive of `00 §11`: it blocks producers
-only on shutdown and otherwise drops the **oldest non-essential** item (a stale
-`corrected_trajectory()`-style request) with a logged drop count when depth exceeds
-`queue_warn_depth` (FM-9); KEYFRAME (any kind), LOOP, and GNSS items are essential and
-are never dropped — losing a keyframe would break the §4.2 contiguity contract (FM-1).
+The input `backend_queue` is the bounded primitive of `00 §11`: it blocks
+producers only on shutdown and otherwise drops the **oldest non-essential** item
+(a stale `corrected_trajectory()`-style request) with a logged drop count when
+depth exceeds `queue_warn_depth` (FM-9). KEYFRAME (any kind), LOOP, and GNSS items
+are essential and never dropped — losing a keyframe would break the §4.2
+contiguity contract (FM-1).
 
 `optimize()`, `corrected_trajectory()`, `refined_calibration()`, and
 `diagnostics()` are the `IBackEnd` methods (`01 §7.4`) the pipeline calls; the
@@ -1477,26 +1432,24 @@ loop above is the internal driver that backs them.
 
 ## 18. Module integration order
 
-This is a single complete system; the list below is only the **compile/integration
-order** for bringing the back-end up against its collaborators — not a feature
-rollout, and nothing is organised around it. Each item is the same final design.
+This is the **compile/integration order** for bringing the back-end up against
+its collaborators — not a feature rollout; each item is the same final design.
 
 1. **Variables + the normal between-edge (§2, §4) + gauge anchor + iSAM2 wiring
    (§9).** Drive it with `RelativeBetween` packets only; assert the
    single-factor-per-edge invariant and the tangent-ordering regression test
-   (§12). This is the spine; everything else attaches to it.
-2. **Restart bridge (§5)** so the graph survives a window restart, and the
-   transient-`V`/`B` marginalization (§11) that keeps it pose-only afterward.
+   (§12). This is the spine.
+2. **Restart bridge (§5)** and the transient-`V`/`B` marginalization (§11) that
+   keeps the graph pose-only afterward.
 3. **GNSS (§6)** — the origin variable `G`, the lever-arm factor, Huber gating.
-4. **Loop closures (§7 PCM + §8 GNC)** and the marginal-covariance gate served to
+4. **Loop closures (§7 PCM + §8)** and the marginal-covariance gate served to
    L5 (§13).
-5. **Online extrinsics (§10)**, off by default and enabled per-platform, with the
-   excitation/freeze safeguards.
+5. **Online extrinsics (§10)**, off by default, with the excitation/freeze
+   safeguards.
 
-A FAST-LIO2-style iEKF front-end exists only as an optional reference/test oracle
-behind `IFrontEnd` (`00 §5.4`); from L3's side it is irrelevant — L3 consumes the
-same `KeyframePacket` regardless of which front-end produced it (Appendix R.2), so
-the back-end never branches on `frontend_kind` (`01 §6.2`).
+Which front-end produced a packet is irrelevant from L3's side (the retired iEKF
+test oracle proved the point, `00 §5.4`): L3 consumes the same `KeyframePacket`
+regardless of producer and never branches on `frontend_kind` (`01 §6.2`).
 
 ---
 
@@ -1513,51 +1466,40 @@ the back-end never branches on `frontend_kind` (`01 §6.2`).
   `00 §9.5`), iEKF-as-oracle (`00 §5.4`).
 - Sibling specs — L2 front-end `04_frontend_estimation.md` (produces
   `RelativeBetween` and the restart `ImuPreintegration` summary), L4 map
-  `06_mapping.md` (consumes `GraphUpdate` for nvblox clear-and-rebuild), L5 place
-  recognition `07_loop_closure.md` (produces `LoopConstraint`, consumes the
-  marginal-covariance gate, and references the canonical squared-Mahalanobis /
-  chi-square convention defined here in §3.2 rather than restating it).
+  `06_mapping.md` (consumes `GraphUpdate`), L5 place recognition
+  `07_loop_closure.md` (produces `LoopConstraint`, consumes the
+  marginal-covariance gate, references the §3.2 chi-square convention).
 - Reference grounding — **Appendix R** (non-normative): ISAM2Params defaults +
   Meridian deltas R.1; L2→L3 hand-off contract R.2; IMU preintegration objects
   R.3; robust kernels / GNC / switchable / PCM contrast R.4; marginalization +
   gtsam_unstable sharp edges R.5; marginal covariance for the loop pre-filter R.6;
   bibliography R.7.
-- Reference code (under `/home/user/slam-reference`) —
-  `FAST_LIO/include/use-ikfom.hpp:12–21` (the full inertial state Meridian keeps
-  inside L2's window, not at the L3 graph level);
-  `FAST_LIO/include/IMU_Processing.hpp` + `config/ouster64.yaml` (IMU / bias noise
-  defaults, online-extrinsic-pinned default); GTSAM-4.2 iSAM2 usage in
-  `LIO-SAM/src/mapOptmization.cpp`, PCM/GNC in `Kimera-RPGO`, fixed-lag in
-  `glim` / `gtsam_points` (Appendix R).
+- Reference code (under `/home/user/slam-reference`) — `FAST_LIO`
+  (`use-ikfom.hpp`, `IMU_Processing.hpp`, `config/ouster64.yaml`), GTSAM-4.2 iSAM2
+  usage in `LIO-SAM/src/mapOptmization.cpp`, PCM/GNC in `Kimera-RPGO`, fixed-lag
+  in `glim` / `gtsam_points` (Appendix R).
 
 ---
 
 *End of spec 05. The L3 back-end consumes only the spec-01 boundary types and
 emits only the spec-01 outputs; its sole non-negotiable internal invariant is the
-single-odometry-factor-per-edge rule of §3.1, the load-bearing L2→L3 hand-off
-contract (Appendix R.2).*
+single-odometry-factor-per-edge rule of §3.1.*
 
 ---
 
 ## Appendix R — SOTA reference grounding (non-normative)
 
-This appendix is evidence, not contract: curated digests of the reference systems
-this spec's design was validated against. Nothing here binds Meridian's behavior —
-the normative sections above own the design. Each block names the reference
-checkout it was verified against; the clones live in `/home/user/slam-reference`.
-
-The iSAM2 / Bayes-tree / fluid-relinearization / partial-recovery algorithm
-theory is owned by the normative body and the cited papers (R.7); it is not
-restated here. GTSAM itself is not cloned under `/home/user/slam-reference`; the
-GTSAM-knob facts below were verified against the **pinned GTSAM 4.2** source plus
-the GTSAM-4.2-using reference systems that are cloned (LIO-SAM, Kimera-RPGO, glim,
-gtsam_points).
+Evidence, not contract: digests of the reference systems this design was validated
+against; nothing here binds Meridian's behavior. Clones live in
+`/home/user/slam-reference`. GTSAM itself is not cloned; GTSAM-knob facts were
+verified against the **pinned GTSAM 4.2** source plus the GTSAM-4.2-using
+references (LIO-SAM, Kimera-RPGO, glim, gtsam_points). The iSAM2/Bayes-tree
+algorithm theory is owned by the normative body and the papers (R.7).
 
 ### R.1 ISAM2Params defaults (GTSAM 4.2) & Meridian deltas
 
-verified against GTSAM 4.2.0 (the spec-11 pin; library not cloned, defaults
-cross-checked against LIO-SAM@0be1fbe `src/mapOptmization.cpp:159-161` and
-`src/imuPreintegration.cpp:233-235`).
+Verified against GTSAM 4.2.0 (the spec-11 pin); cross-checked against
+LIO-SAM@0be1fbe `src/mapOptmization.cpp:159-161`, `src/imuPreintegration.cpp:233-235`.
 
 | Param | Type | GTSAM 4.2 default | Meridian (§9.1) |
 |---|---|---|---|
@@ -1576,15 +1518,9 @@ cross-checked against LIO-SAM@0be1fbe `src/mapOptmization.cpp:159-161` and
 `variablesReeliminated`, `cliques`, `factorsRecalculated`, and (with
 `evaluateNonlinearError`) `errorBefore`/`errorAfter`.
 
-Recommended per-type `relinearizeThreshold` rationale: a `Pose3`'s 6 DoF mix
-radians (rotation) and metres (translation); velocity is m/s; bias is the
-accel/gyro-bias pair — each needs its own delta threshold, which the scalar
-default cannot express. The §9.1 map encodes that split.
-
 ### R.2 The L2→L3 hand-off contract (the load-bearing rule)
 
-verified against GTSAM 4.2 factor semantics; design contract owned by §3.1/§4/§5
-above. Kept here only as the one-line invariant table.
+Design contract owned by §3.1/§4/§5; kept here as the one-line invariant table.
 
 | Mode | New vars at kf `j` | Factor(s) | Rule |
 |---|---|---|---|
@@ -1593,18 +1529,16 @@ above. Kept here only as the one-line invariant table.
 | GNSS @ fix time | none | `GnssFactor` over the two bracketing poses + `G` (robust/switchable) | bound to the fix-time interpolated pose, gated/decimated before insert |
 | Loop `j↔k` | none | switchable `BetweenFactor<Pose3>` (GNC) | PCM-gated before insert |
 
-The single hazard the contract prevents: absolute-prior + between + IMU factor all
-derived from the *same* L2-fused measurements → triple-counted information →
-over-confident covariance → rejected loop/GNSS corrections and a collapsed
-marginal-covariance search radius that silently misses loops. The whole point of
-passing the *marginal* relative covariance (not conditional) is that it already
-reflects observability, so the back-end trusts it correctly per axis.
+The hazard prevented: absolute-prior + between + IMU factor from the *same*
+L2-fused measurements → triple-counted information → over-confident covariance →
+rejected loop/GNSS corrections and a collapsed loop-search radius. Passing the
+*marginal* relative covariance (not conditional) means it already reflects
+observability, so the back-end trusts it correctly per axis.
 
 ### R.3 IMU preintegration (Forster et al. T-RO 2017) — GTSAM objects
 
-verified against GTSAM 4.2 `gtsam/navigation/`; usage cross-checked against
-LIO-SAM@0be1fbe `src/imuPreintegration.cpp` and glim@25ad190
-`src/glim/odometry/`.
+Verified against GTSAM 4.2 `gtsam/navigation/`; usage cross-checked against
+LIO-SAM@0be1fbe `src/imuPreintegration.cpp` and glim@25ad190 `src/glim/odometry/`.
 
 - `PreintegrationCombinedParams`: `accelerometerCovariance`,
   `gyroscopeCovariance`, `integrationCovariance`, `biasAccCovariance`,
@@ -1612,74 +1546,62 @@ LIO-SAM@0be1fbe `src/imuPreintegration.cpp` and glim@25ad190
 - `PreintegratedCombinedMeasurements pim(params, biasHat)`; accumulate via
   `pim.integrateMeasurement(acc, gyro, dt)`.
 - `CombinedImuFactor(X(i),V(i),B(i), X(j),V(j),B(j), pim)` — 6-way; bakes in the
-  bias random walk, so it is preferred over `ImuFactor` + a separate
-  `BetweenFactor<imuBias>`.
+  bias random walk, preferred over `ImuFactor` + separate `BetweenFactor<imuBias>`.
 - `pim.predict(NavState_i, biasHat) → NavState_j` seeds the new keyframe value;
   `pim.resetIntegrationAndSetBias(newBias)` after commit.
 - `n_gravity` sign/axis is world-frame dependent — Meridian's `map` is
   gravity-aligned ENU, so `(0,0,-9.81)` (§5.3).
 
-Meridian rebuilds the PIM from the `ImuPreintegrationSummary` boundary type rather
-than re-integrating raw IMU (§5.1); raw IMU never crosses L2→L3.
+Meridian rebuilds the PIM from the `ImuPreintegrationSummary` boundary type (§5.1);
+raw IMU never crosses L2→L3.
 
 ### R.4 Robust kernels, GNC & switchable constraints — cross-system contrast
 
-verified against gtsam_points@85d0f4c
-(`registration/impl/graduated_non_convexity_impl.hpp`,
-`graduated_non_convexity.cpp`), Kimera-RPGO@d28b4df
+Verified against gtsam_points@85d0f4c
+(`registration/impl/graduated_non_convexity_impl.hpp`), Kimera-RPGO@d28b4df
 (`include/KimeraRPGO/SolverParams.h`, `outlier/Pcm.h`, `src/RobustSolver.cpp`),
 and GTSAM 4.2 `gtsam/nonlinear/GncOptimizer.h`.
 
 | Concept | Reference impl | Verified detail |
 |---|---|---|
 | GNC GM weight | gtsam_points `graduated_non_convexity_impl.hpp:165` | `w = (μ/(μ+e))²`, schedule `μ /= div_factor` (GM **decreases** μ) |
-| GNC `muStep` | Kimera-RPGO `SolverParams.h:65` | `mu_step_ = 1.4` default; "factor to reduce/increase μ in gnc" — direction is per-loss (GM divides, TLS multiplies) |
+| GNC `muStep` | Kimera-RPGO `SolverParams.h:65` | `mu_step_ = 1.4` default; direction is per-loss (GM divides, TLS multiplies) |
 | GNC inlier gate | Kimera-RPGO `SolverParams.h:61-62` | `PROBABILITY` mode, `gnc_inlier_threshold_ = 0.9`; GTSAM's `setInlierCostThresholds` derives `c̄²` from a χ² quantile for the factor dim |
-| GNC is batch | GTSAM `GncOptimizer` wraps LM/GN | not incremental — cannot run inside `ISAM2::update`; Meridian amortises across iSAM2 steps (§8) |
-| PCM | Kimera-RPGO `outlier/Pcm.h`, `max_clique_finder/` | pairwise-consistency + max-clique; defaults `odom_threshold=10.0`, `lc_threshold=5.0` (`SolverParams.h:36-37`) |
-| Switchable constraints | not first-class in GTSAM 4.2 | implement as custom factor + `PriorFactor<double>` switch, **or** use GNC (the modern subsumption) — Meridian uses amortised GNC, no switch variable |
-| Robust M-estimators | GTSAM `noiseModel::Robust` | `Huber` (k≈1.345, convex → safe in incremental IRLS), `GemanMcClure`/`Cauchy`/`Tukey`/`DCS`/`Welsch` (redescending, non-convex) |
-
-Meridian assignment: **Huber on GNSS** (convex, lives inside iSAM2), **GNC on
-loops** (amortised; the most damaging factor), **PCM upstream** of GNC to pick a
-mutually consistent loop set.
+| GNC is batch | GTSAM `GncOptimizer` wraps LM/GN | not incremental — cannot run inside `ISAM2::update` |
+| PCM | Kimera-RPGO `outlier/Pcm.h`, `max_clique_finder/` | pairwise-consistency + max-clique; defaults `odom_threshold=10.0`, `lc_threshold=5.0` |
+| Switchable constraints | not first-class in GTSAM 4.2 | custom factor + `PriorFactor<double>` switch, **or** GNC (the modern subsumption) — Meridian uses no switch variable |
+| Robust M-estimators | GTSAM `noiseModel::Robust` | `Huber` (k≈1.345, convex → safe in incremental IRLS); `GemanMcClure`/`Cauchy`/`Tukey`/`DCS`/`Welsch` are redescending, non-convex |
 
 ### R.5 Bounded graphs: marginalization & the gtsam_unstable sharp edges
 
-verified against gtsam_points@85d0f4c
-(`optimizers/incremental_fixed_lag_smoother_ext.cpp`,
-`incremental_fixed_lag_smoother_with_fallback.hpp`, the `gtsam4.2/` variant) and
-GTSAM 4.2 `gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h`.
+Verified against gtsam_points@85d0f4c
+(`optimizers/incremental_fixed_lag_smoother_ext.cpp`, the `…WithFallback` wrapper)
+and GTSAM 4.2 `gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h`.
 
 `IncrementalFixedLagSmoother` wraps iSAM2 and marginalizes keys older than a lag
-`L` via Schur complement, leaving a `LinearContainerFactor` on the boundary —
-exact for the linearization at marginalization time, but frozen there (cannot be
-relinearized later). It lives in `gtsam_unstable`; sharp edges (confirmed real —
-gtsam_points ships a `…WithFallback` wrapper specifically because the base class
-throws in practice):
+via Schur complement, leaving a `LinearContainerFactor` — exact at the
+marginalization-time linearization, but frozen there. Confirmed sharp edges
+(gtsam_points ships a fallback wrapper because the base class throws in practice):
 
-- Do **not** call `update()` more than once per timestamp; batch all of a
-  keyframe's factors into one `update()`.
-- Segfaults reported when marginalizing a variable with no factor other than a
-  prior — keep every boundary-entering variable constrained by a non-prior factor.
-- "Requested variable … not in this VectorValues" appears when keys/timestamps
-  drift out of sync; keep the `KeyTimestampMap` exactly in step.
+- Do **not** call `update()` more than once per timestamp; batch a keyframe's
+  factors into one `update()`.
+- Segfaults when marginalizing a variable whose only factor is a prior — keep
+  every boundary-entering variable constrained by a non-prior factor.
+- "Requested variable … not in this VectorValues" when keys/timestamps drift —
+  keep the `KeyTimestampMap` exactly in step.
 
-Meridian sidesteps all three by marginalizing only transient `V`/`B` (introduced
-only on restart bridges, §5/§11) — never poses — so no fixed-lag smoother is
-needed for the persistent pose graph.
+Meridian sidesteps all three by marginalizing only transient `V`/`B` (§5/§11) —
+never poses — so no fixed-lag smoother is needed.
 
 ### R.6 Marginal covariance for the loop pre-filter
 
-verified against GTSAM 4.2 `gtsam/nonlinear/ISAM2.h` / `Marginals.h`.
+Verified against GTSAM 4.2 `gtsam/nonlinear/ISAM2.h` / `Marginals.h`.
 
-- `ISAM2::marginalCovariance(Key)` returns the 6×6 marginal (GTSAM tangent order
-  rot-then-trans) reusing the Bayes tree — far cheaper than constructing a
-  `Marginals` object. `jointMarginalCovariance({keys})` for relative uncertainty.
+- `ISAM2::marginalCovariance(Key)` returns the 6×6 marginal (GTSAM tangent order)
+  reusing the Bayes tree — far cheaper than constructing a `Marginals` object;
+  `jointMarginalCovariance({keys})` for relative uncertainty.
 - Pre-filter use (§13): `σ_pos = √λ_max` of the translation block; gate radius
   `k_gate · σ_pos`. Call at keyframe rate, not per scan.
-- An over-confident marginal (from a double-counted hand-off, R.2) shrinks the
-  radius and misses loop closures — a second reason the contract is load-bearing.
 
 ### R.7 Bibliography (compact)
 

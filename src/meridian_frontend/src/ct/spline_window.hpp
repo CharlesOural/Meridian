@@ -48,6 +48,13 @@ public:
   SplineWindow(SplineWindow&&) noexcept;
   SplineWindow& operator=(SplineWindow&&) noexcept;
 
+  // Deep copy carrying every knot VALUE and the full real->virtual time map, so the
+  // copy evaluates bit-identically to the original and owns independent knot storage.
+  // The copy's knot pointers (segmentFor / so3KnotData / r3KnotData) are distinct from
+  // the original's, so residuals rebuilt against the copy point at copy-owned storage
+  // a later mutation of the original cannot disturb.
+  std::unique_ptr<SplineWindow> clone() const;
+
   // Seeds the first N knots all at T0 so the spline is immediately evaluable at t0
   // and starts exactly at T0. The first outer segment opens at t0.
   void initialize(Timestamp t0, const Pose& T0);

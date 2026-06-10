@@ -1,11 +1,8 @@
 #include "ct/residuals_visual.hpp"
 
-#include <ceres/cost_function.h>
-
-#include "ct/spline_analytic.hpp"
-
 #include <basalt/spline/ceres_spline_helper.h>
 #include <ceres/autodiff_cost_function.h>
+#include <ceres/cost_function.h>
 #include <ceres/dynamic_autodiff_cost_function.h>
 #include <ceres/loss_function.h>
 #include <ceres/problem.h>
@@ -17,6 +14,8 @@
 #include <sophus/so3.hpp>
 #include <utility>
 #include <vector>
+
+#include "ct/spline_analytic.hpp"
 
 namespace meridian::ct {
 
@@ -315,7 +314,7 @@ namespace {
 // d r_i/dtau = w * i_cur_i. Knot rotation rows are mapped to ambient quaternion
 // coordinates via tangentToQuatJac for the EigenQuaternionManifold blocks.
 class AnalyticVisualPatchCost final : public ceres::CostFunction {
- public:
+public:
   explicit AnalyticVisualPatchCost(const VisualPatchParams& p) : p_(p) {
     set_num_residuals(kPatchArea);
     for (int j = 0; j < kSplineOrder; ++j) {
@@ -378,19 +377,22 @@ class AnalyticVisualPatchCost final : public ceres::CostFunction {
 
     for (int j = 0; j < kSplineOrder; ++j) {
       if (jacobians[j] != nullptr) {
-        const Eigen::Matrix<double, 3, 4> dqdtheta = tangentToQuatJac(R[static_cast<std::size_t>(j)].unit_quaternion());
+        const Eigen::Matrix<double, 3, 4> dqdtheta =
+            tangentToQuatJac(R[static_cast<std::size_t>(j)].unit_quaternion());
         Eigen::Map<Eigen::Matrix<double, kPatchArea, 4, Eigen::RowMajor>> J(jacobians[j]);
         for (int i = 0; i < kPatchArea; ++i) {
           const Eigen::RowVector3d row =
-              wt * (p_.cur_grad[static_cast<std::size_t>(i)].transpose() * Br[static_cast<std::size_t>(j)]);
+              wt * (p_.cur_grad[static_cast<std::size_t>(i)].transpose() *
+                    Br[static_cast<std::size_t>(j)]);
           J.row(i) = row * dqdtheta;
         }
       }
       if (jacobians[kSplineOrder + j] != nullptr) {
-        Eigen::Map<Eigen::Matrix<double, kPatchArea, 3, Eigen::RowMajor>> J(jacobians[kSplineOrder + j]);
+        Eigen::Map<Eigen::Matrix<double, kPatchArea, 3, Eigen::RowMajor>> J(
+            jacobians[kSplineOrder + j]);
         for (int i = 0; i < kPatchArea; ++i) {
-          J.row(i) =
-              wt * (p_.cur_grad[static_cast<std::size_t>(i)].transpose() * Bp[static_cast<std::size_t>(j)]);
+          J.row(i) = wt * (p_.cur_grad[static_cast<std::size_t>(i)].transpose() *
+                           Bp[static_cast<std::size_t>(j)]);
         }
       }
     }
@@ -403,7 +405,7 @@ class AnalyticVisualPatchCost final : public ceres::CostFunction {
     return true;
   }
 
- private:
+private:
   VisualPatchParams p_;
   Eigen::Vector4d lambda_r_;
   Eigen::Vector4d lambda_p_;
@@ -434,7 +436,8 @@ VisualAssocStats addVisualResiduals(ceres::Problem& problem, SplineWindow& splin
                                     const ImagePyramidView& img, Timestamp t_mid_expo,
                                     ExposureChain& expo, std::size_t expo_index,
                                     const VisualMap& vmap, const FrontendVisual& cfg,
-                                    std::vector<VisualUsedPoint>* used) {
+                                    std::vector<VisualUsedPoint>* used,
+                                    std::vector<VisualPatchParams>* out_patches) {
   VisualAssocStats stats;
   if (!cam.valid() || expo.empty() || expo_index >= expo.size() || !spline.covers(t_mid_expo)) {
     return stats;
@@ -614,6 +617,9 @@ VisualAssocStats addVisualResiduals(ceres::Problem& problem, SplineWindow& splin
     auto* loss = new ceres::HuberLoss(huber);
     problem.AddResidualBlock(cost, loss, blocks);
     ++stats.accepted;
+    if (out_patches != nullptr) {
+      out_patches->push_back(vp);
+    }
     // ssd already holds sum_i (tau_cur I_cur - inv_expo_ref I_ref)^2 over the patch;
     // its per-pixel RMS is this patch's photometric residual magnitude.
     const double rms = std::sqrt(ssd / static_cast<double>(kPatchArea));
@@ -628,6 +634,36 @@ VisualAssocStats addVisualResiduals(ceres::Problem& problem, SplineWindow& splin
     }
   }
   return stats;
+}
+
+int replayVisualResiduals(ceres::Problem& problem, SplineWindow& spline, Timestamp t_mid_expo,
+                          ExposureChain& expo, std::size_t expo_index,
+                          const std::vector<VisualPatchParams>& patches) {
+  if (expo.empty() || expo_index >= expo.size() || !spline.covers(t_mid_expo)) {
+    return 0;
+  }
+  // The captured patches were built against the segment of t_mid_expo and the
+  // expo_index block; binding the rebuilt residuals to the same segment knots (same
+  // index, same normalized position u baked into each patch) and exposure block
+  // reproduces the live problem's photometric block exactly.
+  const SplineWindow::SegmentRef seg = spline.segmentFor(t_mid_expo);
+  int added = 0;
+  for (const VisualPatchParams& vp : patches) {
+    ceres::CostFunction* cost = makeVisualPatchCost(vp);
+    std::vector<double*> blocks;
+    blocks.reserve(2 * kSplineOrder + 1);
+    for (double* p : seg.so3_knots) {
+      blocks.push_back(p);
+    }
+    for (double* p : seg.r3_knots) {
+      blocks.push_back(p);
+    }
+    blocks.push_back(expo.block(expo_index));
+    auto* loss = new ceres::HuberLoss(kHuberWhitened);
+    problem.AddResidualBlock(cost, loss, blocks);
+    ++added;
+  }
+  return added;
 }
 
 }  // namespace meridian::ct

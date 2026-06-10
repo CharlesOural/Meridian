@@ -414,6 +414,112 @@ TEST(Marginalization, QuaternionPriorZeroAndGaussNewton) {
       << " -dx=" << (-dx_pert).transpose();
 }
 
+// The information-deflation scale: scale s multiplies the marginal information by
+// exactly s (sqrt(s) on J0 and r0), and the default scale 1.0 must take the
+// untouched code path so its J0/r0 are bit-identical to a build that never passes
+// the parameter.
+TEST(Marginalization, ScaleDeflatesInformationDefaultBitExact) {
+  // A well-conditioned 3-row system over one kept R^2 block and one dropped R^2
+  // block, with a non-zero gradient so r0 is exercised too.
+  const int total = 4;
+  Eigen::MatrixXd J(3, total);
+  J.row(0) << 1.0, 0.2, 0.5, -0.1;
+  J.row(1) << 0.0, 1.1, 0.3, 0.4;
+  J.row(2) << 0.2, 0.4, 1.0, 0.6;
+  Eigen::VectorXd r(3);
+  r << 0.1, -0.2, 0.05;
+  const Eigen::MatrixXd H = J.transpose() * J;
+  const Eigen::VectorXd b = J.transpose() * r;
+
+  double kept_storage[2] = {0.3, -0.4};
+  std::vector<Block> kept = {{kept_storage, 2, 2}};
+
+  auto unscaled = MarginalizationPrior::fromSchur(H, b, kept, 2);
+  auto scaled = MarginalizationPrior::fromSchur(H, b, kept, 2, 0.25);
+  ASSERT_NE(unscaled, nullptr);
+  ASSERT_NE(scaled, nullptr);
+
+  // information() of the scaled prior is exactly 0.25x the unscaled one.
+  const Eigen::MatrixXd info_u = unscaled->information();
+  const Eigen::MatrixXd info_s = scaled->information();
+  EXPECT_TRUE((info_s - 0.25 * info_u).cwiseAbs().maxCoeff() < 1e-12)
+      << "scaled info=\n" << info_s << "\n0.25 * unscaled=\n" << 0.25 * info_u;
+
+  // The Gauss-Newton step the prior alone induces is unchanged by the scale:
+  // (s H)^-1 (s b) == H^-1 b.
+  const Eigen::VectorXd step_u =
+      unscaled->information().ldlt().solve(unscaled->sqrtInfoJacobian().transpose() *
+                                           unscaled->residual0());
+  const Eigen::VectorXd step_s =
+      scaled->information().ldlt().solve(scaled->sqrtInfoJacobian().transpose() *
+                                         scaled->residual0());
+  EXPECT_TRUE((step_s - step_u).cwiseAbs().maxCoeff() < 1e-12);
+
+  // scale == 1.0 must be BIT-identical to the default (no-parameter) build: the
+  // 1.0 path skips the multiply entirely.
+  auto one = MarginalizationPrior::fromSchur(H, b, kept, 2, 1.0);
+  ASSERT_NE(one, nullptr);
+  ASSERT_EQ(one->sqrtInfoJacobian().rows(), unscaled->sqrtInfoJacobian().rows());
+  ASSERT_EQ(one->residual0().size(), unscaled->residual0().size());
+  for (int i = 0; i < one->sqrtInfoJacobian().rows(); ++i) {
+    for (int j = 0; j < one->sqrtInfoJacobian().cols(); ++j) {
+      EXPECT_EQ(one->sqrtInfoJacobian()(i, j), unscaled->sqrtInfoJacobian()(i, j))
+          << "J0 differs at (" << i << "," << j << ")";
+    }
+  }
+  for (int i = 0; i < one->residual0().size(); ++i) {
+    EXPECT_EQ(one->residual0()(i), unscaled->residual0()(i)) << "r0 differs at " << i;
+  }
+}
+
+// The per-family residual telemetry in the window solver slices the vector
+// returned by Problem::GetResidualBlocks by [begin, end) index ranges recorded as
+// NumResidualBlocks() snapshots around each family's adds. That is only valid if
+// Ceres returns residual blocks in insertion order; this pins the contract: the
+// ids returned by AddResidualBlock, family by family, are exactly the slices of
+// GetResidualBlocks at the recorded ranges.
+TEST(Marginalization, ResidualBlockSlicingByInsertionOrder) {
+  std::array<Eigen::Vector2d, 3> x = {Eigen::Vector2d(0.1, -0.2), Eigen::Vector2d(-0.3, 0.4),
+                                      Eigen::Vector2d(0.5, 0.05)};
+  ceres::Problem problem;
+  for (auto& xi : x) {
+    problem.AddParameterBlock(xi.data(), 2);
+  }
+
+  auto addOne = [&](int i) {
+    Eigen::MatrixXd a = Eigen::MatrixXd::Identity(2, 2);
+    return problem.AddResidualBlock(new LinearResidual({a}, Eigen::Vector2d::Zero()), nullptr,
+                                    x[static_cast<std::size_t>(i)].data());
+  };
+
+  // Three "families" of different sizes, with the per-family marks recorded the
+  // same way the solver records them.
+  std::vector<std::vector<ceres::ResidualBlockId>> family_ids(3);
+  std::vector<std::pair<int, int>> fam_range(3);
+  const std::array<int, 3> fam_sizes = {3, 1, 2};
+  for (int f = 0; f < 3; ++f) {
+    const int mark = problem.NumResidualBlocks();
+    for (int k = 0; k < fam_sizes[static_cast<std::size_t>(f)]; ++k) {
+      family_ids[static_cast<std::size_t>(f)].push_back(addOne((f + k) % 3));
+    }
+    fam_range[static_cast<std::size_t>(f)] = {mark, problem.NumResidualBlocks()};
+  }
+
+  std::vector<ceres::ResidualBlockId> all;
+  problem.GetResidualBlocks(&all);
+  ASSERT_EQ(static_cast<int>(all.size()), problem.NumResidualBlocks());
+
+  for (int f = 0; f < 3; ++f) {
+    const auto [begin, end] = fam_range[static_cast<std::size_t>(f)];
+    ASSERT_EQ(end - begin, fam_sizes[static_cast<std::size_t>(f)]);
+    for (int k = begin; k < end; ++k) {
+      EXPECT_EQ(all[static_cast<std::size_t>(k)],
+                family_ids[static_cast<std::size_t>(f)][static_cast<std::size_t>(k - begin)])
+          << "insertion-order slice broken at family " << f << " element " << (k - begin);
+    }
+  }
+}
+
 // A singular dropped block (H_dd rank-deficient) must not produce NaNs: the
 // eigenvalue floor zeroes the null directions of the inverse.
 TEST(Marginalization, RankDeficientDroppedBlockNoNaN) {

@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <functional>
 #include <limits>
@@ -17,11 +18,13 @@
 #include <sophus/so3.hpp>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
-#include "iekf/iekf_frontend.hpp"
+#include "ct/pose_marginal.hpp"
 #include "meridian/common/cloud.hpp"
+#include "meridian/common/cov_reorder.hpp"
 #include "meridian/common/point.hpp"
 #include "meridian/debug/log.hpp"
 #include "meridian/debug/telemetry.hpp"
@@ -49,32 +52,6 @@ Eigen::Matrix3d skew(const Eigen::Vector3d& v) {
   Eigen::Matrix3d m;
   m << 0, -v.z(), v.y(), v.z(), 0, -v.x(), -v.y(), v.x(), 0;
   return m;
-}
-
-// Symmetrised pseudo-inverse: invert eigenvalues above an absolute floor relative to
-// the largest, zero the rest. Returns false if no eigenvalue clears the floor (the
-// matrix is effectively null), so the caller can reject a rank-deficient block.
-bool robustInverse(const Eigen::MatrixXd& A, Eigen::MatrixXd* out) {
-  const Eigen::MatrixXd sym = 0.5 * (A + A.transpose());
-  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(sym);
-  const Eigen::VectorXd& lambda = es.eigenvalues();
-  const double lam_max = lambda.size() > 0 ? lambda.cwiseAbs().maxCoeff() : 0.0;
-  const double floor = std::max(1e-12, 1e-9 * lam_max);
-  Eigen::VectorXd inv(lambda.size());
-  bool any = false;
-  for (int i = 0; i < lambda.size(); ++i) {
-    if (lambda(i) > floor) {
-      inv(i) = 1.0 / lambda(i);
-      any = true;
-    } else {
-      inv(i) = 0.0;
-    }
-  }
-  if (!any) {
-    return false;
-  }
-  *out = es.eigenvectors() * inv.asDiagonal() * es.eigenvectors().transpose();
-  return true;
 }
 
 // Decode a raw CameraFrame to a single-channel CV_8UC1 intensity image. Mono passes
@@ -133,6 +110,7 @@ std::vector<LidarPoint> validReturns(const LidarScan& scan) {
 CtFrontEnd::CtFrontEnd(const FrontendConfig& cfg, std::shared_ptr<const CalibrationSet> calib,
                        TelemetrySink* telemetry, bool deterministic)
     : cfg_(cfg), telemetry_(telemetry), deterministic_(deterministic) {
+  sync_cov_ = deterministic_ || std::getenv("MERIDIAN_SYNC_KEYFRAME_COV") != nullptr;
   window_dt_ns_ = from_seconds(std::max(cfg_.spline.knot_dt_ms, 1.0) * 1e-3);
   gravity_ = std::make_unique<ct::GravityBlock>(Eigen::Vector3d(0, 0, -kGravityMag), kGravityMag);
   map_ = std::make_unique<ct::LidarLocalMap>(cfg_.lidar);
@@ -143,7 +121,12 @@ CtFrontEnd::CtFrontEnd(const FrontendConfig& cfg, std::shared_ptr<const Calibrat
   }
 }
 
-CtFrontEnd::~CtFrontEnd() = default;
+CtFrontEnd::~CtFrontEnd() {
+  // Join the worker before any member it forwards into (the keyframe sink) is torn down.
+  if (finalizer_) {
+    finalizer_->stop();
+  }
+}
 
 void CtFrontEnd::set_calibration(std::shared_ptr<const CalibrationSet> calib) {
   calib_ = std::move(calib);
@@ -231,6 +214,22 @@ bool CtFrontEnd::visualEnabled(const PreprocessedGroup& group) const {
 
 void CtFrontEnd::set_keyframe_sink(KeyframeSink sink) {
   keyframe_sink_ = std::move(sink);
+  // Live path: spin up the async covariance worker. The worker forwards finished packets
+  // (constraint_cov filled) to the same sink. The deterministic path keeps the inline
+  // synchronous path so replay stays bit-exact against the golden recording.
+  if (!deterministic_) {
+    if (finalizer_) {
+      finalizer_->stop();
+    }
+    finalizer_ = std::make_unique<KeyframeFinalizer>(
+        [this](KeyframePacket&& kf) {
+          if (keyframe_sink_) {
+            keyframe_sink_(std::move(kf));
+          }
+        },
+        telemetry_);
+    finalizer_->start();
+  }
 }
 
 NavState CtFrontEnd::live_state() const {
@@ -243,6 +242,10 @@ FrontEndDiagnostics CtFrontEnd::diagnostics() const {
 
 Duration CtFrontEnd::biasKnotDt() const {
   return static_cast<Duration>(std::max(cfg_.bias.knot_dt_ms, 1.0) * 1e6);
+}
+
+int CtFrontEnd::maxControlPoints() const {
+  return cfg_.spline.n_cp_max > 0 ? cfg_.spline.n_cp_max : 1;
 }
 
 ct::ImuWeights CtFrontEnd::imuWeights(double imu_dt_s) const {
@@ -275,7 +278,7 @@ std::vector<Eigen::Vector3d> CtFrontEnd::weakTranslationAxes(
 int CtFrontEnd::selectKnotDensity(const std::vector<ImuSample>& imu) {
   // n_cp_max <= 1 disables adaptive density: one control point per segment (the
   // uniform-spline case), so the excitation gating below is skipped entirely.
-  const int n_cp_max = cfg_.spline.n_cp_max > 0 ? cfg_.spline.n_cp_max : 1;
+  const int n_cp_max = maxControlPoints();
   if (n_cp_max <= 1) {
     last_n_cp_ = 1;
     return 1;
@@ -288,7 +291,6 @@ int CtFrontEnd::selectKnotDensity(const std::vector<ImuSample>& imu) {
   last_n_cp_ = n_cp;
   return n_cp;
 }
-
 
 std::vector<Timestamp> CtFrontEnd::segmentMidpointTimes(Timestamp t_begin, Timestamp t_end) const {
   // One evaluation point per outer segment the sweep spans: the midpoint of each
@@ -426,6 +428,12 @@ void CtFrontEnd::reseedAfterGap(const PreprocessedGroup& group, Timestamp t_begi
   anchor_pose_.t += anchor_vel_ * to_seconds(t_begin - last_solved_t_);
   restartWindow(t_begin);
 
+  // The predicted hole has no covariance accounting, so no relative keyframe edge may
+  // span it: the next keyframe breaks the chain with an AbsolutePrior. The stored
+  // posterior marginal belongs to the pre-gap window and must not seed that anchor.
+  kf_chain_broken_ = true;
+  have_pose_cov_ = false;
+
   // Cover the reseed sweep and seed the map from it WITHOUT solving: directly after a
   // reseed the gauge pins hold most of the only evaluable segment's control points, so
   // a solve here would crush the whole residual budget into the one free knot and warp
@@ -448,6 +456,9 @@ void CtFrontEnd::reseedAfterGap(const PreprocessedGroup& group, Timestamp t_begi
   }
   if (!world.empty()) {
     map_->insert(world);
+    // Settle deferred push-downs before the next sweep's parallel association so its
+    // concurrent searches only read resolved node flags.
+    map_->flushPendingDeletes();
   }
 
   const Pose T_world_end = spline_->covers(t_end) ? spline_->pose(t_end) : anchor_pose_;
@@ -464,7 +475,7 @@ void CtFrontEnd::reseedAfterGap(const PreprocessedGroup& group, Timestamp t_begi
 }
 
 void CtFrontEnd::restartWindow(Timestamp t_begin) {
-  const int n_cp_max = cfg_.spline.n_cp_max > 0 ? cfg_.spline.n_cp_max : 1;
+  const int n_cp_max = maxControlPoints();
   spline_ = std::make_unique<SplineWindow>(window_dt_ns_, n_cp_max);
   spline_->initialize(t_begin, anchor_pose_);
   traj_start_t_ = t_begin;
@@ -518,11 +529,17 @@ void CtFrontEnd::gateGnss(const PreprocessedGroup& group, Timestamp t_end, GnssC
     }
   }
 
-  // Position marginal of the current odometry (previous sweep's pose covariance
+  // Position marginal of the current odometry (the last keyframe's pose covariance
   // translation block), added to the floored fix covariance in the innovation gate so a
-  // long GNSS gap during which odometry drifted does not reject an otherwise good fix.
+  // long GNSS gap during which odometry drifted does not reject an otherwise good fix. On
+  // the live path the worker produces this marginal; reading it here is stale by up to one
+  // keyframe (the gate only widens with it, so the lag is harmless).
   Eigen::Matrix3d pose_marg = Eigen::Matrix3d::Zero();
-  if (have_pose_cov_) {
+  if (finalizer_) {
+    if (finalizer_->have_pose_cov()) {
+      pose_marg = finalizer_->last_pose_cov().topLeftCorner<3, 3>();
+    }
+  } else if (have_pose_cov_) {
     pose_marg = last_pose_cov_.topLeftCorner<3, 3>();
   }
 
@@ -618,7 +635,12 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
   // banded and SPARSE_NORMAL_CHOLESKY is both correct and cheap here.
   ceres::Solver::Options sopts;
   sopts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-  sopts.num_threads = 1;
+  // The deterministic (replay) path stays single-threaded: Ceres parallel reductions
+  // sum in a nondeterministic order, so >1 thread breaks bit-exact replay==live. The
+  // live path parallelises the per-residual evaluation across the available cores.
+  sopts.num_threads = (deterministic_ || force_single_thread_)
+                          ? 1
+                          : std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
   sopts.minimizer_progress_to_stdout = false;
   sopts.function_tolerance = 1e-8;
 
@@ -664,17 +686,65 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
   bool have_prev_assoc = false;
   std::vector<ct::LidarHit> capped_hits;  // factor-cap survivors, refilled each round
 
+  // Final-round build-input captures for the async covariance worker (live path). Each
+  // is overwritten every round, so after the loop they hold the final round's values; the
+  // capture is materialized into capture_ only on a keyframe sweep, below.
+  const bool want_capture = !deterministic_;
+  std::vector<ct::VisualPatchParams> cap_patches;
+  std::vector<Timestamp> cap_tail_times;
+  std::vector<Timestamp> cap_motion_times;
+  bool cap_motion_engaged = false;
+  int cap_first_pinned = std::numeric_limits<int>::max();
+
   // Select the visible visual-map points once, at the seed pose: the O(map)
   // projection scan is the per-sweep cost driver, and the per-cell winners are stable
   // across cm-level pose refinement. Every outer round's residual build and the
   // post-solve map update then reuse this cache instead of re-scanning the map.
   if (vis != nullptr && vis->img != nullptr && vmap_ && spline_->covers(vis->t_image)) {
+    MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.vmap.select", t_end);
     const Pose T_w_c_seed = spline_->pose(vis->t_image) * T_fe_cam_;
     vmap_->refreshVisibleCache(cam_model_, T_w_c_seed);
   }
 
+  // Residual-family bookkeeping for the per-family telemetry probe below: the
+  // half-open [begin, end) residual-block index range each family's adds occupy in
+  // the problem, in insertion order. Re-recorded on every round (each round rebuilds
+  // the problem from scratch), so after the loop the ranges describe exactly the
+  // final round's problem.
+  enum Family : int {
+    kFamLidar = 0,
+    kFamImu,
+    kFamBias,
+    kFamAnchor,
+    kFamMotionReg,
+    kFamVisual,
+    kFamGnss,
+    kFamPrior,
+    kFamCount
+  };
+  static constexpr std::array<const char*, kFamCount> kFamilyName = {
+      "lidar", "imu", "bias", "anchor", "motionreg", "visual", "gnss", "prior"};
+  std::array<std::pair<int, int>, kFamCount> fam_range{};
+
+  // IMU-innovation reference: the spline pose at t_end as the pure IMU-propagated
+  // seed left it, captured at round-0 entry (NOT per round -- a per-round capture
+  // would only measure the last re-association step). The emitted innovation is the
+  // total correction the whole outer/inner schedule applied to the IMU prediction.
+  const bool have_innov_seed = spline_->covers(t_end);
+  const Pose T_seed_end = have_innov_seed ? spline_->pose(t_end) : Pose{};
+
   int outer_passes = 0;
   for (int round = 0; round < max_outer; ++round) {
+    // Whole-sweep wall-clock gate: only START another association+solve round if
+    // budget remains. The inner Ceres solve is already deadline-bounded, but the
+    // assoc/build that precede it are not -- so without this a hard-geometry sweep
+    // runs two full passes well past the budget and backs up Q_meas (which, dropped,
+    // forces a window restart). Round 0 always runs so every sweep solves at least
+    // once; later rounds (re-association refinement) yield to the deadline.
+    if (round > 0 && total_budget_s > 0.0 && total_iters >= min_iters_floor &&
+        ms_since(solve_start) * 1e-3 >= total_budget_s) {
+      break;
+    }
     ++outer_passes;
     // associate() appends, so start each round from an empty hit set evaluated at
     // the current (seeded, then solved) spline.
@@ -687,6 +757,8 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     }
 
     problem = ceres::Problem();
+    fam_range.fill({0, 0});
+    int fam_mark = 0;
 
     // Bound the LiDAR residual count: cap at max_lidar_factors by normal-stratified
     // subsample, exempting points whose normal aligns with a weak translation axis so
@@ -699,10 +771,15 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
 
     // LiDAR point-to-plane residuals at the current spline (capped set).
     ct::addLidarResiduals(problem, *spline_, T_fe_lidar_, capped_hits, cfg_.lidar);
+    fam_range[kFamLidar] = {fam_mark, problem.NumResidualBlocks()};
     // IMU derivative residuals over the new sweep span + bias random walk.
+    fam_mark = problem.NumResidualBlocks();
     ct::addImuResiduals(problem, *spline_, *bias_, *gravity_, group.group.imu, t_begin, t_end,
                         weights);
+    fam_range[kFamImu] = {fam_mark, problem.NumResidualBlocks()};
+    fam_mark = problem.NumResidualBlocks();
     ct::addBiasRandomWalk(problem, *bias_, weights);
+    fam_range[kFamBias] = {fam_mark, problem.NumResidualBlocks()};
 
     // Tail anchors over the span past the newest measurement: tie the spline's
     // velocity and body rate there to the seed's constant extrapolation. The pinning
@@ -721,10 +798,14 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
         }
         tail_times.push_back(t);
       }
+      fam_mark = problem.NumResidualBlocks();
       ct::addTailAnchors(problem, *spline_, tail_times, seed_vel_end_, seed_omega_end_,
                          kTailSigmaVel, kTailSigmaRate);
+      fam_range[kFamAnchor] = {fam_mark, problem.NumResidualBlocks()};
+      if (want_capture) {
+        cap_tail_times = tail_times;
+      }
     }
-
 
     // Under-excitation regularizer (off by default, config-gated): a low-weight jerk /
     // angular-acceleration pull on the segment knot-midpoints, engaged only when the
@@ -732,16 +813,26 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     // weak-axis set is non-empty), so a span no LiDAR/IMU residual constrains cannot
     // float in the null space. Excluded from the observability and prior assembly so it
     // never inflates apparent observability.
+    bool round_motion_engaged = false;
+    std::vector<Timestamp> round_motion_times;
     if (cfg_.motion_reg.enable && !weak_axes.empty()) {
       const ct::ImuExcitation exc =
           ct::imuExcitation(group.group.imu, anchor_bg_, anchor_ba_, gravity_->magnitude());
       const double floor = cfg_.motion_reg.excitation_floor;
       if (exc.n_omega <= floor && exc.n_accel <= floor) {
         const std::vector<Timestamp> mids = segmentMidpointTimes(t_begin, t_end);
+        fam_mark = problem.NumResidualBlocks();
         ct::addMotionRegularizer(problem, *spline_, mids, cfg_.motion_reg.weight,
                                  1.0 / std::max(weights.sigma_accel, 1e-9),
                                  1.0 / std::max(weights.sigma_gyro, 1e-9));
+        fam_range[kFamMotionReg] = {fam_mark, problem.NumResidualBlocks()};
+        round_motion_engaged = true;
+        round_motion_times = mids;
       }
+    }
+    if (want_capture) {
+      cap_motion_engaged = round_motion_engaged;
+      cap_motion_times = std::move(round_motion_times);
     }
 
     // Sparse-direct photometric residuals into the SAME problem, against the visual
@@ -750,10 +841,16 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     // map is empty on the first sweep, so this is a no-op until promote() has run.
     if (vis != nullptr && vis->img != nullptr && vis->expo != nullptr && vmap_) {
       MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.visual", t_end);
+      fam_mark = problem.NumResidualBlocks();
       std::vector<ct::VisualUsedPoint> round_used;
-      const ct::VisualAssocStats round_stats =
-          ct::addVisualResiduals(problem, *spline_, cam_model_, T_fe_cam_, *vis->img, vis->t_image,
-                                 *vis->expo, /*expo_index=*/0, *vmap_, cfg_.visual, &round_used);
+      std::vector<ct::VisualPatchParams> round_patches;
+      const ct::VisualAssocStats round_stats = ct::addVisualResiduals(
+          problem, *spline_, cam_model_, T_fe_cam_, *vis->img, vis->t_image, *vis->expo,
+          /*expo_index=*/0, *vmap_, cfg_.visual, &round_used,
+          want_capture ? &round_patches : nullptr);
+      if (want_capture) {
+        cap_patches = std::move(round_patches);
+      }
       // Report the round with the most acceptances over the outer schedule rather than
       // the last round's count: re-association at a not-yet-converged pose can transiently
       // reject patches a converged pose accepts, so the peak is the faithful "how much
@@ -772,6 +869,8 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
       } else if (problem.HasParameterBlock(vis->expo->block(0))) {
         problem.SetParameterBlockConstant(vis->expo->block(0));
       }
+      // The visual family covers the photometric residuals plus the exposure prior.
+      fam_range[kFamVisual] = {fam_mark, problem.NumResidualBlocks()};
     }
 
     // Conservative GNSS absolute-position residuals into the SAME problem. Each gated
@@ -781,10 +880,12 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     // Gating (quality floor, innovation, persistence) already ran once at the seeded
     // pose, so this only rebuilds the survivors' residuals each outer round.
     if (gnss != nullptr) {
+      fam_mark = problem.NumResidualBlocks();
       for (const GnssMeasurement& m : gnss->fixes) {
         ct::addGnssResidual(problem, *spline_, m.z_world, gnss->t_fe_ant, m.t_fix, m.sqrt_info,
                             kHuberGnss);
       }
+      fam_range[kFamGnss] = {fam_mark, problem.NumResidualBlocks()};
     }
 
     // Gravity is pinned to the unit sphere; SO(3) knots carry the quaternion
@@ -821,6 +922,9 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
           }
         }
       }
+      if (want_capture) {
+        cap_first_pinned = first_pinned;
+      }
     }
     std::vector<double*> params;
     problem.GetParameterBlocks(&params);
@@ -829,14 +933,6 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
         problem.SetManifold(p, new ceres::EigenQuaternionManifold());
       }
     }
-
-    // Bias freeze seam. The accel bias is always frozen: a single bias knot cannot
-    // separate a constant accel bias from gravity, so an unpinned accel bias absorbs
-    // the gravity/acceleration ambiguity and drives a vertical drift; it re-enables
-    // only once a multi-knot random walk ties consecutive knots (not yet built — one
-    // bias knot spans the window). The gyro bias unfreezes under strong rotational
-    // excitation, where the gyro residual senses it directly so its box bound becomes
-    // live; otherwise it too is held to avoid solver jitter. The seam stays closed by
 
     // Both biases are free states: the gyro residual senses b_g directly, and with
     // gravity pinned the accel residual's DC error is exactly what b_a must absorb
@@ -867,6 +963,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
 
     // Marginalization prior (if any). Once a prior exists it pins the gauge.
     if (prior_) {
+      fam_mark = problem.NumResidualBlocks();
       problem.AddResidualBlock(prior_->makeCost(), nullptr, [&] {
         std::vector<double*> ptrs;
         ptrs.reserve(prior_->blocks().size());
@@ -875,6 +972,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
         }
         return ptrs;
       }());
+      fam_range[kFamPrior] = {fam_mark, problem.NumResidualBlocks()};
     } else {
       // Gauge fix while no prior exists: pin knots of the window's leading active
       // segment. We anchor on the interior support knots (so3_knots[1], r3_knots[1..2])
@@ -959,17 +1057,161 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     }
   }
 
+  // IMU innovation: how far the converged solve moved the sweep-end pose away from
+  // the pure IMU-propagated seed (round-0 entry; see T_seed_end above). A growing
+  // translation/rotation innovation under steady motion means the measurements are
+  // fighting the inertial prediction. Cheap, emitted every sweep.
+  if (telemetry_ && have_innov_seed && spline_->covers(t_end)) {
+    const Pose T_solved_end = spline_->pose(t_end);
+    if (telemetry_->enabled("frontend/innov/trans_m")) {
+      telemetry_->scalar("frontend/innov/trans_m", (T_solved_end.t - T_seed_end.t).norm(), t_end);
+    }
+    if (telemetry_->enabled("frontend/innov/rot_deg")) {
+      // angle(R_seed^T R_solved): the geodesic rotation between seed and solution.
+      const Eigen::Quaterniond dq = (T_seed_end.q.conjugate() * T_solved_end.q).normalized();
+      telemetry_->scalar("frontend/innov/rot_deg", Sophus::SO3d(dq).log().norm() * 180.0 / M_PI,
+                         t_end);
+    }
+  }
+
+  // Per-family residual statistics on the converged final-round problem (raw
+  // whitened residuals: loss functions off, so the stats are comparable across
+  // families). The build above recorded each family's residual-block index range;
+  // Ceres returns residual blocks in insertion order (asserted by unit test), so
+  // slicing the full block list by a range selects exactly that family. The extra
+  // Problem::Evaluate sweep is gated to ~1 in 5 sweeps plus keyframe sweeps.
+  ++resid_probe_counter_;
+  if (telemetry_ != nullptr &&
+      (resid_probe_counter_ % 5 == 0 || keyframeDue(spline_->pose(t_end), t_end))) {
+    std::vector<ceres::ResidualBlockId> all_blocks;
+    problem.GetResidualBlocks(&all_blocks);
+    ceres::Problem::EvaluateOptions eopts;
+    eopts.apply_loss_function = false;
+    eopts.num_threads = 1;
+    std::vector<double> fam_res;
+    for (int f = 0; f < kFamCount; ++f) {
+      const auto [fam_begin, fam_end] = fam_range[static_cast<std::size_t>(f)];
+      if (fam_end <= fam_begin || fam_end > static_cast<int>(all_blocks.size())) {
+        continue;  // family absent this sweep
+      }
+      eopts.residual_blocks.assign(all_blocks.begin() + fam_begin, all_blocks.begin() + fam_end);
+      fam_res.clear();
+      if (!problem.Evaluate(eopts, nullptr, &fam_res, nullptr, nullptr) || fam_res.empty()) {
+        continue;
+      }
+      double sum_sq = 0.0;
+      double sum_abs = 0.0;
+      for (const double v : fam_res) {
+        sum_sq += v * v;
+        sum_abs += std::abs(v);
+      }
+      const double n_rows = static_cast<double>(fam_res.size());
+      const char* fam_name = kFamilyName[static_cast<std::size_t>(f)];
+      char key[64];
+      std::snprintf(key, sizeof(key), "frontend/resid/%s/rms", fam_name);
+      telemetry_->scalar(key, std::sqrt(sum_sq / n_rows), t_end);
+      std::snprintf(key, sizeof(key), "frontend/resid/%s/mean_abs", fam_name);
+      telemetry_->scalar(key, sum_abs / n_rows, t_end);
+      std::snprintf(key, sizeof(key), "frontend/resid/%s/n_rows", fam_name);
+      telemetry_->scalar(key, n_rows, t_end);
+    }
+  }
+
   // Pose-block marginal covariance from the solved posterior (LiDAR + IMU + prior),
   // read here while the Ceres problem is alive; emitKeyframe prefers it over the
   // LiDAR-only marginal. Must precede slideWindow, which may re-linearize the problem.
-  Eigen::Matrix<double, 6, 6> pose_cov;
-  have_pose_cov_ = poseMarginalFromProblem(problem, t_end, &pose_cov);
-  if (have_pose_cov_) {
-    last_pose_cov_ = pose_cov;
+  // Recovering this marginal is a sparse back-substitution over the whole window -- the
+  // costliest post-solve step, and unlike the solve it is not deadline-bounded. It is
+  // consumed only by emitKeyframe (the keyframe-edge covariance) and, stale-tolerant, by
+  // the GNSS innovation gate, so compute it only on sweeps that actually emit a keyframe.
+  // Between keyframes the stored marginal stands in for the gate; emitKeyframe recomputes
+  // (or falls back) here whenever a keyframe is due. The predicate is pure and re-checked
+  // before emitKeyframe, so a disagreement only wastes/skips this recovery, never the edge.
+  // Deterministic path: compute the marginal INLINE on the live problem, exactly as
+  // before, so replay stays bit-exact against the golden recording. Live path: capture
+  // the final round's build inputs (cheap value copies) so the async worker can rebuild a
+  // bit-identical problem off T2 and recover the same marginal a keyframe interval later.
+  capture_.valid = false;
+  if (keyframeDue(spline_->pose(t_end), t_end)) {
+    if (sync_cov_) {
+      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.posecov", t_end);
+      Eigen::Matrix<double, 6, 6> pose_cov;
+      have_pose_cov_ = poseMarginalFromProblem(problem, t_end, &pose_cov);
+      if (have_pose_cov_) {
+        last_pose_cov_ = pose_cov;
+      }
+    } else {
+      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.covsnapshot", t_end);
+      captureFinalRound(t_begin, t_end, imu, weights, capped_hits, cap_patches,
+                        vis != nullptr && vis->img != nullptr ? vis : nullptr, gnss,
+                        cap_motion_engaged, cap_motion_times, cap_tail_times, cap_first_pinned);
+    }
+
+    // Bit-exact parity probe (tests only): compute the marginal both ways on the
+    // identical solved state -- (a) the synchronous routine on the live problem, (b) the
+    // worker routine on the freshly rebuilt snapshot clone -- and record both. The probe
+    // evaluates at an interior, well-supported stamp one knot cadence back from t_end:
+    // the bit-exactness under test is a property of the rebuilt problem and is
+    // stamp-independent, and the interior stamp avoids the trailing pinned-knot edge so
+    // the marginal is actually recovered (a fall-back at t_end would test nothing).
+    if (parity_probe_ && capture_.valid) {
+      ParityProbeResult res;
+      res.absolute_prior = !have_prev_kf_ || kf_chain_broken_;
+      const Timestamp probe_stamp =
+          spline_->covers(t_end - window_dt_ns_) ? t_end - window_dt_ns_ : t_end;
+      Eigen::Matrix<double, 6, 6> cov_a;
+      res.sync_ok = ct::poseMarginalFromProblem(problem, *spline_, probe_stamp, &cov_a);
+      res.sync_cov = cov_a;
+
+      // Independent clones so the probe never disturbs the snapshot the worker will use.
+      auto probe_spline = capture_.spline_clone->clone();
+      auto probe_bias = std::make_unique<ct::BiasKnots>(capture_.bias_clone->clone());
+      ct::GravityBlock probe_gravity = capture_.gravity_clone;
+      std::unique_ptr<ct::MarginalizationPrior> probe_prior;
+      if (capture_.prior_clone) {
+        SplineWindow* ps = probe_spline.get();
+        ct::BiasKnots* pb = probe_bias.get();
+        SplineWindow* cs = capture_.spline_clone.get();
+        ct::BiasKnots* cb = capture_.bias_clone.get();
+        const int nk = cs->numKnots();
+        const int nb = cb->numKnots();
+        probe_prior = capture_.prior_clone->cloneRemapped([&](double* p) -> double* {
+          for (int i = 0; i < nk; ++i) {
+            if (p == cs->so3KnotData(i)) return ps->so3KnotData(i);
+            if (p == cs->r3KnotData(i)) return ps->r3KnotData(i);
+          }
+          for (int i = 0; i < nb; ++i) {
+            if (p == cb->gyroBlock(i)) return pb->gyroBlock(i);
+            if (p == cb->accelBlock(i)) return pb->accelBlock(i);
+          }
+          return p;
+        });
+      }
+      ct::WindowProblemInputs probe_in = capture_.inputs;
+      probe_in.spline = probe_spline.get();
+      probe_in.bias = probe_bias.get();
+      probe_in.gravity = &probe_gravity;
+      probe_in.prior = probe_prior.get();
+      probe_in.capped_hits = &capture_.capped_hits;
+      probe_in.imu = &capture_.imu;
+      ceres::Problem probe_problem;
+      ct::WindowExposureScratch probe_expo(probe_in.visual_cfg);
+      ct::WindowExposureScratch* probe_expo_ptr =
+          probe_in.visual_patches.empty() ? nullptr : &probe_expo;
+      ct::buildWindowProblem(probe_problem, probe_in, probe_expo_ptr);
+      Eigen::Matrix<double, 6, 6> cov_b;
+      res.worker_ok =
+          ct::poseMarginalFromProblem(probe_problem, *probe_spline, probe_stamp, &cov_b);
+      res.worker_cov = cov_b;
+      parity_probe_results_.push_back(res);
+    }
   }
 
   // Slide the window on the final, solved problem.
-  slideWindow(problem, t_begin, t_end);
+  {
+    MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.marg", t_end);
+    slideWindow(problem, t_begin, t_end);
+  }
 
   diag_.iterations = total_iters;
   diag_.outer_iters = outer_passes;
@@ -982,6 +1224,23 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     }
     if (telemetry_->enabled("frontend/bias_bounded")) {
       telemetry_->scalar("frontend/bias_bounded", bound_engaged ? 1.0 : 0.0, t_end);
+    }
+    // Solved-state evolution at the sweep end (bias spline and velocity read-outs).
+    if (telemetry_->enabled("frontend/state/bias_gyr_norm")) {
+      telemetry_->scalar("frontend/state/bias_gyr_norm", bias_->gyroBiasAt(t_end).norm(), t_end);
+    }
+    if (telemetry_->enabled("frontend/state/bias_acc_norm")) {
+      telemetry_->scalar("frontend/state/bias_acc_norm", bias_->accelBiasAt(t_end).norm(), t_end);
+    }
+    if (telemetry_->enabled("frontend/state/vel_norm") && spline_->covers(t_end)) {
+      telemetry_->scalar("frontend/state/vel_norm", spline_->linearVelocityWorld(t_end).norm(),
+                         t_end);
+    }
+    // Prior health after the slide: the residual dimension of the prior the NEXT
+    // sweep will solve under (0 = chain broken / not yet started).
+    if (telemetry_->enabled("frontend/prior/dim")) {
+      telemetry_->scalar("frontend/prior/dim",
+                         prior_ ? static_cast<double>(prior_->residualDim()) : 0.0, t_end);
     }
   }
   return accepted;
@@ -1122,7 +1381,7 @@ void CtFrontEnd::slideWindow(ceres::Problem& problem, Timestamp t_begin, Timesta
   Eigen::VectorXd bvec;
   ct::linearizeBlocks(problem, residuals, order, &H, &bvec);
   std::unique_ptr<ct::MarginalizationPrior> next =
-      ct::MarginalizationPrior::fromSchur(H, bvec, kept, dropped_dim);
+      ct::MarginalizationPrior::fromSchur(H, bvec, kept, dropped_dim, cfg_.marg_prior_scale);
   if (next) {
     prior_ = std::move(next);
     diag_.knots_marginalized += static_cast<int>(dropped.size());
@@ -1184,6 +1443,9 @@ void CtFrontEnd::updateMap(const std::vector<LidarPoint>& scan_ds, Timestamp t0_
   // Segment the ikd-Tree to a cube around the current body so map RAM and the per-point
   // nearest-neighbour search depth stay bounded over a long mission.
   map_->trimAround(anchor_pose_.t, cfg_.lidar.local_map_cube_m);
+  // Resolve every deferred push-down the insert/trim left behind so the next sweep's
+  // parallel association only ever reads settled node flags and cannot race on them.
+  map_->flushPendingDeletes();
 }
 
 void CtFrontEnd::publishPatchOverlay(const cv::Mat& intensity, Timestamp t_image,
@@ -1209,6 +1471,122 @@ void CtFrontEnd::publishPatchOverlay(const cv::Mat& intensity, Timestamp t_image
     ov.patches.push_back(patch);
   }
   telemetry_->image("frontend/visual/patches", ov, t_image);
+}
+
+void CtFrontEnd::captureFinalRound(Timestamp t_begin, Timestamp t_end,
+                                   const std::vector<ImuSample>& imu, const ct::ImuWeights& weights,
+                                   const std::vector<ct::LidarHit>& capped_hits,
+                                   const std::vector<ct::VisualPatchParams>& patches,
+                                   const VisualContext* vis, const GnssContext* gnss,
+                                   bool motion_reg_engaged,
+                                   const std::vector<Timestamp>& motion_reg_times,
+                                   const std::vector<Timestamp>& tail_times,
+                                   int first_pinned_knot) {
+  capture_ = WindowBuildCapture{};
+  ct::WindowProblemInputs& in = capture_.inputs;
+
+  // Deep value copies the worker owns; the live spline/bias/gravity/prior keep mutating
+  // on T2 and are destroyed at the next slide, so the job must not alias them.
+  capture_.spline_clone = spline_->clone();
+  capture_.bias_clone = std::make_unique<ct::BiasKnots>(bias_->clone());
+  capture_.gravity_clone = *gravity_;
+
+  // Remap the prior's kept-block pointers from live knot storage to the clones', matched
+  // by deque index. A pointer the remap does not recognise (none expected here) passes
+  // through unchanged.
+  if (prior_) {
+    SplineWindow* sc = capture_.spline_clone.get();
+    ct::BiasKnots* bc = capture_.bias_clone.get();
+    const int n_knots = spline_->numKnots();
+    const int n_bias = bias_->numKnots();
+    capture_.prior_clone = prior_->cloneRemapped([&](double* p) -> double* {
+      for (int i = 0; i < n_knots; ++i) {
+        if (p == spline_->so3KnotData(i)) return sc->so3KnotData(i);
+        if (p == spline_->r3KnotData(i)) return sc->r3KnotData(i);
+      }
+      for (int i = 0; i < n_bias; ++i) {
+        if (p == bias_->gyroBlock(i)) return bc->gyroBlock(i);
+        if (p == bias_->accelBlock(i)) return bc->accelBlock(i);
+      }
+      return p;
+    });
+  }
+
+  in.t_begin = t_begin;
+  in.t_end = t_end;
+  capture_.capped_hits = capped_hits;
+  in.T_fe_lidar = T_fe_lidar_;
+  in.lidar_cfg = cfg_.lidar;
+
+  capture_.imu = imu;  // segment IMU samples (copied; addImuResiduals filters by span)
+  in.weights = weights;
+
+  in.tail_times = tail_times;
+  in.seed_vel_end = seed_vel_end_;
+  in.seed_omega_end = seed_omega_end_;
+  in.tail_sigma_vel = 0.2;
+  in.tail_sigma_rate = 0.1;
+
+  in.motion_reg_engaged = motion_reg_engaged;
+  in.motion_reg_times = motion_reg_times;
+  in.motion_reg_weight = cfg_.motion_reg.weight;
+  in.motion_reg_accel_weight = 1.0 / std::max(weights.sigma_accel, 1e-9);
+  in.motion_reg_gyro_weight = 1.0 / std::max(weights.sigma_gyro, 1e-9);
+
+  in.visual_patches = patches;
+  in.visual_cfg = cfg_.visual;
+  if (vis != nullptr && !patches.empty()) {
+    in.t_image = vis->t_image;
+    in.inv_expo = inv_expo_;
+    in.inv_expo_prior = inv_expo_prior_;
+    in.inv_expo_std = inv_expo_std_;
+    in.exposure_estimate_en = cfg_.visual.exposure_estimate_en;
+  }
+
+  if (gnss != nullptr) {
+    in.t_fe_ant = gnss->t_fe_ant;
+    in.gnss_huber = kHuberGnss;
+    in.gnss_factors.reserve(gnss->fixes.size());
+    for (const GnssMeasurement& m : gnss->fixes) {
+      ct::GnssFactor f;
+      f.z_world = m.z_world;
+      f.sqrt_info = m.sqrt_info;
+      f.t_fix = m.t_fix;
+      in.gnss_factors.push_back(f);
+    }
+  }
+
+  in.bias_gyr_max = std::max(cfg_.bias.gyr_max, 0.0);
+  in.bias_acc_max = std::max(cfg_.bias.acc_max, 0.0);
+  in.gauge_seg_t = t_begin;
+  in.first_pinned_knot = first_pinned_knot;
+
+  capture_.valid = true;
+}
+
+void CtFrontEnd::submitKeyframeJob(KeyframePacket&& pkt, const Pose& T_world_body, Timestamp stamp,
+                                   const std::vector<ct::LidarHit>& hits, bool absolute_prior) {
+  KeyframeJob job;
+  job.spline = std::move(capture_.spline_clone);
+  job.bias = std::move(capture_.bias_clone);
+  job.gravity = capture_.gravity_clone;
+  job.prior = std::move(capture_.prior_clone);
+  job.inputs = std::move(capture_.inputs);
+  job.capped_hits = std::move(capture_.capped_hits);
+  job.imu = std::move(capture_.imu);
+  job.stamp = stamp;
+  job.pkt = std::move(pkt);
+  job.absolute_prior = absolute_prior;
+  // LiDAR-only marginal as the worker's fallback if the rebuilt posterior is rank-
+  // deficient -- the same fallback the synchronous path would have taken.
+  job.fallback_pose_cov = poseMarginal(T_world_body, hits);
+  capture_.valid = false;
+
+  // The push blocks only when the finalizer queue is full (worker behind by a full
+  // queue depth of keyframes); the timer makes such a stall visible in the telemetry
+  // instead of appearing as an anonymous sweep overrun.
+  MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.covsubmit", stamp);
+  finalizer_->submit(std::move(job));
 }
 
 Eigen::Matrix<double, 6, 6> CtFrontEnd::poseMarginal(const Pose& T_world_body,
@@ -1237,138 +1615,7 @@ Eigen::Matrix<double, 6, 6> CtFrontEnd::poseMarginal(const Pose& T_world_body,
 
 bool CtFrontEnd::poseMarginalFromProblem(ceres::Problem& problem, Timestamp stamp,
                                          Eigen::Matrix<double, 6, 6>* cov) {
-  if (!spline_->covers(stamp)) {
-    return false;
-  }
-  // The pose at stamp depends only on its segment's 4 SO(3) + 4 R^3 knots. Collect
-  // them in a fixed tangent order (so3 then r3, 3 DoF each), and gather every residual
-  // in the solved problem that touches any of them -- this is their Markov blanket and
-  // carries the LiDAR, IMU, bias, and prior information that constrains the pose.
-  const SplineWindow::SegmentRef seg = spline_->segmentFor(stamp);
-  std::array<double*, kSplineOrder * 2> pose_knots{};
-  std::array<bool, kSplineOrder * 2> knot_is_so3{};
-  for (int j = 0; j < kSplineOrder; ++j) {
-    pose_knots[j] = seg.so3_knots[j];
-    knot_is_so3[j] = true;
-    pose_knots[kSplineOrder + j] = seg.r3_knots[j];
-    knot_is_so3[kSplineOrder + j] = false;
-  }
-
-  std::vector<ceres::ResidualBlockId> residuals;
-  std::unordered_set<const void*> res_seen;
-  for (double* p : pose_knots) {
-    if (!problem.HasParameterBlock(p)) {
-      return false;  // a pose knot is missing from the problem: cannot trust the block
-    }
-    std::vector<ceres::ResidualBlockId> rs;
-    problem.GetResidualBlocksForParameterBlock(p, &rs);
-    for (ceres::ResidualBlockId r : rs) {
-      if (res_seen.insert(r).second) {
-        residuals.push_back(r);
-      }
-    }
-  }
-  if (residuals.empty()) {
-    return false;
-  }
-
-  // Order the blanket with the 8 pose knots first (free, never gauge-pinned at the
-  // window's trailing edge), then the remaining free blocks the residuals reach.
-  // Constant gauge pins carry no information and are dropped from the order.
-  auto makeBlock = [&](double* p) {
-    ct::MarginalizationPrior::Block b;
-    b.ptr = p;
-    b.global_size = problem.ParameterBlockSize(p);
-    b.local_size = problem.ParameterBlockTangentSize(p);
-    return b;
-  };
-  std::unordered_set<double*> pose_set(pose_knots.begin(), pose_knots.end());
-  std::vector<ct::MarginalizationPrior::Block> order;
-  int pose_dim = 0;
-  for (double* p : pose_knots) {
-    if (problem.IsParameterBlockConstant(p)) {
-      return false;  // a pinned pose knot has no posterior spread; defer to the fallback
-    }
-    order.push_back(makeBlock(p));
-    pose_dim += order.back().local_size;
-  }
-  std::unordered_set<double*> seen(pose_set);
-  for (ceres::ResidualBlockId r : residuals) {
-    std::vector<double*> ps;
-    problem.GetParameterBlocksForResidualBlock(r, &ps);
-    for (double* p : ps) {
-      if (seen.count(p) || problem.IsParameterBlockConstant(p)) {
-        continue;
-      }
-      seen.insert(p);
-      order.push_back(makeBlock(p));
-    }
-  }
-
-  Eigen::MatrixXd H;
-  Eigen::VectorXd b;
-  ct::linearizeBlocks(problem, residuals, order, &H, &b);
-
-  // Joint marginal covariance of the blanket; the pose-knot marginal is its leading
-  // pose_dim x pose_dim block (a sub-block of the joint covariance is the marginal).
-  Eigen::MatrixXd cov_full;
-  if (!robustInverse(H, &cov_full)) {
-    return false;
-  }
-  const Eigen::MatrixXd cov_knots = cov_full.topLeftCorner(pose_dim, pose_dim);
-
-  // Spline pose Jacobian J (6 x pose_dim) at stamp, by central finite difference of
-  // T_W_Fe(stamp) under each knot's tangent perturbation, in the same knot ordering.
-  // The pose tangent is the decoupled translation-first chart [delta t_world; delta
-  // phi_body] that the LiDAR Jacobian and the rotation-first reorder both assume.
-  const Pose T0 = spline_->pose(stamp);
-  const Eigen::Quaterniond q0_inv = T0.q.conjugate();
-  Eigen::MatrixXd Jpose = Eigen::MatrixXd::Zero(6, pose_dim);
-  const double eps = 1e-6;
-  int col = 0;
-  for (int k = 0; k < kSplineOrder * 2; ++k) {
-    double* ptr = pose_knots[k];
-    if (knot_is_so3[k]) {
-      Eigen::Map<Eigen::Quaterniond> qk(ptr);
-      const Eigen::Quaterniond saved = qk;
-      for (int a = 0; a < 3; ++a) {
-        Eigen::Vector3d d = Eigen::Vector3d::Zero();
-        d(a) = eps;
-        qk = (saved * Sophus::SO3d::exp(d).unit_quaternion()).normalized();
-        const Pose Tp = spline_->pose(stamp);
-        qk = (saved * Sophus::SO3d::exp(-d).unit_quaternion()).normalized();
-        const Pose Tm = spline_->pose(stamp);
-        qk = saved;
-        // Body-frame right-perturbation tangent of each sample relative to T0, then a
-        // central difference: phi_+- = Log(q0^{-1} q_+-), J = (phi_+ - phi_-)/(2 eps).
-        const Eigen::Vector3d phi_p = Sophus::SO3d((q0_inv * Tp.q).normalized()).log();
-        const Eigen::Vector3d phi_m = Sophus::SO3d((q0_inv * Tm.q).normalized()).log();
-        Jpose.block<3, 1>(0, col) = (Tp.t - Tm.t) / (2.0 * eps);
-        Jpose.block<3, 1>(3, col) = (phi_p - phi_m) / (2.0 * eps);
-        ++col;
-      }
-    } else {
-      Eigen::Map<Eigen::Vector3d> pk(ptr);
-      const Eigen::Vector3d saved = pk;
-      for (int a = 0; a < 3; ++a) {
-        pk = saved;
-        pk(a) = saved(a) + eps;
-        const Pose Tp = spline_->pose(stamp);
-        pk(a) = saved(a) - eps;
-        const Pose Tm = spline_->pose(stamp);
-        pk = saved;
-        const Eigen::Vector3d phi_p = Sophus::SO3d((q0_inv * Tp.q).normalized()).log();
-        const Eigen::Vector3d phi_m = Sophus::SO3d((q0_inv * Tm.q).normalized()).log();
-        Jpose.block<3, 1>(0, col) = (Tp.t - Tm.t) / (2.0 * eps);
-        Jpose.block<3, 1>(3, col) = (phi_p - phi_m) / (2.0 * eps);
-        ++col;
-      }
-    }
-  }
-
-  *cov = Jpose * cov_knots * Jpose.transpose();
-  *cov = 0.5 * (*cov + cov->transpose()).eval();
-  return true;
+  return ct::poseMarginalFromProblem(problem, *spline_, stamp, cov);
 }
 
 ObservabilityReport CtFrontEnd::computeObservability(const Pose& T_world_body,
@@ -1450,27 +1697,19 @@ void CtFrontEnd::emitKeyframe(const Pose& T_world_body, Timestamp stamp,
   pkt.kinematics_included = false;
   pkt.observability = last_obs_;
 
-  // Prefer the window-posterior pose marginal (carries the IMU and prior information
-  // L3 relies on being baked into the relative edge); fall back to the LiDAR-only
-  // marginal only when the posterior extraction failed for this sweep.
-  const Eigen::Matrix<double, 6, 6> pose_cov =
-      have_pose_cov_ ? last_pose_cov_ : poseMarginal(T_world_body, hits);
-
-  if (!have_prev_kf_) {
+  // First keyframe, or the window was reseeded across a data hole on a constant-velocity
+  // prediction: a relative edge spanning that discontinuity would carry the prediction
+  // error with no covariance accounting for it, so break the relative chain and hand the
+  // consumer an absolute anchor instead.
+  const bool absolute_prior = !have_prev_kf_ || kf_chain_broken_;
+  if (absolute_prior) {
     pkt.constraint_kind = KeyframePacket::ConstraintKind::AbsolutePrior;
     pkt.rel_to_id = 0;
     pkt.T_relto_this = Pose{};
-    pkt.constraint_cov.form = GaussianBlock<6>::Form::Covariance;
-    pkt.constraint_cov.M = IekfFrontEnd::reorderTransRotToRotTrans(pose_cov);
   } else {
     pkt.constraint_kind = KeyframePacket::ConstraintKind::RelativeBetween;
     pkt.rel_to_id = prev_kf_id_;
     pkt.T_relto_this = prev_kf_pose_.inverse() * T_world_body;
-    // Conservative relative cov: the sum of the two absolute pose marginals upper-
-    // bounds the true relative marginal (which subtracts their cross-covariance).
-    const Eigen::Matrix<double, 6, 6> rel_cov = pose_cov + prev_kf_pose_cov_;
-    pkt.constraint_cov.form = GaussianBlock<6>::Form::Covariance;
-    pkt.constraint_cov.M = IekfFrontEnd::reorderTransRotToRotTrans(rel_cov);
   }
 
   // cloud_body: the downsampled scan warped to the body frame at stamp. Each point
@@ -1492,11 +1731,39 @@ void CtFrontEnd::emitKeyframe(const Pose& T_world_body, Timestamp stamp,
   }
   pkt.cloud_body = std::move(cloud);
 
+  // Advance the chain bookkeeping on T2 regardless of path: keyframeDue and the next
+  // relative transform read these. The pose-marginal CHAIN (prev_kf_pose_cov_) is owned
+  // by the synchronous path here, or by the worker on the live path.
   prev_kf_pose_ = T_world_body;
   prev_kf_stamp_ = stamp;
-  prev_kf_pose_cov_ = pose_cov;
   prev_kf_id_ = pkt.id;
   have_prev_kf_ = true;
+  // An emitted anchor consumes the pending chain break.
+  kf_chain_broken_ = false;
+
+  if (finalizer_ && capture_.valid) {
+    // Live path: the worker fills constraint_cov off T2 from the captured snapshot and
+    // forwards the packet to the sink. The marginal chain is the worker's.
+    submitKeyframeJob(std::move(pkt), T_world_body, stamp, hits, absolute_prior);
+    return;
+  }
+
+  // Deterministic path (or a sweep with no valid capture): pack constraint_cov inline,
+  // exactly as before. Prefer the window-posterior marginal computed on the live problem,
+  // falling back to the LiDAR-only marginal when extraction failed.
+  const Eigen::Matrix<double, 6, 6> pose_cov =
+      have_pose_cov_ ? last_pose_cov_ : poseMarginal(T_world_body, hits);
+  if (absolute_prior) {
+    pkt.constraint_cov.form = GaussianBlock<6>::Form::Covariance;
+    pkt.constraint_cov.M = reorderTransRotToRotTrans(pose_cov);
+  } else {
+    // Conservative relative cov: the sum of the two absolute pose marginals upper-bounds
+    // the true relative marginal (which subtracts their cross-covariance).
+    const Eigen::Matrix<double, 6, 6> rel_cov = pose_cov + prev_kf_pose_cov_;
+    pkt.constraint_cov.form = GaussianBlock<6>::Form::Covariance;
+    pkt.constraint_cov.M = reorderTransRotToRotTrans(rel_cov);
+  }
+  prev_kf_pose_cov_ = pose_cov;
 
   if (keyframe_sink_) {
     keyframe_sink_(std::move(pkt));
@@ -1552,7 +1819,7 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
     // t_begin and is extended to t_end so the first sweep has full coverage. The
     // spline carries the configured adaptive control-point cap; the first (static)
     // segment opens at a single control point and density follows motion thereafter.
-    const int n_cp_max = cfg_.spline.n_cp_max > 0 ? cfg_.spline.n_cp_max : 1;
+    const int n_cp_max = maxControlPoints();
     spline_ = std::make_unique<SplineWindow>(window_dt_ns_, n_cp_max);
     spline_->initialize(t_begin, anchor_pose_);
     bias_ = std::make_unique<ct::BiasKnots>(t_begin, biasKnotDt(), 2);
@@ -1592,6 +1859,9 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
     }
     if (!world.empty()) {
       map_->insert(world);
+      // Settle deferred push-downs before the next sweep's parallel association so its
+      // concurrent searches only read resolved node flags.
+      map_->flushPendingDeletes();
     }
 
     bootstrapped_ = true;
@@ -1622,13 +1892,15 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   const Duration sweep_span = t_end > t_begin ? t_end - t_begin : window_dt_ns_;
   const bool sweep_gap = t_begin > last_solved_t_ + sweep_span / 2;
   if (sweep_gap) {
-    Duration imu_period = window_dt_ns_ / 20;
-    if (mg.imu.size() >= 2) {
-      imu_period = (mg.imu.back().stamp - mg.imu.front().stamp) /
-                   static_cast<Duration>(mg.imu.size() - 1);
-    }
-    const bool imu_bridges =
-        !mg.imu.empty() && mg.imu.front().stamp <= last_solved_t_ + 2 * imu_period;
+    // A short gap (a sweep or two dropped under load) is bridged, NOT restarted:
+    // buildSeed integrates the group's IMU from last_solved_t_ across the hole
+    // (extrapolating the leading span from the first sample), extendTo appends the
+    // missing segments, and the sweep then SOLVES normally against its LiDAR -- so a
+    // dropped sweep costs centimetres of extrapolation, not a coast. Restart only for
+    // a genuinely large hole, where extrapolating the seed would warp the associations
+    // beyond what re-association can recover. The bound is a few sweeps of motion.
+    const Duration max_bridge = static_cast<Duration>(5) * window_dt_ns_;
+    const bool imu_bridges = !mg.imu.empty() && (t_begin - last_solved_t_) <= max_bridge;
     const double gap_ms = static_cast<double>(t_begin - last_solved_t_) / 1e6;
     if (imu_bridges) {
       if (telemetry_) {
@@ -1641,8 +1913,8 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
     } else {
       if (telemetry_) {
         char msg[96];
-        std::snprintf(msg, sizeof(msg),
-                      "sweep gap %.0f ms exceeds IMU horizon; window reseeded", gap_ms);
+        std::snprintf(msg, sizeof(msg), "sweep gap %.0f ms exceeds IMU horizon; window reseeded",
+                      gap_ms);
         telemetry_->event(Level::Warn, "frontend/window_restart", msg, t_begin);
       }
       reseedAfterGap(group, t_begin, t_end);
@@ -1739,7 +2011,10 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   anchor_bg_ = bias_->gyroBiasAt(t_end);
   anchor_ba_ = bias_->accelBiasAt(t_end);
 
-  last_obs_ = computeObservability(T_world_end, hits);
+  {
+    MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.obs", t_end);
+    last_obs_ = computeObservability(T_world_end, hits);
+  }
   diag_.observability = last_obs_;
 
   {
@@ -1780,9 +2055,18 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
       publishPatchOverlay(pyramid.front(), t_img, vctx.used);
     }
 
-    vmap_->updateAfterSolve(*vctx.img, cam_model_, T_w_c, inv_expo_);
-    vmap_->promote(*vctx.img, cam_model_, T_w_c, inv_expo_, hits);
-    vmap_->evict(T_w_c.t);
+    {
+      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.vmap.update", t_end);
+      vmap_->updateAfterSolve(*vctx.img, cam_model_, T_w_c, inv_expo_);
+    }
+    {
+      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.vmap.promote", t_end);
+      vmap_->promote(*vctx.img, cam_model_, T_w_c, inv_expo_, hits);
+    }
+    {
+      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.vmap.evict", t_end);
+      vmap_->evict(T_w_c.t);
+    }
   }
 
   if (telemetry_) {
@@ -1795,12 +2079,11 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
     // Funnel observability: map population and per-frame candidate count localize a
     // tracking dropout to promotion, candidacy gating, or the warp/NCC stages.
     if (vmap_ && telemetry_->enabled("frontend/visual/map_points")) {
-      telemetry_->scalar("frontend/visual/map_points", static_cast<double>(vmap_->size()),
-                         t_end);
+      telemetry_->scalar("frontend/visual/map_points", static_cast<double>(vmap_->size()), t_end);
     }
     if (telemetry_->enabled("frontend/visual/n_candidates")) {
-      telemetry_->scalar("frontend/visual/n_candidates",
-                         static_cast<double>(vctx.stats.candidates), t_end);
+      telemetry_->scalar("frontend/visual/n_candidates", static_cast<double>(vctx.stats.candidates),
+                         t_end);
     }
     if (telemetry_->enabled("frontend/visual/n_converged")) {
       telemetry_->scalar("frontend/visual/n_converged", static_cast<double>(vctx.stats.accepted),
@@ -1829,6 +2112,14 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   if (telemetry_) {
     if (telemetry_->enabled("frontend/lidar/n_inlier")) {
       telemetry_->scalar("frontend/lidar/n_inlier", static_cast<double>(accepted), t_end);
+    }
+    if (telemetry_->enabled("frontend/map/size")) {
+      telemetry_->scalar("frontend/map/size", static_cast<double>(map_->size()), t_end);
+    }
+    // The weakest pose axis of this sweep's LiDAR observability report.
+    if (telemetry_->enabled("frontend/obs/min_score")) {
+      telemetry_->scalar("frontend/obs/min_score",
+                         *std::min_element(last_obs_.score.begin(), last_obs_.score.end()), t_end);
     }
     if (telemetry_->enabled("frontend/iter_count")) {
       telemetry_->scalar("frontend/iter_count", static_cast<double>(diag_.iterations), t_end);

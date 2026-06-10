@@ -7,9 +7,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <sophus/so3.hpp>
 #include <unordered_set>
 #include <vector>
-#include <sophus/so3.hpp>
 
 namespace meridian {
 
@@ -34,6 +34,27 @@ SplineWindow::SplineWindow(Duration knot_dt_ns, int n_cp_max)
 SplineWindow::~SplineWindow() = default;
 SplineWindow::SplineWindow(SplineWindow&&) noexcept = default;
 SplineWindow& SplineWindow::operator=(SplineWindow&&) noexcept = default;
+
+std::unique_ptr<SplineWindow> SplineWindow::clone() const {
+  auto copy = std::make_unique<SplineWindow>(knot_dt_ns_, n_cp_max_);
+  copy->initialized_ = initialized_;
+  copy->dt_v_ns_ = dt_v_ns_;
+  copy->t_min_ = t_min_;
+  copy->t_max_ = t_max_;
+  copy->kt_ = kt_;
+  copy->segments_ = segments_;
+  // Rebuild the basalt deques by value: each knot's SO(3) rotation and R^3 vector are
+  // pushed in order, so the copy holds identical knot values in independent storage.
+  // Index i in the copy's deques matches index i in kt_, exactly as in the original.
+  copy->so3_ = std::make_unique<basalt::So3Spline<kOrder, double>>(dt_v_ns_, 0);
+  copy->r3_ = std::make_unique<basalt::RdSpline<3, kOrder, double>>(dt_v_ns_, 0);
+  const int n = static_cast<int>(kt_.size());
+  for (int i = 0; i < n; ++i) {
+    copy->so3_->knotsPushBack(so3_->getKnot(i));
+    copy->r3_->knotsPushBack(r3_->getKnot(i));
+  }
+  return copy;
+}
 
 void SplineWindow::initialize(Timestamp t0, const Pose& T0) {
   so3_ = std::make_unique<basalt::So3Spline<kOrder, double>>(dt_v_ns_, 0);
@@ -91,14 +112,12 @@ void SplineWindow::extendTo(Timestamp t, const std::function<Pose(Timestamp)>& s
   }
 }
 
-
 void SplineWindow::reseedFrom(int from_idx, const std::function<Pose(Timestamp)>& seed) {
   const int n = static_cast<int>(kt_.size());
   for (int j = std::max(from_idx, 1); j < n; ++j) {
     // Same placement rule as extendTo: a control point dominates the curve one local
     // knot step before its grid time, so sample the seed there to land on it.
-    const Timestamp step =
-        kt_[static_cast<std::size_t>(j)] - kt_[static_cast<std::size_t>(j - 1)];
+    const Timestamp step = kt_[static_cast<std::size_t>(j)] - kt_[static_cast<std::size_t>(j - 1)];
     const Pose p = seed(kt_[static_cast<std::size_t>(j)] - step);
     so3_->getKnot(j) = toSophus(p.q);
     r3_->getKnot(j) = p.t;
