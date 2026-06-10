@@ -20,6 +20,8 @@ inline constexpr const char* kTeleIndeterminate = "backend/indeterminate";
 inline constexpr const char* kTeleDegenerate = "backend/degenerate";
 inline constexpr const char* kTeleInfoForm = "backend/info_form";
 inline constexpr const char* kTeleObsFrame = "backend/obs_frame";
+inline constexpr const char* kTeleRestartBridge = "backend/restart_bridge";
+inline constexpr const char* kTeleMarginalizeSkip = "backend/marginalize_skip";
 
 // Per-keyframe vector series; the keyframe id is appended ("backend/observability/<id>").
 inline constexpr const char* kTeleObservabilityPrefix = "backend/observability/";

@@ -1,9 +1,11 @@
 #pragma once
 
+#include <gtsam/inference/Key.h>
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
 
+#include <boost/optional.hpp>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -34,6 +36,14 @@ public:
   void add_loop_constraint(const LoopConstraint& lc) override;
   void add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id) override;
 
+  // Identifies one inertial restart bridge: the CombinedImuFactor edge i->j brought its own
+  // V(i),B(i),V(j),B(j) into the graph. The V/B keys are derivable through keyV/keyB(i|j),
+  // so storing the two ids is enough to schedule their later marginalization.
+  struct BridgeRecord {
+    std::uint64_t i = 0;
+    std::uint64_t j = 0;
+  };
+
   GraphUpdate optimize() override;
 
   std::vector<StampedPose> corrected_trajectory() const override;
@@ -48,10 +58,27 @@ public:
 private:
   std::unique_ptr<gtsam::ISAM2> make_isam2(bool use_qr) const;
   // Folds the staged batch into isam2_, recovering from an indeterminate linear system
-  // by rebuilding on QR; returns false if the batch had to be abandoned.
-  bool run_update_with_recovery(gtsam::ISAM2Result& result, Timestamp ts);
+  // by rebuilding on QR; returns false if the batch had to be abandoned. constrained, when
+  // present, fixes the elimination grouping for the bridge-clearing update (group 0 keys
+  // become Bayes-tree leaves so they can be marginalized straight after).
+  bool run_update_with_recovery(
+      gtsam::ISAM2Result& result, Timestamp ts,
+      const boost::optional<gtsam::FastMap<gtsam::Key, int>>& constrained);
   GraphUpdate build_graph_update();
   void record_keyframe(KeyframePacket&& kf);
+  // Stages the restart bridge: new V(i),B(i),V(j),B(j), loose priors pinning the freshly
+  // created i-side states, and the CombinedImuFactor for the i->j interval.
+  void add_restart_imu_edge(KeyframePacket&& kf);
+  // Promotes the not-yet-marginalized bridges' V/B into the next-fold marginalize set. Run
+  // when a normal keyframe follows a bridge and inertial variables are not being kept.
+  void schedule_bridge_marginalization();
+  // Builds the constrainedKeys group map for the fold update that clears a bridge: group 0
+  // is the V/B about to be marginalized (forced leaf-ward), group 1 is every other live key
+  // (X poses in kf_order_ plus any V/B still pending). Empty when nothing is pending.
+  boost::optional<gtsam::FastMap<gtsam::Key, int>> bridge_constraint_groups() const;
+  // After the fold update, marginalizes the scheduled V/B that are now leaves; any key not
+  // yet present or not leaf-eligible stays pending and is retried next fold.
+  void perform_bridge_marginalization(Timestamp ts);
   // Emits per-axis observability inflation telemetry and a marker when an axis is locked.
   void publish_observability(std::uint64_t id, const ObservabilityReport& obs,
                              const InflationResult& inf);
@@ -84,6 +111,13 @@ private:
   std::optional<std::uint64_t> last_kf_id_;
   ChainCovariance chain_cov_;
   Pose T_map_odom_;
+
+  // Restart-bridge bookkeeping. pending_bridges_ holds bridges whose V/B are still live;
+  // once a normal keyframe follows, their V/B keys move into pending_marginalize_ and are
+  // removed at the next fold (unless cfg_.keep_inertial pins them forever). A key stays in
+  // pending_marginalize_ until it is actually a Bayes-tree leaf and marginalizes cleanly.
+  std::vector<BridgeRecord> pending_bridges_;
+  std::vector<gtsam::Key> pending_marginalize_;
 
   BackEndDiagnostics diag_;
 };

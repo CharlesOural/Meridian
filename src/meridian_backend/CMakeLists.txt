@@ -21,6 +21,7 @@ add_library(meridian_backend SHARED
   src/gauge_damping_factor.cpp
   src/observability_inflation.cpp
   src/chain_covariance.cpp
+  src/pim_from_summary.cpp
   src/isam2_backend.cpp
   src/backend_factory.cpp
 )
@@ -72,7 +73,8 @@ if(BUILD_TESTING)
   # GTSAM themselves (it is private to the library and not in its link interface).
   foreach(t test_gtsam_adapter test_tangent_ordering test_gauge_damping
             test_observability_inflation test_chain_covariance test_backend_spine
-            test_determinism test_backend_recovery)
+            test_determinism test_backend_recovery test_pim_from_summary
+            test_restart_bridge)
     meridian_add_gtest(${t} test/${t}.cpp)
     target_link_libraries(${t} meridian_backend gtsam)
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

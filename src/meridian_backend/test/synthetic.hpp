@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "meridian/common/imu_preintegration.hpp"
 #include "meridian/common/keyframe_packet.hpp"
 #include "meridian/common/pose.hpp"
 #include "meridian/common/time.hpp"
@@ -127,5 +128,121 @@ public:
     return it == events.end() ? 0 : it->second;
   }
 };
+
+// Builds a KeyframePacket carrying an ImuPreintegrationSummary (the window-restart
+// fallback). The motion is a closed-form constant-rate integration of a fixed body-frame
+// angular rate omega and specific force accel over N steps of dt seconds, so the summary
+// is self-consistent in the [dR | dv | dp] order the boundary uses.
+//
+// The summary is geometrically valid in isolation but its pose/motion need NOT be
+// physically consistent with the surrounding chain: these tests exercise graph
+// bookkeeping (which variables/factors the bridge adds and marginalizes), not trajectory
+// accuracy, so the bridge edge is allowed to disagree with T_ref_body.
+inline KeyframePacket make_restart_packet(std::uint64_t prev_id, std::uint64_t id, Timestamp stamp,
+                                          const Pose& T_ref_body, std::uint32_t seed = 7) {
+  // Per-axis constant body rate and specific force; seeded so distinct restarts differ
+  // but a fixed seed is reproducible. The magnitudes are deliberately mild.
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> u(-0.3, 0.3);
+  const Eigen::Vector3d omega(0.05 + u(rng), -0.04 + u(rng), 0.03 + u(rng));  // [rad/s]
+  const Eigen::Vector3d accel(0.2 + u(rng), -0.1 + u(rng), 0.15 + u(rng));    // [m/s^2]
+
+  constexpr int kN = 20;
+  constexpr double kDt = 0.005;  // [s] per IMU step -> 0.1 s window
+  const double total_s = kN * kDt;
+
+  ImuPreintegrationSummary s;
+  s.t_i = stamp - static_cast<Timestamp>(total_s * 1e9);
+  s.t_j = stamp;
+  s.gravity_mag = 9.81;
+  s.bias_g_lin = Eigen::Vector3d::Zero();
+  s.bias_a_lin = Eigen::Vector3d::Zero();
+
+  // Forward Euler on the gravity-free preintegrated increment, accumulating the
+  // first-order bias Jacobians along the way:
+  //   dR_{k+1} = dR_k * Exp(omega*dt)
+  //   dv_{k+1} = dv_k + dR_k * accel * dt
+  //   dp_{k+1} = dp_k + dv_k * dt + 0.5 * dR_k * accel * dt^2
+  // A perturbation of the gyro bias rotates every subsequent dR; an accel-bias
+  // perturbation feeds through dR_k into dv and dp. Rotation carries no accel-bias
+  // dependence, so dR_dba is identically zero and is not stored.
+  Eigen::Matrix3d dR = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d dv = Eigen::Vector3d::Zero();
+  Eigen::Vector3d dp = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d dR_dbg = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d dv_dbg = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d dv_dba = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d dp_dbg = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d dp_dba = Eigen::Matrix3d::Zero();
+
+  const auto skew = [](const Eigen::Vector3d& w) {
+    Eigen::Matrix3d m;
+    m << 0, -w.z(), w.y(), w.z(), 0, -w.x(), -w.y(), w.x(), 0;
+    return m;
+  };
+
+  // Constant-rate step rotation Exp(omega*dt) and its transpose, formed once.
+  const Eigen::Vector3d phi = omega * kDt;
+  const double phi_norm = phi.norm();
+  const Eigen::Matrix3d inc =
+      (phi_norm > 0.0 ? Eigen::Matrix3d(Eigen::AngleAxisd(phi_norm, phi / phi_norm))
+                      : Eigen::Matrix3d::Identity());
+  const Eigen::Matrix3d inc_T = inc.transpose();
+
+  for (int k = 0; k < kN; ++k) {
+    const Eigen::Matrix3d dR_k = dR;
+    const Eigen::Vector3d dv_k = dv;
+    const Eigen::Matrix3d dR_dbg_k = dR_dbg;
+    const Eigen::Vector3d acc_w = dR_k * accel;  // accel in the i-frame at step k
+
+    dp += dv_k * kDt + 0.5 * acc_w * kDt * kDt;
+    dv += acc_w * kDt;
+
+    dp_dbg += dv_dbg * kDt - 0.5 * skew(acc_w) * dR_dbg_k * kDt * kDt;
+    dp_dba += dv_dba * kDt + 0.5 * dR_k * kDt * kDt;
+    dv_dbg += -skew(acc_w) * dR_dbg_k * kDt;
+    dv_dba += dR_k * kDt;
+
+    // d(dR)/d(bg): rotating one more step propagates the accumulated Jacobian through
+    // the new increment and subtracts this step's right-Jacobian contribution.
+    dR_dbg = inc_T * dR_dbg_k - dR_k * kDt;
+    dR = dR_k * inc;
+  }
+
+  const Eigen::Quaterniond delta_R(dR);
+  s.delta_R = delta_R.normalized();
+  s.delta_v = dv;
+  s.delta_p = dp;
+  s.dR_dbg = dR_dbg;
+  s.dv_dbg = dv_dbg;
+  s.dv_dba = dv_dba;
+  s.dp_dbg = dp_dbg;
+  s.dp_dba = dp_dba;
+
+  // Small SPD diagonal in [dR | dv | dp] order; rotation tightest, position loosest,
+  // matching how preintegration uncertainty grows by integration order.
+  s.preint_cov.form = GaussianBlock<9>::Form::Covariance;
+  s.preint_cov.M.setZero();
+  for (int k = 0; k < 3; ++k) s.preint_cov.M(k, k) = 1e-4;  // dR
+  for (int k = 3; k < 6; ++k) s.preint_cov.M(k, k) = 1e-3;  // dv
+  for (int k = 6; k < 9; ++k) s.preint_cov.M(k, k) = 1e-2;  // dp
+
+  KeyframePacket p;
+  p.id = id;
+  p.stamp = stamp;
+  p.ref_frame = Frame::Odom;
+  p.T_ref_body = T_ref_body;
+  p.constraint_kind = KeyframePacket::ConstraintKind::ImuPreintegration;
+  p.rel_to_id = prev_id;
+  // The restart fallback carries the kinematic state so the bridge can seed V and B.
+  p.kinematics_included = true;
+  p.v_ref = dv;  // a plausible body velocity in ref_frame; not chain-consistent
+  p.b_g = Eigen::Vector3d::Zero();
+  p.b_a = Eigen::Vector3d::Zero();
+  p.imu_summary = std::move(s);
+  p.calib_version = 1;
+  p.frontend_kind = 1;
+  return p;
+}
 
 }  // namespace meridian::backend::testing

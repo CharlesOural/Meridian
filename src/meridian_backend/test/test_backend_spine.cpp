@@ -201,9 +201,10 @@ TEST(BackendSpine, LatestMarginal) {
   EXPECT_GT(trace50, trace5);
 }
 
-// A restart packet is dropped, and because no bridge is fabricated the next packet
-// (which references the dropped id) must fall to the contiguity gate.
-TEST(BackendSpine, RestartPacketDropped) {
+// A restart packet that lacks its IMU summary cannot form a bridge, so it is rejected
+// rather than fabricated; the chain then continues from the last accepted keyframe. A
+// well-formed restart bridge is exercised in test_restart_bridge.
+TEST(BackendSpine, MalformedRestartRejected) {
   SynthOptions opt;
   opt.n = 5;
   const SynthChain chain = make_chain(opt);
@@ -215,14 +216,16 @@ TEST(BackendSpine, RestartPacketDropped) {
     be->optimize();
   }
 
+  // ImuPreintegration kind but no imu_summary / kinematics: the precondition fails.
   KeyframePacket restart = chain.packets[3];
   restart.constraint_kind = KeyframePacket::ConstraintKind::ImuPreintegration;
-  be->add_keyframe(std::move(restart));
-  EXPECT_EQ(sink.count("backend/restart_unsupported"), 1);
+  EXPECT_NO_THROW(be->add_keyframe(std::move(restart)));
+  be->optimize();
+  // The malformed restart never enters the estimate.
+  EXPECT_EQ(trajIds(be->corrected_trajectory()), (std::vector<std::uint64_t>{0, 1, 2}));
 
+  // Packet 4 references the rejected id 3, so it too falls to the contiguity gate.
   feed(*be, chain.packets[4]);
-  EXPECT_EQ(sink.count("backend/contiguity"), 1);
-
   be->optimize();
   EXPECT_EQ(trajIds(be->corrected_trajectory()), (std::vector<std::uint64_t>{0, 1, 2}));
 }
