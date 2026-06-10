@@ -1,181 +1,127 @@
-# Testing Meridian against a FusionPortable bag
+# Testing Meridian against a Newer College bag
 
-End-to-end check of the Phase-1 system (L0 sensors → L1 preprocessing → aggregated,
-cold-start-deskewed sweeps), driven by a real dataset through the live ROS node.
-Everything runs inside the dev container (see `DEVELOPMENT.md`); on the Mac the flow
-is identical minus rviz (use Foxglove on `ws://localhost:8765`).
+End-to-end check of the live system (L0 sensors → L1 preprocessing → L2 CT
+front-end), driven by a Newer College multi-cam sequence through the ROS node.
+Everything runs inside the dev container (see `DEVELOPMENT.md`). Dataset
+download, conversion, layout and per-collection calibration: `docs/DATASET.md`.
 
-## 0. Build the workspace
+**Current scope: LIO only.** The visual stage is switched off in the configs
+(`frontend.visual.enable: false`): the Alphasense cameras suffer heavy
+vignetting, so the benchmark is LiDAR-inertial first; re-enabling visual on
+this dataset is a future task. The camera calibration stays in the configs so
+the flip is one line.
+
+## Testing policy (mandatory)
+
+- **Routine validation runs ONE sequence: `quad-easy`.** Every day-to-day
+  change is judged on it alone.
+- **The 3-sequence pass (`quad-easy` + `math-medium` + `park`) runs ONLY
+  before committing large work** — not per-iteration.
+- **`quad-hard` is a HOLDOUT.** Never tune on it, never use it to pick between
+  candidates; it is reserved for milestone evaluations, and any run on it is
+  recorded as a validation result (see `docs/DATASET.md`).
+
+| sequence | config (`src/meridian_ros/config/`) | role |
+|---|---|---|
+| quad-easy | `newer-college-quad.yaml` | routine validation |
+| math-medium | `newer-college-math.yaml` | pre-commit pass |
+| park | `newer-college-park.yaml` | pre-commit pass |
+| quad-hard | `newer-college-quad.yaml` | **HOLDOUT** — milestones only |
+
+The configs differ per collection (the rig was recalibrated between them);
+never run park with the quad config.
+
+## 0. Build + unit gates
 
 ```bash
-colcon build --symlink-install            # Linux/GPU box
+colcon build --symlink-install
 source install/setup.bash
+colcon test --packages-select meridian_frontend meridian_pipeline meridian_config \
+  && colcon test-result --verbose
 ```
 
-## 1. Get a sequence
+The front-end unit/integration tests (spline, IMU/LiDAR residual parity,
+marginalization, oracle differential) must be green before judging a bag run.
 
-FusionPortable is the primary development dataset (`docs/DATASET.md`). Start with a
-handheld/campus sequence — `20220216_garden_day` is the bring-up reference. Download
-the ROS1 bag (and the Kalibr calibration files) from the FusionPortable dataset site
-(linked from the paper in `docs/DATASET.md`).
+## 1. Preflight
 
-## 2. Convert ROS1 → ROS2
+Follow the preflight in `docs/REALTIME_DEBUGGING.md` before trusting any
+number — in short: quiet box (load ≲ 1), no ghost `odometry_node`, and the
+`TRANSPORT LOSS` gate in the node log must stay silent for the whole run. The
+runner refuses to start while a stale node is alive, but it cannot see
+background load for you.
 
-The datasets ship as ROS 1 bags; convert once with the `rosbags` tool (pure Python,
-no ROS 1 install needed):
+## 2. Headless run + ATE (the canonical loop)
 
 ```bash
-pip install rosbags
-rosbags-convert --src 20220216_garden_day.bag --dst bags/garden_day
+tools/run_bag_headless.sh /tmp/nc_quad_easy          # defaults: quad-easy bag + quad config
+python3 tools/eval_ate.py \
+    bags/newer-college/gt/tum_asimu/gt-nc-quad-easy.csv /tmp/nc_quad_easy/traj_tum.txt
 ```
 
-## 3. Confirm the topic names
+The runner starts the node headless, plays the bag with the player-side QoS
+override (`tools/replay_qos_overrides.yaml` — reliable LiDAR writer, paired
+with `sensors.lidar.qos_reliable: true` in the configs), records the TUM
+trajectory plus `node.log` / `events.yaml` / `timing.yaml` / `telemetry.yaml`,
+and verifies the node died. Other sequences:
 
 ```bash
-ros2 bag info bags/garden_day
+BAG=bags/newer-college/math-medium CONFIG=src/meridian_ros/config/newer-college-math.yaml \
+  tools/run_bag_headless.sh /tmp/nc_math_medium
+BAG=bags/newer-college/park CONFIG=src/meridian_ros/config/newer-college-park.yaml \
+  tools/run_bag_headless.sh /tmp/nc_park
 ```
 
-The default config (`src/meridian_ros/config/fusionportable.yaml`) expects:
+**Ground truth:** always score against `gt/tum_asimu/*.csv` (GT re-expressed in
+the Alphasense-IMU estimation frame), never `gt/tum/`. The `tum_asimu` files
+are plain TUM (`stamp x y z qx qy qz qw`, whitespace-separated, no header) —
+`eval_ate.py` reads them directly, no conversion step.
 
-| sensor | topic |
-|---|---|
-| LiDAR (Ouster OS1-128) | `/os_cloud_node/points` |
-| IMU | `/imu/data` |
-| camera (left) | `/stereo/left/image` |
-| GNSS (disabled by default) | `/ublox/fix` |
+Healthy quad-easy run, for calibration of expectations: all ~1991 scans reach
+the node (`wrapper/lidar/cb_n` ≈ published count, `lost_upstream_n` = 0), no
+`TRANSPORT LOSS` warning, no window restarts, `pipeline/q_meas_dropped` absent
+or ~0, ATE in the 0.1–0.3 m band (LIO-only reference: ~0.2 m rmse full bag).
 
-If your bag differs, edit the four `topic:` keys. While there, paste the Kalibr
-LiDAR-IMU extrinsic into `sensors.lidar.extrinsic_T/extrinsic_R` (identity is fine
-for a first visual check, required before judging geometry).
+## 3. Interactive run (rviz)
 
-## 4. Run
-
-Terminal A — the node (+ rviz):
+Terminal A — the node (+ rviz, fixed frame `odom`):
 
 ```bash
-ros2 launch meridian_ros meridian.launch.py \
-    config_file:=$(pwd)/src/meridian_ros/config/fusionportable.yaml \
-    use_sim_time:=true rviz:=true
+ros2 launch meridian_ros meridian.launch.py use_sim_time:=true rviz:=true
+# config_file:=$(pwd)/src/meridian_ros/config/<other>.yaml for non-quad sequences
 ```
 
-Terminal B — the bag, publishing the sim clock:
+Terminal B — the bag, publishing the sim clock, with the same QoS override the
+runner uses (without it, best-effort delivery silently drops scans):
 
 ```bash
-ros2 bag play bags/garden_day --clock
+ros2 bag play bags/newer-college/quad-easy --clock \
+    --qos-profile-overrides-path tools/replay_qos_overrides.yaml
 ```
 
-## 5. What you should see
+What you should see:
 
-- **rviz** (fixed frame `body`): the deskewed sweep streaming on
-  `/meridian/cloud_body`, coloured by intensity. (No TF yet — there is no pose
-  estimate until the L2 front-end lands; each sweep is shown in the body frame at
-  its own scan-end.)
-- **Node log**: a `group #N: ... deskewed=1` line every 5 s, and a
-  `preprocess/imu_init_done` event once the static IMU init converges. The init
-  needs ~10 IMU samples with the rig near-still; sequences that start in motion
-  retry until a quiet window appears (watch `/meridian/events`).
-- **Telemetry**:
+- **World-stable geometry**: walls/ground in `/meridian/cloud_registered` stay
+  put as the rig moves — no smearing or swimming per sweep.
+- **Smooth odom track**: `/meridian/odom` traces a continuous path, no
+  teleports; the stationary start holds still.
+- **Events**: one `preprocess/imu_init_done` (static init needs the ~10 s
+  still period at the sequence start), recurring `frontend/keyframe`, and
+  **no** window-restart / no-effective-points events.
 
 ```bash
-ros2 topic echo /meridian/stage_timing          # preprocess + deskew wall time
-ros2 topic echo /meridian/telemetry             # rates, group sizes, queue gauges
-ros2 topic echo /meridian/events                # init / health / drop events
-```
-
-- **Runtime debug control** (no restart):
-
-```bash
-ros2 service call /meridian/set_debug_key meridian_msgs/srv/SetDebugKey \
-    "{key: 'body/scan', enable: true, max_hz: 5.0}"
-ros2 service call /meridian/set_log_level meridian_msgs/srv/SetLogLevel \
-    "{module: '', level: 1}"
+ros2 topic hz /meridian/odom               # ≈10 Hz (sweep rate)
+ros2 topic echo /meridian/events           # init / health / drop events
+ros2 topic echo /meridian/stage_timing     # per-stage wall time (assoc/solve/marg/map)
+ros2 topic echo /meridian/telemetry        # rates, queue gauges, waterfall counters
 ```
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| `dropping scan: missing ... per-point time field` | wrong LiDAR topic, or the bag's cloud has no `t`/`time` field — check `ros2 bag info` and the field list with `ros2 topic echo --once <topic> \| head` |
-| no `/meridian/cloud_body` | IMU init not converged (see `/meridian/events`), or `debug.publish_clouds: false` |
-| health events report degraded sync | expected in bag replay: there is no live PTP discipline, recorded stamps pass through unchanged |
+| `TRANSPORT LOSS` in the node log | QoS pairing broken — player override not passed, or `sensors.lidar.qos_reliable` edited; see `docs/REALTIME_DEBUGGING.md` |
+| `q_meas_dropped` / `window_restart` events | overload — triage with the stage-timing budget in `docs/REALTIME_DEBUGGING.md` |
+| `dropping scan: missing ... per-point time field` | wrong LiDAR topic, or a bag prepared without the verification pass in `docs/DATASET.md` |
 | nothing at all | `use_sim_time:=true` on the node but the bag played without `--clock` (or vice versa) |
-
-## Scope note
-
-This exercises sensing + preprocessing (Phase 1). Odometry, TF, the map and drift
-metrics arrive with the L2 front-end and later layers; the evaluation harness
-(`docs/specs/10_evaluation_harness.md`) then replays the same sequences off-ROS for
-ATE/RPE scoring.
-
-## Front-end verification
-
-The L2 CT front-end now runs inside the pipeline (`frontend.kind: ct_livo` in the
-config). It owns a trajectory, so rviz's fixed frame is `odom`, the node publishes
-the `odom -> body` TF, and `/meridian/cloud_registered` is the world-stable map view.
-The body-frame `/meridian/cloud_body` stays available (rviz display **DeskewedBodyScan**,
-disabled by default) as a debug view.
-
-### Build/test gates
-
-```bash
-colcon test --packages-select meridian_frontend && colcon test-result --verbose
-colcon test --packages-select meridian_pipeline meridian_config
-```
-
-The front-end's own unit/integration tests (spline, IMU/LiDAR residuals,
-marginalization, oracle differential) must be green before judging a bag run.
-
-### Bag run
-
-Same launch as above (`fusionportable.yaml` already carries the `frontend:` block).
-
-```bash
-ros2 launch meridian_ros meridian.launch.py \
-    config_file:=$(pwd)/src/meridian_ros/config/fusionportable.yaml \
-    use_sim_time:=true rviz:=true
-ros2 bag play bags/garden_day --clock          # second terminal
-```
-
-### Visual checklist (rviz, fixed frame `odom`)
-
-- **World-stable geometry**: walls/ground in `/meridian/cloud_registered` stay put as
-  the rig moves — they do not smear or swim with each sweep.
-- **Smooth odom track**: the **Odometry** arrows (`/meridian/odom`, last ~100) trace a
-  continuous path with no teleports between sweeps.
-- **Stationary start holds**: while the rig is still at the start, the `odom -> body`
-  TF and the odom track do not drift.
-- **No restarts**: `/meridian/events` shows the one-time `preprocess/imu_init_done` and
-  recurring `frontend/keyframe`, and **no** window-restart / no-effective-points events.
-
-### Topic checklist
-
-```bash
-ros2 topic hz /meridian/odom               # ~ sweep rate (≈10 Hz on this bag)
-ros2 topic hz /meridian/cloud_registered   # heavy key, rate-limited (≈2 Hz)
-ros2 topic echo /meridian/odom --once      # pose in frame_id "odom", child "body"
-ros2 run tf2_ros tf2_echo odom body        # the live transform, updating at sweep rate
-ros2 topic echo /meridian/telemetry        # frontend/keyframe_count climbs; queue gauges
-```
-
-Expected ranges: `/meridian/odom` near the LiDAR rate; `pipeline/q_meas_dropped` should
-stay absent (front-end keeps up); `frontend/keyframe_count` increments roughly on the
-keyframe cadence (`frontend.keyframe.{dist_m,rot_deg,time_s}`).
-
-### TUM export + ATE
-
-Record the track to a TUM file (runs inside the box; flushes on Ctrl-C):
-
-```bash
-python3 tools/record_tum.py /tmp/meridian_odom.tum     # start before the bag
-# ... play the bag, Ctrl-C the recorder when it finishes ...
-```
-
-Compare against the FusionPortable ground truth with `evo` (optional — not assumed
-installed; `pip install evo` if missing):
-
-```bash
-evo_ape tum GT.tum /tmp/meridian_odom.tum -a            # align (Sim(3)) and report ATE
-```
-
-The ground-truth TUM comes with the sequence (see `docs/DATASET.md`); `-a` removes the
-arbitrary odom-origin offset before scoring.
+| ATE meters-scale on a healthy log | wrong per-collection config for the sequence, or scored against `gt/tum/` instead of `gt/tum_asimu/` |

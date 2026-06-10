@@ -15,7 +15,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     share = get_package_share_directory('meridian_ros')
-    default_config = os.path.join(share, 'config', 'fusionportable.yaml')
+    default_config = os.path.join(share, 'config', 'newer-college-quad.yaml')
     default_rviz = os.path.join(share, 'rviz', 'meridian.rviz')
 
     config_file = LaunchConfiguration('config_file')

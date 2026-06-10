@@ -29,7 +29,7 @@ single source of truth never drifts. When in doubt, follow the spec, not this fi
   **Appendix R**, verified against the clones in `/home/user/slam-reference`; these
   describe *those* systems, not Meridian's API.
 - `docs/DEVELOPMENT.md` — the dev-environment runbook (summarised below).
-- `docs/TESTING.md` — running the system against a dataset bag (FusionPortable).
+- `docs/TESTING.md` — running the system against a dataset bag (Newer College).
 
 ## Dev environment & commands
 

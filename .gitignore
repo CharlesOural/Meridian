@@ -18,3 +18,4 @@ _reference/
 # vcs-imported source deps land under src/ (nvblox, ouster-ros) — not versioned here
 /src/nvblox/
 /src/ouster-ros/
+__pycache__/
