@@ -56,3 +56,4 @@ The Jetson is slower per core — these are the dials to recover headroom there.
 | `kMaxInsertRangeM` (ct_frontend.cpp:1160) | 200 | map-insert sanity bound [m] from anchor |
 | `kHuberWhitened` (residuals_lidar/visual.cpp) | 1.0 | robust-kernel knee on the whitened (unit-variance) residual |
 | `VisualMapConfig` defaults (visual_map.hpp) | ref_obs_cap 30, ref_add_angle 10°, ref_converged_obs 8 / 30°, grid_cell_px 32, depth_continuity_m 0.5 | visual-point reference-patch lifecycle; not yet config-exposed |
+| `kMaxExpansions` (backend/max_clique.cpp) | 200000 | PCM exact max-clique work budget; above it the bounded Bron–Kerbosch abandons the exact search and falls back to the greedy clique (FM-4). Deterministic (expansion count, not wall-clock). Raise only if a real loop set needs a larger exact search. |

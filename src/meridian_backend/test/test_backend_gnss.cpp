@@ -31,7 +31,7 @@ using meridian::backend::testing::SynthOptions;
 
 namespace {
 
-constexpr const char* kDatumLockedEvent = "backend/datum_locked";
+constexpr const char* kDatumLockedEvent = "backend/gnss/datum_locked";
 
 // A GNSS-bearing config: enable the datum path and relax decimation so the test can drive
 // a dense, well-excited fix stream without fighting the spacing/confidence gates. The

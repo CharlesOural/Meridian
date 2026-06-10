@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "meridian/calib/calibration_set.hpp"
@@ -43,6 +44,10 @@ public:
   // Marginal covariance of the latest keyframe pose, translation-first [rho; phi];
   // nullopt before the first optimize().
   virtual std::optional<PoseCov6> latest_pose_marginal() const = 0;
+
+  // Debug snapshot: writes the current graph (pose vertices + relative edges) to a .g2o file.
+  // A best-effort hook for offline inspection; failures are logged, not thrown.
+  virtual void write_g2o(const std::string& path) const = 0;
 };
 
 std::unique_ptr<IBackEnd> makeBackEnd(const BackendConfig& cfg,

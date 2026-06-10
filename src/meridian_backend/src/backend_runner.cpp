@@ -7,7 +7,7 @@
 // Usage:
 //   backend_runner <config.yaml> <packets.bin> <out.tum>
 //                  [--inject-loops <loops.yaml>] [--online-tum <file>]
-//                  [--max-keyframes N]
+//                  [--max-keyframes N] [--g2o <out.g2o>]
 #include <yaml-cpp/yaml.h>
 
 #include <Eigen/Core>
@@ -39,7 +39,7 @@ int usage() {
   std::fprintf(stderr,
                "usage: backend_runner <config.yaml> <packets.bin> <out.tum>\n"
                "                      [--inject-loops <loops.yaml>] [--online-tum <file>]\n"
-               "                      [--max-keyframes N]\n");
+               "                      [--max-keyframes N] [--g2o <out.g2o>]\n");
   return 2;
 }
 
@@ -114,6 +114,7 @@ int main(int argc, char** argv) {
 
   std::string loops_path;
   std::string online_path;
+  std::string g2o_path;
   std::uint64_t max_keyframes = 0;  // 0 = unlimited
   for (int arg = 4; arg < argc; ++arg) {
     const std::string_view a = argv[arg];
@@ -127,6 +128,8 @@ int main(int argc, char** argv) {
       } catch (const std::exception&) {
         return usage();
       }
+    } else if (a == "--g2o" && arg + 1 < argc) {
+      g2o_path = argv[++arg];
     } else {
       return usage();
     }
@@ -205,6 +208,10 @@ int main(int argc, char** argv) {
       write_tum_line(out, sp.stamp, sp.T_map_body);
     }
     out.flush();
+
+    if (!g2o_path.empty()) {
+      backend->write_g2o(g2o_path);
+    }
 
     const BackEndDiagnostics d = backend->diagnostics();
     std::fprintf(stderr,

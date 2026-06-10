@@ -56,6 +56,7 @@ public:
   BackEndDiagnostics diagnostics() const override;
   bool wants_immediate_optimize() const override;
   std::optional<PoseCov6> latest_pose_marginal() const override;
+  void write_g2o(const std::string& path) const override;
 
   // Test seam: appends directly to the staged batch the next optimize() folds.
   void stage_for_test(gtsam::NonlinearFactorGraph graph, gtsam::Values values);

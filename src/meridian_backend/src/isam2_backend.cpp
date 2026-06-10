@@ -8,6 +8,7 @@
 #include <gtsam/navigation/ImuBias.h>
 #include <gtsam/nonlinear/PriorFactor.h>
 #include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/slam/dataset.h>
 
 #include <Eigen/Core>
 #include <algorithm>
@@ -37,6 +38,9 @@
 namespace meridian::backend {
 
 namespace {
+
+// A fold relinearizing more than this many variables is flagged as a loop-thrash / bad-fold event.
+constexpr int kRelinEventThresh = 20;
 
 TelemetrySink* fallback_sink() {
   static NullSink sink;
@@ -255,7 +259,7 @@ void Isam2BackEnd::add_loop_constraint(const LoopConstraint& lc) {
   // geometric match is unlikely to be consistent and only inflates the consistency graph.
   if (lc.fitness < cfg_.loop_min_fitness) {
     ++diag_.num_loops_rejected;
-    sink_->event(Level::Info, kTeleLoopRejected,
+    sink_->event(Level::Info, kTeleLoopRejectedPcm,
                  "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) +
                      " fitness " + std::to_string(lc.fitness) + " below floor; dropped",
                  tele_stamp());
@@ -292,7 +296,7 @@ void Isam2BackEnd::process_pending_loops(Timestamp ts) {
     publish_loop_marker(lc, /*accepted=*/false, ts);
     pcm_.mark_rejected(h);
     ++diag_.num_loops_rejected;
-    sink_->event(Level::Info, kTeleLoopRejected,
+    sink_->event(Level::Info, kTeleLoopRejectedPcm,
                  "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) +
                      " PCM-inconsistent; dropped",
                  ts);
@@ -339,7 +343,7 @@ void Isam2BackEnd::finalize_pending_loops(const gtsam::ISAM2Result& result, Time
     const LoopConstraint& lc = pcm_.at(handle);
     publish_loop_marker(lc, /*accepted=*/true, ts);
     sink_->event(
-        Level::Info, kTeleLoopAdmitted,
+        Level::Info, kTeleLoopAccepted,
         "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) + " admitted", ts);
   }
   for (const std::size_t handle : staged_evict_handles_) {
@@ -447,7 +451,7 @@ void Isam2BackEnd::run_gnc_consolidation(Timestamp ts) {
     staged_gnc_reject_handles_.push_back(handle);
   }
   if (!staged_gnc_reject_handles_.empty()) {
-    sink_->event(Level::Info, kTeleLoopConsolidate,
+    sink_->event(Level::Info, kTeleLoopRejectedGnc,
                  "batch GNC flagged " + std::to_string(staged_gnc_reject_handles_.size()) +
                      " loop(s) for removal",
                  ts);
@@ -804,10 +808,20 @@ GraphUpdate Isam2BackEnd::optimize() {
 
   sink_->scalar(kTeleChi2, diag_.chi2, ts);
   sink_->scalar(kTeleNFactors, static_cast<double>(isam2_->getFactorsUnsafe().size()), ts);
+  sink_->scalar(kTeleNLoops, static_cast<double>(diag_.num_loops), ts);
+  sink_->scalar(kTeleNGnss, static_cast<double>(diag_.num_gnss_factors), ts);
   sink_->scalar(kTeleUpdateMs, diag_.isam_update_ms, ts);
   sink_->scalar(kTeleRelinCount, static_cast<double>(diag_.variables_relinearized), ts);
   sink_->scalar(kTeleOptimizeLag, static_cast<double>(folded), ts);
   sink_->timing("backend.optimize", diag_.isam_update_ms, ts);
+  // A fold that relinearizes a large fraction of the trajectory is the loop-thrash / bad-fold
+  // signature worth flagging for the operator, with the Bayes-tree size for context.
+  if (diag_.variables_relinearized > kRelinEventThresh) {
+    sink_->event(Level::Debug, kTeleRelinearize,
+                 "relinearized " + std::to_string(diag_.variables_relinearized) + " of " +
+                     std::to_string(isam2_->getFactorsUnsafe().size()) + " factors",
+                 ts);
+  }
 
   new_graph_.resize(0);
   new_values_.clear();
@@ -932,6 +946,30 @@ std::optional<PoseCov6> Isam2BackEnd::latest_pose_marginal() const {
     return std::nullopt;
   }
   return marginal_cache_;
+}
+
+void Isam2BackEnd::write_g2o(const std::string& path) const {
+  // Export only the pose sub-graph: Pose3 vertices for every estimated keyframe plus the
+  // relative (between/loop) edges. Velocity/bias/GNSS/gauge factors are not g2o-representable,
+  // so filtering them keeps the snapshot a clean, loadable trajectory graph.
+  gtsam::Values poses;
+  for (const std::uint64_t id : kf_order_) {
+    if (estimate_cache_.exists(keyX(id))) {
+      poses.insert(keyX(id), estimate_cache_.at<gtsam::Pose3>(keyX(id)));
+    }
+  }
+  gtsam::NonlinearFactorGraph edges;
+  for (const auto& f : isam2_->getFactorsUnsafe()) {
+    if (f && boost::dynamic_pointer_cast<gtsam::BetweenFactor<gtsam::Pose3>>(f)) {
+      edges.push_back(f);
+    }
+  }
+  try {
+    gtsam::writeG2o(edges, poses, path);
+  } catch (const std::exception& e) {
+    sink_->event(Level::Warn, "backend/g2o_snapshot",
+                 std::string("g2o snapshot failed: ") + e.what(), tele_stamp());
+  }
 }
 
 void Isam2BackEnd::stage_for_test(gtsam::NonlinearFactorGraph graph, gtsam::Values values) {

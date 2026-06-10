@@ -2,7 +2,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "meridian/backend/ibackend.hpp"
@@ -165,7 +167,7 @@ TEST(BackendSpine, LoopGateRejectsLowFitness) {
   // A default LoopConstraint has fitness 0, below the floor, so it is rejected at the gate
   // before ever reaching PCM (the admit/evict path is exercised in test_backend_loops).
   be->add_loop_constraint(LoopConstraint{});
-  EXPECT_EQ(sink.count("backend/loop_rejected"), 1);
+  EXPECT_EQ(sink.count("backend/loop_rejected_pcm"), 1);
   EXPECT_EQ(be->diagnostics().num_loops_rejected, 1u);
   EXPECT_EQ(be->diagnostics().num_loops, 0u);
 
@@ -232,4 +234,33 @@ TEST(BackendSpine, MalformedRestartRejected) {
   feed(*be, chain.packets[4]);
   be->optimize();
   EXPECT_EQ(trajIds(be->corrected_trajectory()), (std::vector<std::uint64_t>{0, 1, 2}));
+}
+
+// The .g2o snapshot writes one SE3 vertex per estimated keyframe and is loadable text.
+TEST(BackendSpine, G2oSnapshot) {
+  SynthOptions opt;
+  opt.n = 12;
+  const SynthChain chain = make_chain(opt);
+
+  CountingSink sink;
+  auto be = makeBackend(&sink);
+  for (const KeyframePacket& p : chain.packets) {
+    feed(*be, p);
+    be->optimize();
+  }
+
+  const std::string path = "/tmp/meridian_spine_snapshot.g2o";
+  be->write_g2o(path);
+
+  std::ifstream f(path);
+  ASSERT_TRUE(f.good());
+  int vertices = 0;
+  int edges = 0;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.rfind("VERTEX_SE3", 0) == 0) ++vertices;
+    if (line.rfind("EDGE_SE3", 0) == 0) ++edges;
+  }
+  EXPECT_EQ(vertices, opt.n);
+  EXPECT_EQ(edges, opt.n - 1);  // one between-edge per consecutive pair
 }

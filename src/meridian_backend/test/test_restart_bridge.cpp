@@ -92,7 +92,7 @@ TEST(RestartBridge, BridgeAcceptedAfterNormal) {
   feed(*be, restart);
   EXPECT_NO_THROW(be->optimize());
 
-  EXPECT_GE(sink.count("backend/restart_bridge"), 1);
+  EXPECT_GE(sink.count("backend/window_restart_bridge"), 1);
   const auto traj = be->corrected_trajectory();
   EXPECT_EQ(traj.size(), 3u);
   EXPECT_TRUE(trajHasId(traj, 2));

@@ -94,3 +94,36 @@ IMU factor is still autodiff.
   silently runs mixed-version code. Finish or kill replays first.
 - Runner plays `bags/canteen_day_fixed` (column-clock-repaired). A raw download has
   unrepaired per-point LiDAR times.
+
+## Back-end (L3) & GNSS-referenced harness
+
+The back-end has its own offline loop, decoupled from the front-end replay, via
+`tools/backend_dev.sh` (every subcommand runs inside the `meridian` container):
+
+```bash
+# Dump the front-end's back-end input stream once (keyframes + GNSS + loops), then iterate
+# on the back-end alone at ~thousands of folds/second (no front-end, no ROS):
+backend_dev.sh dump  <cfg> <bag_dir> bags/run            # -> bags/run.packets.bin (+ .index.txt)
+backend_dev.sh run   <cfg> bags/run.packets.bin out.tum  # [--inject-loops L.yaml] [--g2o g.g2o]
+backend_dev.sh check <cfg> bags/run.packets.bin          # byte-determinism + identity property
+backend_dev.sh loops bags/run.packets.bin.index.txt L.yaml --gt GT.tum   # truth-anchored loops
+```
+
+`backend_runner --g2o <file>` dumps the pose sub-graph (SE3 vertices + relative edges) for
+offline inspection. Key back-end telemetry: `backend/chi2` (graph health), `backend/update_ms`,
+`backend/relin_count` + the `backend/relinearize` event (loop-thrash), `backend/n_loops` /
+`backend/n_gnss`, `backend/fallback_count` (FM-3b rebuilds — a field-survival alarm), the
+`backend/loop_edge` marker (green accepted / red rejected), and `backend/gnss/datum_locked`.
+
+**GNSS as a drift reference (no GT file needed).** When a sequence has GNSS, the fixes are an
+independent absolute reference for the *front-end*:
+
+```bash
+# Capped front-end replay -> packet dump -> front-end drift vs GNSS (rmse_fit is the A/B metric):
+backend_dev.sh gnss-eval <cfg> <bag_dir> <max_secs> [--fit-window-s S] [--onset-thresh M]
+```
+
+It fits the 4-DoF map<-ENU datum on an early trusted window (the same fit the back-end locks)
+and reports residual growth; `rmse_fit` is the baseline drift a tuning A/B minimises and
+`onset_kf` is the divergence onset GNSS sees. Cross-checked against the back-end datum lock
+(fitted yaw matches to <0.2°).
