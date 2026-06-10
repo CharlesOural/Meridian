@@ -42,7 +42,7 @@ ament_target_dependencies(odometry_node
 
 find_package(rosbag2_cpp REQUIRED)
 add_executable(replay_runner src/replay_runner.cpp)
-target_link_libraries(replay_runner meridian_ros_support)
+target_link_libraries(replay_runner meridian_ros_support meridian_debug::meridian_debug)
 ament_target_dependencies(replay_runner rclcpp sensor_msgs rosbag2_cpp)
 
 install(TARGETS odometry_node replay_runner DESTINATION lib/${PROJECT_NAME})

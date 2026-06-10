@@ -7,8 +7,10 @@ include(MeridianToolchain)
 include(MeridianDeps)            # Eigen3::Eigen, Sophus::Sophus
 
 find_package(meridian_common REQUIRED)
+find_package(meridian_config REQUIRED)
 
 add_library(meridian_calib
+  src/calibration_from_config.cpp
   src/calibration_store.cpp
   src/camera_model.cpp)
 
@@ -21,6 +23,7 @@ meridian_apply_warnings(meridian_calib)
 
 target_link_libraries(meridian_calib PUBLIC
   meridian_common::meridian_common
+  meridian_config::meridian_config
   Eigen3::Eigen Sophus::Sophus)
 
 
@@ -29,7 +32,7 @@ install(TARGETS meridian_calib EXPORT meridian_calibTargets
         ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 
 ament_export_targets(meridian_calibTargets HAS_LIBRARY_TARGET)
-ament_export_dependencies(meridian_common Eigen3 Sophus)
+ament_export_dependencies(meridian_common meridian_config Eigen3 Sophus)
 
 if(BUILD_TESTING)
   include(MeridianTesting)

@@ -10,10 +10,10 @@
 //
 // Usage:
 //   replay_runner <config.yaml> <bag_dir> <out.tum> [max_content_secs]
-#include <algorithm>
+//                 [--dump-keyframes <packets.bin>] [--dump-clouds]
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
-#include <map>
 #include <memory>
 #include <optional>
 #include <rclcpp/serialization.hpp>
@@ -27,12 +27,16 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "conversions/ros2core.hpp"
 #include "meridian/config/config_loader.hpp"
-#include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/file_sink.hpp"
+#include "meridian/debug/packet_log.hpp"
+#include "meridian/debug/tum_writer.hpp"
 #include "meridian/pipeline/meridian_pipeline.hpp"
 
 namespace {
@@ -46,89 +50,46 @@ Msg deserialize(const rosbag2_storage::SerializedBagMessageSharedPtr& bag_msg) {
   return msg;
 }
 
-// File-backed telemetry: events, scalars/vecs, and per-stage timing land in text
-// files in the same block layout `ros2 topic echo` produces, so the offline
-// analyzers parse a replay exactly like a live capture. Heavy payloads
-// (clouds/markers/images) are dropped.
-class FileSink final : public meridian::TelemetrySink {
-public:
-  FileSink(const std::string& events_path, const std::string& telemetry_path,
-           std::string stage_path)
-      : ev_(events_path), tm_(telemetry_path), stage_path_(std::move(stage_path)) {}
-
-  ~FileSink() override {
-    std::ofstream st(stage_path_);
-    for (const auto& [stage, s] : stages_) {
-      st << "stage: " << stage << "\nms: " << s.last << "\nms_avg: " << (s.sum / s.n)
-         << "\nms_max: " << s.maxv << "\ncount: " << s.n << "\n---\n";
-    }
-  }
-
-  bool enabled(const char*) const override { return true; }
-
-  void scalar(const char* key, double v, meridian::Timestamp t) override {
-    stamp(tm_, t);
-    tm_ << "key: " << key << "\nvalues:\n- " << v << "\naxis_order: ''\n---\n";
-  }
-
-  void vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v, meridian::Timestamp t,
-           const char* axis_order) override {
-    stamp(tm_, t);
-    tm_ << "key: " << key << "\nvalues:\n";
-    for (Eigen::Index i = 0; i < v.size(); ++i) {
-      tm_ << "- " << v(i) << '\n';
-    }
-    tm_ << "axis_order: " << (axis_order ? axis_order : "''") << "\n---\n";
-  }
-
-  void cloud(const char*, const meridian::PointCloudView&, meridian::Frame,
-             meridian::Timestamp) override {}
-  void pose(const char*, const meridian::Pose&, meridian::Frame, meridian::Timestamp) override {}
-  void marker(const meridian::Marker&, meridian::Timestamp) override {}
-  void image(const char*, const meridian::ImageOverlay&, meridian::Timestamp) override {}
-
-  void timing(const char* stage, double ms, meridian::Timestamp) override {
-    auto& s = stages_[stage];
-    s.sum += ms;
-    s.maxv = std::max(s.maxv, ms);
-    s.last = ms;
-    ++s.n;
-  }
-
-  void event(meridian::Level lvl, const char* tag, std::string_view msg,
-             meridian::Timestamp t) override {
-    stamp(ev_, t);
-    ev_ << "level: " << static_cast<int>(lvl) << "\ntag: " << tag << "\nmessage: " << msg
-        << "\n---\n";
-  }
-
-private:
-  struct Stat {
-    double sum = 0, maxv = 0, last = 0;
-    std::uint64_t n = 0;
-  };
-  static void stamp(std::ofstream& o, meridian::Timestamp t) {
-    const auto tt = t > 0 ? t : 0;
-    o << "stamp:\n  sec: " << tt / 1000000000LL << "\n  nanosec: " << tt % 1000000000LL << '\n';
-  }
-  std::ofstream ev_, tm_;
-  std::string stage_path_;
-  std::map<std::string, Stat> stages_;
-};
+int usage() {
+  std::fprintf(stderr,
+               "usage: replay_runner <config.yaml> <bag_dir> <out.tum> [max_content_secs]\n"
+               "                     [--dump-keyframes <packets.bin>] [--dump-clouds]\n");
+  return 2;
+}
 
 }  // namespace
 
 int main(int argc, char** argv) {
   using namespace meridian;
-  if (argc < 4 || argc > 5) {
-    std::fprintf(stderr,
-                 "usage: replay_runner <config.yaml> <bag_dir> <out.tum> [max_content_secs]\n");
-    return 2;
+  if (argc < 4) {
+    return usage();
   }
   const std::string config_path = argv[1];
   const std::string bag_path = argv[2];
   const std::string out_path = argv[3];
-  const double max_secs = argc == 5 ? std::stod(argv[4]) : 0.0;
+
+  // argv[4] is max_content_secs iff present and not an option; everything after is flags.
+  double max_secs = 0.0;
+  std::string dump_path;
+  bool dump_clouds = false;
+  int arg = 4;
+  if (arg < argc && std::string_view(argv[arg]).substr(0, 2) != "--") {
+    max_secs = std::stod(argv[arg++]);
+  }
+  for (; arg < argc; ++arg) {
+    const std::string_view a = argv[arg];
+    if (a == "--dump-keyframes" && arg + 1 < argc) {
+      dump_path = argv[++arg];
+    } else if (a == "--dump-clouds") {
+      dump_clouds = true;
+    } else {
+      return usage();
+    }
+  }
+  if (dump_clouds && dump_path.empty()) {
+    std::fprintf(stderr, "error: --dump-clouds requires --dump-keyframes\n");
+    return usage();
+  }
 
   Config cfg = load_config_yaml(config_path);
   cfg.pipeline.mode = PipelineMode::Replay;  // synchronous + deterministic, regardless of file
@@ -143,9 +104,7 @@ int main(int argc, char** argv) {
   const std::string stem = out_path.size() > 4 && out_path.substr(out_path.size() - 4) == ".tum"
                                ? out_path.substr(0, out_path.size() - 4)
                                : out_path;
-  MeridianPipeline pipeline(
-      cfg, std::make_unique<FileSink>(stem + "_events.txt", stem + "_telemetry.txt",
-                                      stem + "_stage.txt"));
+  MeridianPipeline pipeline(cfg, make_file_sink(stem));
   std::uint64_t groups = 0;
   pipeline.set_group_sink([&](PreprocessedGroup&&) {
     // Replay runs the group sink on this thread, where live_state() is valid.
@@ -153,19 +112,34 @@ int main(int argc, char** argv) {
     if (s.stamp <= 0) {
       return;  // pre-init groups carry a zero state; a t=0 pose would poison analysis
     }
-    const Pose& T = s.T_world_body;
-    out << std::fixed;
-    out.precision(9);
-    out << s.stamp * 1e-9 << ' ';
-    out.precision(6);
-    out << T.t.x() << ' ' << T.t.y() << ' ' << T.t.z() << ' ';
-    out.precision(9);
-    out << T.q.x() << ' ' << T.q.y() << ' ' << T.q.z() << ' ' << T.q.w() << '\n';
+    write_tum_line(out, s.stamp, s.T_world_body);
     if (++groups % 250 == 0) {
       std::fprintf(stderr, "  %llu groups\n", static_cast<unsigned long long>(groups));
       out.flush();
     }
   });
+  // Optional back-end input dump: every keyframe / anchored GNSS fix / loop closure
+  // the back-end would consume, recorded in feed order for offline replay.
+  std::unique_ptr<PacketLogWriter> packet_log;
+  std::uint64_t kf_dumped = 0;
+  if (!dump_path.empty()) {
+    packet_log = std::make_unique<PacketLogWriter>(dump_path, dump_clouds);
+    pipeline.set_backend_tap([&](const MeridianPipeline::BackendItem& item) {
+      std::visit(
+          [&](const auto& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, KeyframePacket>) {
+              packet_log->write_keyframe(v);
+              ++kf_dumped;
+            } else if constexpr (std::is_same_v<T, MeridianPipeline::GnssForBackend>) {
+              packet_log->write_gnss(v.fix, v.nearest_kf_id);
+            } else {  // LoopConstraint
+              packet_log->write_loop(v);
+            }
+          },
+          item);
+    });
+  }
   pipeline.start();  // no-op in replay; keeps the call sequence identical to live
 
   rosbag2_cpp::readers::SequentialReader reader;
@@ -216,8 +190,13 @@ int main(int argc, char** argv) {
   }
   pipeline.stop();
   out.flush();
+  packet_log.reset();  // flush + close the dump before reporting it
   std::fprintf(stderr, "replay done: %llu messages, %llu groups -> %s\n",
                static_cast<unsigned long long>(n_msgs), static_cast<unsigned long long>(groups),
                out_path.c_str());
+  if (!dump_path.empty()) {
+    std::fprintf(stderr, "  dumped %llu keyframes -> %s\n",
+                 static_cast<unsigned long long>(kf_dumped), dump_path.c_str());
+  }
   return 0;
 }

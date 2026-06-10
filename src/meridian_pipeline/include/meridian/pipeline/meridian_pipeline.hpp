@@ -10,6 +10,7 @@
 #include <variant>
 
 #include "meridian/common/keyframe_packet.hpp"
+#include "meridian/common/loop_constraint.hpp"
 #include "meridian/common/measure_group.hpp"
 #include "meridian/common/nav_state.hpp"
 #include "meridian/common/preprocessed_group.hpp"
@@ -87,6 +88,20 @@ class MeridianPipeline {
   using KeyframeSink = std::function<void(KeyframePacket&&)>;
   void set_keyframe_sink(KeyframeSink sink);
 
+  // A GNSS fix on its way to the back-end, tagged with the id of the freshest keyframe
+  // at the time the fix's sweep was ingested (the fix's anchor in the pose graph).
+  struct GnssForBackend {
+    GnssFix fix;
+    std::uint64_t nearest_kf_id = 0;
+  };
+  // One item of the back-end input stream: a keyframe, a verified loop closure, or a
+  // tagged GNSS fix.
+  using BackendItem = std::variant<KeyframePacket, LoopConstraint, GnssForBackend>;
+  // Observes every back-end input item in feed order, on the front-end thread (Live) or
+  // the caller's thread (Replay). Set before start(); must not block.
+  using BackendTap = std::function<void(const BackendItem&)>;
+  void set_backend_tap(BackendTap tap);
+
   // The front-end's smooth odom-frame estimate at the latest valid time. Thread-confined
   // to the front-end thread; the group sink runs there, so reading this from within a
   // group-sink callback is safe.
@@ -126,6 +141,9 @@ class MeridianPipeline {
   // The front-end's keyframe callback: counts, raises telemetry, flips spline_active_ on
   // the first keyframe, and forwards to the wrapper sink.
   void on_keyframe(KeyframePacket&& kf);
+  // The single feed point of the back-end input stream; every item passes through here
+  // (and the tap, when set) in feed order.
+  void feed_backend(BackendItem&& item);
 
   Config cfg_;
   bool sync_mode_ = false;  // Replay: process inline, no thread/queue
@@ -164,6 +182,10 @@ class MeridianPipeline {
 
   GroupSink group_sink_;
   KeyframeSink keyframe_sink_;
+  BackendTap backend_tap_;
+  // Id of the most recent keyframe, the anchor GNSS fixes are tagged with; empty until
+  // the first keyframe. Thread-confined to the front-end thread (caller's in Replay).
+  std::optional<std::uint64_t> last_kf_id_;
   std::atomic<std::uint64_t> keyframe_count_{0};
   std::thread stage_thread_;
   std::thread frontend_thread_;

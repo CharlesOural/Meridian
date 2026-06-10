@@ -1,4 +1,6 @@
+#include <cstdint>
 #include <memory>
+#include <variant>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -9,9 +11,12 @@
 #include "meridian/sensors/raw_frames.hpp"
 
 using meridian::Config;
+using meridian::GnssFix;
+using meridian::KeyframePacket;
 using meridian::MeridianPipeline;
 using meridian::PipelineMode;
 using meridian::PreprocessedGroup;
+using meridian::RawGnssFrame;
 using meridian::RawImuFrame;
 using meridian::RawLidarFrame;
 using meridian::RawPoint;
@@ -76,6 +81,22 @@ struct Fixture {
     pipeline->ingest(f);
   }
 
+  // One healthy RTK fix that passes every gate check (strong fix type, enough sats,
+  // tight covariance; the velocity spoof check passes with no velocity source).
+  void push_gnss(Timestamp t) {
+    RawGnssFrame f;
+    f.gps_second_ns = t;
+    f.has_pps_reference = true;
+    f.host_arrival = t;
+    f.lat_deg = 48.0;
+    f.lon_deg = 2.0;
+    f.alt_m = 100.0;
+    f.cov_enu = Eigen::Matrix3d::Identity() * 0.01;
+    f.fix = GnssFix::FixType::RTK_Fixed;
+    f.num_sats = 12;
+    pipeline->ingest(f);
+  }
+
   Config cfg;
   RecordingSink* rec = nullptr;
   std::unique_ptr<MeridianPipeline> pipeline;
@@ -128,6 +149,50 @@ TEST(MeridianPipeline, BuffersSweepsUntilImuInitThenFlushesDeskewed) {
   for (const auto& c : fx.rec->clouds)
     if (c.key == std::string("body/scan")) saw_body_scan = true;
   EXPECT_TRUE(saw_body_scan);
+}
+
+TEST(MeridianPipeline, BackendTapSeesKeyframesThenAnchoredGnss) {
+  Fixture fx;
+  std::vector<MeridianPipeline::BackendItem> items;
+  fx.pipeline->set_backend_tap(
+      [&](const MeridianPipeline::BackendItem& item) { items.push_back(item); });
+  std::vector<std::uint64_t> sink_ids;
+  fx.pipeline->set_keyframe_sink(
+      [&](KeyframePacket&& kf) { sink_ids.push_back(kf.id); });
+
+  // Converge the IMU init, then one covered sweep carrying one accepted GNSS fix.
+  const Timestamp t0 = 1'000 * kMs;
+  for (int i = 0; i < 12; ++i) fx.push_imu(t0 + i * 10 * kMs);
+  fx.push_scan(t0 + 130 * kMs);
+  fx.push_gnss(t0 + 170 * kMs);
+  fx.push_imu(t0 + 240 * kMs);
+  fx.push_imu(t0 + 250 * kMs);
+  ASSERT_EQ(fx.groups.size(), 1u);
+
+  // The tap saw the same keyframes the wrapper sink did, in the same order, and each
+  // keyframe item was fed before the sink's move consumed it.
+  std::vector<std::uint64_t> tap_ids;
+  for (const auto& item : items) {
+    if (const auto* kf = std::get_if<KeyframePacket>(&item)) tap_ids.push_back(kf->id);
+  }
+  ASSERT_FALSE(tap_ids.empty());
+  EXPECT_EQ(tap_ids, sink_ids);
+
+  // Exactly one GNSS item, fed after the keyframe its sweep produced and anchored to
+  // the freshest keyframe id at that point.
+  std::uint64_t last_kf_seen = 0;
+  int gnss_items = 0;
+  for (const auto& item : items) {
+    if (const auto* kf = std::get_if<KeyframePacket>(&item)) {
+      last_kf_seen = kf->id;
+    } else if (const auto* g = std::get_if<MeridianPipeline::GnssForBackend>(&item)) {
+      ++gnss_items;
+      EXPECT_EQ(g->nearest_kf_id, last_kf_seen);
+      EXPECT_DOUBLE_EQ(g->fix.lat_deg, 48.0);
+      EXPECT_EQ(g->fix.fix, GnssFix::FixType::RTK_Fixed);
+    }
+  }
+  EXPECT_EQ(gnss_items, 1);
 }
 
 TEST(MeridianPipeline, StationaryDeskewIsNearIdentity) {

@@ -17,8 +17,7 @@ find_package(meridian_preprocess REQUIRED)
 find_package(meridian_frontend REQUIRED)
 
 add_library(meridian_pipeline
-  src/meridian_pipeline.cpp
-  src/calibration_from_config.cpp)
+  src/meridian_pipeline.cpp)
 
 target_include_directories(meridian_pipeline PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

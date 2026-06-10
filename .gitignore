@@ -22,3 +22,4 @@ _reference/
 # OS / python junk
 .DS_Store
 __pycache__/
+/out/

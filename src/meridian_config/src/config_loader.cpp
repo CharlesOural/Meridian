@@ -319,18 +319,76 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
 void load_backend(const YAML::Node& root, BackendConfig& c) {
   const YAML::Node n = root["backend"];
   if (!n) return;
+  get(n, "enable", c.enable);
   if (n["kind"]) {
     c.kind = parse_enum<BackEndKind>(n["kind"], "backend.kind",
                                      {{"isam2", BackEndKind::Isam2}});
   }
+  get(n, "anchor_sigma", c.anchor_sigma);
+  get(n, "isam2_relinearize_skip", c.isam2_relinearize_skip);
+  // Both the short legacy key and the full name are accepted; the full name wins.
   get(n, "relinearize_thresh", c.isam2_relinearize_thresh);
+  get(n, "isam2_relinearize_thresh", c.isam2_relinearize_thresh);
+  get(n, "extra_iters_normal", c.extra_iters_normal);
+  get(n, "extra_iters_loop", c.extra_iters_loop);
+  get(n, "isam2_use_qr", c.isam2_use_qr);
+  get(n, "optimize_interval_ms", c.optimize_interval_ms);
+  get(n, "queue_warn_depth", c.queue_warn_depth);
+  get(n, "obs_inflation_max", c.obs_inflation_max);
+  get(n, "obs_inflation_gamma", c.obs_inflation_gamma);
+  get(n, "degenerate_thresh", c.degenerate_thresh);
+  get(n, "degenerate_lock", c.degenerate_lock);
+  get(n, "loop_min_fitness", c.loop_min_fitness);
+  get(n, "pcm_chi2_alpha", c.pcm_chi2_alpha);
+  get(n, "pcm_max_nodes", c.pcm_max_nodes);
   if (n["robust"]) {
     c.robust_kernel = parse_enum<RobustKernel>(n["robust"], "backend.robust",
-                                               {{"gnc_cauchy", RobustKernel::Cauchy},
+                                               {{"huber", RobustKernel::Huber},
+                                                {"gnc_cauchy", RobustKernel::Cauchy},
                                                 {"cauchy", RobustKernel::Cauchy},
                                                 {"gm", RobustKernel::Gm},
                                                 {"tls", RobustKernel::Tls}});
   }
+  get(n, "loop_huber_k", c.loop_huber_k);
+  get(n, "gnss_huber_k", c.gnss_huber_k);
+  get(n, "gnc_reject_w", c.gnc_reject_w);
+  get(n, "gnc_enabled", c.gnc_enabled);
+  get(n, "gnc_anneal_steps", c.gnc_anneal_steps);
+  get(n, "gnc_consolidate_interval", c.gnc_consolidate_interval);
+  get(n, "gnss_enabled", c.gnss_enabled);
+  get(n, "gnss_max_cov", c.gnss_max_cov);
+  get(n, "gnss_lock_yaw", c.gnss_lock_yaw);
+  get(n, "gnss_min_baseline", c.gnss_min_baseline);
+  get(n, "gnss_min_excitation", c.gnss_min_excitation);
+  get(n, "gnss_min_speed", c.gnss_min_speed);
+  get(n, "gnss_min_moving_fixes", c.gnss_min_moving_fixes);
+  get(n, "gnss_datum_yaw_sigma_max", c.gnss_datum_yaw_sigma_max);
+  get(n, "gnss_skip_if_confident", c.gnss_skip_if_confident);
+  get(n, "gnss_skip_confidence_k", c.gnss_skip_confidence_k);
+  get(n, "gnss_min_spacing", c.gnss_min_spacing);
+  get(n, "gnss_redistribute", c.gnss_redistribute);
+  get(n, "gnss_reacq_fix", c.gnss_reacq_fix);
+  get(n, "gnss_reacq_persist", c.gnss_reacq_persist);
+  get(n, "gnss_redistribute_span_max", c.gnss_redistribute_span_max);
+  get(n, "extrinsic_refine", c.extrinsic_refine);
+  get(n, "extrinsic_prior_sigma", c.extrinsic_prior_sigma);
+  get(n, "extrinsic_refine_sigma", c.extrinsic_refine_sigma);
+  get(n, "extrinsic_excite_rot", c.extrinsic_excite_rot);
+  get(n, "extrinsic_excite_trans", c.extrinsic_excite_trans);
+  get(n, "extrinsic_freeze_cov", c.extrinsic_freeze_cov);
+  get(n, "extrinsic_max_dev", c.extrinsic_max_dev);
+  get(n, "keep_inertial", c.keep_inertial);
+  get(n, "reintegrate_thresh", c.reintegrate_thresh);
+  get(n, "emit_moved_cov", c.emit_moved_cov);
+  get(n, "loop_gate_k", c.loop_gate_k);
+  const YAML::Node imu = n["imu"];
+  get(imu, "acc_noise", c.imu.acc_noise);
+  get(imu, "gyr_noise", c.imu.gyr_noise);
+  get(imu, "acc_bias_rw", c.imu.acc_bias_rw);
+  get(imu, "gyr_bias_rw", c.imu.gyr_bias_rw);
+  get(n, "debug_dump_residuals", c.debug_dump_residuals);
+  get(n, "snapshot_on_request", c.snapshot_on_request);
+  get(n, "snapshot_dir", c.snapshot_dir);
 }
 
 void load_map(const YAML::Node& root, MapConfig& c) {
@@ -545,6 +603,102 @@ bool Config::validate(std::string* error_out) const {
   }
   if (frontend.visual.warp_cond_max < 1.0) {
     return fail("frontend.visual.warp_cond_max must be >= 1");
+  }
+
+  // --- back-end ---
+  if (backend.anchor_sigma <= 0.0) {
+    return fail("backend.anchor_sigma must be > 0");
+  }
+  if (backend.extra_iters_normal < 0 || backend.extra_iters_loop < 0) {
+    return fail("backend.extra_iters_{normal,loop} must be >= 0");
+  }
+  if (backend.optimize_interval_ms <= 0.0) {
+    return fail("backend.optimize_interval_ms must be > 0");
+  }
+  if (backend.queue_warn_depth < 1) {
+    return fail("backend.queue_warn_depth must be >= 1");
+  }
+  if (backend.obs_inflation_max < 1.0) {
+    return fail("backend.obs_inflation_max must be >= 1");
+  }
+  if (backend.obs_inflation_gamma <= 0.0) {
+    return fail("backend.obs_inflation_gamma must be > 0");
+  }
+  if (backend.degenerate_thresh < 0.0 || backend.degenerate_thresh > 1.0) {
+    return fail("backend.degenerate_thresh must be in [0, 1]");
+  }
+  if (backend.loop_min_fitness < 0.0 || backend.loop_min_fitness > 1.0) {
+    return fail("backend.loop_min_fitness must be in [0, 1]");
+  }
+  if (backend.pcm_chi2_alpha <= 0.0 || backend.pcm_chi2_alpha >= 1.0) {
+    return fail("backend.pcm_chi2_alpha must be in (0, 1)");
+  }
+  if (backend.pcm_max_nodes < 1) {
+    return fail("backend.pcm_max_nodes must be >= 1");
+  }
+  if (backend.loop_huber_k <= 0.0 || backend.gnss_huber_k <= 0.0) {
+    return fail("backend.{loop,gnss}_huber_k must be > 0");
+  }
+  if (backend.gnc_reject_w <= 0.0 || backend.gnc_reject_w >= 1.0) {
+    return fail("backend.gnc_reject_w must be in (0, 1)");
+  }
+  if (backend.gnc_anneal_steps < 1) {
+    return fail("backend.gnc_anneal_steps must be >= 1");
+  }
+  if (backend.gnc_consolidate_interval < 0) {
+    return fail("backend.gnc_consolidate_interval must be >= 0");
+  }
+  if (backend.gnss_max_cov <= 0.0) {
+    return fail("backend.gnss_max_cov must be > 0");
+  }
+  if (backend.gnss_min_baseline <= 0.0) {
+    return fail("backend.gnss_min_baseline must be > 0");
+  }
+  if (backend.gnss_min_excitation <= 0.0) {
+    return fail("backend.gnss_min_excitation must be > 0");
+  }
+  if (backend.gnss_min_speed <= 0.0) {
+    return fail("backend.gnss_min_speed must be > 0");
+  }
+  if (backend.gnss_min_moving_fixes < 1) {
+    return fail("backend.gnss_min_moving_fixes must be >= 1");
+  }
+  if (backend.gnss_datum_yaw_sigma_max <= 0.0) {
+    return fail("backend.gnss_datum_yaw_sigma_max must be > 0");
+  }
+  if (backend.gnss_skip_confidence_k <= 0.0) {
+    return fail("backend.gnss_skip_confidence_k must be > 0");
+  }
+  if (backend.gnss_min_spacing < 0.0) {
+    return fail("backend.gnss_min_spacing must be >= 0");
+  }
+  if (backend.gnss_reacq_persist < 1) {
+    return fail("backend.gnss_reacq_persist must be >= 1");
+  }
+  if (backend.gnss_redistribute_span_max < 1) {
+    return fail("backend.gnss_redistribute_span_max must be >= 1");
+  }
+  if (backend.extrinsic_prior_sigma <= 0.0 || backend.extrinsic_refine_sigma <= 0.0) {
+    return fail("backend.extrinsic_{prior,refine}_sigma must be > 0");
+  }
+  if (backend.extrinsic_excite_rot <= 0.0 || backend.extrinsic_excite_trans <= 0.0) {
+    return fail("backend.extrinsic_excite_{rot,trans} must be > 0");
+  }
+  if (backend.extrinsic_freeze_cov <= 0.0) {
+    return fail("backend.extrinsic_freeze_cov must be > 0");
+  }
+  if (backend.extrinsic_max_dev <= 0.0) {
+    return fail("backend.extrinsic_max_dev must be > 0");
+  }
+  if (backend.reintegrate_thresh < 0.0) {
+    return fail("backend.reintegrate_thresh must be >= 0");
+  }
+  if (backend.loop_gate_k <= 0.0) {
+    return fail("backend.loop_gate_k must be > 0");
+  }
+  if (backend.imu.acc_noise <= 0.0 || backend.imu.gyr_noise <= 0.0 ||
+      backend.imu.acc_bias_rw <= 0.0 || backend.imu.gyr_bias_rw <= 0.0) {
+    return fail("backend.imu.{acc,gyr}_noise and {acc,gyr}_bias_rw must be > 0");
   }
 
   // --- LiDAR range gate ---

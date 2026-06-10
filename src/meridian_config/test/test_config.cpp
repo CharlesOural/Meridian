@@ -320,5 +320,111 @@ TEST(Config, KnotHysteresisOutOfRangeFails) {
   EXPECT_NE(err.find("hysteresis"), std::string::npos) << err;
 }
 
+// ---- backend ----
+
+TEST(Config, BackendDefaults) {
+  Config c;
+  EXPECT_TRUE(c.backend.enable);
+  EXPECT_EQ(c.backend.kind, BackEndKind::Isam2);
+  EXPECT_DOUBLE_EQ(c.backend.anchor_sigma, 1e-4);
+  EXPECT_EQ(c.backend.isam2_relinearize_skip, 1);
+  EXPECT_DOUBLE_EQ(c.backend.isam2_relinearize_thresh, 0.1);
+  EXPECT_EQ(c.backend.extra_iters_normal, 0);
+  EXPECT_EQ(c.backend.extra_iters_loop, 4);
+  EXPECT_FALSE(c.backend.isam2_use_qr);
+  EXPECT_DOUBLE_EQ(c.backend.optimize_interval_ms, 100.0);
+  EXPECT_EQ(c.backend.queue_warn_depth, 32);
+  EXPECT_DOUBLE_EQ(c.backend.obs_inflation_max, 1e4);
+  EXPECT_DOUBLE_EQ(c.backend.obs_inflation_gamma, 2.0);
+  EXPECT_DOUBLE_EQ(c.backend.degenerate_thresh, 0.05);
+  EXPECT_TRUE(c.backend.degenerate_lock);
+  EXPECT_DOUBLE_EQ(c.backend.loop_min_fitness, 0.5);
+  EXPECT_DOUBLE_EQ(c.backend.pcm_chi2_alpha, 0.99);
+  EXPECT_EQ(c.backend.pcm_max_nodes, 64);
+  EXPECT_EQ(c.backend.robust_kernel, RobustKernel::Huber);
+  EXPECT_DOUBLE_EQ(c.backend.loop_huber_k, 1.345);
+  EXPECT_DOUBLE_EQ(c.backend.gnss_huber_k, 1.345);
+  EXPECT_DOUBLE_EQ(c.backend.gnc_reject_w, 0.1);
+  EXPECT_FALSE(c.backend.gnc_enabled);
+  EXPECT_EQ(c.backend.gnc_anneal_steps, 5);
+  EXPECT_EQ(c.backend.gnc_consolidate_interval, 10);
+  EXPECT_TRUE(c.backend.gnss_enabled);
+  EXPECT_DOUBLE_EQ(c.backend.gnss_max_cov, 25.0);
+  EXPECT_FALSE(c.backend.gnss_lock_yaw);
+  EXPECT_DOUBLE_EQ(c.backend.gnss_min_baseline, 5.0);
+  EXPECT_DOUBLE_EQ(c.backend.gnss_min_excitation, 3.0);
+  EXPECT_DOUBLE_EQ(c.backend.gnss_min_speed, 0.5);
+  EXPECT_EQ(c.backend.gnss_min_moving_fixes, 5);
+  EXPECT_DOUBLE_EQ(c.backend.gnss_datum_yaw_sigma_max, 5.0);
+  EXPECT_TRUE(c.backend.gnss_skip_if_confident);
+  EXPECT_DOUBLE_EQ(c.backend.gnss_skip_confidence_k, 1.0);
+  EXPECT_DOUBLE_EQ(c.backend.gnss_min_spacing, 1.0);
+  EXPECT_FALSE(c.backend.gnss_redistribute);
+  EXPECT_EQ(c.backend.gnss_reacq_fix, 1);
+  EXPECT_EQ(c.backend.gnss_reacq_persist, 5);
+  EXPECT_EQ(c.backend.gnss_redistribute_span_max, 200);
+  EXPECT_FALSE(c.backend.extrinsic_refine);
+  EXPECT_DOUBLE_EQ(c.backend.extrinsic_prior_sigma, 1e-3);
+  EXPECT_DOUBLE_EQ(c.backend.extrinsic_refine_sigma, 1e-2);
+  EXPECT_DOUBLE_EQ(c.backend.extrinsic_excite_rot, 0.5);
+  EXPECT_DOUBLE_EQ(c.backend.extrinsic_excite_trans, 2.0);
+  EXPECT_DOUBLE_EQ(c.backend.extrinsic_freeze_cov, 1e-6);
+  EXPECT_DOUBLE_EQ(c.backend.extrinsic_max_dev, 0.1);
+  EXPECT_FALSE(c.backend.keep_inertial);
+  EXPECT_DOUBLE_EQ(c.backend.reintegrate_thresh, 0.1);
+  EXPECT_FALSE(c.backend.emit_moved_cov);
+  EXPECT_DOUBLE_EQ(c.backend.loop_gate_k, 3.0);
+  EXPECT_DOUBLE_EQ(c.backend.imu.acc_noise, 0.1);
+  EXPECT_DOUBLE_EQ(c.backend.imu.gyr_noise, 0.1);
+  EXPECT_DOUBLE_EQ(c.backend.imu.acc_bias_rw, 1e-4);
+  EXPECT_DOUBLE_EQ(c.backend.imu.gyr_bias_rw, 1e-4);
+  EXPECT_FALSE(c.backend.debug_dump_residuals);
+  EXPECT_FALSE(c.backend.snapshot_on_request);
+  EXPECT_EQ(c.backend.snapshot_dir, "/tmp/meridian");
+}
+
+TEST(ConfigLoader, RoundTripsBackendKeys) {
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_backend_keys.yaml";
+  {
+    std::ofstream f(path);
+    f << "meridian:\n"
+         "  backend:\n"
+         "    enable: false\n"
+         "    optimize_interval_ms: 50\n"
+         "    extra_iters_loop: 6\n"
+         "    gnss_datum_yaw_sigma_max: 2.5\n"
+         "    robust: huber\n"
+         "    imu: { acc_noise: 0.2, gyr_noise: 0.05, acc_bias_rw: 2.0e-4, gyr_bias_rw: 3.0e-4 }\n";
+  }
+
+  const Config c = load_config_yaml(path);
+
+  EXPECT_FALSE(c.backend.enable);
+  EXPECT_DOUBLE_EQ(c.backend.optimize_interval_ms, 50.0);
+  EXPECT_EQ(c.backend.extra_iters_loop, 6);
+  EXPECT_DOUBLE_EQ(c.backend.gnss_datum_yaw_sigma_max, 2.5);
+  EXPECT_EQ(c.backend.robust_kernel, RobustKernel::Huber);
+  EXPECT_DOUBLE_EQ(c.backend.imu.acc_noise, 0.2);
+  EXPECT_DOUBLE_EQ(c.backend.imu.gyr_noise, 0.05);
+  EXPECT_DOUBLE_EQ(c.backend.imu.acc_bias_rw, 2.0e-4);
+  EXPECT_DOUBLE_EQ(c.backend.imu.gyr_bias_rw, 3.0e-4);
+}
+
+TEST(Config, PcmChi2AlphaOutOfRangeFails) {
+  Config c;
+  c.backend.pcm_chi2_alpha = 1.5;
+  std::string err;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("pcm_chi2_alpha"), std::string::npos) << err;
+}
+
+TEST(Config, ZeroQueueWarnDepthFails) {
+  Config c;
+  c.backend.queue_warn_depth = 0;
+  std::string err;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("queue_warn_depth"), std::string::npos) << err;
+}
+
 }  // namespace
 }  // namespace meridian

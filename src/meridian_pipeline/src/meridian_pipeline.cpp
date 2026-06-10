@@ -9,8 +9,8 @@
 
 #include <Eigen/Geometry>
 
-#include "calibration_from_config.hpp"
 #include "health_bridge.hpp"
+#include "meridian/calib/calibration_from_config.hpp"
 #include "meridian/calib/extrinsic.hpp"
 #include "meridian/calib/intrinsics.hpp"
 #include "meridian/debug/telemetry.hpp"
@@ -190,6 +190,8 @@ void MeridianPipeline::set_keyframe_sink(KeyframeSink sink) {
   keyframe_sink_ = std::move(sink);
 }
 
+void MeridianPipeline::set_backend_tap(BackendTap tap) { backend_tap_ = std::move(tap); }
+
 NavState MeridianPipeline::live_state() const { return frontend_->live_state(); }
 
 TelemetrySink* MeridianPipeline::telemetry() { return sink_.get(); }
@@ -261,6 +263,14 @@ void MeridianPipeline::process_meas(MeasSample&& m) {
           // it carries; then the front-end optimises the window against it.
           if (group_sink_) group_sink_(PreprocessedGroup{sample});
           frontend_->ingest(sample);
+          // The group's GNSS fixes follow the ingest, so a keyframe this very sweep
+          // produced is already the freshest anchor. Before the first keyframe there is
+          // no node to anchor a fix to, so pre-init fixes are not forwarded.
+          if (last_kf_id_) {
+            for (const GnssFix& fix : sample.group.gnss) {
+              feed_backend(BackendItem{GnssForBackend{fix, *last_kf_id_}});
+            }
+          }
         } else {  // ImuSample
           frontend_->ingest_imu_live(sample);
         }
@@ -275,7 +285,16 @@ void MeridianPipeline::on_keyframe(KeyframePacket&& kf) {
   if (!spline_active_) spline_active_ = true;
   sink_->event(Level::Info, "frontend/keyframe", "front-end emitted a keyframe", kf.stamp);
   sink_->scalar("frontend/keyframe_count", static_cast<double>(n), kf.stamp);
+  last_kf_id_ = kf.id;
+  // The back-end stream sees the keyframe before the wrapper sink consumes the move;
+  // the copy is cheap because the heavy payloads are shared-immutable handles.
+  feed_backend(BackendItem{kf});
   if (keyframe_sink_) keyframe_sink_(std::move(kf));
+}
+
+void MeridianPipeline::feed_backend(BackendItem&& item) {
+  // The single hand-off into the back-end input stream; the consumer attaches here.
+  if (backend_tap_) backend_tap_(item);
 }
 
 void MeridianPipeline::process(SensorSample&& s) {

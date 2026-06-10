@@ -10,7 +10,9 @@ find_package(meridian_common REQUIRED)
 
 add_library(meridian_debug
   src/telemetry.cpp
-  src/log.cpp)
+  src/log.cpp
+  src/file_sink.cpp
+  src/packet_log.cpp)
 
 target_include_directories(meridian_debug PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -36,6 +38,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_telemetry meridian_debug)
   meridian_add_gtest(test_sinks test/test_sinks.cpp)
   target_link_libraries(test_sinks meridian_debug)
+  meridian_add_gtest(test_file_sink test/test_file_sink.cpp)
+  target_link_libraries(test_file_sink meridian_debug)
+  meridian_add_gtest(test_packet_log test/test_packet_log.cpp)
+  target_link_libraries(test_packet_log meridian_debug)
 endif()
 
 ament_package()

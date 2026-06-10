@@ -1,4 +1,4 @@
-#include "calibration_from_config.hpp"
+#include "meridian/calib/calibration_from_config.hpp"
 
 #include <Eigen/Geometry>
 #include <cmath>

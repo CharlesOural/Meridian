@@ -22,7 +22,7 @@ enum class BackEndKind { Isam2 };
 enum class MapBackend { Nvblox };
 enum class MeshKind { MarchingCubes };
 enum class PlaceKind { ScanContextPp };
-enum class RobustKernel { Cauchy, Gm, Tls };
+enum class RobustKernel { Huber, Cauchy, Gm, Tls };
 enum class SplineOrder { Cubic };
 enum class LogLevel { Trace, Debug, Info, Warn, Error };
 enum class StoreBackend { Ram, Mmap };
@@ -392,40 +392,72 @@ struct BackendImu {
   double gyr_bias_rw = 1e-4;  // [ (rad/s^2)/sqrt(Hz) ]
 };
 struct BackendConfig {
+  bool enable = true;  // bring-up switch: off runs the pipeline without the back-end
   BackEndKind kind = BackEndKind::Isam2;
+  // gauge anchor on the first pose; lambda = 1/sigma^2
   double anchor_sigma = 1e-4;
+  // iSAM2
   int isam2_relinearize_skip = 1;
   double isam2_relinearize_thresh = 0.1;
-  int isam2_extra_iters = 1;
+  int extra_iters_normal = 0;  // extra Dogleg passes on a normal batch
+  int extra_iters_loop = 4;    // extra Dogleg passes when a loop was admitted
   bool isam2_use_qr = false;
+  // optimise cadence, decoupled from keyframe insert
+  double optimize_interval_ms = 100.0;  // min wall-clock between batched update calls
+  int queue_warn_depth = 32;            // input queue depth that raises a warning
+  // observability -> noise inflation
   double obs_inflation_max = 1e4;
   double obs_inflation_gamma = 2.0;
-  double degenerate_thresh = 0.05;
-  bool degenerate_lock = true;
-  double loop_min_fitness = 0.5;
+  double degenerate_thresh = 0.05;  // score below = degenerate
+  bool degenerate_lock = true;      // hard-lock worst axis if degenerate
+  // loops + PCM
+  double loop_min_fitness = 0.5;  // reject low GICP fitness
   double pcm_chi2_alpha = 0.99;
-  int pcm_max_nodes = 64;
-  RobustKernel robust_kernel = RobustKernel::Cauchy;
-  bool gnc_enabled = true;
-  int gnc_anneal_steps = 5;
-  double gnc_reject_w = 0.1;
+  int pcm_max_nodes = 64;  // exact max-clique cap
+  // robust kernels: huber is the committed incremental loop kernel
+  RobustKernel robust_kernel = RobustKernel::Huber;
+  double loop_huber_k = 1.345;
   double gnss_huber_k = 1.345;
+  double gnc_reject_w = 0.1;  // weight below which a loop is removed
+  bool gnc_enabled = false;   // experimental amortised GNC inside iSAM2
+  int gnc_anneal_steps = 5;
+  int gnc_consolidate_interval = 10;  // admitted loops between batch consolidations (0 = off)
+  // GNSS
   bool gnss_enabled = true;
-  double gnss_max_cov = 25.0;  // [m^2]
-  double gnss_min_baseline = 5.0;
-  bool gnss_lock_yaw = false;
-  bool extrinsic_refine = true;
+  double gnss_max_cov = 25.0;  // [m^2] drop fix if trace(cov_enu) above
+  bool gnss_lock_yaw = false;  // external heading available
+  // datum init
+  double gnss_min_baseline = 5.0;    // [m] min travelled baseline before datum fit
+  double gnss_min_excitation = 3.0;  // [m] min dominant-axis span of buffered ENU track
+  double gnss_min_speed = 0.5;       // [m/s] speed a fix must exceed to count as moving
+  int gnss_min_moving_fixes = 5;     // moving fixes required before datum fit
+  double gnss_datum_yaw_sigma_max = 5.0;  // [deg] reject datum fit above this yaw uncertainty
+  // gating + decimation
+  bool gnss_skip_if_confident = true;   // skip fix no tighter than the back-end marginal
+  double gnss_skip_confidence_k = 1.0;  // kappa in the skip-if-confident test
+  double gnss_min_spacing = 1.0;        // [m] min travelled baseline between admitted fixes
+  // drift redistribution across an outage span
+  bool gnss_redistribute = false;
+  int gnss_reacq_fix = 1;      // min fix-quality enum to count as re-acquired
+  int gnss_reacq_persist = 5;  // consecutive accepted fixes to declare re-acquisition
+  int gnss_redistribute_span_max = 200;  // max keyframes back redistribution reaches
+  // online extrinsics, off by default; enable per-platform
+  bool extrinsic_refine = false;
   double extrinsic_prior_sigma = 1e-3;
   double extrinsic_refine_sigma = 1e-2;
-  double extrinsic_excite_rot = 0.5;    // [rad]
-  double extrinsic_excite_trans = 2.0;  // [m]
-  double extrinsic_freeze_cov = 1e-6;
-  double extrinsic_max_dev = 0.1;
-  bool keep_inertial = false;
-  double reintegrate_thresh = 0.1;  // [m]
-  bool emit_moved_cov = false;
-  double loop_gate_k = 3.0;
+  double extrinsic_excite_rot = 0.5;    // [rad] cumulative before refine
+  double extrinsic_excite_trans = 2.0;  // [m] cumulative before refine
+  double extrinsic_freeze_cov = 1e-6;   // freeze when marginal below
+  double extrinsic_max_dev = 0.1;       // sanity clamp
+  // marginalization
+  bool keep_inertial = false;  // keep restart V/B variables live
+  // L4 re-integration trigger
+  double reintegrate_thresh = 0.1;  // [m] pose-move threshold
+  bool emit_moved_cov = false;      // fill moved-set covariances (costly)
+  // loop pre-filter marginal
+  double loop_gate_k = 3.0;  // k_gate * sigma_pos search radius
   BackendImu imu{};
+  // debug
   bool debug_dump_residuals = false;
   bool snapshot_on_request = false;
   std::string snapshot_dir = "/tmp/meridian";
