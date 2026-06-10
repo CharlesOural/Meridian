@@ -158,16 +158,18 @@ TEST(BackendSpine, MovedSemantics) {
   }
 }
 
-TEST(BackendSpine, UnsupportedPathsWarn) {
+TEST(BackendSpine, LoopsStillUnsupported) {
   CountingSink sink;
   auto be = makeBackend(&sink);
 
+  // Loop closures land in a later phase; until then they are rejected, not graphed.
   be->add_loop_constraint(LoopConstraint{});
   EXPECT_EQ(sink.count("backend/loops_unsupported"), 1);
   EXPECT_EQ(be->diagnostics().num_loops_rejected, 1u);
 
-  be->add_absolute(GnssFix{}, 0);
-  EXPECT_EQ(sink.count("backend/gnss_unsupported"), 1);
+  // A GNSS fix before any keyframe has no pose to anchor against; it must drop cleanly.
+  EXPECT_NO_THROW(be->add_absolute(GnssFix{}, 0));
+  EXPECT_EQ(be->diagnostics().num_gnss_factors, 0u);
 }
 
 // The latest-pose marginal exists after the first optimize, is finite, and its

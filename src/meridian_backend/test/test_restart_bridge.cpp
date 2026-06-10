@@ -99,6 +99,54 @@ TEST(RestartBridge, BridgeAcceptedAfterNormal) {
   EXPECT_EQ(be->diagnostics().num_keyframes, 3u);
 }
 
+// Two restarts back-to-back chain onto a node whose V/B are still live (no normal keyframe
+// between them to marginalize). The bridge must reuse those variables, not re-insert them.
+TEST(RestartBridge, ConsecutiveRestartsDoNotDuplicateInsert) {
+  const SynthChain chain = make_chain(SynthOptions{/*n=*/4});
+  CountingSink sink;
+  auto be = makeBackend(&sink);
+
+  feed(*be, chain.packets[0]);
+  be->optimize();
+  feed(*be, chain.packets[1]);
+  be->optimize();
+
+  const Timestamp t2 = stampAfter(chain.packets[1].stamp);
+  feed(*be, make_restart_packet(/*prev_id=*/1, /*id=*/2, t2, chain.gt[2]));
+  EXPECT_NO_THROW(be->optimize());
+
+  // Second restart chains onto id 2, whose V(2)/B(2) are still in the graph.
+  const Timestamp t3 = stampAfter(t2);
+  feed(*be, make_restart_packet(/*prev_id=*/2, /*id=*/3, t3, chain.gt[3]));
+  EXPECT_NO_THROW(be->optimize());
+
+  const auto traj = be->corrected_trajectory();
+  EXPECT_EQ(traj.size(), 4u);
+  EXPECT_TRUE(trajHasId(traj, 3));
+}
+
+// keep_inertial keeps V/B live across normal keyframes; a later restart that chains onto a
+// previously-bridged node must still reuse, not re-insert, the existing inertial variables.
+TEST(RestartBridge, KeepInertialSecondBridgeDoesNotDuplicate) {
+  BackendConfig cfg;
+  cfg.keep_inertial = true;
+  const SynthChain chain = make_chain(SynthOptions{/*n=*/4});
+  CountingSink sink;
+  auto be = makeBackend(&sink, cfg);
+
+  feed(*be, chain.packets[0]);
+  be->optimize();
+  feed(*be, chain.packets[1]);
+  be->optimize();
+  const Timestamp t2 = stampAfter(chain.packets[1].stamp);
+  feed(*be, make_restart_packet(/*prev_id=*/1, /*id=*/2, t2, chain.gt[2]));
+  be->optimize();
+  // Normal keyframe 3; with keep_inertial, V(2)/B(2) stay live.
+  feed(*be, chain.packets[3]);
+  EXPECT_NO_THROW(be->optimize());
+  EXPECT_EQ(be->corrected_trajectory().size(), 4u);
+}
+
 // After the bridge introduces V/B, the next NORMAL keyframe must marginalize them out and
 // still leave a solvable graph. Without internal access the V/B removal is asserted
 // INDIRECTLY: a subsequent normal keyframe must optimize cleanly (no indeterminate growth)

@@ -11,7 +11,9 @@
 
 #include <Eigen/Core>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -19,11 +21,15 @@
 #include <vector>
 
 #include "gauge_damping_factor.hpp"
+#include "gnss_factor.hpp"
 #include "gtsam_adapter.hpp"
 #include "keys.hpp"
+#include "meridian/calib/calibration_set.hpp"
+#include "meridian/common/frame.hpp"
 #include "meridian/debug/telemetry.hpp"
 #include "observability_inflation.hpp"
 #include "pim_from_summary.hpp"
+#include "robust_kernels.hpp"
 #include "telemetry_keys.hpp"
 
 namespace meridian::backend {
@@ -179,18 +185,33 @@ void Isam2BackEnd::add_restart_imu_edge(KeyframePacket&& kf) {
   const gtsam::Vector3 v_j = T_map_odom_.q * kf.v_ref;
   const gtsam::imuBias::ConstantBias bias(kf.b_a, kf.b_g);
 
-  new_values_.insert(keyV(i), v_i);
-  new_values_.insert(keyB(i), bias);
-  new_values_.insert(keyV(j), v_j);
-  new_values_.insert(keyB(j), bias);
-  new_values_.insert(keyX(j), to_gtsam(T_map_odom_ * kf.T_ref_body));
+  // Insert each inertial variable only if it is not already live: a second restart that
+  // chains onto a still-inertial node (back-to-back restarts, or any restart under
+  // keep_inertial) would otherwise re-insert an existing key and throw from Values::insert.
+  const auto ensure = [&](gtsam::Key k, const auto& val) {
+    if (new_values_.exists(k) || isam2_->valueExists(k)) {
+      return false;
+    }
+    new_values_.insert(k, val);
+    return true;
+  };
+  const bool created_v_i = ensure(keyV(i), v_i);
+  const bool created_b_i = ensure(keyB(i), bias);
+  ensure(keyV(j), v_j);
+  ensure(keyB(j), bias);
+  ensure(keyX(j), to_gtsam(T_map_odom_ * kf.T_ref_body));
 
-  // V(i)/B(i) are otherwise unconstrained on their older side, so pin them with loose
-  // priors; without them ISAM2 reports an indeterminate system on the inertial block.
-  new_graph_.emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
-      keyV(i), v_i, gtsam::noiseModel::Isotropic::Sigma(3, 10.0));
-  new_graph_.emplace_shared<gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(
-      keyB(i), bias, gtsam::noiseModel::Isotropic::Sigma(6, 1.0));
+  // Pin the older-side inertial variables only when this bridge created them; without the
+  // pin ISAM2 reports an indeterminate system on the fresh inertial block, but re-pinning an
+  // already-constrained node would double-count.
+  if (created_v_i) {
+    new_graph_.emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
+        keyV(i), v_i, gtsam::noiseModel::Isotropic::Sigma(3, 10.0));
+  }
+  if (created_b_i) {
+    new_graph_.emplace_shared<gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(
+        keyB(i), bias, gtsam::noiseModel::Isotropic::Sigma(6, 1.0));
+  }
 
   const gtsam::PreintegratedCombinedMeasurements pim = pim_from_summary(*kf.imu_summary, cfg_.imu);
   new_graph_.emplace_shared<gtsam::CombinedImuFactor>(keyX(i), keyV(i), keyX(j), keyV(j), keyB(i),
@@ -207,8 +228,17 @@ void Isam2BackEnd::add_restart_imu_edge(KeyframePacket&& kf) {
   pose_cov_rotfirst.topRightCorner<3, 3>() = pim_cov.block<3, 3>(0, 3);
   pose_cov_rotfirst.bottomLeftCorner<3, 3>() = pim_cov.block<3, 3>(3, 0);
   pose_cov_rotfirst.bottomRightCorner<3, 3>() = pim_cov.block<3, 3>(3, 3);
+  Eigen::Matrix<double, 6, 6> pose_cov = reorder_gtsam_to_meridian(pose_cov_rotfirst);
+  // The pim position block is the gravity-free preintegrated increment; the true relative
+  // translation also carries v_i*dt, whose uncertainty (the loose V(i) prior) is not in the
+  // pim. Inflate the translation block by Var(v_i)*dt^2 so the bridge edge stays conservative
+  // for the loop/PCM chain covariance, which would otherwise under-trust nothing and admit
+  // bad cross-restart loops. Translation is the leading 3x3 in Meridian (translation-first).
+  const double dt = static_cast<double>(kf.imu_summary->t_j - kf.imu_summary->t_i) * 1e-9;
+  constexpr double kVelPriorVar = 100.0;  // (10 m/s)^2, matching the V(i) prior sigma
+  pose_cov.topLeftCorner<3, 3>() += (kVelPriorVar * dt * dt) * Eigen::Matrix3d::Identity();
   const Pose T_i_j = kf_records_.at(i).T_ref_body.inverse() * kf.T_ref_body;
-  chain_cov_.extend(i, j, T_i_j, reorder_gtsam_to_meridian(pose_cov_rotfirst));
+  chain_cov_.extend(i, j, T_i_j, pose_cov);
 
   pending_bridges_.push_back(BridgeRecord{i, j});
   sink_->event(Level::Info, kTeleRestartBridge,
@@ -224,9 +254,236 @@ void Isam2BackEnd::add_loop_constraint(const LoopConstraint& lc) {
                tele_stamp());
 }
 
-void Isam2BackEnd::add_absolute(const GnssFix& /*fix*/, std::uint64_t nearest_kf_id) {
-  sink_->event(Level::Warn, "backend/gnss_unsupported",
-               "gnss fix near kf " + std::to_string(nearest_kf_id) + " dropped", tele_stamp());
+std::optional<Isam2BackEnd::Bracket> Isam2BackEnd::find_bracket(Timestamp stamp,
+                                                                std::uint64_t hint) const {
+  // Only keyframes already in the estimate can anchor a factor; kf_order_ is in insert =
+  // time order, so the bracket is the last estimated keyframe at/before the fix and the
+  // first one after it. The hint just biases logging; the scan is authoritative.
+  (void)hint;
+  std::optional<std::uint64_t> prev;  // last estimated kf with stamp <= fix
+  for (const std::uint64_t id : kf_order_) {
+    if (!estimate_cache_.exists(keyX(id))) {
+      continue;
+    }
+    const Timestamp s = kf_records_.at(id).stamp;
+    if (s <= stamp) {
+      prev = id;
+    } else {
+      // First estimated keyframe strictly after the fix: it closes the bracket.
+      if (prev) {
+        const Timestamp s_prev = kf_records_.at(*prev).stamp;
+        if (s == s_prev) {
+          return Bracket{*prev, *prev, true};  // zero-width interval, treat as endpoint
+        }
+        return Bracket{*prev, id, false};
+      }
+      // Fix precedes every estimated keyframe; clamp to the earliest as an endpoint.
+      return Bracket{id, id, true};
+    }
+  }
+  if (prev) {
+    // Fix is at or after the latest estimated keyframe; no successor yet.
+    return Bracket{*prev, *prev, true};
+  }
+  return std::nullopt;
+}
+
+void Isam2BackEnd::add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id) {
+  if (!cfg_.gnss_enabled || gnss_auto_disabled_) {
+    sink_->event(Level::Debug, kTeleGnssSkip,
+                 "gnss disabled; fix near kf " + std::to_string(nearest_kf_id) + " dropped",
+                 tele_stamp());
+    return;
+  }
+
+  // The antenna lever arm in body is required to relate a fix to a body pose. A rig without
+  // a GNSS extrinsic cannot use GNSS; drop quietly rather than throw out of the driver.
+  Eigen::Vector3d lever;
+  try {
+    lever = calib_->extrinsic(Frame::GnssLink).T_parent_child.t;
+  } catch (const std::exception&) {
+    sink_->event(Level::Warn, kTeleGnssSkip, "no GnssLink extrinsic; fix dropped", tele_stamp());
+    return;
+  }
+
+  // First accepted fix fixes the ENU tangent-plane origin. Origin set != datum locked: the
+  // map<-ENU transform G is fit only once the track is observable.
+  if (!gnss_origin_.set) {
+    gnss_origin_.lat0_deg = fix.lat_deg;
+    gnss_origin_.lon0_deg = fix.lon_deg;
+    gnss_origin_.alt0_m = fix.alt_m;
+    gnss_origin_.set = true;
+  }
+  const Eigen::Vector3d p_enu = lla_to_enu(fix.lat_deg, fix.lon_deg, fix.alt_m, gnss_origin_);
+
+  const std::optional<Bracket> br = find_bracket(fix.stamp, nearest_kf_id);
+  if (!br) {
+    // No estimated keyframe to anchor against yet (before the first optimize()).
+    sink_->event(Level::Debug, kTeleGnssSkip, "no estimated keyframe to anchor gnss fix",
+                 tele_stamp());
+    return;
+  }
+
+  if (!datum_locked_) {
+    // Antenna position in map from the current estimate of the anchor keyframe pose.
+    const Pose X_anchor = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br->i)));
+    const Eigen::Vector3d ant_map = X_anchor * lever;
+
+    // Speed from the anchor keyframe and its predecessor: ||dp|| / dt over the last interval.
+    // A single keyframe (or a coincident-stamp neighbour) yields zero, which the moving-fix
+    // gate treats as stationary.
+    double speed = 0.0;
+    for (std::size_t k = 0; k + 1 < kf_order_.size(); ++k) {
+      if (kf_order_[k + 1] != br->i) {
+        continue;
+      }
+      const std::uint64_t a = kf_order_[k];
+      const std::uint64_t b = kf_order_[k + 1];
+      if (!estimate_cache_.exists(keyX(a)) || !estimate_cache_.exists(keyX(b))) {
+        break;
+      }
+      const double dt = to_seconds(kf_records_.at(b).stamp - kf_records_.at(a).stamp);
+      if (dt > 0.0) {
+        const Pose Xa = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(a)));
+        const Pose Xb = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(b)));
+        speed = (Xb.t - Xa.t).norm() / dt;
+      }
+      break;
+    }
+
+    datum_.add(p_enu, ant_map, speed, fix.stamp);
+    const double yaw_sigma_max_rad = cfg_.gnss_datum_yaw_sigma_max * M_PI / 180.0;
+    const DatumResult lock =
+        datum_.try_lock(cfg_.gnss_min_baseline, cfg_.gnss_min_excitation, cfg_.gnss_min_speed,
+                        cfg_.gnss_min_moving_fixes, yaw_sigma_max_rad);
+    if (!lock.locked) {
+      return;  // keep buffering; buffered fixes never become factors, only the datum does
+    }
+
+    // Lock the datum: G enters the graph as a weakly-anchored variable. Translation is tight
+    // (the origin is well defined), yaw carries the fitted sigma, and roll/pitch stay tight
+    // since the planar fit pins them to zero. The prior order is rotation-first [r;t].
+    new_values_.insert(kKeyG, to_gtsam(lock.T_map_enu));
+    Eigen::Matrix<double, 6, 1> sigmas;
+    constexpr double kTightRotSigma = 1e-3;   // [rad] roll/pitch
+    constexpr double kTightTransSigma = 0.5;  // [m]
+    sigmas << kTightRotSigma, kTightRotSigma, std::max(lock.yaw_sigma_rad, kTightRotSigma),
+        kTightTransSigma, kTightTransSigma, kTightTransSigma;
+    new_graph_.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+        kKeyG, to_gtsam(lock.T_map_enu), gtsam::noiseModel::Diagonal::Sigmas(sigmas));
+
+    datum_locked_ = true;
+    datum_just_locked_ = true;
+    diag_.datum_locked = true;
+    gnss_last_antenna_ = ant_map;
+    gnss_travelled_since_admit_ = 0.0;
+
+    const double yaw = std::atan2(2.0 * (lock.T_map_enu.q.w() * lock.T_map_enu.q.z() +
+                                         lock.T_map_enu.q.x() * lock.T_map_enu.q.y()),
+                                  1.0 - 2.0 * (lock.T_map_enu.q.y() * lock.T_map_enu.q.y() +
+                                               lock.T_map_enu.q.z() * lock.T_map_enu.q.z()));
+    sink_->event(Level::Info, kTeleDatumLocked,
+                 "datum locked: yaw=" + std::to_string(yaw) +
+                     " rad, yaw_sigma=" + std::to_string(lock.yaw_sigma_rad) +
+                     " rad, fixes=" + std::to_string(datum_.size()),
+                 tele_stamp());
+    return;
+  }
+
+  admit_gnss_fix(fix, p_enu, *br);
+}
+
+void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_enu,
+                                  const Bracket& br) {
+  // Map-frame antenna position of this fix, for travel accounting and the residual check.
+  Eigen::Vector3d lever;
+  try {
+    lever = calib_->extrinsic(Frame::GnssLink).T_parent_child.t;
+  } catch (const std::exception&) {
+    return;
+  }
+
+  // Body pose at the fix instant: SE(3) interpolation of the bracket (or the single anchor).
+  double beta = 0.0;
+  if (!br.single) {
+    const Timestamp si = kf_records_.at(br.i).stamp;
+    const Timestamp sj = kf_records_.at(br.j).stamp;
+    const Timestamp span = sj - si;
+    beta = span > 0 ? static_cast<double>(fix.stamp - si) / static_cast<double>(span) : 0.0;
+  }
+  const bool endpoint = br.single || beta <= 0.0 || beta >= 1.0;
+  // The single keyframe an endpoint factor differentiates against: i when the fix sits at or
+  // before i, j when it sits at or after j.
+  const std::uint64_t end_id = (!br.single && beta >= 1.0) ? br.j : br.i;
+
+  Pose X_body;
+  if (endpoint) {
+    X_body = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(end_id)));
+  } else {
+    const Pose Xi = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br.i)));
+    const Pose Xj = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br.j)));
+    X_body = Xi.boxplus(Xj.boxminus(Xi) * beta);
+  }
+  const Eigen::Vector3d ant_map = X_body * lever;
+
+  // Travel since the last admitted fix accumulates the antenna arc length over consecutive
+  // post-lock fixes; the gate decimates on it.
+  if (gnss_last_antenna_) {
+    gnss_travelled_since_admit_ += (ant_map - *gnss_last_antenna_).norm();
+  }
+  gnss_last_antenna_ = ant_map;
+
+  double marginal_pos_trace = std::numeric_limits<double>::max();
+  if (const std::optional<PoseCov6> m = latest_pose_marginal()) {
+    // PoseCov6 is translation-first [rho; phi]; the position block is the leading 3x3.
+    marginal_pos_trace = m->M.topLeftCorner<3, 3>().trace();
+  }
+
+  const GnssGate::Decision decision =
+      gnss_gate_.evaluate(fix, marginal_pos_trace, gnss_travelled_since_admit_, cfg_);
+  if (decision != GnssGate::Decision::Accept) {
+    const char* reason = decision == GnssGate::Decision::RejectQuality   ? "quality"
+                         : decision == GnssGate::Decision::SkipConfident ? "confident"
+                                                                         : "spacing";
+    sink_->event(Level::Debug, kTeleGnssSkip, std::string("gnss fix dropped: ") + reason,
+                 tele_stamp());
+    return;
+  }
+
+  // FM-6 health: the whitened residual against cov_enu. The datum maps map->ENU, so the
+  // predicted ENU antenna is G^{-1} * ant_map; chi2 = r^T cov_enu^{-1} r.
+  if (estimate_cache_.exists(kKeyG)) {
+    const Pose G = from_gtsam(estimate_cache_.at<gtsam::Pose3>(kKeyG));
+    const Eigen::Vector3d r = G.inverse() * ant_map - p_enu;
+    const double chi2 = r.dot(fix.cov_enu.ldlt().solve(r));
+    if (chi2 > chi2inv(0.99, 3)) {
+      ++gnss_consecutive_chi2_reject_;
+      if (gnss_consecutive_chi2_reject_ >= cfg_.gnss_reacq_persist) {
+        gnss_auto_disabled_ = true;
+        sink_->event(Level::Error, kTeleGnssDisabled,
+                     "gnss auto-disabled after " + std::to_string(gnss_consecutive_chi2_reject_) +
+                         " consecutive chi2-failing fixes",
+                     tele_stamp());
+        return;
+      }
+    } else {
+      gnss_consecutive_chi2_reject_ = 0;
+    }
+    sink_->vec(kTeleGnssResidual, r, tele_stamp(), "e,n,u");
+  }
+
+  const gtsam::SharedNoiseModel noise = make_gnss_noise(fix.cov_enu, cfg_.gnss_huber_k);
+  const gtsam::Point3 lever_pt(lever);
+  const gtsam::Point3 meas(p_enu);
+  if (endpoint) {
+    new_graph_.emplace_shared<GnssFactorEndpoint>(keyX(end_id), kKeyG, lever_pt, meas, noise);
+  } else {
+    new_graph_.emplace_shared<GnssFactor>(keyX(br.i), keyX(br.j), kKeyG, beta, lever_pt, meas,
+                                          noise);
+  }
+  ++diag_.num_gnss_factors;
+  gnss_gate_.note_admitted();
+  gnss_travelled_since_admit_ = 0.0;
 }
 
 GraphUpdate Isam2BackEnd::optimize() {
@@ -296,6 +553,7 @@ GraphUpdate Isam2BackEnd::optimize() {
   new_values_.clear();
   remove_indices_.clear();
   batch_has_loop_ = false;
+  datum_just_locked_ = false;
   staged_count_ = 0;
 
   return update;
@@ -394,7 +652,7 @@ BackEndDiagnostics Isam2BackEnd::diagnostics() const {
 }
 
 bool Isam2BackEnd::wants_immediate_optimize() const {
-  return batch_has_loop_;
+  return batch_has_loop_ || datum_just_locked_;
 }
 
 std::optional<PoseCov6> Isam2BackEnd::latest_pose_marginal() const {
@@ -456,18 +714,17 @@ boost::optional<gtsam::FastMap<gtsam::Key, int>> Isam2BackEnd::bridge_constraint
     return boost::none;
   }
   // Group 0 is eliminated first (leaf-ward) and holds exactly the V/B to be marginalized.
-  // Group 1 must list EVERY other key in the graph, because any key the map omits silently
-  // defaults to group 0 and would be forced into the leaf set too. Build group 1 from
-  // kf_order_ (deterministic) plus the V/B of bridges still pending.
+  // Group 1 must list EVERY other key, because any key the map omits silently defaults to
+  // group 0 and would be forced into the leaf set too. Enumerate the actual live key set
+  // (the graph's linearization point plus anything staged this batch) rather than a fixed
+  // list of key classes, so the GNSS origin G and any extrinsic E are never miscategorised.
+  // Both key containers iterate in sorted key order, so the result is deterministic.
   gtsam::FastMap<gtsam::Key, int> groups;
-  for (const std::uint64_t id : kf_order_) {
-    groups[keyX(id)] = 1;
+  for (const gtsam::Key key : isam2_->getLinearizationPoint().keys()) {
+    groups[key] = 1;
   }
-  for (const BridgeRecord& b : pending_bridges_) {
-    groups[keyV(b.i)] = 1;
-    groups[keyB(b.i)] = 1;
-    groups[keyV(b.j)] = 1;
-    groups[keyB(b.j)] = 1;
+  for (const gtsam::Key key : new_values_.keys()) {
+    groups[key] = 1;
   }
   for (const gtsam::Key key : pending_marginalize_) {
     groups[key] = 0;

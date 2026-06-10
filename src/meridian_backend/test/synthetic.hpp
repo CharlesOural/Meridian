@@ -9,9 +9,11 @@
 #include <string_view>
 #include <vector>
 
+#include "geodetic.hpp"
 #include "meridian/common/imu_preintegration.hpp"
 #include "meridian/common/keyframe_packet.hpp"
 #include "meridian/common/pose.hpp"
+#include "meridian/common/sample.hpp"
 #include "meridian/common/time.hpp"
 #include "meridian/debug/telemetry.hpp"
 
@@ -243,6 +245,128 @@ inline KeyframePacket make_restart_packet(std::uint64_t prev_id, std::uint64_t i
   p.calib_version = 1;
   p.frontend_kind = 1;
   return p;
+}
+
+// Builds an L-shaped keyframe chain with a known ground truth: n_before steps along +x,
+// a single 90-degree left turn, then n_after steps along +y (n_before + n_after + 1
+// keyframes total). The right-angle gives the buffered ENU track excitation along BOTH
+// horizontal axes, so the datum-init yaw is well observable (a straight track leaves yaw
+// near-singular and is rejected by the Hessian gate). Same packet layout as make_chain:
+// packet 0 is an AbsolutePrior at the start pose, the rest are exact RelativeBetween edges,
+// so the chain is its own optimum.
+inline SynthChain make_l_chain(int n_before, int n_after, double step_m,
+                               const SynthOptions& base = SynthOptions{}) {
+  SynthChain chain;
+  const int n = n_before + n_after + 1;
+  chain.gt.reserve(static_cast<std::size_t>(n));
+  chain.packets.reserve(static_cast<std::size_t>(n));
+
+  const Eigen::Quaterniond q_turn(Eigen::AngleAxisd(M_PI_2, Eigen::Vector3d::UnitZ()));
+  const Pose step_fwd{Eigen::Quaterniond::Identity(), Eigen::Vector3d(step_m, 0.0, 0.0)};
+  // A single in-place 90-degree yaw at the corner, then a straight leg in the rotated
+  // body frame keeps walking the world +y axis.
+  const Pose turn{q_turn, Eigen::Vector3d::Zero()};
+
+  chain.gt.push_back(Pose{});
+  for (int i = 1; i < n; ++i) {
+    if (i == n_before + 1) {
+      chain.gt.push_back(chain.gt.back() * turn * step_fwd);
+    } else {
+      chain.gt.push_back(chain.gt.back() * step_fwd);
+    }
+  }
+
+  GaussianBlock<6> cov;
+  cov.M.diagonal() << base.cov_rot, base.cov_rot, base.cov_rot, base.cov_trans, base.cov_trans,
+      base.cov_trans;
+
+  for (int i = 0; i < n; ++i) {
+    KeyframePacket p;
+    p.id = static_cast<std::uint64_t>(i);
+    p.stamp = static_cast<Timestamp>(1'000'000'000LL) + static_cast<Timestamp>(i) * 100'000'000LL;
+    p.ref_frame = Frame::Odom;
+    p.constraint_cov = cov;
+    p.calib_version = 1;
+    p.frontend_kind = 1;
+
+    if (i == 0) {
+      p.constraint_kind = KeyframePacket::ConstraintKind::AbsolutePrior;
+      p.T_ref_body = chain.gt[0];
+    } else {
+      p.constraint_kind = KeyframePacket::ConstraintKind::RelativeBetween;
+      p.rel_to_id = static_cast<std::uint64_t>(i - 1);
+      p.T_relto_this = chain.gt[static_cast<std::size_t>(i - 1)].inverse() *
+                       chain.gt[static_cast<std::size_t>(i)];
+      p.T_ref_body = chain.gt[static_cast<std::size_t>(i)];
+    }
+    chain.packets.push_back(std::move(p));
+  }
+  return chain;
+}
+
+// Numerically inverts geodetic lla_to_enu: returns the (lat,lon,alt) whose ENU position
+// about `origin` is `enu`. Using the back-end's OWN lla_to_enu as the forward model makes
+// the round-trip exact to solver tolerance regardless of the WGS84 ellipsoid details, so
+// a fix synthesized here reprojects back to exactly the intended p_enu inside the graph
+// (no model-mismatch bias). The Jacobian is the near-constant local metres-per-degree
+// scaling, so a few fixed-point steps converge; the altitude axis is decoupled (1 m / m).
+inline void enu_to_lla(const Eigen::Vector3d& enu, const GeodeticDatum& origin, double* lat_deg,
+                       double* lon_deg, double* alt_m) {
+  // Local linear sensitivities d(enu)/d(deg) about the origin, estimated by finite
+  // differences through the real forward map; ~1e-6 deg keeps the secant well-conditioned.
+  constexpr double kDegEps = 1e-6;
+  const Eigen::Vector3d e_lat =
+      (lla_to_enu(origin.lat0_deg + kDegEps, origin.lon0_deg, origin.alt0_m, origin)) / kDegEps;
+  const Eigen::Vector3d e_lon =
+      (lla_to_enu(origin.lat0_deg, origin.lon0_deg + kDegEps, origin.alt0_m, origin)) / kDegEps;
+  // 2x2 horizontal sensitivity (E,N) vs (lat,lon); alt maps 1:1 to Up by construction.
+  Eigen::Matrix2d J;
+  J << e_lat.x(), e_lon.x(), e_lat.y(), e_lon.y();
+  const Eigen::Matrix2d Jinv = J.inverse();
+
+  double lat = origin.lat0_deg, lon = origin.lon0_deg;
+  double alt = origin.alt0_m + enu.z();
+  for (int it = 0; it < 8; ++it) {
+    const Eigen::Vector3d cur = lla_to_enu(lat, lon, alt, origin);
+    const Eigen::Vector2d res(enu.x() - cur.x(), enu.y() - cur.y());
+    if (res.norm() < 1e-9) break;
+    const Eigen::Vector2d d = Jinv * res;
+    lat += d.x();
+    lon += d.y();
+  }
+  *lat_deg = lat;
+  *lon_deg = lon;
+  *alt_m = alt;
+}
+
+// Synthesizes a GNSS fix consistent with a ground-truth map pose, a chosen datum
+// T_map_enu, and a geodetic origin. The antenna sits at gt_map_pose * lever in map; that
+// point is pushed into ENU through T_map_enu^{-1}, then a zero-mean isotropic position
+// error of sigma_m (in ENU metres) is added before converting back to lla. cov_enu is set
+// isotropic at sigma_m^2 so the back-end weights the fix exactly as drawn. The same seed
+// reproduces the same fix, so two deterministic runs see byte-identical input.
+inline GnssFix make_fix(const Pose& gt_map_pose, const Eigen::Vector3d& lever,
+                        const Pose& T_map_enu, const GeodeticDatum& origin, Timestamp stamp,
+                        double sigma_m, GnssFix::FixType fix, std::uint32_t seed) {
+  const Eigen::Vector3d antenna_map = gt_map_pose * lever;
+  Eigen::Vector3d enu = T_map_enu.inverse() * antenna_map;
+
+  if (sigma_m > 0.0) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<double> gauss(0.0, sigma_m);
+    enu += Eigen::Vector3d(gauss(rng), gauss(rng), gauss(rng));
+  }
+
+  GnssFix f;
+  f.stamp = stamp;
+  f.sensor_id = 0;
+  f.sensor_frame = Frame::GnssLink;
+  enu_to_lla(enu, origin, &f.lat_deg, &f.lon_deg, &f.alt_m);
+  const double var = (sigma_m > 0.0 ? sigma_m * sigma_m : 1e-4);
+  f.cov_enu = var * Eigen::Matrix3d::Identity();
+  f.fix = fix;
+  f.num_sats = 12;
+  return f;
 }
 
 }  // namespace meridian::backend::testing

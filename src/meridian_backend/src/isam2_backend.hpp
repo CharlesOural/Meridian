@@ -5,6 +5,7 @@
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
 
+#include <Eigen/Core>
 #include <boost/optional.hpp>
 #include <cstdint>
 #include <memory>
@@ -13,6 +14,9 @@
 #include <vector>
 
 #include "chain_covariance.hpp"
+#include "datum.hpp"
+#include "geodetic.hpp"
+#include "gnss_gate.hpp"
 #include "kf_record.hpp"
 #include "meridian/backend/ibackend.hpp"
 #include "observability_inflation.hpp"
@@ -82,6 +86,22 @@ private:
   // Emits per-axis observability inflation telemetry and a marker when an axis is locked.
   void publish_observability(std::uint64_t id, const ObservabilityReport& obs,
                              const InflationResult& inf);
+
+  // The keyframe pair straddling a fix timestamp. When single is true the fix lands on (or
+  // past) one node and only `i` is used (endpoint factor); otherwise stamp(i) <= fix <=
+  // stamp(j) and beta interpolates between them. ids index into kf_records_.
+  struct Bracket {
+    std::uint64_t i = 0;
+    std::uint64_t j = 0;
+    bool single = false;
+  };
+  // Locates the bracketing keyframe pair for a fix stamp, seeded by the nearest-keyframe
+  // hint and searching kf_order_ deterministically. nullopt when no keyframe is in the
+  // estimate yet (nothing to anchor against).
+  std::optional<Bracket> find_bracket(Timestamp stamp, std::uint64_t hint) const;
+  // Folds one accepted GNSS fix into the staged batch after the datum is locked: gates it,
+  // builds the interpolated or endpoint factor, and runs the sustained-rejection auto-disable.
+  void admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_enu, const Bracket& br);
   // Drops bookkeeping for keyframes whose variables are not in the estimate after an
   // abandoned batch, restoring chain consistency.
   void rollback_uncommitted_keyframes();
@@ -118,6 +138,25 @@ private:
   // pending_marginalize_ until it is actually a Bayes-tree leaf and marginalizes cleanly.
   std::vector<BridgeRecord> pending_bridges_;
   std::vector<gtsam::Key> pending_marginalize_;
+
+  // GNSS / datum state. gnss_origin_ fixes the ENU tangent plane on the first accepted fix;
+  // datum_ buffers correspondences until the map<-ENU transform G is fit and locked. Once
+  // locked, fixes pass through gnss_gate_ and become factors tying the trajectory to G.
+  GeodeticDatum gnss_origin_;
+  DatumInitializer datum_;
+  GnssGate gnss_gate_;
+  bool datum_locked_ = false;
+  // Set when the datum locks in the current batch so optimize() folds immediately; cleared
+  // at the end of optimize().
+  bool datum_just_locked_ = false;
+  // FM-6 auto-disable: once tripped, every later fix is dropped silently.
+  bool gnss_auto_disabled_ = false;
+  // Arc length travelled (map-frame antenna) since the last admitted fix, for spacing decimation.
+  double gnss_travelled_since_admit_ = 0.0;
+  // Map-frame antenna position of the last fix seen after lock, to accumulate travel.
+  std::optional<Eigen::Vector3d> gnss_last_antenna_;
+  // Sustained rejection counter: consecutive post-lock fixes whose chi2 exceeds the gate.
+  int gnss_consecutive_chi2_reject_ = 0;
 
   BackEndDiagnostics diag_;
 };
