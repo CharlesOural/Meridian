@@ -2,7 +2,7 @@
 
 > Status: DRAFT for build. Cross-cutting spec. Authoritative for: the offline replay harness, accuracy metrics (ATE/RPE via evo), full-system + module-integration acceptance criteria, the unit/integration/regression test strategy, and map-quality (cloud-to-cloud / cloud-to-mesh) metrics. Consumes the `RunManifest` (Spec 00 §6 / `specs/00_architecture.md`), the telemetry bus (Spec 00 §10), and the core interfaces (Spec 01 / `specs/01_interfaces_and_data_types.md`). References — does **not** duplicate — the dataset decision in `docs/DATASET.md`. Frame/unit conventions inherited from Spec 01 §2. Logging/timing primitives (`ScopedTimer`, `TimingRegistry`, the `ParquetTelemetrySink` and its fixed columnar schema, the pinned determinism hash, and the `Config::dump`/`RunManifest` provenance) are defined in Spec 09 (`specs/09_debug_introspection.md`) and consumed here.
 >
-> **What Meridian is, for the purposes of this spec.** A single, complete **continuous-time (CT), tightly-coupled LiDAR-Inertial-Visual-GNSS** estimator (Spec 00): one CT B-spline sliding-window front-end (`ct_livo`) fusing direct point-to-plane LiDAR at each point's true sample time, FAST-LIVO2-style sparse-direct photometric vision, IMU, and GNSS; an iSAM2 factor-graph back-end; and a GPU **nvblox** TSDF+colour+Marching-Cubes map. There is **one** system to evaluate — not a sequence of shippable versions. The harness therefore measures one estimator against ground truth; it does not gate a "filter v1" against a "CT v2." (The FAST-LIO2-style iEKF in `meridian_frontend/src/iekf/` exists **only** as a differential-test oracle behind the same `IFrontEnd`, Spec 00 §5.4; §8.2 below uses it that way and nowhere treats it as a product path.)
+> **What Meridian is, for the purposes of this spec.** A single, complete **continuous-time (CT), tightly-coupled LiDAR-Inertial-Visual-GNSS** estimator (Spec 00): one CT B-spline sliding-window front-end (`ct_livo`) fusing direct point-to-plane LiDAR at each point's true sample time, FAST-LIVO2-style sparse-direct photometric vision, IMU, and GNSS; an iSAM2 factor-graph back-end; and a GPU **nvblox** TSDF+colour+Marching-Cubes map. There is **one** system to evaluate — not a sequence of shippable versions. The harness therefore measures one estimator against ground truth; it does not gate a "filter v1" against a "CT v2." (The FAST-LIO2-style iEKF that once served as a differential-test oracle behind the same `IFrontEnd` is **removed** — Spec 00 §5.4. The front-end cross-check is now direct: GT-tracking tests, analytic-vs-autodiff parity twins, and the clean-LIO ablation toggle; §8.2.)
 >
 > **Deployment target.** NVIDIA Jetson Orin; a CUDA GPU is **always present**. Mapping is nvblox, GPU-only — there is no CPU map path to evaluate and no CPU-fallback gate. **Single LiDAR + single IMU + single camera + GNSS** — there is no multi-LiDAR merge to test.
 
@@ -71,7 +71,7 @@ eval/
   datasets/<dataset>/<sequence>.yaml      # provenance, GT path, extrinsics ref, expected metrics
   configs/<profile>.yaml                  # estimator config profiles used by eval (the full meridian:: tree, Spec 00 §8.2)
   baselines/<sequence>/<profile>.json     # frozen regression baselines (committed)
-  smoke/<clip>.mcap                        # tiny CI clips (LFS) — see DATASET.md "How it plugs into the build"
+  smoke/<clip>.mcap                        # tiny CI clips (LFS) — the only bags committed; full bags stay external (DATASET.md)
 runs/<run_id>/                             # produced; gitignored
   manifest.json                            # RunManifest (Spec 00 §6)
   trajectory_odom.tum                      # front-end (L2) live odometry trajectory
@@ -83,37 +83,38 @@ runs/<run_id>/                             # produced; gitignored
   plots/*.pdf
 ```
 
-`run_id` = `<sequence>__<profile>__<git_sha8>__<utc_timestamp>`; it is also stored inside `manifest.json` so a result is never separated from its conditions. The single production profile is the full CT LIVO+GNSS estimator (`frontend.kind: ct_livo`, `backend.kind: isam2`, `map.backend: nvblox`, Spec 00 §8.2); the `iekf_lio` profile (§8.2) appears in `eval/configs/` only as the differential-test oracle.
+`run_id` = `<sequence>__<profile>__<git_sha8>__<utc_timestamp>`; it is also stored inside `manifest.json` so a result is never separated from its conditions. The single production profile is the full CT LIVO+GNSS estimator (`frontend.kind: ct_livo`, `backend.kind: isam2`, `map.backend: nvblox`, Spec 00 §8.2). Any other profile in `eval/configs/` is a *diagnostic ablation* of the same `ct_livo` tree (e.g. the clean-LIO profile: vision residuals off), never a different estimator.
 
 ### 1.3 The dataset descriptor (`eval/datasets/<dataset>/<sequence>.yaml`)
 
-The harness never hard-codes dataset facts. `DATASET.md` (Recommendation, How-it-plugs-in) decides *which* sequences and the GT/format conventions; this YAML is the machine-readable instance, one per sequence:
+The harness never hard-codes dataset facts. `DATASET.md` decides *which* sequences and the GT/format conventions; this YAML is the machine-readable instance, one per sequence:
 
 ```yaml
-dataset: fusionportable
-sequence: 20220216_garden_day
+dataset: newer_college_2021
+sequence: quad-easy
 bag:
-  uri: "https://.../20220216_garden_day.mcap"        # fetched to ~/.cache/meridian/datasets (DATASET.md)
+  uri: "bags/newer-college/quad-easy"                # prepared ros2 bag (DATASET.md pipeline)
   sha256: "…"
-  format: mcap                                       # mcap | ros2bag | ros1(converted via rosbags-convert)
+  format: ros2bag                                    # ros2bag | mcap | ros1(converted via rosbags-convert)
 topics:                                              # bag topic → core sensor (the L0 ISensorSource mapping)
-  /os_cloud_node/points:  { sensor: lidar,  type: lidar }   # the single LiDAR
-  /imu/data:              { sensor: imu,    type: imu }
-  /stereo/left/image:     { sensor: cam,    type: image }   # single camera (sparse-direct photometric)
-  /ublox/fix:             { sensor: gnss,   type: gnss }
+  /os_cloud_node/points:       { sensor: lidar, type: lidar }   # the single LiDAR (OS0-128, 10 Hz, per-point t)
+  /alphasense_driver_ros/imu:  { sensor: imu,   type: imu }     # 200 Hz
+  /alphasense_driver_ros/cam0/compressed: { sensor: cam, type: image }  # visual stage disabled on this set
+  # no gnss entry — the Newer College rig carries no GNSS
 groundtruth:
-  path: "20220216_garden_day_gt.tum"                 # TUM (DATASET.md, evo-readable)
+  path: "gt/tum_asimu/gt-nc-quad-easy.csv"           # TUM, re-expressed in the IMU frame (DATASET.md, evo-readable)
   frame: "gt_world"
   body_frame: "imu"                                  # frame the GT pose refers to (matches estimation_frame)
-calibration: "calib/fusionportable_os1.yaml"         # hashed into manifest (Spec 00 §6, Spec 01 §5)
-characteristics: [indoor_outdoor, revisit_loop]      # free-form tags used to select acceptance gates
+calibration: "src/meridian_ros/config/newer-college-quad.yaml"  # per-collection; hashed into manifest (Spec 00 §6, Spec 01 §5)
+characteristics: [outdoor, revisit_loop]             # free-form tags used to select acceptance gates
+role: tuning                                          # tuning | holdout (quad-hard is holdout: milestone evals only)
 expected:                                             # per-sequence acceptance (drives the §6.2 system test)
   ate_rmse_m_max: 0.30
   rpe_trans_pct_max: 1.5
   drift_pct_max: 0.8
 ```
 
-There is exactly **one** `lidar` entry — Meridian is single-LiDAR (Spec 00 §2, Spec 01 §4.2). A bag carrying extra LiDAR streams (e.g. a multi-LiDAR public rig) maps only its primary cloud topic to `sensor: lidar`; surplus streams are simply not subscribed. The `body_frame` field is essential: ATE compares like-with-like, and GT is in each dataset's own world frame at a specific body frame. The harness composes the estimator output (the estimation frame `imu_link`, Spec 01 §2.3) with the GT body frame before alignment (§3.2).
+There is exactly **one** `lidar` entry — Meridian is single-LiDAR (Spec 00 §2, Spec 01 §4.2). A bag carrying surplus streams maps only its chosen topics; the rest are simply not subscribed (Newer College's secondary Ouster-internal IMU `/os_cloud_node/imu` is an example, as would be the extra cloud topics of a multi-LiDAR rig). The `body_frame` field is essential: ATE compares like-with-like, and GT is in each dataset's own world frame at a specific body frame. The harness composes the estimator output (the estimation frame `imu_link`, Spec 01 §2.3) with the GT body frame before alignment (§3.2). `role: holdout` marks a sequence as **blind validation only**: the system runner accepts it solely for milestone evaluations (§6.2), and the regression tiers (§7.2, §8.3) must never select it — running a holdout routinely turns it into a tuning input.
 
 ---
 
@@ -139,7 +140,7 @@ public:
 };
 ```
 
-Critical subtlety — **time sync must match the live path**: FusionPortable is hardware-synced (identity offset), M2DGR is not (DATASET.md notes both). `BagSource` applies *exactly the same* L0 sync transform the live `ISensorSource` applies, because time sync is core code (Spec 00 L0, `specs/02_sensors_timesync.md`), not a harness convenience. The harness additionally *records* the measured per-sensor offset as a diagnostic into `timing.parquet`. It must never silently "fix up" timestamps in a way the live node wouldn't.
+Critical subtlety — **time sync must match the live path**: a hardware-synced rig takes the identity offset (Newer College: Ouster + alphasense share one synced clock, DATASET.md), an unsynced one takes the live L0 estimated offset. Either way `BagSource` applies *exactly the same* L0 sync transform the live `ISensorSource` applies, because time sync is core code (Spec 00 L0, `specs/02_sensors_timesync.md`), not a harness convenience. The harness additionally *records* the measured per-sensor offset as a diagnostic into `timing.parquet`. It must never silently "fix up" timestamps in a way the live node wouldn't.
 
 ### 2.2 Replay clock injection
 
@@ -205,7 +206,7 @@ enum class ReplayMode {
 
 ### 3.1 Ingestion
 
-All GT enters as TUM (DATASET.md fixes evo/TUM as the convention). The metrics stage loads it via evo's TUM reader; the harness's only GT responsibility in the *replay* stage is to copy/normalize the path into the run dir so a run is self-contained. GT for the **GNSS prior fed *into* the estimator** (when a sequence exercises GNSS factors, e.g. M2DGR with RTK) comes from the bag's GNSS topic, **never** from the evaluation GT — otherwise we leak the answer into the estimate and ATE becomes meaningless. The harness asserts the eval GT file path is not the input GNSS topic (§9.1).
+All GT enters as TUM (DATASET.md fixes evo/TUM as the convention). The metrics stage loads it via evo's TUM reader; the harness's only GT responsibility in the *replay* stage is to copy/normalize the path into the run dir so a run is self-contained. GT for the **GNSS prior fed *into* the estimator** (when a sequence exercises GNSS factors — none of the current Newer College set does; the rig has no GNSS) comes from the bag's GNSS topic, **never** from the evaluation GT — otherwise we leak the answer into the estimate and ATE becomes meaningless. The harness asserts the eval GT file path is not the input GNSS topic (§9.1).
 
 ### 3.2 Frame and body-frame reconciliation
 
@@ -214,6 +215,8 @@ The estimator reports poses of the estimation frame `imu_link` (Spec 01 §2.3). 
 $$ \hat{\mathbf{T}}_{\text{gt-body}}(t) \;=\; \mathbf{T}^{\text{gt-body}}_{\,F_e}\cdot \mathbf{T}_{\text{est}}(t), $$
 
 where $\mathbf{T}^{\text{gt-body}}_{\,F_e}$ is the static extrinsic from the calibration file (Spec 01 §5) mapping the estimation frame $F_e$ into the GT body frame. We transform the *estimate* into the GT body frame (not vice-versa) so the trajectory we judge is what the rest of the world consumes from us. The world-frame gauge difference between the estimator world and `gt_world` is then absorbed by Umeyama alignment (§4.4).
+
+A constant body offset does **not** wash out under that alignment — Umeyama removes one rigid world transform, not a per-pose lever arm that rotates with the body — so skipping this composition biases ATE by up to the lever-arm length. Newer College is the worked instance: the dataset's native GT is in the *base* frame, ~7.6 cm from the estimation (alphasense-IMU) frame, so DATASET.md re-expresses GT offline into the IMU frame (`gt/tum_asimu/`); for those sequences `body_frame: imu` and the composition above is identity. ATE is scored against `tum_asimu`, never the base-frame files.
 
 ---
 
@@ -245,7 +248,7 @@ $$ \mathbf{F}_i = \hat{\mathbf{Q}}_i^{-1}\,\mathbf{Q}_i, \qquad \text{RPE}_{\tex
 
 We additionally report **drift as % of distance travelled** (KITTI-style): RPE translational error over $\{100,200,\dots,800\}$ m sub-paths, averaged — this is the number directly comparable to the LIO literature and is the one in `<sequence>.yaml: expected.drift_pct_max`. The rotational RPE is reported in deg/m.
 
-> Worked example. On a 480 m FusionPortable `garden_day` run, suppose $\text{ATE}_{\text{rmse}}=0.21$ m and KITTI-drift $=0.55\%$. The drift figure ($0.0055 \times$ path) implies an *expected* end-to-end translational gap of $\sim2.6$ m before loop closure; if `trajectory_world` (post loop) ATE is 0.21 m, loop closure is recovering $\sim92\%$ of the open-loop drift — a healthy back-end. If instead post-loop ATE were *also* $\sim2.5$ m, loop closure is not firing or PCM (Spec 01 §7.6 `fitness`/PCM) is rejecting good loops. This is the causal reasoning the two-trajectory + drift% reporting is designed to enable.
+> Worked example. On the ~570 s Newer College `park` sequence, suppose a ~480 m walked path with $\text{ATE}_{\text{rmse}}=0.21$ m and KITTI-drift $=0.55\%$. The drift figure ($0.0055 \times$ path) implies an *expected* end-to-end translational gap of $\sim2.6$ m before loop closure; if `trajectory_world` (post loop) ATE is 0.21 m, loop closure is recovering $\sim92\%$ of the open-loop drift — a healthy back-end. If instead post-loop ATE were *also* $\sim2.5$ m, loop closure is not firing or PCM (Spec 01 §7.6 `fitness`/PCM) is rejecting good loops. This is the causal reasoning the two-trajectory + drift% reporting is designed to enable.
 
 ### 4.4 Alignment policy (and the scale trap)
 
@@ -281,7 +284,7 @@ Trajectory accuracy is necessary but not sufficient: a low-ATE run can still pro
 
 ### 5.1 Reference geometry
 
-Map ground truth is the relevant dataset's reference: a survey/TLS reference cloud or prior map where one exists (FusionPortable provides prior maps for some sequences; DATASET.md records provenance per sequence). When no metric reference map exists, map quality is reported only as **self-consistency** metrics (§5.4), clearly labelled, and never used as an absolute gate.
+Map ground truth is the relevant dataset's reference: a survey/TLS reference cloud or prior map where one exists (Newer College ships the TLS-derived `prior_map/maths-institute.ply` covering the `math-medium` collection; DATASET.md records provenance per sequence). When no metric reference map exists, map quality is reported only as **self-consistency** metrics (§5.4), clearly labelled, and never used as an absolute gate.
 
 ### 5.2 Cloud-to-Cloud (C2C) — accuracy and completeness
 
@@ -338,26 +341,28 @@ Each milestone has (a) a *smoke* gate that must pass in CI on every commit (tiny
 
 The milestone order mirrors Spec 00 §13 (a convenience for integration), not a roadmap of shippable variants; every interface (Spec 01) is in place from the first milestone.
 
+Scope note on the current benchmark set (DATASET.md: Newer College 2021): it exercises the **LiDAR-inertial core** — the visual stage is disabled on these bags and the rig carries no GNSS — so the visual and GNSS portions of the gates below run on synthetic/injected data (§6.3, §8.2) until the set grows, and published ATE numbers are LIO-only. `quad-hard` is the **holdout** (`role: holdout`, §1.3): blind milestone validation only, never a tuning or regression input.
+
 | Milestone (Spec 00 §13 step) | What is being integrated into the one system | Primary eval sequence(s) (DATASET.md) | Acceptance metric (gate) |
 |---|---|---|---|
 | **M0 — contracts + skeleton** (steps 1) | Cross-cutting types + the full interface set compile; no-op module bodies; harness runs the empty pipeline end-to-end | smoke clip | Harness runs end-to-end; `manifest.json` valid; determinism: rerun byte-identical. No accuracy gate. |
-| **M1 — sensing path** (steps 2) | L0/L1: real measurements onto the monotonic timeline, time-synced, preprocessed | FusionPortable `garden_day` (sensing only) | Per-sensor sync offset within sequence spec; preprocessed scan rate/density sane; no dropped-sample storm. Determinism holds. |
-| **M2 — CT front-end** (step 3) | L2 `ct_livo`: CT spline window + LiDAR point-to-plane @ true point time + IMU-derivative + sparse-direct photometric + GNSS residuals, in one solve. (iEKF oracle brought up alongside *only* to differential-test, §8.2.) | FP `garden_day`; M2DGR `street_01` for GNSS | `trajectory_odom` ATE RMSE ≤ 0.30 m; KITTI-drift ≤ 0.8%; front-end p99 < LiDAR period; rt_factor < 0.7. CT-vs-iEKF differential check within bounds (§8.2). |
-| **M3 — nvblox map** (step 4) | L4: GPU TSDF+colour+Marching-Cubes mesh consuming keyframe clouds; KeyframeStore | FP `garden_day` (+ ref map where available) | Mesh extracts without holes in covered region; C2C F-score@0.1 ≥ 0.85 vs ref where available; C2M signed-distance unimodal. |
-| **M4 — back-end** (step 5) | L3: iSAM2 graph consuming `KeyframePacket`s; `GraphUpdate` feedback to L2/L4; GNC robust kernels; online extrinsic refinement | FP `garden_day` | `trajectory_world` ATE ≤ `trajectory_odom` ATE (back-end helps, never hurts); ATE ≤ 0.20 m on garden; online extrinsic converges to within 1° / 2 cm of the calib prior. |
-| **M5 — loop closure** (step 6) | L5: SC++→STD/BTC→GICP→PCM feeding loop constraints to L3; closing the correction loop into L4's clear-and-rebuild | FP revisit sequences; M2DGR `street_01` | Loop precision = 1.0 (zero false loops via PCM); ATE drops or holds after loop; re-integration stability (§5.4) holds; no ATE spike at loop time. |
-| **M6 — full-system robustness & global** (step 7 + system) | The complete system under degeneracy, outliers, GNSS, and global consistency | M2DGR (RTK), FP `corridor_day`/fast-motion, Hilti `exp04`, UrbanNav canyon | On degeneracy: no divergence (ATE finite, < 2× nominal) and the unobservable axis's `observability.score` drops (Spec 01 §3.4); GNSS factor: ATE in global ENU ≤ 0.5 m where RTK-fixed, clean GNSS-denied handoff (no jump > 0.3 m at re-acquisition); GNC drives injected outliers' weight → 0 (§6.3). |
+| **M1 — sensing path** (steps 2) | L0/L1: real measurements onto the monotonic timeline, time-synced, preprocessed | NC `quad-easy` (sensing only) | Per-sensor sync offset within sequence spec; preprocessed scan rate/density sane; no dropped-sample storm. Determinism holds. |
+| **M2 — CT front-end** (step 3) | L2 `ct_livo`: CT spline window + LiDAR point-to-plane @ true point time + IMU-derivative + sparse-direct photometric + GNSS residuals, in one solve. (Photometric + GNSS residuals proven on the synthetic bag, §8.2 — no current sequence carries them.) | NC `quad-easy`, `math-medium` | `trajectory_odom` ATE RMSE ≤ 0.30 m; KITTI-drift ≤ 0.8%; front-end p99 < LiDAR period; rt_factor < 0.7. Direct GT-tracking and Jacobian-parity checks green (§8.1–§8.2). |
+| **M3 — nvblox map** (step 4) | L4: GPU TSDF+colour+Marching-Cubes mesh consuming keyframe clouds; KeyframeStore | NC `math-medium` (+ `prior_map/maths-institute.ply` as reference) | Mesh extracts without holes in covered region; C2C F-score@0.1 ≥ 0.85 vs ref where available; C2M signed-distance unimodal. |
+| **M4 — back-end** (step 5) | L3: iSAM2 graph consuming `KeyframePacket`s; `GraphUpdate` feedback to L2/L4; GNC robust kernels; online extrinsic refinement | NC `quad-easy` | `trajectory_world` ATE ≤ `trajectory_odom` ATE (back-end helps, never hurts); ATE ≤ 0.20 m on quad-easy; online extrinsic converges to within 1° / 2 cm of the calib prior. |
+| **M5 — loop closure** (step 6) | L5: SC++→STD/BTC→GICP→PCM feeding loop constraints to L3; closing the correction loop into L4's clear-and-rebuild | NC revisit sequences (`quad-easy` quad circuits, `park`) | Loop precision = 1.0 (zero false loops via PCM); ATE drops or holds after loop; re-integration stability (§5.4) holds; no ATE spike at loop time. |
+| **M6 — full-system robustness & global** (step 7 + system) | The complete system under degeneracy, outliers, GNSS, and global consistency | Fault-injected variants of the tuning set (§6.3); NC `quad-hard` **HOLDOUT** (blind, milestone-only) | On (injected) degeneracy: no divergence (ATE finite, < 2× nominal) and the unobservable axis's `observability.score` drops (Spec 01 §3.4); GNSS factor on synthetic injection until a GNSS-carrying sequence is added (target: global ENU ≤ 0.5 m where the fix is good, no jump > 0.3 m at re-acquisition); GNC drives injected outliers' weight → 0 (§6.3); quad-hard ATE within its `expected` bounds without any retuning. |
 
-There is no milestone for "swap the front-end." The CT estimator is THE front-end from M2 onward; the iEKF appears only as the differential oracle that helps validate M2 (§8.2). Multi-LiDAR, ESDF, and semantics are deferred (Spec 00 §12) and have no milestone here.
+There is no milestone for "swap the front-end." The CT estimator is THE front-end from M2 onward; its cross-check is the direct GT-tracking test (§8.2 — the retired iEKF oracle has no role here). Multi-LiDAR, ESDF, and semantics are deferred (Spec 00 §12) and have no milestone here.
 
 ### 6.1 Mapping of dataset *characteristics* → which gate applies
 
 The harness selects extra gates from `<sequence>.yaml: characteristics` (so we do not, e.g., assert a GNSS gate on a GNSS-less sequence):
 
-- `degeneracy_corridor` ⇒ assert at least one `observability.score[axis]` drops below threshold during the degenerate span AND ATE finite (no divergence). (FP corridor, Hilti degenerate — DATASET.md robustness gate.)
-- `low_illumination` ⇒ the sparse-direct visual residual count > 0 yet bounded; the LiDAR-inertial part must carry the estimate (ATE not worse than a LiDAR-only diagnostic run by > 10%). The "LiDAR-only diagnostic run" is a *config toggle on the same `ct_livo` front-end* (vision residuals off), not a separate estimator.
-- `gnss_denied_transition` (UrbanNav canyon) ⇒ continuity gate at the GNSS-denied transition (M6).
-- `fast_motion` ⇒ the IMU-only cold-start deskew bootstrap path is exercised (Spec 00 §7.2): assert the cold-start branch ran on the first $k$ scans, then the CT trajectory took over point registration (the `restarted`/bootstrap flag in `FrontEndDiagnostics`, Spec 01 Appendix A).
+- `degeneracy_corridor` ⇒ assert at least one `observability.score[axis]` drops below threshold during the degenerate span AND ATE finite (no divergence). (No current sequence carries the tag — the NC `stairs` extra is the candidate once imported; until then the gate runs on injected degeneracy, §6.3.)
+- `low_illumination` ⇒ the sparse-direct visual residual count > 0 yet bounded; the LiDAR-inertial part must carry the estimate (ATE not worse than the clean-LIO ablation by > 10%). The clean-LIO ablation is a *config toggle on the same `ct_livo` front-end* (vision residuals off), not a separate estimator. (Dormant while the visual stage is disabled on the current set.)
+- `gnss_denied_transition` ⇒ continuity gate at the GNSS-denied transition (M6). (Tag retained for a future GNSS-carrying sequence; none in the current set.)
+- `fast_motion` ⇒ the IMU-only cold-start deskew bootstrap path is exercised (Spec 00 §7.2): assert the cold-start branch ran on the first $k$ scans, then the CT trajectory took over point registration (the `restarted`/bootstrap flag in `FrontEndDiagnostics`, Spec 01 Appendix A). (Candidate carrier: `quad-hard` — holdout, so this fires at milestone evals only.)
 
 ### 6.2 The system test runner
 
@@ -383,11 +388,11 @@ The window-restart fallback (Spec 00 §7.4, Spec 01 §6.4 `ImuPreintegration`) i
 
 ### 7.1 What a baseline is
 
-A **baseline** is a frozen `results.json` (and the `manifest.json` that produced it) for a `(sequence, profile)` pair, committed under `eval/baselines/<sequence>/<profile>.json`. It is the authoritative "this is how good we were" record. The `RunManifest` (Spec 00 §6: git SHA, config hash, calib hash, dataset id, input content hash) is what makes a baseline meaningful — a metric number without its conditions is noise. The tracked profile is the full `ct_livo` production system; the `iekf_lio` oracle is tracked only for the differential-check tolerance (§8.2), not as a product baseline.
+A **baseline** is a frozen `results.json` (and the `manifest.json` that produced it) for a `(sequence, profile)` pair, committed under `eval/baselines/<sequence>/<profile>.json`. It is the authoritative "this is how good we were" record. The `RunManifest` (Spec 00 §6: git SHA, config hash, calib hash, dataset id, input content hash) is what makes a baseline meaningful — a metric number without its conditions is noise. The tracked profile is the full `ct_livo` production system (on the current Newer College set that runs LIO-only — visual disabled, no GNSS — and the baseline records exactly that config). The clean-LIO ablation profile may carry its own baseline as a diagnostic reference, never as the headline.
 
 ### 7.2 The regression check
 
-On every PR (CI) and nightly (full), for each tracked `(sequence, profile)`:
+On every PR (CI) and nightly (full), for each tracked `(sequence, profile)`. The holdout sequence (`role: holdout`, §1.3) is **never** in the tracked set — comparing against it per-PR would make it a tuning input; it is exercised only by the §6.2 milestone runs:
 
 ```
 new = run_replay_and_metrics(sequence, profile)
@@ -422,7 +427,7 @@ The milestone gates above are the *system* tier. Beneath them:
 
 Per core module, table-driven tests on each interface contract (Spec 01) with synthetic inputs and known answers. The clock-free, side-effect-explicit interfaces (Spec 01) are exactly what makes these trivial — each module is a near-pure function of its inputs.
 
-- **Math kernels**: SO(3)/SE(3) exp/log round-trips, box-plus/box-minus on `Pose`/`NavState`, Jacobian checks by finite difference (each analytic Jacobian in L2/L3 has an `EXPECT_NEAR(analytic, numeric, 1e-6)` test — non-negotiable given the rigour of the derivations in `specs/04_frontend_estimation.md`).
+- **Math kernels**: SO(3)/SE(3) exp/log round-trips, box-plus/box-minus on `Pose`/`NavState`, Jacobian checks by finite difference (each analytic Jacobian in L2/L3 has an `EXPECT_NEAR(analytic, numeric, 1e-6)` test — non-negotiable given the rigour of the derivations in `specs/04_frontend_estimation.md`) and **analytic-vs-autodiff parity**: every analytic factor family (LiDAR, visual, IMU) keeps its autodiff twin behind an `*Autodiff` factory and must match it at near-machine precision.
 - **CT registration / deskew**: a synthetic constant-twist trajectory registers a known scan to a known cloud; assert residual < ε. Includes the IMU-only cold-start branch (Spec 00 §7.2) and the steady-state CT per-point registration (Spec 00 §7.5) as separate cases.
 - **Data association / voxel map**: insertion/query correctness, plane fit on synthetic planes (`query_plane`, Spec 01 §7.5).
 - **KeyframePacket round-trip**: serialize/deserialize equality; `kinematics_included` flag honoured (Spec 01 §6).
@@ -431,7 +436,8 @@ Per core module, table-driven tests on each interface contract (Spec 01) with sy
 ### 8.2 Integration tests (multi-module, tiny synthetic or smoke clip)
 
 - **L0→L2 on a synthetic bag**: a programmatically generated bag (known trajectory, simulated planar-room single LiDAR + IMU) where the *exact* answer is known; assert ATE ≈ 0 (within numerical tolerance). This catches frame/convention bugs that real-data ATE (with its own GT error) cannot.
-- **CT-vs-iEKF differential check (the oracle's one job)**: on the same synthetic and smoke clips, run the production `ct_livo` front-end and the `iekf_lio` reference oracle (Spec 00 §5.4) behind the *same* `IFrontEnd`, and assert their trajectories agree to within an expected bound. Divergence flags a bug in one of them. This is the *only* role the iEKF plays — it is never gated as a product, never deployed, and nothing else in the harness is organised around it.
+- **Direct GT-tracking check (replaced the retired CT-vs-iEKF differential, Spec 04 §5.6)**: on the same synthetic bags and on smoke clips carrying a reference trajectory, drive the production `ct_livo` front-end and assert `live_state()` tracks the reference pose within an absolute position/orientation bound, with the visual stage independently confirmed to engage (converged photometric residuals) where it is enabled. A direct absolute-error bound is stronger and more interpretable than a "two estimators agree" comparison.
+- **Clean-LIO ablation**: the same clip run with the §6.1 vision-off toggle on the same `ct_livo` config; the delta between the two runs isolates the photometric stage's contribution and is the first bisect step when a tracking regression appears.
 - **Loop closure + re-integration**: a synthetic loop where the true loop constraint is known; assert PCM accepts it, the back-end corrects, and `apply_graph_update` (Spec 01 §7.5) reduces the planarity residual (§5.4).
 - **Restart/fallback** (§6.4).
 - **End-to-end smoke**: the M0 gate — full L0→L6 on a 5–15 s clip, asserting it runs, produces a valid manifest, and is deterministic.
@@ -445,7 +451,7 @@ Per core module, table-driven tests on each interface contract (Spec 01) with sy
 | Regression | every PR (CI) | smoke clips + 1–2 short full seqs | < 20 min |
 | System | nightly + pre-milestone-gate | full sequences (fetched by hash) | hours (parallel over sequences) |
 
-The split honours DATASET.md (How-it-plugs-in): only tiny clips live in the repo (LFS); full bags are fetched by URL+hash into `~/.cache/meridian/datasets` and are therefore *not* in the per-commit path.
+The split honours DATASET.md: only tiny clips live in the repo (LFS); the full benchmark bags are not committed — they are fetched and prepared per DATASET.md (content-hashed in the descriptor, §1.3) and are therefore *not* in the per-commit path. The holdout (`role: holdout`) is excluded from every tier here including nightly; it runs only in pre-milestone system evals (§6.2, §7.2).
 
 ---
 
@@ -478,7 +484,7 @@ The harness's job is to fail *informatively*. Named, asserted failure modes:
 | Real-time miss (Orin) | front-end `step` p99 > sensor period; rt_factor ≥ 1 | §5.5 |
 | Restart path broken | forced-restart test: discontinuity, or wrong factor emitted | §6.4 |
 | Deskew cold-start not exercised | `fast_motion` seq without the IMU-only bootstrap flag set | §6.1 |
-| CT/iEKF divergence | oracle differential check exceeds bound (one of the two has a bug) | §8.2 |
+| Front-end estimator bug | direct GT-tracking bound exceeded on synthetic/smoke data; or an analytic factor diverges from its autodiff parity twin | §8.1–§8.2 |
 | GT leakage | GNSS GT used as both input prior and eval reference | §3.1 (asserted: eval GT path ≠ input GNSS topic) |
 
 ---
@@ -489,7 +495,7 @@ The harness's job is to fail *informatively*. Named, asserted failure modes:
 - **Open3D** for C2C/C2M (KD-tree NN, ICP refine, mesh signed-distance) — single choice; the `Metric` interface (§5.6) hides it.
 - **Arrow/Parquet** for telemetry logs (Spec 09 sink) — columnar, fast to query in pandas/duckdb.
 - **GoogleTest** for unit/integration; **CTest** labels (`unit`, `integration`, `regression`, `system`) drive the tiers (§8.3).
-- Bag IO: `mcap` C++ reader (primary), `rosbag2` reader where needed; ROS 1 datasets are converted offline to mcap with `rosbags-convert` (DATASET.md, How-it-plugs-in).
+- Bag IO: `rosbag2` reader (primary — the prepared benchmark bags are ros2/sqlite3), `mcap` C++ reader for the smoke clips; ROS 1 originals are converted offline with `rosbags-convert` (DATASET.md).
 
 CLI surface (all ROS-free, built under `meridian_tools`):
 ```

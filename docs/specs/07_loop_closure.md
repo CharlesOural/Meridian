@@ -187,9 +187,9 @@ Because L5's geometry comes from the same `KeyframeStore` that the back-end fill
 from the `KeyframePacket`, L5 is independent of the estimator internals: the
 packet's `cloud_body` is a Shared-immutable handle the back-end forwards to the
 store; L5 dereferences it through the store, never touching an L2-internal buffer.
-(The architecture keeps the CT front-end and the test-only iEKF reference oracle
-behind the same `IFrontEnd` interface, `00` §5.4; L5 is identical regardless of
-which produced the keyframe, because it only ever sees `01` boundary types.)
+(The front-end sits behind the `IFrontEnd` interface, `00` §5.4; L5 is identical
+regardless of which estimator produced the keyframe, because it only ever sees
+`01` boundary types.)
 
 ---
 
@@ -354,7 +354,7 @@ metric transform plus a **fitness we can trust** (`Appendix R.3`). PCM is the
 last line: it rejects geometrically-plausible-but-globally-inconsistent loops
 (perceptual aliasing that survived A–C; `Appendix R.4`). This is the
 defence-in-depth hierarchy of `Appendix R.6`. Dropping any stage measurably
-degrades precision/recall on the FusionPortable / M2DGR targets (`DATASET.md`).
+degrades precision/recall on the Newer College benchmark sequences (`DATASET.md`).
 
 ---
 
@@ -475,8 +475,8 @@ descriptor **plus** a binary appearance code (a local occupancy bit-string), and
 BTC is a strict **superset** of STD — set the appearance code to a constant and the
 re-rank degrades exactly to STD triangle matching. The binary code is a cheap
 Hamming-distance pre-filter ahead of the triangle hash vote, and it is precisely
-the discriminator that breaks the corridor/parking-row aliasing the target datasets
-exhibit (two corridors with identical triangle geometry but different local
+the discriminator that breaks corridor/parking-row-style aliasing (two
+self-similar places with identical triangle geometry but different local
 occupancy). The interface (§11) is descriptor-agnostic; this is one descriptor
 pipeline (SC++ retrieve → BTC re-rank), not two competing pipelines.
 
@@ -1147,9 +1147,9 @@ struct IConsistencyFilter {          // Stage D
 
 All under `meridian.place` in the typed `Config` tree (`00_architecture.md` §8;
 file `config/place.yaml`). Defaults are the KITTI-tuned Scan Context starting
-points (`Appendix R.1`) adapted for Ouster on FusionPortable / M2DGR-like data
-(`DATASET.md`); they are *starting points* to be swept on the replay sets, never
-trusted as-is (`Appendix R.1`).
+points (`Appendix R.1`); they are *starting points* to be swept on the Newer
+College replay sequences with the Ouster OS0-128 (`DATASET.md`), never trusted
+as-is (`Appendix R.1`).
 
 | Param | Default | Meaning |
 |---|---|---|
@@ -1267,10 +1267,10 @@ loop-level degeneracy is *visible*, mirroring L2's observability reporting (`00`
 
 ## 15. Test plan
 
-Per `00_architecture.md` §9.4 and the dataset acceptance mapping (`DATASET.md`:
-"back-end + loop closure → ATE drop after loop closure; no false-loop
-corruption"). Runs under `colcon test` with the deterministic single-thread mode
-(`00` §11.2) for reproducibility.
+Per `00_architecture.md` §9.4, against the Newer College benchmark set
+(`DATASET.md`). The L5 acceptance criterion: ATE drops after loop closure; no
+false-loop corruption. Runs under `colcon test` with the deterministic
+single-thread mode (`00` §11.2) for reproducibility.
 
 1. **Unit — Scan Context invariance.** Synthetic cloud rotated by a known yaw ⇒
    recovered `Δψ` within one sector; translated within tolerance ⇒ SC distance
@@ -1305,16 +1305,20 @@ corruption"). Runs under `colcon test` with the deterministic single-thread mode
    covariance composed with Adjoint transport and PSD-guarded (§8.2); tangent
    permutation ($[t,r]\!\to\![\rho;\phi]$, and the GTSAM $[\text{rot};\text{trans}]$
    adapter) verified against a hand-computed case (`Appendix R.5`).
-7. **Integration — replay.** FusionPortable (primary) + M2DGR (co-primary)
-   sequences with revisits (`DATASET.md`). Metrics: precision/recall of detected
-   loops vs the GT revisit set; **ATE before/after** loop closure; target **zero
-   false loops** on the primary set.
+7. **Integration — replay.** Newer College tuning sequences with revisits
+   (quad-easy, math-medium, park; `DATASET.md`). Metrics: precision/recall of
+   detected loops vs the GT revisit set (revisit pairs derived from the
+   `gt/tum_asimu` trajectories); **ATE before/after** loop closure; target
+   **zero false loops** on the tuning set. quad-hard is the holdout: milestone
+   evaluations only, never tuned on.
 8. **Integration — de-integration.** Force a loop on a drifted trajectory; assert
    the back-end's `GraphUpdate` lists the correct moved keyframes and that
    `apply_graph_update` is invoked; assert the nvblox map RMSE-to-GT drops in the
-   region after rebuild (cross-checked with `06_mapping.md`'s test).
-9. **Stress — perceptual aliasing.** A sequence with repeated identical corridors
-   (M2DGR indoor); assert the BTC appearance code, PCM odom self-test, and GNC
+   region after rebuild (cross-checked with `06_mapping.md`'s test). For
+   math-medium the dataset's `prior_map/maths-institute.ply` serves as the map
+   ground truth for a map-vs-map check.
+9. **Stress — perceptual aliasing.** Synthetic sequence of repeated identical
+   corridors; assert the BTC appearance code, PCM odom self-test, and GNC
    reject aliased loops; inspect `place/rejected_loop` reasons.
 10. **Stress — degenerate revisit.** A tunnel/corridor revisit; assert high `cond`,
     per-axis covariance inflation, and that the loop bends yaw but not along-axis
@@ -1349,8 +1353,9 @@ corruption"). Runs under `colcon test` with the deterministic single-thread mode
 - `05_backend_graph.md` (again) — the back-end the loop factor is handed to (robust
   noise model, GNC/Huber/switchable, marginal-covariance gate); kept in lock-step on
   tangent order and the PCM-front-gate / GNC-safety-net split.
-- `DATASET.md` — FusionPortable (primary), M2DGR (co-primary): evaluation data and
-  loop-closure acceptance (ATE drop, zero false loops).
+- `DATASET.md` — the Newer College benchmark set (quad-easy / math-medium / park
+  tuning, quad-hard holdout; `prior_map/maths-institute.ply` for map-vs-map
+  checks): evaluation data and loop-closure acceptance (ATE drop, zero false loops).
 
 ### Reference code (geometric primitives L5 reuses; cited `file:line`)
 

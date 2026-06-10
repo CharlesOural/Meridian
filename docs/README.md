@@ -9,7 +9,8 @@ It is a clean-slate rebuild — it reuses no prior code. Every technical claim i
 One LiDAR + one IMU + one camera + GNSS feed a **continuous-time B-spline trajectory** (the front-end, L2): every measurement attaches a residual to the spline at its true timestamp — direct LiDAR point-to-plane, FAST-LIVO2-style sparse-direct photometric (LiDAR gives depth, so no triangulation), IMU as a derivative residual, and GNSS — all fused into one trajectory by a sliding-window solver. Keyframes flow to a **GTSAM iSAM2 back-end** (L3) for global consistency and loop closure (Scan Context++ → STD/BTC → GICP → PCM, L5). Keyframe poses drive an **nvblox GPU map** (L4) — TSDF + colour → Marching Cubes mesh — corrected by clear-and-rebuild on loop closure. The result streams to the operator as a colour mesh with a confidence overlay (L6).
 
 **Design commitments (deliberately simple — best option per job, no fallbacks):**
-- Full CT LIVO+GNSS from the start. No phased rollout, no "iEKF v1 then CT v2". (An iEKF is kept only as an offline test oracle behind `IFrontEnd`.)
+
+- Full CT LIVO+GNSS from the start. No phased rollout, no "iEKF v1 then CT v2". (The interim iEKF test oracle has been removed; CT correctness is validated directly against ground truth.)
 - Single LiDAR. (Multi-LiDAR is a future extension behind the same interfaces, not designed now.)
 - nvblox, GPU-only. No CPU fallback, no second map backend.
 - ROS 2 **Humble**, C++20, colcon/ament_cmake. ROS-agnostic core C++ library + thin ROS 2 wrappers.
@@ -24,20 +25,20 @@ One LiDAR + one IMU + one camera + GNSS feed a **continuous-time B-spline trajec
 
 ## `specs/` — implementation specs (the build target)
 
-| # | Spec | Scope |
-|---|---|---|
-| 00 | [`00_architecture.md`](specs/00_architecture.md) | ROS-agnostic core vs thin ROS 2 wrappers; package/dependency graph; threading; config; debug bus |
-| 01 | [`01_interfaces_and_data_types.md`](specs/01_interfaces_and_data_types.md) | **The contracts.** Core math/sensor/calibration types, the `KeyframePacket` (L2→L3), the six layer interfaces |
-| 02 | [`02_sensors_timesync.md`](specs/02_sensors_timesync.md) | L0 — sensor abstraction; PTP time sync (linuxptp) from GNSS PPS |
-| 03 | [`03_preprocessing.md`](specs/03_preprocessing.md) | L1 — filtering, organized cloud, deskew (spline-query + IMU-only cold-start) |
-| 04 | [`04_frontend_estimation.md`](specs/04_frontend_estimation.md) | **L2 — the CT B-spline tightly-coupled LIVO+GNSS estimator** (basalt-headers + Ceres) |
-| 05 | [`05_backend_graph.md`](specs/05_backend_graph.md) | L3 — GTSAM iSAM2 keyframe graph; no-double-counting hand-off; robust factors |
-| 06 | [`06_mapping.md`](specs/06_mapping.md) | L4 — nvblox GPU TSDF+RGB → Marching Cubes mesh; clear-and-rebuild de-integration |
-| 07 | [`07_loop_closure.md`](specs/07_loop_closure.md) | L5 — Scan Context++ → STD/BTC → small_gicp → PCM |
-| 08 | [`08_calibration.md`](specs/08_calibration.md) | Calibration: offline prior + online extrinsic refinement |
-| 09 | [`09_debug_introspection.md`](specs/09_debug_introspection.md) | Debug topics, rviz markers, per-module timing — "see what the estimator is doing" |
-| 10 | [`10_evaluation_harness.md`](specs/10_evaluation_harness.md) | Replay==live harness; evo ATE/RPE; per-dataset acceptance |
-| 11 | [`11_build_system_libraries.md`](specs/11_build_system_libraries.md) | Library choice per job (justified); colcon workspace; CUDA/nvblox on Orin; version pins |
+| #   | Spec                                                                       | Scope                                                                                                         |
+| --- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| 00  | [`00_architecture.md`](specs/00_architecture.md)                           | ROS-agnostic core vs thin ROS 2 wrappers; package/dependency graph; threading; config; debug bus              |
+| 01  | [`01_interfaces_and_data_types.md`](specs/01_interfaces_and_data_types.md) | **The contracts.** Core math/sensor/calibration types, the `KeyframePacket` (L2→L3), the six layer interfaces |
+| 02  | [`02_sensors_timesync.md`](specs/02_sensors_timesync.md)                   | L0 — sensor abstraction; PTP time sync (linuxptp) from GNSS PPS                                               |
+| 03  | [`03_preprocessing.md`](specs/03_preprocessing.md)                         | L1 — filtering, organized cloud, deskew (spline-query + IMU-only cold-start)                                  |
+| 04  | [`04_frontend_estimation.md`](specs/04_frontend_estimation.md)             | **L2 — the CT B-spline tightly-coupled LIVO+GNSS estimator** (basalt-headers + Ceres)                         |
+| 05  | [`05_backend_graph.md`](specs/05_backend_graph.md)                         | L3 — GTSAM iSAM2 keyframe graph; no-double-counting hand-off; robust factors                                  |
+| 06  | [`06_mapping.md`](specs/06_mapping.md)                                     | L4 — nvblox GPU TSDF+RGB → Marching Cubes mesh; clear-and-rebuild de-integration                              |
+| 07  | [`07_loop_closure.md`](specs/07_loop_closure.md)                           | L5 — Scan Context++ → STD/BTC → small_gicp → PCM                                                              |
+| 08  | [`08_calibration.md`](specs/08_calibration.md)                             | Calibration: offline prior + online extrinsic refinement                                                      |
+| 09  | [`09_debug_introspection.md`](specs/09_debug_introspection.md)             | Debug topics, rviz markers, per-module timing — "see what the estimator is doing"                             |
+| 10  | [`10_evaluation_harness.md`](specs/10_evaluation_harness.md)               | Replay==live harness; evo ATE/RPE; per-dataset acceptance                                                     |
+| 11  | [`11_build_system_libraries.md`](specs/11_build_system_libraries.md)       | Library choice per job (justified); colcon workspace; CUDA/nvblox on Orin; version pins                       |
 
 ## Reference grounding — each spec's Appendix R
 
@@ -45,4 +46,5 @@ Each spec carries a non-normative **Appendix R — SOTA reference grounding** th
 
 ## Other
 
-- [`DATASET.md`](DATASET.md) — dev/eval datasets (FusionPortable primary, M2DGR co-primary — all modalities at once).
+- [`DATASET.md`](DATASET.md) — the benchmark dataset (Newer College 2021, Ouster OS0-128 + Alphasense): bag setup, ground truth, calibration, and per-sequence roles including the `quad-hard` holdout.
+

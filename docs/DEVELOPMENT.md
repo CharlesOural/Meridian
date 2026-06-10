@@ -15,11 +15,11 @@ Meridian/                       # this repo IS the colcon workspace (mounted at 
 ├── setup-distrobox.sh          # Linux: build GPU image + create the Distrobox
 ├── dependencies.repos          # vcs deps built in-workspace (nvblox GPU, ouster-ros)
 ├── src/                        # the colcon source space (meridian_* packages go here)
-└── bags/                       # rosbag recordings (FusionPortable / M2DGR — see docs/DATASET.md)
+└── bags/                       # benchmark bags + ground truth (see docs/DATASET.md)
 ```
 
 **What the image contains** (the dependency canon from
-[`docs/specs/11_build_system_libraries.md`](docs/specs/11_build_system_libraries.md)):
+[`docs/specs/11_build_system_libraries.md`](specs/11_build_system_libraries.md)):
 ROS 2 Humble (desktop-full), C++20 toolchain (GCC 11), colcon/rosdep/vcstool,
 Eigen 3.4, Sophus 1.22.10, **Ceres 2.1**, **GTSAM 4.2**, PCL 1.12, OpenCV 4,
 small_gicp, yaml-cpp, linuxptp, evo, and the Foxglove bridge. The GPU image adds
@@ -44,7 +44,7 @@ distrobox enter meridian
 Then, one-time workspace bring-up from the repo root:
 
 ```bash
-git submodule update --init          # vendor/ (basalt, ikd-Tree, scancontext)
+git submodule update --init          # vendor/ (basalt-headers, ikd-Tree, scancontext)
 vcs import src < dependencies.repos              # nvblox (GPU) + ouster-ros
 vcs custom src --git --args submodule update --init --recursive   # nested submodules (ouster-sdk)
 rosdep install --from-paths src --ignore-src -y
@@ -97,12 +97,11 @@ CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install \
     --packages-skip meridian_map meridian_pipeline meridian_ros meridian_tools
 ```
 
-This builds and unit-tests every **CPU layer** — L0 sensors, L1 preprocessing,
-**L2 the CT front-end**, **L3 the iSAM2 back-end**, and L5 place recognition —
-in isolation. The integrated pipeline + replay harness link `meridian_map` (L4),
-so those run on the Linux/GPU box. (A future test-only `NullMapLayer` behind
-`IMapLayer` could let the pipeline link GPU-free for integration tests — noted,
-not built.)
+This builds and unit-tests every **CPU algorithm layer** in isolation — L0
+sensors, L1 preprocessing, and **L2 the CT front-end** (plus the cross-cutting
+packages). The skip list covers `meridian_map` (L4, CUDA-only) and the
+integration/ROS packages; integrated pipeline runs and bag replay happen on the
+Linux/GPU box. (colcon just warns about skip names not yet in the tree.)
 
 Visualization on Mac (and Linux too — the shared viz tool):
 
@@ -123,14 +122,16 @@ is defined; both Dockerfiles run it. Add a library by editing that script (or
 `apt install` permanently inside a running container, or you lose reproducibility.
 Version pins live in `install-deps.sh` (source builds) and follow spec 11 §3.
 
-> **Pinning TODO.** A few refs are not yet locked to a SHA (`small_gicp`,
-> `nvblox`, `ouster-ros`, and the `vendor/` submodules). Pin them per spec 11 §3
-> before any release/air-gapped build so nothing floats on a moving branch.
+> **Pinning TODO.** A few refs are not yet locked to a SHA (`small_gicp` in
+> `install-deps.sh`; `nvblox` and `ouster-ros` in `dependencies.repos`). Pin them
+> per spec 11 §3 before any release/air-gapped build so nothing floats on a
+> moving branch. (The `vendor/` submodules are already SHA-pinned by gitlink.)
 
 ---
 
 ## Testing with a dataset
 
-`docs/TESTING.md` walks the full bag pipeline: download a FusionPortable sequence,
-convert it with `rosbags-convert`, confirm the topics, and drive the live node with
-`ros2 bag play --clock` while watching the deskewed cloud and telemetry.
+The benchmark set is Newer College 2021 under `bags/newer-college/` (`quad-easy`
+is the routine sequence). `docs/DATASET.md` covers download, `rosbags-convert`,
+and the local layout; `docs/TESTING.md` covers running against it — the headless
+run + ATE loop, or driving the live node with `ros2 bag play --clock`.
