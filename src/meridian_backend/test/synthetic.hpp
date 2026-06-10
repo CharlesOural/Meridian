@@ -12,6 +12,7 @@
 #include "geodetic.hpp"
 #include "meridian/common/imu_preintegration.hpp"
 #include "meridian/common/keyframe_packet.hpp"
+#include "meridian/common/loop_constraint.hpp"
 #include "meridian/common/pose.hpp"
 #include "meridian/common/sample.hpp"
 #include "meridian/common/time.hpp"
@@ -367,6 +368,29 @@ inline GnssFix make_fix(const Pose& gt_map_pose, const Eigen::Vector3d& lever,
   f.fix = fix;
   f.num_sats = 12;
   return f;
+}
+
+// A loop closure tying keyframe to_id back to from_id, with the relative transform taken from the
+// ground-truth chain (so on a drifted estimate it pulls the two poses into truth-consistent
+// relative geometry). cov is an isotropic translation-first diagonal. corrupt offsets the loop's
+// translation, fabricating a pairwise-inconsistent outlier when its norm is large.
+inline LoopConstraint make_loop(const SynthChain& chain, std::uint64_t from_id, std::uint64_t to_id,
+                                double sigma_t, double sigma_r, double fitness = 0.9,
+                                const Eigen::Vector3d& corrupt = Eigen::Vector3d::Zero()) {
+  LoopConstraint lc;
+  lc.from_id = from_id;
+  lc.to_id = to_id;
+  Pose rel = chain.gt[static_cast<std::size_t>(from_id)].inverse() *
+             chain.gt[static_cast<std::size_t>(to_id)];
+  rel.t += corrupt;
+  lc.T_from_to = rel;
+  lc.cov.form = PoseCov6::Form::Covariance;
+  Eigen::Matrix<double, 6, 1> d;
+  d << sigma_t * sigma_t, sigma_t * sigma_t, sigma_t * sigma_t, sigma_r * sigma_r,
+      sigma_r * sigma_r, sigma_r * sigma_r;
+  lc.cov.M = d.asDiagonal();
+  lc.fitness = fitness;
+  return lc;
 }
 
 }  // namespace meridian::backend::testing

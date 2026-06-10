@@ -930,6 +930,14 @@ on LoopConstraint lc (from ILoopDetector::detect, 01 §7.6):
 This maps to `IBackEnd::add_loop_constraint` (`01 §7.4`): the method enqueues the
 constraint; the back-end thread runs the PCM step above on the next iteration.
 
+A pending loop that is *testable* against an established consensus (a clique of size ≥ 2
+whose members all have known endpoint poses and chain covariance) yet shares **no**
+consistency edge with any clique member is **rejected** rather than left pending forever:
+it is a measured inconsistency with the agreed set, not merely a not-yet-observable one.
+A loop whose endpoints are simply absent this pass stays pending. Rejections (here and at
+the fitness gate) and evictions both count toward `num_loops_rejected`; `num_loops` counts
+loops currently in the graph.
+
 > **Why PCM *and* a robust kernel.** PCM is a *combinatorial set-level* pre-filter
 > (which loops are mutually consistent, using current estimates); the committed
 > convex kernel (§8.1) is a *continuous factor-level* robustifier (per-factor weights

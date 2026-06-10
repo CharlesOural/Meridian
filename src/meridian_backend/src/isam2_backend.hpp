@@ -20,6 +20,7 @@
 #include "kf_record.hpp"
 #include "meridian/backend/ibackend.hpp"
 #include "observability_inflation.hpp"
+#include "pcm.hpp"
 
 namespace meridian::backend {
 
@@ -87,6 +88,25 @@ private:
   void publish_observability(std::uint64_t id, const ObservabilityReport& obs,
                              const InflationResult& inf);
 
+  // Runs one PCM pass over the buffered loops against the current estimate: drops the loops PCM
+  // judges inconsistent with the admitted consensus, stages the newly consistent clique as
+  // committed-Huber between factors (recording each factor's batch slot for index reconciliation),
+  // and queues displaced loops for removal in this same fold. No-op when no loop is buffered or
+  // in the graph.
+  void process_pending_loops(Timestamp ts);
+  // After a committed fold: resolves each staged loop's global factor index from the update result,
+  // flips PCM state to in-graph/evicted, updates counters and edge markers, and triggers the batch
+  // consolidation when enough loops have accumulated.
+  void finalize_pending_loops(const gtsam::ISAM2Result& result, Timestamp ts);
+  // After an abandoned fold: the staged loop factors never entered and any scheduled eviction did
+  // not happen, so leave every loop in its prior PCM state to retry next fold.
+  void abandon_pending_loops();
+  // Off-live batch-GNC re-judgement of the in-graph loop sub-graph; loops GNC drives below the
+  // reject weight are scheduled for removal and returned to the PCM buffer as rejected.
+  void run_gnc_consolidation(Timestamp ts);
+  // Publishes a map-frame line marker between a loop's endpoints (green admitted, red rejected).
+  void publish_loop_marker(const LoopConstraint& lc, bool accepted, Timestamp ts);
+
   // The keyframe pair straddling a fix timestamp. When single is true the fix lands on (or
   // past) one node and only `i` is used (endpoint factor); otherwise stamp(i) <= fix <=
   // stamp(j) and beta interpolates between them. ids index into kf_records_.
@@ -99,6 +119,10 @@ private:
   // hint and searching kf_order_ deterministically. nullopt when no keyframe is in the
   // estimate yet (nothing to anchor against).
   std::optional<Bracket> find_bracket(Timestamp stamp, std::uint64_t hint) const;
+  // Body pose at a fix instant: the SE(3) interpolation of the bracket (or the single anchor).
+  // Both the datum-buffering correspondence and the post-lock factor/residual evaluate the
+  // antenna here, so the datum is fit against the exact geometry the factor later uses.
+  Pose body_pose_at_fix(const Bracket& br, Timestamp stamp) const;
   // Folds one accepted GNSS fix into the staged batch after the datum is locked: gates it,
   // builds the interpolated or endpoint factor, and runs the sustained-rejection auto-disable.
   void admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_enu, const Bracket& br);
@@ -157,6 +181,22 @@ private:
   std::optional<Eigen::Vector3d> gnss_last_antenna_;
   // Sustained rejection counter: consecutive post-lock fixes whose chi2 exceeds the gate.
   int gnss_consecutive_chi2_reject_ = 0;
+
+  // Loop closures. pcm_ buffers every accepted LoopConstraint and decides admit/evict/reject via
+  // pairwise-consistency max-clique. loop_factor_index_ maps an in-graph loop's PCM handle to its
+  // live iSAM2 factor index so eviction/consolidation can remove it. staged_loop_slots_ /
+  // staged_evict_handles_ hold this fold's pending admit (handle -> new_graph_ slot) and eviction
+  // handles until the fold commits. admitted_since_consolidate_ counts admissions toward the next
+  // batch-GNC pass.
+  Pcm pcm_;
+  std::unordered_map<std::size_t, gtsam::FactorIndex> loop_factor_index_;
+  std::vector<std::pair<std::size_t, std::size_t>> staged_loop_slots_;
+  std::vector<std::size_t> staged_evict_handles_;
+  // Loops the batch consolidation flagged this fold: their removal is staged into remove_indices_,
+  // but the PCM-reject bookkeeping is deferred to a committed fold so an abandoned update leaves
+  // the (still-live) loop intact and re-judgeable.
+  std::vector<std::size_t> staged_gnc_reject_handles_;
+  int admitted_since_consolidate_ = 0;
 
   BackEndDiagnostics diag_;
 };

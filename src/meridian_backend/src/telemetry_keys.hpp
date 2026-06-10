@@ -28,6 +28,12 @@ inline constexpr const char* kTeleMarginalizeSkip = "backend/marginalize_skip";
 inline constexpr const char* kTeleDatumLocked = "backend/datum_locked";
 inline constexpr const char* kTeleGnssDisabled = "backend/gnss_disabled";
 inline constexpr const char* kTeleGnssSkip = "backend/gnss_skip";
+inline constexpr const char* kTeleLoopAdmitted = "backend/loop_admitted";
+inline constexpr const char* kTeleLoopRejected = "backend/loop_rejected";
+inline constexpr const char* kTeleLoopConsolidate = "backend/loop_consolidate";
+
+// Loop-closure edge marker (green = admitted, red = PCM/GNC-rejected); keyed by endpoint pair.
+inline constexpr const char* kTeleLoopEdge = "backend/loop_edge";
 
 // Per-keyframe vector series; the keyframe id is appended ("backend/observability/<id>").
 inline constexpr const char* kTeleObservabilityPrefix = "backend/observability/";

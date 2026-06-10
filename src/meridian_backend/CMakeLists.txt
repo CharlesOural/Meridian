@@ -21,6 +21,9 @@ add_library(meridian_backend SHARED
   src/gauge_damping_factor.cpp
   src/observability_inflation.cpp
   src/chain_covariance.cpp
+  src/max_clique.cpp
+  src/pcm.cpp
+  src/gnc_consolidation.cpp
   src/pim_from_summary.cpp
   src/geodetic.cpp
   src/robust_kernels.cpp
@@ -80,7 +83,8 @@ if(BUILD_TESTING)
             test_observability_inflation test_chain_covariance test_backend_spine
             test_determinism test_backend_recovery test_pim_from_summary
             test_restart_bridge test_geodetic test_robust_kernels test_gnss_factor
-            test_datum test_gnss_gate test_backend_gnss)
+            test_datum test_gnss_gate test_backend_gnss test_max_clique test_pcm
+            test_gnc_consolidation test_backend_loops)
     meridian_add_gtest(${t} test/${t}.cpp)
     target_link_libraries(${t} meridian_backend gtsam)
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

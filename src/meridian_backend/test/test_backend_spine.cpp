@@ -158,14 +158,16 @@ TEST(BackendSpine, MovedSemantics) {
   }
 }
 
-TEST(BackendSpine, LoopsStillUnsupported) {
+TEST(BackendSpine, LoopGateRejectsLowFitness) {
   CountingSink sink;
   auto be = makeBackend(&sink);
 
-  // Loop closures land in a later phase; until then they are rejected, not graphed.
+  // A default LoopConstraint has fitness 0, below the floor, so it is rejected at the gate
+  // before ever reaching PCM (the admit/evict path is exercised in test_backend_loops).
   be->add_loop_constraint(LoopConstraint{});
-  EXPECT_EQ(sink.count("backend/loops_unsupported"), 1);
+  EXPECT_EQ(sink.count("backend/loop_rejected"), 1);
   EXPECT_EQ(be->diagnostics().num_loops_rejected, 1u);
+  EXPECT_EQ(be->diagnostics().num_loops, 0u);
 
   // A GNSS fix before any keyframe has no pose to anchor against; it must drop cleanly.
   EXPECT_NO_THROW(be->add_absolute(GnssFix{}, 0));

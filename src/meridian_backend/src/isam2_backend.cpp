@@ -11,6 +11,7 @@
 
 #include <Eigen/Core>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -21,6 +22,7 @@
 #include <vector>
 
 #include "gauge_damping_factor.hpp"
+#include "gnc_consolidation.hpp"
 #include "gnss_factor.hpp"
 #include "gtsam_adapter.hpp"
 #include "keys.hpp"
@@ -53,7 +55,8 @@ Isam2BackEnd::Isam2BackEnd(const BackendConfig& cfg, std::shared_ptr<const Calib
       calib_(std::move(calib)),
       sink_(telemetry ? telemetry : fallback_sink()),
       deterministic_(deterministic),
-      isam2_(make_isam2(cfg_.isam2_use_qr)) {}
+      isam2_(make_isam2(cfg_.isam2_use_qr)),
+      pcm_(chi2inv(cfg.pcm_chi2_alpha, 6), cfg.pcm_max_nodes) {}
 
 std::unique_ptr<gtsam::ISAM2> Isam2BackEnd::make_isam2(bool use_qr) const {
   gtsam::ISAM2Params params;
@@ -248,10 +251,228 @@ void Isam2BackEnd::add_restart_imu_edge(KeyframePacket&& kf) {
 }
 
 void Isam2BackEnd::add_loop_constraint(const LoopConstraint& lc) {
-  ++diag_.num_loops_rejected;
-  sink_->event(Level::Warn, "backend/loops_unsupported",
-               "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) + " dropped",
-               tele_stamp());
+  // A loop below the detector's fitness floor is rejected before it ever reaches PCM: a poor
+  // geometric match is unlikely to be consistent and only inflates the consistency graph.
+  if (lc.fitness < cfg_.loop_min_fitness) {
+    ++diag_.num_loops_rejected;
+    sink_->event(Level::Info, kTeleLoopRejected,
+                 "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) +
+                     " fitness " + std::to_string(lc.fitness) + " below floor; dropped",
+                 tele_stamp());
+    return;
+  }
+  // Buffer the loop; the next optimize() runs PCM and admits the consistent max-clique.
+  pcm_.add(lc);
+}
+
+void Isam2BackEnd::process_pending_loops(Timestamp ts) {
+  // Re-judge the established loop set first so its removals ride this same fold; it reads the last
+  // committed estimate, which is stable until the update below.
+  if (deterministic_ && cfg_.gnc_consolidate_interval > 0 &&
+      admitted_since_consolidate_ >= cfg_.gnc_consolidate_interval && !loop_factor_index_.empty()) {
+    run_gnc_consolidation(ts);
+    admitted_since_consolidate_ = 0;
+  }
+
+  const Pcm::PoseFn pose_fn = [this](std::uint64_t id) -> std::optional<Pose> {
+    if (estimate_cache_.exists(keyX(id))) {
+      return from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(id)));
+    }
+    return std::nullopt;
+  };
+  const Pcm::ChainCovFn chain_fn = [this](std::uint64_t a, std::uint64_t b) {
+    return chain_cov_.between(a, b);
+  };
+
+  const PcmDecision decision = pcm_.update(pose_fn, chain_fn);
+
+  // Rejections do not depend on the fold; apply and report them immediately.
+  for (const std::size_t h : decision.to_reject) {
+    const LoopConstraint& lc = pcm_.at(h);
+    publish_loop_marker(lc, /*accepted=*/false, ts);
+    pcm_.mark_rejected(h);
+    ++diag_.num_loops_rejected;
+    sink_->event(Level::Info, kTeleLoopRejected,
+                 "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) +
+                     " PCM-inconsistent; dropped",
+                 ts);
+  }
+
+  // Stage the newly consistent clique as committed-Huber between factors, recording each factor's
+  // slot in the staged batch so its global index can be recovered after the update commits.
+  for (const std::size_t h : decision.to_admit) {
+    const LoopConstraint& lc = pcm_.at(h);
+    Eigen::Matrix<double, 6, 6> cov_m = lc.cov.M;  // translation-first
+    if (lc.cov.form == PoseCov6::Form::Information) {
+      ensure_psd(cov_m);
+      cov_m = cov_m.inverse();
+    }
+    Eigen::Matrix<double, 6, 6> cov_gtsam = reorder_meridian_to_gtsam(cov_m);  // rotation-first
+    ensure_psd(cov_gtsam);
+    staged_loop_slots_.emplace_back(h, static_cast<std::size_t>(new_graph_.size()));
+    new_graph_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+        keyX(lc.from_id), keyX(lc.to_id), to_gtsam(lc.T_from_to),
+        make_huber_noise(cov_gtsam, cfg_.loop_huber_k));
+    batch_has_loop_ = true;
+  }
+
+  // Queue any displaced in-graph loop for removal in this same fold.
+  for (const std::size_t h : decision.to_evict) {
+    const auto it = loop_factor_index_.find(h);
+    if (it != loop_factor_index_.end()) {
+      remove_indices_.push_back(it->second);
+      staged_evict_handles_.push_back(h);
+    }
+  }
+}
+
+void Isam2BackEnd::finalize_pending_loops(const gtsam::ISAM2Result& result, Timestamp ts) {
+  for (const auto& [handle, slot] : staged_loop_slots_) {
+    // newFactorsIndices is in 1-to-1 order with the factors handed to update(), so the slot
+    // recorded at stage time recovers this loop's live factor index for later eviction.
+    if (slot < result.newFactorsIndices.size()) {
+      loop_factor_index_[handle] = result.newFactorsIndices[slot];
+    }
+    pcm_.mark_admitted(handle);
+    ++diag_.num_loops;
+    ++admitted_since_consolidate_;
+    const LoopConstraint& lc = pcm_.at(handle);
+    publish_loop_marker(lc, /*accepted=*/true, ts);
+    sink_->event(
+        Level::Info, kTeleLoopAdmitted,
+        "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) + " admitted", ts);
+  }
+  for (const std::size_t handle : staged_evict_handles_) {
+    // Eviction is a displacement, not a rejection: the loop returns to Pending and may be
+    // re-admitted by a later clique, so it drops out of the in-graph count but is not tallied
+    // as rejected.
+    pcm_.mark_evicted(handle);
+    loop_factor_index_.erase(handle);
+    if (diag_.num_loops > 0) {
+      --diag_.num_loops;
+    }
+  }
+  // Consolidation rejections committed: the factor is gone, so retire the loop in PCM (no retry).
+  for (const std::size_t handle : staged_gnc_reject_handles_) {
+    publish_loop_marker(pcm_.at(handle), /*accepted=*/false, ts);
+    pcm_.mark_rejected(handle);
+    loop_factor_index_.erase(handle);
+    if (diag_.num_loops > 0) {
+      --diag_.num_loops;
+    }
+    ++diag_.num_loops_rejected;
+  }
+  staged_loop_slots_.clear();
+  staged_evict_handles_.clear();
+  staged_gnc_reject_handles_.clear();
+}
+
+void Isam2BackEnd::abandon_pending_loops() {
+  // The fold was dropped: the staged loop factors never entered, and neither the scheduled
+  // evictions nor the consolidation removals applied, so every loop keeps its prior PCM state
+  // (still in the graph, still re-judgeable) and retries on the next fold.
+  staged_loop_slots_.clear();
+  staged_evict_handles_.clear();
+  staged_gnc_reject_handles_.clear();
+}
+
+void Isam2BackEnd::run_gnc_consolidation(Timestamp ts) {
+  if (loop_factor_index_.empty()) {
+    return;
+  }
+  // Iterate the in-graph loops in a fixed (handle-sorted) order: the loop set drives factor
+  // insertion order in the sub-problem, and a hash-map order would make the batch
+  // non-deterministic.
+  std::vector<std::size_t> handles;
+  handles.reserve(loop_factor_index_.size());
+  for (const auto& [handle, idx] : loop_factor_index_) {
+    (void)idx;
+    handles.push_back(handle);
+  }
+  std::sort(handles.begin(), handles.end());
+
+  std::uint64_t lo = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t hi = 0;
+  for (const std::size_t handle : handles) {
+    const LoopConstraint& lc = pcm_.at(handle);
+    lo = std::min({lo, lc.from_id, lc.to_id});
+    hi = std::max({hi, lc.from_id, lc.to_id});
+  }
+
+  GncConsolidationInput in;
+  in.barc2 = chi2inv(cfg_.pcm_chi2_alpha, 6);
+  in.reject_w = cfg_.gnc_reject_w;
+  std::optional<std::uint64_t> prev;
+  for (const std::uint64_t id : kf_order_) {
+    if (id < lo || id > hi || !estimate_cache_.exists(keyX(id))) {
+      continue;
+    }
+    const Pose X = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(id)));
+    in.keyframes.push_back(id);
+    in.estimate[id] = X;
+    if (prev) {
+      if (const auto c = chain_cov_.between(*prev, id)) {
+        GncOdom e;
+        e.from_id = *prev;
+        e.to_id = id;
+        e.T_from_to = in.estimate.at(*prev).inverse() * X;
+        e.cov = *c;
+        ensure_psd(e.cov);  // GTSAM Gaussian::Covariance requires a PD matrix
+        in.odom.push_back(e);
+      }
+    }
+    prev = id;
+  }
+  for (const std::size_t handle : handles) {
+    const LoopConstraint& lc = pcm_.at(handle);
+    GncLoop g;
+    g.handle = handle;
+    g.from_id = lc.from_id;
+    g.to_id = lc.to_id;
+    g.T_from_to = lc.T_from_to;
+    g.cov = (lc.cov.form == PoseCov6::Form::Information) ? lc.cov.M.inverse().eval() : lc.cov.M;
+    ensure_psd(g.cov);  // GTSAM Gaussian::Covariance requires a PD matrix
+    in.loops.push_back(g);
+  }
+
+  const std::vector<std::size_t> rejected = gnc_consolidate(in);
+  for (const std::size_t handle : rejected) {
+    const auto it = loop_factor_index_.find(handle);
+    if (it == loop_factor_index_.end()) {
+      continue;
+    }
+    // Stage the live factor for removal in this fold; defer the PCM-reject bookkeeping until the
+    // fold commits so an abandoned update does not orphan a still-live loop factor.
+    remove_indices_.push_back(it->second);
+    staged_gnc_reject_handles_.push_back(handle);
+  }
+  if (!staged_gnc_reject_handles_.empty()) {
+    sink_->event(Level::Info, kTeleLoopConsolidate,
+                 "batch GNC flagged " + std::to_string(staged_gnc_reject_handles_.size()) +
+                     " loop(s) for removal",
+                 ts);
+  }
+}
+
+void Isam2BackEnd::publish_loop_marker(const LoopConstraint& lc, bool accepted, Timestamp ts) {
+  if (!sink_->enabled(kTeleLoopEdge)) {
+    return;
+  }
+  if (!estimate_cache_.exists(keyX(lc.from_id)) || !estimate_cache_.exists(keyX(lc.to_id))) {
+    return;
+  }
+  const Pose a = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(lc.from_id)));
+  const Pose b = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(lc.to_id)));
+  Marker m;
+  m.type = Marker::Type::LineList;
+  m.frame = Frame::Map;
+  m.ns = kTeleLoopEdge;
+  m.id = static_cast<std::int32_t>((lc.to_id << 20) ^ lc.from_id);
+  m.points = {a.t.cast<float>(), b.t.cast<float>()};
+  m.color = accepted ? std::array<float, 4>{0.0F, 1.0F, 0.0F, 1.0F}
+                     : std::array<float, 4>{1.0F, 0.0F, 0.0F, 1.0F};
+  m.scale = 0.15F;
+  sink_->marker(m, ts);
 }
 
 std::optional<Isam2BackEnd::Bracket> Isam2BackEnd::find_bracket(Timestamp stamp,
@@ -306,6 +527,15 @@ void Isam2BackEnd::add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id)
     return;
   }
 
+  // Quality floor before anything persistent: a no-fix or excessively-uncertain measurement must
+  // neither seed the permanent ENU origin nor poison the datum fit. This guards the pre-lock path
+  // (the post-lock path gates again through gnss_gate_).
+  if (fix.fix == GnssFix::FixType::None || fix.cov_enu.trace() > cfg_.gnss_max_cov) {
+    sink_->event(Level::Debug, kTeleGnssSkip, "gnss fix below quality floor; dropped",
+                 tele_stamp());
+    return;
+  }
+
   // First accepted fix fixes the ENU tangent-plane origin. Origin set != datum locked: the
   // map<-ENU transform G is fit only once the track is observable.
   if (!gnss_origin_.set) {
@@ -325,9 +555,9 @@ void Isam2BackEnd::add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id)
   }
 
   if (!datum_locked_) {
-    // Antenna position in map from the current estimate of the anchor keyframe pose.
-    const Pose X_anchor = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br->i)));
-    const Eigen::Vector3d ant_map = X_anchor * lever;
+    // Antenna position in map at the fix instant, interpolated across the bracket exactly as the
+    // post-lock factor evaluates it, so the datum is fit against consistent correspondences.
+    const Eigen::Vector3d ant_map = body_pose_at_fix(*br, fix.stamp) * lever;
 
     // Speed from the anchor keyframe and its predecessor: ||dp|| / dt over the last interval.
     // A single keyframe (or a coincident-stamp neighbour) yields zero, which the moving-fix
@@ -393,6 +623,25 @@ void Isam2BackEnd::add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id)
   admit_gnss_fix(fix, p_enu, *br);
 }
 
+Pose Isam2BackEnd::body_pose_at_fix(const Bracket& br, Timestamp stamp) const {
+  if (br.single) {
+    return from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br.i)));
+  }
+  const Timestamp si = kf_records_.at(br.i).stamp;
+  const Timestamp sj = kf_records_.at(br.j).stamp;
+  const Timestamp span = sj - si;
+  const double beta = span > 0 ? static_cast<double>(stamp - si) / static_cast<double>(span) : 0.0;
+  if (beta <= 0.0) {
+    return from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br.i)));
+  }
+  if (beta >= 1.0) {
+    return from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br.j)));
+  }
+  const Pose Xi = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br.i)));
+  const Pose Xj = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br.j)));
+  return Xi.boxplus(Xj.boxminus(Xi) * beta);
+}
+
 void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_enu,
                                   const Bracket& br) {
   // Map-frame antenna position of this fix, for travel accounting and the residual check.
@@ -403,7 +652,8 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
     return;
   }
 
-  // Body pose at the fix instant: SE(3) interpolation of the bracket (or the single anchor).
+  // beta / endpoint select the factor form; the antenna position itself comes from the shared
+  // interpolation helper so it matches the datum-buffering geometry exactly.
   double beta = 0.0;
   if (!br.single) {
     const Timestamp si = kf_records_.at(br.i).stamp;
@@ -416,15 +666,7 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
   // before i, j when it sits at or after j.
   const std::uint64_t end_id = (!br.single && beta >= 1.0) ? br.j : br.i;
 
-  Pose X_body;
-  if (endpoint) {
-    X_body = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(end_id)));
-  } else {
-    const Pose Xi = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br.i)));
-    const Pose Xj = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(br.j)));
-    X_body = Xi.boxplus(Xj.boxminus(Xi) * beta);
-  }
-  const Eigen::Vector3d ant_map = X_body * lever;
+  const Eigen::Vector3d ant_map = body_pose_at_fix(br, fix.stamp) * lever;
 
   // Travel since the last admitted fix accumulates the antenna arc length over consecutive
   // post-lock fixes; the gate decimates on it.
@@ -457,6 +699,8 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
     const Eigen::Vector3d r = G.inverse() * ant_map - p_enu;
     const double chi2 = r.dot(fix.cov_enu.ldlt().solve(r));
     if (chi2 > chi2inv(0.99, 3)) {
+      // A fix that fails the health check is dropped, never graphed; only a sustained run of
+      // failures escalates to auto-disable.
       ++gnss_consecutive_chi2_reject_;
       if (gnss_consecutive_chi2_reject_ >= cfg_.gnss_reacq_persist) {
         gnss_auto_disabled_ = true;
@@ -464,11 +708,13 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
                      "gnss auto-disabled after " + std::to_string(gnss_consecutive_chi2_reject_) +
                          " consecutive chi2-failing fixes",
                      tele_stamp());
-        return;
+      } else {
+        sink_->event(Level::Debug, kTeleGnssSkip, "gnss fix failed chi2 health; dropped",
+                     tele_stamp());
       }
-    } else {
-      gnss_consecutive_chi2_reject_ = 0;
+      return;
     }
+    gnss_consecutive_chi2_reject_ = 0;
     sink_->vec(kTeleGnssResidual, r, tele_stamp(), "e,n,u");
   }
 
@@ -487,12 +733,18 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
 }
 
 GraphUpdate Isam2BackEnd::optimize() {
+  const Timestamp ts = tele_stamp();
+  // Run PCM before measuring the staged batch: admitted loops add factors and evictions add
+  // removals, both of which the fold below must see.
+  if (pcm_.pending_count() > 0 || !loop_factor_index_.empty()) {
+    process_pending_loops(ts);
+  }
+
   const bool nothing_staged = new_graph_.empty() && new_values_.empty() && remove_indices_.empty();
   if (nothing_staged && kf_order_.empty()) {
     return {};
   }
 
-  const Timestamp ts = tele_stamp();
   const int folded = staged_count_;
   diag_.last_optimize_diverged = false;
 
@@ -527,6 +779,14 @@ GraphUpdate Isam2BackEnd::optimize() {
   if (!committed) {
     // The batch was abandoned; purge the keyframes it staged so the chain stays consistent.
     rollback_uncommitted_keyframes();
+  }
+
+  // Loop bookkeeping reads the refreshed estimate (for markers) and the update result (for factor
+  // indices); on an abandoned fold the staged loops never entered, so they stay pending.
+  if (committed) {
+    finalize_pending_loops(result, ts);
+  } else {
+    abandon_pending_loops();
   }
 
   GraphUpdate update = build_graph_update();
