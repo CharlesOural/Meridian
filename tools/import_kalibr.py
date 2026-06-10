@@ -89,7 +89,16 @@ CalibLoader.add_constructor('tag:yaml.org,2002:opencv-matrix', _opencv_matrix)
 
 def load_calib(path: Path) -> dict:
     with path.open() as f:
-        return yaml.load(f, Loader=CalibLoader)
+        doc = yaml.load(f, Loader=CalibLoader)
+    # Some calib batches tag matrix blocks `!!opencv-matrix` (collapsed by the
+    # constructor above); others store a plain {rows, cols, dt, data} mapping with
+    # no tag. Flatten that untagged form to the bare `data` list here so both
+    # layouts reduce to what the extractors expect.
+    if isinstance(doc, dict):
+        for key, value in doc.items():
+            if isinstance(value, dict) and 'data' in value:
+                doc[key] = value['data']
+    return doc
 
 
 def require(doc: dict, key: str, src: Path):
@@ -97,6 +106,18 @@ def require(doc: dict, key: str, src: Path):
     if key not in doc:
         raise SystemExit(f'error: {src} is missing required key {key!r}')
     return doc[key]
+
+
+def require_alt(doc: dict, keys, src: Path):
+    """Fetch the first present key from `keys`, or fail naming all of them.
+
+    The body-IMU extrinsic is stored as `*_sensor_bodyimu` in some calib batches
+    and `*_sensor_body_imu` in others; either spelling is the same quantity."""
+    for key in keys:
+        if key in doc:
+            return doc[key]
+    joined = ', '.join(repr(k) for k in keys)
+    raise SystemExit(f'error: {src} is missing required key (one of {joined})')
 
 
 def quat_to_rotation(qw, qx, qy, qz):
@@ -153,8 +174,8 @@ def rotation_to_quat(R):
 
 def lidar_extrinsic(doc: dict, src: Path):
     """T_imu_lidar (R row-major 9-list, t 3-list) from the stored T_lidar_bodyimu."""
-    q = require(doc, 'quaternion_sensor_bodyimu', src)
-    t = require(doc, 'translation_sensor_bodyimu', src)
+    q = require_alt(doc, ('quaternion_sensor_bodyimu', 'quaternion_sensor_body_imu'), src)
+    t = require_alt(doc, ('translation_sensor_bodyimu', 'translation_sensor_body_imu'), src)
     if len(q) != 4 or len(t) != 3:
         raise SystemExit(f'error: {src} body-imu extrinsic has wrong shape')
     R_lidar_imu = quat_to_rotation(*q)
@@ -198,8 +219,8 @@ def camera_intrinsics(doc: dict, src: Path):
 
 def camera_extrinsic(doc: dict, src: Path):
     """T_imu_cam as [tx, ty, tz, qx, qy, qz, qw] from the stored T_cam_bodyimu."""
-    q = require(doc, 'quaternion_sensor_bodyimu', src)
-    t = require(doc, 'translation_sensor_bodyimu', src)
+    q = require_alt(doc, ('quaternion_sensor_bodyimu', 'quaternion_sensor_body_imu'), src)
+    t = require_alt(doc, ('translation_sensor_bodyimu', 'translation_sensor_body_imu'), src)
     if len(q) != 4 or len(t) != 3:
         raise SystemExit(f'error: {src} body-imu extrinsic has wrong shape')
     R_cam_imu = quat_to_rotation(*q)

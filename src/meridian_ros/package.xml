@@ -26,6 +26,7 @@
   <depend>meridian_config</depend>
   <depend>meridian_debug</depend>
   <depend>meridian_sensors</depend>
+  <depend>rosbag2_cpp</depend>
 
   <exec_depend>ros2launch</exec_depend>
   <exec_depend>rviz2</exec_depend>
