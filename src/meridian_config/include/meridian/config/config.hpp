@@ -1,12 +1,11 @@
 #pragma once
 
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
-
-#include <Eigen/Core>
-#include <Eigen/Geometry>
 
 #include "meridian/common/pose.hpp"
 #include "meridian/common/sample.hpp"
@@ -17,7 +16,7 @@ namespace meridian {
 // the YAML loader rejects any value outside the set.
 enum class PipelineMode { Live, Replay };
 enum class TimeSource { Ptp, Pps, Host };
-enum class FrontEndKind { CtLivo, IekfOracle };
+enum class FrontEndKind { CtLivo };
 enum class BackEndKind { Isam2 };
 enum class MapBackend { Nvblox };
 enum class MeshKind { MarchingCubes };
@@ -80,9 +79,9 @@ struct TimeHealth {
 };
 // Standing live stamp-integrity gate; one instance per sensor in L0.
 struct ValidatorConfig {
-  double gap_periods = 2.5;       // dropout when a raw gap exceeds this many periods
-  double skew_warn_ppm = 200.0;   // |skew_ppm| above this raises SkewOutOfRange
-  double nan_ratio_warn = 0.05;   // LiDAR NaN/Inf fraction above this raises a warning
+  double gap_periods = 2.5;      // dropout when a raw gap exceeds this many periods
+  double skew_warn_ppm = 200.0;  // |skew_ppm| above this raises SkewOutOfRange
+  double nan_ratio_warn = 0.05;  // LiDAR NaN/Inf fraction above this raises a warning
 };
 struct TimeConfig {
   TimeSource source = TimeSource::Ptp;
@@ -116,6 +115,12 @@ struct LidarSensorConfig {
   // automatically transfer to a recording (hardware sync paths differ); set this only
   // after an empirical check on the actual data.
   double time_offset_ms = 0.0;
+  // Subscribe RELIABLE instead of best-effort. Best-effort delivery of the large
+  // fragmented scan messages silently loses a double-digit percentage in flight when
+  // the host is under compute load, and a reliable reader pairs only with a reliable
+  // writer -- so this must match the publisher: true for bag replay (with the player's
+  // QoS override), false for a sensor driver publishing best-effort.
+  bool qos_reliable = false;
 };
 struct ImuSensorConfig {
   int id = 0;
@@ -192,16 +197,16 @@ struct AggregationConfig {
 // ---- preprocess (L1) ----
 struct PreprocLidar {
   SensorModel model = SensorModel::OusterOS1_128;
-  double blind = 0.5;       // [m] reject returns closer than this
-  double det_range = 120.0; // [m] max usable range
-  int point_filter_num = 3; // keep every Nth point
+  double blind = 0.5;        // [m] reject returns closer than this
+  double det_range = 120.0;  // [m] max usable range
+  int point_filter_num = 3;  // keep every Nth point
   // Surf-voxel downsample: bucket survivors into a grid of edge voxel_surf_m and keep
   // at most surf_max_pts per cell. The sweep-duration floor never drops below this
   // fraction of one nominal period so deskew always has a horizon to cover.
-  double voxel_surf_m = 0.5;        // [m] downsample voxel edge
-  double sweep_floor_frac = 0.5;    // sweep-duration floor as a fraction of one period
-  int surf_max_pts = 1;             // points kept per surf voxel
-  std::uint64_t surf_seed = 0;      // reservoir RNG seed when surf_max_pts > 1
+  double voxel_surf_m = 0.5;      // [m] downsample voxel edge
+  double sweep_floor_frac = 0.5;  // sweep-duration floor as a fraction of one period
+  int surf_max_pts = 1;           // points kept per surf voxel
+  std::uint64_t surf_seed = 0;    // reservoir RNG seed when surf_max_pts > 1
   bool intensity_gate = false;
   double i_min = 0.0;
   double i_max = 1e9;
@@ -320,16 +325,16 @@ struct FrontendVisual {
 // of consecutive in-gate fixes required to re-admit GNSS after a gap or a gated-out run.
 struct FrontendGnss {
   bool use = true;
-  double floor_fixed_h = 0.05;   // RTK_Fixed horizontal std [m]
-  double floor_fixed_v = 0.10;   // RTK_Fixed vertical std [m]
-  double floor_float_h = 0.50;   // RTK_Float horizontal std [m]
-  double floor_float_v = 1.00;   // RTK_Float vertical std [m]
-  double floor_dgps_h = 1.50;    // DGPS horizontal std [m]
-  double floor_dgps_v = 3.00;    // DGPS vertical std [m]
-  double floor_spp_h = 3.00;     // SPP horizontal std [m]
-  double floor_spp_v = 6.00;     // SPP vertical std [m]
-  double innovation_k = 3.0;     // Mahalanobis innovation gate
-  int reacquire_count = 5;       // consecutive in-gate fixes to re-admit
+  double floor_fixed_h = 0.05;  // RTK_Fixed horizontal std [m]
+  double floor_fixed_v = 0.10;  // RTK_Fixed vertical std [m]
+  double floor_float_h = 0.50;  // RTK_Float horizontal std [m]
+  double floor_float_v = 1.00;  // RTK_Float vertical std [m]
+  double floor_dgps_h = 1.50;   // DGPS horizontal std [m]
+  double floor_dgps_v = 3.00;   // DGPS vertical std [m]
+  double floor_spp_h = 3.00;    // SPP horizontal std [m]
+  double floor_spp_v = 6.00;    // SPP vertical std [m]
+  double innovation_k = 3.0;    // Mahalanobis innovation gate
+  int reacquire_count = 5;      // consecutive in-gate fixes to re-admit
 };
 struct FrontendKeyframe {
   double dist_m = 1.0;
@@ -355,7 +360,7 @@ struct FrontendBias {
 // under-excited spans (excitation below the floor and a degenerate eigenaxis).
 struct FrontendMotionReg {
   bool enable = true;
-  double weight = 1e-3;            // relative to the IMU accel weight
+  double weight = 1e-3;           // relative to the IMU accel weight
   double excitation_floor = 0.0;  // engage below this excitation level
 };
 struct FrontendConfig {
@@ -373,6 +378,11 @@ struct FrontendConfig {
   int reassoc_steps = 2;
   double assoc_shift_thresh_m = 0.02;
   double assoc_shift_thresh_deg = 0.2;
+  // Multiplier in (0, 1] on the marginalization prior's information at build time
+  // (sqrt(scale) on its sqrt-information and residual, so the prior's Gauss-Newton
+  // step direction is preserved while its confidence is deflated). 1.0 leaves the
+  // prior untouched and is bit-identical to a build without the knob.
+  double marg_prior_scale = 1.0;
   FrontendSolver solver{};
   FrontendBias bias{};
   FrontendMotionReg motion_reg{};
@@ -380,7 +390,6 @@ struct FrontendConfig {
   FrontendLidar lidar{};
   FrontendVisual visual{};
   FrontendGnss gnss{};
-  bool extrinsic_refine = true;
   FrontendKeyframe keyframe{};
 };
 
@@ -475,7 +484,7 @@ struct PlaceConfig {
   // STD/BTC
   int std_max_keypoints = 500;
   int std_knn_kp = 10;
-  double std_side_min = 0.5;  // [m]
+  double std_side_min = 0.5;   // [m]
   double std_side_max = 50.0;  // [m]
   double std_side_tol = 0.2;   // [m]
   int std_min_matches = 4;
@@ -486,7 +495,7 @@ struct PlaceConfig {
   std::array<double, 3> scoreB_w = {0.2, 0.5, 0.3};
   int std_topK = 2;
   // GICP / small_gicp
-  double gicp_downsample = 0.25;   // [m]
+  double gicp_downsample = 0.25;    // [m]
   double gicp_max_corr_dist = 1.0;  // [m]
   int gicp_num_threads = 4;
   double gicp_voxel_res = 1.0;  // [m]
@@ -511,6 +520,7 @@ struct DebugConfig {
   LogLevel level = LogLevel::Info;
   bool publish_clouds = true;
   bool publish_markers = true;
+  bool publish_odom = true;  // /meridian/odom (the rviz pose arrow); TF is published regardless
   bool timing = true;
   double telemetry_rate_hz = 10.0;
 };
