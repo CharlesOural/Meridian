@@ -55,6 +55,19 @@ std::shared_ptr<const CalibrationSet> calibrationFromConfig(const SensorsConfig&
     set->extrinsics.push_back(cam);
   }
 
+  // GNSS antenna lever arm (phase centre in the body frame). Published only when the config
+  // supplied it; a defaulted identity is not a calibration, so the back-end drops fixes rather
+  // than anchor every antenna position at the body origin.
+  if (sensors.gnss.extrinsic_set) {
+    Extrinsic gnss;
+    gnss.child = Frame::GnssLink;
+    gnss.parent = Frame::ImuLink;
+    gnss.T_parent_child =
+        Pose{Eigen::Quaterniond(sensors.gnss.extrinsic_R), sensors.gnss.extrinsic_T};
+    gnss.source = CalibSource::Manual;
+    set->extrinsics.push_back(gnss);
+  }
+
   IntrinsicsCamera intr;
   intr.fx = sensors.camera.intrinsics[0];
   intr.fy = sensors.camera.intrinsics[1];

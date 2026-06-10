@@ -82,6 +82,11 @@ meridian:
       # /3dm_ins/gnss_right/fix is the second antenna (heading aid), not used here.
       topic: /3dm_ins/gnss_left/fix
       enable: true
+      # Antenna lever arm in the body-IMU frame [m]. The sequence calibration ships the
+      # 3DM GNSS antenna offset as a zero placeholder (the real roof-mount offset was not
+      # published), so it is set to zero here: the fix is treated as the body position.
+      # Replace with the measured phase-centre offset if it becomes available.
+      extrinsic_T: [0.0, 0.0, 0.0]
   preprocess:
     blind: 0.5
     det_range: 120.0
@@ -90,6 +95,13 @@ meridian:
     sweep_floor_frac: 0.5     # min sweep_duration = half a 10 Hz period
     surf_max_pts: 1           # one representative per voxel (nearest centre)
     surf_seed: 0              # only used when surf_max_pts > 1
+    gnss:
+      # The 3DM-GQ7 INS outputs sub-metre RTK-quality fixes, but sensor_msgs/NavSatFix
+      # cannot encode RTK in its status field, so the driver stamps STATUS_FIX — which
+      # maps to SPP here. Accept SPP so the real fixes are not gated out; the per-fix
+      # position_covariance (~0.7 m^2 horizontal on this drive) carries the true weight.
+      min_fix_type: spp
+      max_pos_var: 25.0       # [m^2] reject a fix whose ENU covariance trace exceeds this
   frontend:
     kind: ct_livo
     init_time_s: 1.0          # static-start window; a longer window tightens the

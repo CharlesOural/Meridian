@@ -1,12 +1,12 @@
 #include "meridian/config/config_loader.hpp"
 
+#include <yaml-cpp/yaml.h>
+
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <yaml-cpp/yaml.h>
 
 namespace meridian {
 namespace {
@@ -39,9 +39,9 @@ void load_pipeline(const YAML::Node& root, PipelineConfig& c) {
   const YAML::Node n = root["pipeline"];
   if (!n) return;
   if (n["mode"]) {
-    c.mode = parse_enum<PipelineMode>(n["mode"], "pipeline.mode",
-                                      {{"live", PipelineMode::Live},
-                                       {"replay", PipelineMode::Replay}});
+    c.mode =
+        parse_enum<PipelineMode>(n["mode"], "pipeline.mode",
+                                 {{"live", PipelineMode::Live}, {"replay", PipelineMode::Replay}});
   }
   const YAML::Node t = n["threads"];
   get(t, "frontend", c.threads.frontend);
@@ -80,8 +80,7 @@ void get_vec(const YAML::Node& parent, const char* key, std::vector<double>& dst
   if (!parent || !parent[key]) return;
   const YAML::Node n = parent[key];
   if (!n.IsSequence()) {
-    throw std::runtime_error(std::string("config: key '") + key +
-                             "' must be a numeric sequence");
+    throw std::runtime_error(std::string("config: key '") + key + "' must be a numeric sequence");
   }
   std::vector<double> v;
   v.reserve(n.size());
@@ -103,7 +102,8 @@ Eigen::Matrix3d read_mat3(const YAML::Node& n, const std::string& key) {
   }
   Eigen::Matrix3d m;
   for (int r = 0; r < 3; ++r)
-    for (int col = 0; col < 3; ++col) m(r, col) = n[static_cast<std::size_t>(3 * r + col)].as<double>();
+    for (int col = 0; col < 3; ++col)
+      m(r, col) = n[static_cast<std::size_t>(3 * r + col)].as<double>();
   return m;
 }
 
@@ -119,9 +119,12 @@ void load_sensors(const YAML::Node& root, SensorsConfig& c) {
     get(l, "nominal_rate_hz", c.lidar.nominal_rate_hz);
     get(l, "ptp", c.lidar.ptp);
     get(l, "timestamp_mode", c.lidar.timestamp_mode);
-    if (l["extrinsic_T"]) c.lidar.extrinsic_T = read_vec3(l["extrinsic_T"], "sensors.lidar.extrinsic_T");
-    if (l["extrinsic_R"]) c.lidar.extrinsic_R = read_mat3(l["extrinsic_R"], "sensors.lidar.extrinsic_R");
-    c.lidar.extrinsic_set = static_cast<bool>(l["extrinsic_T"]) || static_cast<bool>(l["extrinsic_R"]);
+    if (l["extrinsic_T"])
+      c.lidar.extrinsic_T = read_vec3(l["extrinsic_T"], "sensors.lidar.extrinsic_T");
+    if (l["extrinsic_R"])
+      c.lidar.extrinsic_R = read_mat3(l["extrinsic_R"], "sensors.lidar.extrinsic_R");
+    c.lidar.extrinsic_set =
+        static_cast<bool>(l["extrinsic_T"]) || static_cast<bool>(l["extrinsic_R"]);
   }
 
   const YAML::Node i = n["imu"];
@@ -145,12 +148,10 @@ void load_sensors(const YAML::Node& root, SensorsConfig& c) {
     if (cam["intrinsics"]) {
       const YAML::Node iv = cam["intrinsics"];
       if (!iv.IsSequence() || iv.size() != 4) {
-        throw std::runtime_error(
-            "config: key 'sensors.camera.intrinsics' must be [fx,fy,cx,cy]");
+        throw std::runtime_error("config: key 'sensors.camera.intrinsics' must be [fx,fy,cx,cy]");
       }
-      c.camera.intrinsics =
-          Eigen::Vector4d(iv[0].as<double>(), iv[1].as<double>(), iv[2].as<double>(),
-                          iv[3].as<double>());
+      c.camera.intrinsics = Eigen::Vector4d(iv[0].as<double>(), iv[1].as<double>(),
+                                            iv[2].as<double>(), iv[3].as<double>());
     }
     get(cam, "distortion_model", c.camera.distortion_model);
     if (cam["distortion_coeffs"]) {
@@ -190,6 +191,12 @@ void load_sensors(const YAML::Node& root, SensorsConfig& c) {
   if (g) {
     get(g, "topic", c.gnss.topic);
     get(g, "enable", c.gnss.enable);
+    if (g["extrinsic_T"])
+      c.gnss.extrinsic_T = read_vec3(g["extrinsic_T"], "sensors.gnss.extrinsic_T");
+    if (g["extrinsic_R"])
+      c.gnss.extrinsic_R = read_mat3(g["extrinsic_R"], "sensors.gnss.extrinsic_R");
+    c.gnss.extrinsic_set =
+        static_cast<bool>(g["extrinsic_T"]) || static_cast<bool>(g["extrinsic_R"]);
   }
 }
 
@@ -208,13 +215,13 @@ void load_preprocess(const YAML::Node& root, PreprocessConfig& c) {
   if (g) {
     get(g, "enable", c.gnss.enable);
     if (g["min_fix_type"]) {
-      c.gnss.min_fix_type = parse_enum<GnssFix::FixType>(
-          g["min_fix_type"], "preprocess.gnss.min_fix_type",
-          {{"none", GnssFix::FixType::None},
-           {"spp", GnssFix::FixType::SPP},
-           {"dgps", GnssFix::FixType::DGPS},
-           {"rtk_float", GnssFix::FixType::RTK_Float},
-           {"rtk_fixed", GnssFix::FixType::RTK_Fixed}});
+      c.gnss.min_fix_type =
+          parse_enum<GnssFix::FixType>(g["min_fix_type"], "preprocess.gnss.min_fix_type",
+                                       {{"none", GnssFix::FixType::None},
+                                        {"spp", GnssFix::FixType::SPP},
+                                        {"dgps", GnssFix::FixType::DGPS},
+                                        {"rtk_float", GnssFix::FixType::RTK_Float},
+                                        {"rtk_fixed", GnssFix::FixType::RTK_Fixed}});
     }
     get(g, "min_sats", c.gnss.min_sats);
     get(g, "max_pos_var", c.gnss.max_pos_var);
@@ -230,9 +237,9 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   const YAML::Node n = root["frontend"];
   if (!n) return;
   if (n["kind"]) {
-    c.kind = parse_enum<FrontEndKind>(n["kind"], "frontend.kind",
-                                      {{"ct_livo", FrontEndKind::CtLivo},
-                                       {"iekf_oracle", FrontEndKind::IekfOracle}});
+    c.kind = parse_enum<FrontEndKind>(
+        n["kind"], "frontend.kind",
+        {{"ct_livo", FrontEndKind::CtLivo}, {"iekf_oracle", FrontEndKind::IekfOracle}});
   }
   get(n, "init_time_s", c.init_time_s);
   get(n, "solver_max_iterations", c.solver_max_iterations);
@@ -260,9 +267,8 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   const YAML::Node sp = n["spline"];
   if (sp) {
     if (sp["order"]) {
-      c.spline.order =
-          parse_enum<SplineOrder>(sp["order"], "frontend.spline.order",
-                                  {{"cubic", SplineOrder::Cubic}});
+      c.spline.order = parse_enum<SplineOrder>(sp["order"], "frontend.spline.order",
+                                               {{"cubic", SplineOrder::Cubic}});
     }
     get(sp, "knot_dt_ms", c.spline.knot_dt_ms);
     get(sp, "window_knots", c.spline.window_knots);
@@ -321,8 +327,7 @@ void load_backend(const YAML::Node& root, BackendConfig& c) {
   if (!n) return;
   get(n, "enable", c.enable);
   if (n["kind"]) {
-    c.kind = parse_enum<BackEndKind>(n["kind"], "backend.kind",
-                                     {{"isam2", BackEndKind::Isam2}});
+    c.kind = parse_enum<BackEndKind>(n["kind"], "backend.kind", {{"isam2", BackEndKind::Isam2}});
   }
   get(n, "anchor_sigma", c.anchor_sigma);
   get(n, "isam2_relinearize_skip", c.isam2_relinearize_skip);
@@ -395,14 +400,14 @@ void load_map(const YAML::Node& root, MapConfig& c) {
   const YAML::Node n = root["map"];
   if (!n) return;
   if (n["backend"]) {
-    c.backend = parse_enum<MapBackend>(n["backend"], "map.backend",
-                                       {{"nvblox", MapBackend::Nvblox}});
+    c.backend =
+        parse_enum<MapBackend>(n["backend"], "map.backend", {{"nvblox", MapBackend::Nvblox}});
   }
   get(n, "tsdf_voxel_m", c.tsdf_voxel_m);
   get(n, "reg_voxel_m", c.reg_voxel_m);
   if (n["mesh"]) {
-    c.mesh = parse_enum<MeshKind>(n["mesh"], "map.mesh",
-                                  {{"marching_cubes", MeshKind::MarchingCubes}});
+    c.mesh =
+        parse_enum<MeshKind>(n["mesh"], "map.mesh", {{"marching_cubes", MeshKind::MarchingCubes}});
   }
   get(n, "colour", c.colour);
 }
@@ -552,11 +557,11 @@ bool Config::validate(std::string* error_out) const {
   // Each stratum's guaranteed floor must fit inside the global cap.
   if (frontend.lidar.min_factors_per_normal * frontend.lidar.normal_strata >
       frontend.lidar.max_lidar_factors) {
-    return fail("frontend.lidar.min_factors_per_normal * normal_strata (" +
-                std::to_string(frontend.lidar.min_factors_per_normal *
-                               frontend.lidar.normal_strata) +
-                ") must be <= max_lidar_factors (" +
-                std::to_string(frontend.lidar.max_lidar_factors) + ")");
+    return fail(
+        "frontend.lidar.min_factors_per_normal * normal_strata (" +
+        std::to_string(frontend.lidar.min_factors_per_normal * frontend.lidar.normal_strata) +
+        ") must be <= max_lidar_factors (" + std::to_string(frontend.lidar.max_lidar_factors) +
+        ")");
   }
 
   // --- adaptive-knot density ---
@@ -717,8 +722,7 @@ bool Config::validate(std::string* error_out) const {
     return fail("preprocess.point_filter_num must be >= 1");
   }
   // The sweep-duration floor is a fraction of one nominal period, never more.
-  if (preprocess.lidar.sweep_floor_frac <= 0.0 ||
-      preprocess.lidar.sweep_floor_frac > 1.0) {
+  if (preprocess.lidar.sweep_floor_frac <= 0.0 || preprocess.lidar.sweep_floor_frac > 1.0) {
     return fail("preprocess.sweep_floor_frac must be in (0, 1]");
   }
   if (preprocess.lidar.surf_max_pts < 1) {
@@ -745,8 +749,7 @@ bool Config::validate(std::string* error_out) const {
   const double lidar_period_ms = 1000.0 / sensors.lidar.nominal_rate_hz;
   if (aggregation.max_wait_ms < lidar_period_ms) {
     return fail("aggregation.max_wait_ms (" + std::to_string(aggregation.max_wait_ms) +
-                ") must be >= one LiDAR period (" + std::to_string(lidar_period_ms) +
-                " ms)");
+                ") must be >= one LiDAR period (" + std::to_string(lidar_period_ms) + " ms)");
   }
 
   // --- PTP requires at least one PTP-disciplined sensor ---
@@ -757,8 +760,7 @@ bool Config::validate(std::string* error_out) const {
   }
 
   // --- thread counts ---
-  if (pipeline.threads.frontend < 1 || pipeline.threads.backend < 1 ||
-      pipeline.threads.map < 1) {
+  if (pipeline.threads.frontend < 1 || pipeline.threads.backend < 1 || pipeline.threads.map < 1) {
     return fail("pipeline.threads.{frontend,backend,map} must each be >= 1");
   }
 
@@ -770,17 +772,18 @@ bool Config::validate(std::string* error_out) const {
 
   // --- camera shutter (the rolling-shutter path is designed but not built) ---
   if (sensors.camera.shutter != "global") {
-    return fail("sensors.camera.shutter must be 'global' (got '" +
-                sensors.camera.shutter + "'); the rolling-shutter path is not built");
+    return fail("sensors.camera.shutter must be 'global' (got '" + sensors.camera.shutter +
+                "'); the rolling-shutter path is not built");
   }
 
   // --- camera distortion model (closed string set; reject unknowns loudly) ---
   {
     const std::string& m = sensors.camera.distortion_model;
-    if (m != "none" && m != "radtan" && m != "plumb_bob" && m != "equidistant" &&
-        m != "equi") {
-      return fail("sensors.camera.distortion_model must be one of "
-                  "none|radtan|plumb_bob|equidistant|equi (got '" + m + "')");
+    if (m != "none" && m != "radtan" && m != "plumb_bob" && m != "equidistant" && m != "equi") {
+      return fail(
+          "sensors.camera.distortion_model must be one of "
+          "none|radtan|plumb_bob|equidistant|equi (got '" +
+          m + "')");
     }
   }
 

@@ -1,12 +1,11 @@
 #pragma once
 
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
-
-#include <Eigen/Core>
-#include <Eigen/Geometry>
 
 #include "meridian/common/pose.hpp"
 #include "meridian/common/sample.hpp"
@@ -80,9 +79,9 @@ struct TimeHealth {
 };
 // Standing live stamp-integrity gate; one instance per sensor in L0.
 struct ValidatorConfig {
-  double gap_periods = 2.5;       // dropout when a raw gap exceeds this many periods
-  double skew_warn_ppm = 200.0;   // |skew_ppm| above this raises SkewOutOfRange
-  double nan_ratio_warn = 0.05;   // LiDAR NaN/Inf fraction above this raises a warning
+  double gap_periods = 2.5;      // dropout when a raw gap exceeds this many periods
+  double skew_warn_ppm = 200.0;  // |skew_ppm| above this raises SkewOutOfRange
+  double nan_ratio_warn = 0.05;  // LiDAR NaN/Inf fraction above this raises a warning
 };
 struct TimeConfig {
   TimeSource source = TimeSource::Ptp;
@@ -175,6 +174,11 @@ struct GnssSensorConfig {
   std::string topic = "/gnss/fix";
   bool enable = true;
   bool pps_disciplines_clock = true;
+  // Antenna lever arm: the GNSS phase-centre position in the body (IMU) frame. The back-end
+  // needs it to relate an absolute antenna fix to a body pose; without it GNSS is unusable.
+  Eigen::Vector3d extrinsic_T = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d extrinsic_R = Eigen::Matrix3d::Identity();
+  bool extrinsic_set = false;
 };
 struct SensorsConfig {
   LidarSensorConfig lidar{};
@@ -192,16 +196,16 @@ struct AggregationConfig {
 // ---- preprocess (L1) ----
 struct PreprocLidar {
   SensorModel model = SensorModel::OusterOS1_128;
-  double blind = 0.5;       // [m] reject returns closer than this
-  double det_range = 120.0; // [m] max usable range
-  int point_filter_num = 3; // keep every Nth point
+  double blind = 0.5;        // [m] reject returns closer than this
+  double det_range = 120.0;  // [m] max usable range
+  int point_filter_num = 3;  // keep every Nth point
   // Surf-voxel downsample: bucket survivors into a grid of edge voxel_surf_m and keep
   // at most surf_max_pts per cell. The sweep-duration floor never drops below this
   // fraction of one nominal period so deskew always has a horizon to cover.
-  double voxel_surf_m = 0.5;        // [m] downsample voxel edge
-  double sweep_floor_frac = 0.5;    // sweep-duration floor as a fraction of one period
-  int surf_max_pts = 1;             // points kept per surf voxel
-  std::uint64_t surf_seed = 0;      // reservoir RNG seed when surf_max_pts > 1
+  double voxel_surf_m = 0.5;      // [m] downsample voxel edge
+  double sweep_floor_frac = 0.5;  // sweep-duration floor as a fraction of one period
+  int surf_max_pts = 1;           // points kept per surf voxel
+  std::uint64_t surf_seed = 0;    // reservoir RNG seed when surf_max_pts > 1
   bool intensity_gate = false;
   double i_min = 0.0;
   double i_max = 1e9;
@@ -320,16 +324,16 @@ struct FrontendVisual {
 // of consecutive in-gate fixes required to re-admit GNSS after a gap or a gated-out run.
 struct FrontendGnss {
   bool use = true;
-  double floor_fixed_h = 0.05;   // RTK_Fixed horizontal std [m]
-  double floor_fixed_v = 0.10;   // RTK_Fixed vertical std [m]
-  double floor_float_h = 0.50;   // RTK_Float horizontal std [m]
-  double floor_float_v = 1.00;   // RTK_Float vertical std [m]
-  double floor_dgps_h = 1.50;    // DGPS horizontal std [m]
-  double floor_dgps_v = 3.00;    // DGPS vertical std [m]
-  double floor_spp_h = 3.00;     // SPP horizontal std [m]
-  double floor_spp_v = 6.00;     // SPP vertical std [m]
-  double innovation_k = 3.0;     // Mahalanobis innovation gate
-  int reacquire_count = 5;       // consecutive in-gate fixes to re-admit
+  double floor_fixed_h = 0.05;  // RTK_Fixed horizontal std [m]
+  double floor_fixed_v = 0.10;  // RTK_Fixed vertical std [m]
+  double floor_float_h = 0.50;  // RTK_Float horizontal std [m]
+  double floor_float_v = 1.00;  // RTK_Float vertical std [m]
+  double floor_dgps_h = 1.50;   // DGPS horizontal std [m]
+  double floor_dgps_v = 3.00;   // DGPS vertical std [m]
+  double floor_spp_h = 3.00;    // SPP horizontal std [m]
+  double floor_spp_v = 6.00;    // SPP vertical std [m]
+  double innovation_k = 3.0;    // Mahalanobis innovation gate
+  int reacquire_count = 5;      // consecutive in-gate fixes to re-admit
 };
 struct FrontendKeyframe {
   double dist_m = 1.0;
@@ -355,7 +359,7 @@ struct FrontendBias {
 // under-excited spans (excitation below the floor and a degenerate eigenaxis).
 struct FrontendMotionReg {
   bool enable = true;
-  double weight = 1e-3;            // relative to the IMU accel weight
+  double weight = 1e-3;           // relative to the IMU accel weight
   double excitation_floor = 0.0;  // engage below this excitation level
 };
 struct FrontendConfig {
@@ -430,10 +434,10 @@ struct BackendConfig {
   double gnss_max_cov = 25.0;  // [m^2] drop fix if trace(cov_enu) above
   bool gnss_lock_yaw = false;  // external heading available
   // datum init
-  double gnss_min_baseline = 5.0;    // [m] min travelled baseline before datum fit
-  double gnss_min_excitation = 3.0;  // [m] min dominant-axis span of buffered ENU track
-  double gnss_min_speed = 0.5;       // [m/s] speed a fix must exceed to count as moving
-  int gnss_min_moving_fixes = 5;     // moving fixes required before datum fit
+  double gnss_min_baseline = 5.0;         // [m] min travelled baseline before datum fit
+  double gnss_min_excitation = 3.0;       // [m] min dominant-axis span of buffered ENU track
+  double gnss_min_speed = 0.5;            // [m/s] speed a fix must exceed to count as moving
+  int gnss_min_moving_fixes = 5;          // moving fixes required before datum fit
   double gnss_datum_yaw_sigma_max = 5.0;  // [deg] reject datum fit above this yaw uncertainty
   // gating + decimation
   bool gnss_skip_if_confident = true;   // skip fix no tighter than the back-end marginal
@@ -441,8 +445,8 @@ struct BackendConfig {
   double gnss_min_spacing = 1.0;        // [m] min travelled baseline between admitted fixes
   // drift redistribution across an outage span
   bool gnss_redistribute = false;
-  int gnss_reacq_fix = 1;      // min fix-quality enum to count as re-acquired
-  int gnss_reacq_persist = 5;  // consecutive accepted fixes to declare re-acquisition
+  int gnss_reacq_fix = 1;                // min fix-quality enum to count as re-acquired
+  int gnss_reacq_persist = 5;            // consecutive accepted fixes to declare re-acquisition
   int gnss_redistribute_span_max = 200;  // max keyframes back redistribution reaches
   // online extrinsics, off by default; enable per-platform
   bool extrinsic_refine = false;
@@ -510,7 +514,7 @@ struct PlaceConfig {
   // STD/BTC
   int std_max_keypoints = 500;
   int std_knn_kp = 10;
-  double std_side_min = 0.5;  // [m]
+  double std_side_min = 0.5;   // [m]
   double std_side_max = 50.0;  // [m]
   double std_side_tol = 0.2;   // [m]
   int std_min_matches = 4;
@@ -521,7 +525,7 @@ struct PlaceConfig {
   std::array<double, 3> scoreB_w = {0.2, 0.5, 0.3};
   int std_topK = 2;
   // GICP / small_gicp
-  double gicp_downsample = 0.25;   // [m]
+  double gicp_downsample = 0.25;    // [m]
   double gicp_max_corr_dist = 1.0;  // [m]
   int gicp_num_threads = 4;
   double gicp_voxel_res = 1.0;  // [m]
