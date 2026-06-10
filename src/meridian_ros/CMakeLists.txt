@@ -40,7 +40,12 @@ target_link_libraries(odometry_node meridian_ros_support)
 ament_target_dependencies(odometry_node
   rclcpp tf2_ros geometry_msgs sensor_msgs meridian_msgs)
 
-install(TARGETS odometry_node DESTINATION lib/${PROJECT_NAME})
+find_package(rosbag2_cpp REQUIRED)
+add_executable(replay_runner src/replay_runner.cpp)
+target_link_libraries(replay_runner meridian_ros_support)
+ament_target_dependencies(replay_runner rclcpp sensor_msgs rosbag2_cpp)
+
+install(TARGETS odometry_node replay_runner DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch config rviz DESTINATION share/${PROJECT_NAME})
 
 ament_package()
