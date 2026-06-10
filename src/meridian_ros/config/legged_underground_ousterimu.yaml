@@ -1,0 +1,179 @@
+# Ouster-internal-IMU alternate for the FusionPortable v2 `legged_underground`
+# sequence (hardware-synced IMU; A/B foil for the STIM300 main config)
+# (Unitree legged platform, Ouster OS1-128 + STIM300 body IMU + FLIR frame camera).
+#
+# Topics match this bag as recorded (verified with `ros2 bag info`). The sensor
+# extrinsics, camera intrinsics/distortion, and IMU noise below were imported from
+# the sequence's own 20230912 calibration via tools/import_kalibr.py (ouster00 /
+# frame_cam00 / body_imu). Re-import if the calibration files change.
+meridian:
+  pipeline:
+    mode: live              # the node ingests from topics; ros2 bag play drives them
+    queue:
+      meas_capacity: 8      # Q_meas (lossy under overload); ~0.8 s at 10 Hz
+      kf_capacity: 64       # Q_kf (lossless back-pressure)
+      map_capacity: 64      # Q_map (lossless back-pressure)
+  time:
+    source: host            # bag replay: no live PTP discipline; stamps pass through
+    max_skew_ms: 5.0
+    validator:              # standing live stamp-integrity gate, always on
+      gap_periods: 2.5      # dropout when a raw gap exceeds 2.5 nominal periods
+      skew_warn_ppm: 200
+      nan_ratio_warn: 0.05  # reject only an all-NaN scan; drop offending points below this
+  sensors:
+    lidar:
+      topic: /os_cloud_node/points
+      model: ouster_os1_128
+      nominal_rate_hz: 10.0
+      ptp: false            # no PTP servo during replay; recorded stamps are final
+      # The STIM300 stream is stamped ~26 ms late vs the Ouster/LiDAR clock (gyro
+      # cross-correlation on this bag; drifts -28..-21 ms over the sequence). With
+      # the covariances above, correcting it measured slightly WORSE (0.2 -> 1.3 m),
+      # so it stays 0; revisit if a future bag shows a larger lag.
+      time_offset_ms: 0.0
+      # Extrinsic relative to the Ouster's built-in IMU (factory-rigid, near-identity).
+      extrinsic_T: [-0.006253, 0.011775, -0.007645]
+      extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    imu:
+      topic: /os_cloud_node/imu/data_raw   # Ouster OS1 built-in IMU, 100 Hz
+      rate_hz: 100.0
+      # Squared Allan densities from ouster00_imu.yaml; this MEMS unit's floor is
+      # already at the locomotion-vibration level, so no inflation is needed.
+      cov_acc: 5.488040322532213e-05
+      cov_gyr: 1.4880171637287368e-07
+      b_acc_cov: 9.733025129293326e-09
+      b_gyr_cov: 2.397861858727196e-11
+    camera:
+      # FLIR frame camera (left), JPEG-compressed in the bag; decoded to mono8 at
+      # ingest. The DAVIS event camera (/stereo/davis_left, 346x260, calib
+      # event_cam00) is a lower-resolution alternative not used here.
+      topic: /stereo/frame_left/image_raw/compressed
+      compressed: true        # JPEG stream; decoded to mono8 at ingest
+      # Constant stamp correction onto the body-IMU timeline (t_corr = t + offset).
+      # The calib reports a -13.6 ms cam<->body-IMU timeshift; left at 0 for a first
+      # run (the GPIO-triggered stamps are already disciplined) pending a bag A/B.
+      time_offset_ms: 0.0
+      model: pinhole
+      nominal_rate_hz: 20.0
+      shutter: global         # rolling-shutter path is designed but not built
+      trigger: gpio
+      exposure_from_meta: true
+      # [fx, fy, cx, cy] — imported from the calib by tools/import_kalibr.py.
+      intrinsics: [602.4532, 602.4183, 520.8442, 397.542]
+      # Lens distortion, also imported. plumb_bob in the source file is normalised to
+      # radtan; coeffs are k1,k2,p1,p2[,k3]. width/height are the image size.
+      # T_imu_cam (body-IMU <- camera), inverted from the
+      # quaternion/translation_sensor_body_imu entry of frame_cam00 (same stored
+      # convention as the LiDAR entry above). Camera +Z maps to body +X: forward.
+      extrinsic: [0.08529096607975445, 0.06908451214164484, -0.01807885619537639, -0.4943665238246194, 0.5051695352713559, -0.49781552747914076, 0.5025785325259619]
+      distortion_model: radtan
+      distortion_coeffs: [-0.0891, 0.0885, 0.0005, 0.002, 0.0]
+      width: 1024
+      height: 768
+      photometric:
+        exposure_comp: true
+    gnss:
+      topic: /ublox/fix
+      enable: false # No GPS heres
+  preprocess:
+    blind: 0.5
+    det_range: 120.0
+    point_filter_num: 2
+    voxel_surf_m: 0.5         # surf-voxel downsample edge
+    sweep_floor_frac: 0.5     # min sweep_duration = half a 10 Hz period
+    surf_max_pts: 1           # one representative per voxel (nearest centre)
+    surf_seed: 0              # only used when surf_max_pts > 1
+  frontend:
+    kind: ct_livo
+    init_time_s: 1.0          # static-start window; a longer window tightens the
+                              # gravity/bias init whose residual error the frozen
+                              # accel bias cannot absorb
+    # Iteration caps sized for full convergence: with the garden_day 5/4
+    # schedule the corridor walk under-converges and diverges at t~188 s
+    # (replay, deadline off). Live, solver.time_limit_ms gates the schedule
+    # either way, so the deeper caps do not change on-target latency.
+    solver_max_iterations: 12
+    solver_epsi: 1.0e-3
+    degeneracy_thresh: 10.0   # eigenvalue floor for the per-axis degeneracy score
+    max_outer_iters: 6        # re-association passes
+    reassoc_steps: 2          # inner LM steps per pass
+    assoc_shift_thresh_m: 0.02
+    assoc_shift_thresh_deg: 0.2
+    solver:
+      time_limit_ms: 90       # per-sweep wall budget (10 Hz cadence)
+      min_iterations: 2
+    bias:
+      gyr_max: 0.5            # [rad/s] gyro bias box bound
+      acc_max: 5.0            # [m/s^2] accel bias box bound
+      knot_dt_ms: 500         # bias random-walk knot cadence
+    motion_reg:
+      enable: true            # gated jerk / ang-accel regularizer on under-excited spans
+      weight: 1.0e-3
+      excitation_floor: 0.05  # engage below ~0.05 rad/s & m/s2 (near-static spans only)
+    spline:
+      knot_dt_ms: 100         # one outer segment per 10 Hz sweep
+      window_knots: 8
+      # Adaptive density is mathematically validated (transition test + bag at
+      # parity with unbounded solve time), but density-2 segments inflate the
+      # autodiff problem past the 90 ms budget (0.123 m starved vs 0.039 m
+      # unbounded). Ship 1 until analytic Jacobians buy the headroom, then flip
+      # to 3.
+      n_cp_max: 1
+      knot_omega_thresh: [0.5, 1.5]   # [rad/s] N_omega band edges raising n_cp to 2, 3
+      knot_accel_thresh: [1.0, 3.0]   # [m/s^2] N_a band edges raising n_cp to 2, 3
+      knot_density_hysteresis: 0.15
+    lidar:
+      voxel_map_m: 0.6
+      num_match_points: 5
+      max_match_dist_sq: 5.0
+      plane_thresh: 0.1
+      point_cov: 1.0e-3
+      max_lidar_factors: 1000
+      min_factors_per_normal: 50
+      normal_strata: 7
+    visual:
+      # Sparse-direct photometric stage. Gated off automatically whenever the camera
+      # intrinsics are zero/invalid; this is the operator master switch on top of that.
+      enable: true
+      patch: 8
+      levels: 3
+      img_point_cov: 100.0
+      outlier_threshold: 1000.0
+      ncc_thre: 0.5
+      exposure_estimate_en: true
+      inv_expo_cov: 1.0e-2
+      inv_expo_min: 1.0e-3
+      grid_cell_px: 32
+      warp_det_min: 0.1
+      warp_det_max: 10.0
+      warp_cond_max: 50.0
+      # Active visual-map half-extent [m]. Bounds per-sweep map maintenance to the
+      # local point set; sized to the camera's indoor re-observability range, not the
+      # LiDAR map scale (60 m here grew the map to ~69k points and blew the budget).
+      active_box_m: 20.0
+    gnss:
+      # Conservative absolute-position residual. Off => the GNSS code path is never
+      # entered and the trajectory is bit-identical to a build without it. Floors are
+      # per-fix-type position-std (horizontal, vertical) [m]; cov_enu is floored to at
+      # least these before weighting.
+      use: false
+      floor_fixed_h: 0.05
+      floor_fixed_v: 0.10
+      floor_float_h: 0.50
+      floor_float_v: 1.00
+      floor_dgps_h: 1.50
+      floor_dgps_v: 3.00
+      floor_spp_h: 3.00
+      floor_spp_v: 6.00
+      innovation_k: 3.0         # Mahalanobis k-sigma acceptance gate
+      reacquire_count: 5        # consecutive in-gate fixes to re-admit after a gap
+    keyframe:
+      dist_m: 1.0
+      rot_deg: 10.0
+      time_s: 1.0
+  debug:
+    level: info
+    publish_clouds: true
+    publish_markers: true
+    timing: true
+    telemetry_rate_hz: 10.0

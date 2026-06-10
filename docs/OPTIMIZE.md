@@ -22,11 +22,11 @@ The Jetson is slower per core — these are the dials to recover headroom there.
 
 | knob | now | trades |
 |---|---|---|
-| `visual.enable` | true | false → drop the whole photometric stage (~20 ms), clean LIO ~7.5 cm. Biggest cut. |
+| `visual.enable` | true (garden_day); **false (legged_underground)** | false → drop the whole photometric stage (~20 ms), clean LIO ~7.5 cm. Biggest cut. On the legged bag the stage is also an accuracy hazard: in the dark corridor it diverges the estimate (full-bag replay 340–2834 m vs 4.5 m off; the well-lit first 120 s are fine at 1.3 m). Low-light gating needed before re-enabling there. |
 | camera (`sensors.camera`) | FLIR 1024×768 | DAVIS `event_cam00` 346×260 ≈ 8× fewer pixels in the visual stage |
 | `lidar.num_match_points` | 5 | ↓ = fewer NN neighbours per assoc query |
 | `solver.time_limit_ms` | 90 | hard per-sweep solve cap (safety, not tuning); ↓ bounds latency but shallows the solve |
-| `max_outer_iters` / `reassoc_steps` | 4 / 2 | ↓ = fewer re-association passes → less assoc+solve, less refinement |
+| `max_outer_iters` / `reassoc_steps` | 4 / 2 (garden_day); **6 / 2 + `solver_max_iterations` 12 (legged_underground)** | ↓ = fewer re-association passes → less assoc+solve, less refinement. On the legged bag the 5/4 caps under-converge the corridor walk and diverge at t≈188 s even with the deadline off (replay ATE 340 m vs 4.5 m at 12/6); live, `time_limit_ms` gates the schedule either way. |
 | analytic IMU factor | not built | ~5 ms off solve, no accuracy cost (last autodiff residual; spec-04 banner item) |
 | ceres `num_threads` (ct_frontend.cpp:621, marginalization.cpp:241) | 1 | >1 helps only on large problems; ours is small. Must stay deterministic (replay==live). |
 
@@ -34,6 +34,7 @@ The Jetson is slower per core — these are the dials to recover headroom there.
 
 | knob | now | role |
 |---|---|---|
+| `sensors.imu.cov_*` (legged_underground) | ≈×40 the calib Allan densities | IMU-vs-LiDAR trust. Static-calib Allan floors over-trust the IMU under locomotion vibration: calib values diverge (448 m ATE / 120 s), ×10 still diverges (116 m), ×20 holds (0.5 m), ×40 holds (0.6 m; shipped values 0.2 m, full bag 4.5 m / 161 m). Set per platform from a GT replay sweep, not from the calib file. |
 | `spline.n_cp_max` | 1 | adaptive knot density; >1 is math-validated but inflates the solve past budget — flip to 3 only after the analytic IMU lands |
 | `spline.window_knots` / `knot_dt_ms` | 8 / 100 | window length (knots) / one knot per 10 Hz sweep |
 | `bias.gyr_max` / `acc_max` / `knot_dt_ms` | 0.5 / 5.0 / 500 | bias box bounds [rad/s, m/s²] + random-walk knot cadence [ms] |
