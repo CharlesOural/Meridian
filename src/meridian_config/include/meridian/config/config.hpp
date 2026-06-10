@@ -394,8 +394,11 @@ struct BackendImu {
 struct BackendConfig {
   bool enable = true;  // bring-up switch: off runs the pipeline without the back-end
   BackEndKind kind = BackEndKind::Isam2;
-  // gauge anchor on the first pose; lambda = 1/sigma^2
-  double anchor_sigma = 1e-4;
+  // Gauge damping on the first pose, lambda = 1/sigma^2. Two-sided: every pose marginal
+  // floors at sigma^2 (keep sigma small), while a rigid correction propagates through the
+  // anchor at ~chain_info/(chain_info+lambda) per solver iteration (keep lambda moderate;
+  // measured: lambda >= 1e4 visibly freezes the rigid mode even in a batch solve).
+  double anchor_sigma = 0.1;
   // iSAM2
   int isam2_relinearize_skip = 1;
   double isam2_relinearize_thresh = 0.1;

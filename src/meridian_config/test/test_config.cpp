@@ -326,7 +326,7 @@ TEST(Config, BackendDefaults) {
   Config c;
   EXPECT_TRUE(c.backend.enable);
   EXPECT_EQ(c.backend.kind, BackEndKind::Isam2);
-  EXPECT_DOUBLE_EQ(c.backend.anchor_sigma, 1e-4);
+  EXPECT_DOUBLE_EQ(c.backend.anchor_sigma, 0.1);
   EXPECT_EQ(c.backend.isam2_relinearize_skip, 1);
   EXPECT_DOUBLE_EQ(c.backend.isam2_relinearize_thresh, 0.1);
   EXPECT_EQ(c.backend.extra_iters_normal, 0);

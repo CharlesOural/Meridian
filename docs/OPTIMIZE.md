@@ -35,6 +35,7 @@ The Jetson is slower per core — these are the dials to recover headroom there.
 | knob | now | role |
 |---|---|---|
 | `sensors.imu.cov_*` (legged_underground) | ≈×40 the calib Allan densities | IMU-vs-LiDAR trust. Static-calib Allan floors over-trust the IMU under locomotion vibration: calib values diverge (448 m ATE / 120 s), ×10 still diverges (116 m), ×20 holds (0.5 m), ×40 holds (0.6 m; shipped values 0.2 m, full bag 4.5 m / 161 m). Set per platform from a GT replay sweep, not from the calib file. |
+| `backend.anchor_sigma` | 0.1 (λ=100) | gauge-anchor damping: every pose marginal floors at σ² (↓σ tightens loop-gate marginals) vs rigid corrections propagate at ~chain_info/(chain_info+λ) per solver iteration (↑σ floats faster). Measured (10-edge chain + conflicting absolute prior): λ=100 absorbs >99.9% of a forced rigid shift; λ=1e4 stalls at 38% after 5000 iters even in batch GN; λ=1e8 ≈ hard prior (0.02%) and the conflict permanently distorts relative geometry instead. Floor at default = (10 cm)². |
 | `spline.n_cp_max` | 1 | adaptive knot density; >1 is math-validated but inflates the solve past budget — flip to 3 only after the analytic IMU lands |
 | `spline.window_knots` / `knot_dt_ms` | 8 / 100 | window length (knots) / one knot per 10 Hz sweep |
 | `bias.gyr_max` / `acc_max` / `knot_dt_ms` | 0.5 / 5.0 / 500 | bias box bounds [rad/s, m/s²] + random-walk knot cadence [ms] |

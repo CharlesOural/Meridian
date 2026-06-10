@@ -267,8 +267,21 @@ whose `error()` is identically zero and whose `linearize()` returns a
 `JacobianFactor(keyX(first), √λ·I₆, 0₆)`. Because the linear factor is rebuilt at
 every relinearisation, the damping re-centres on the *current* linearisation point —
 it never pulls toward a remembered value. The damping magnitude is
-`λ = 1 / backend.anchor_sigma²` (default `anchor_sigma = 1e-4`, i.e. a strong but
-value-free regulariser). It is added once, at the first keyframe, and **never**
+`λ = 1 / backend.anchor_sigma²` (default `anchor_sigma = 0.1`, λ = 100). The value is a
+**two-sided trade, set from measurement** (10-edge chain, conflicting tight absolute
+prior on the far end, GTSAM 4.2): every pose marginal floors at `anchor_sigma²` (σ must
+stay small for the §13 loop-gate marginals to be meaningful), while a correction that
+demands rigidly translating the trajectory propagates through the anchor at roughly
+`chain_info/(chain_info+λ)` per solver iteration. Measured: λ = 100 absorbs >99.9% of a
+forced rigid shift (batch GN exact; iSAM2 follows over repeated updates); λ = 1e4 stalls
+at ~38% after 5000 iterations *even in a batch solve*; λ = 1e8 is operationally a hard
+prior (0.02% absorbed) — the failure mode being that a conflicting absolute measurement
+then permanently distorts the *relative* geometry instead of shifting the gauge. The
+marginal floor at the default is (10 cm)², negligible against the drift the §13 gate
+measures. The system also avoids exciting the rigid mode by construction — GNSS aligns
+through the datum variable `G` (§6.2) and loop corrections bend the chain — but
+post-datum-lock GNSS after a rigid drift *does* push on this mode, which is why the
+throttling matters. The anchor is added once, at the first keyframe, and **never**
 re-added. The first keyframe normally arrives with `constraint_kind ==
 AbsolutePrior` (`01 §6.4`: "Used for the first keyframe … to fix the gauge"); L3
 maps that to this damping anchor. **Mandatory test trio:** (a) a between-only chain
@@ -1447,7 +1460,7 @@ struct BackendConfig {
   std::string kind = "isam2";              // [cold] the IBackEnd impl (00 §8.2)
 
   // --- gauge / anchor ---
-  double anchor_sigma                = 1e-4;  // [cold] GaugeDampingFactor sigma on X(first); lambda = 1/sigma^2
+  double anchor_sigma                = 0.1;   // [cold] GaugeDampingFactor sigma on X(first); lambda = 1/sigma^2 (§3 trade, measured)
 
   // --- iSAM2 (§9.1; Appendix R.1) ---
   int    isam2_relinearize_skip      = 1;     // [hot]
