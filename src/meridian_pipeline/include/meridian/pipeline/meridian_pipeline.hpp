@@ -9,13 +9,13 @@
 #include <thread>
 #include <variant>
 
+#include "meridian/common/bounded_queue.hpp"
 #include "meridian/common/keyframe_packet.hpp"
 #include "meridian/common/measure_group.hpp"
 #include "meridian/common/nav_state.hpp"
 #include "meridian/common/preprocessed_group.hpp"
 #include "meridian/common/sample.hpp"
 #include "meridian/config/config.hpp"
-#include "meridian/pipeline/bounded_queue.hpp"
 #include "meridian/sensors/raw_frames.hpp"
 
 namespace meridian {
@@ -51,7 +51,7 @@ class TelemetrySink;
 // threads (front-end first, then sensor stage) and tears down in reverse. The wrapper
 // owns exactly one pipeline.
 class MeridianPipeline {
- public:
+public:
   // `sink` is the telemetry sink for the whole pipeline; the pipeline takes ownership
   // and outlives every module that borrows it. nullptr installs a NullSink. `cfg` must
   // already be validated. In Live mode the sink is written from both the ingest threads
@@ -79,11 +79,12 @@ class MeridianPipeline {
   using GroupSink = std::function<void(PreprocessedGroup&&)>;
   void set_group_sink(GroupSink sink);
 
-  // Receives every keyframe the front-end emits, moved, on the front-end thread (Live)
-  // or the caller's thread (Replay). Set before start(); must only enqueue. When unset
-  // the pipeline still counts keyframes and raises the "frontend/keyframe" telemetry
-  // event. The first keyframe flips the front-end into steady-state deskew, so emitted
-  // groups stop reporting cold_start after it.
+  // Receives every keyframe the front-end emits, moved, on the front-end's keyframe
+  // finalizer thread (Live; packets arrive in id order with constraint_cov filled) or
+  // the caller's thread (Replay, inline). Set before start(); must only enqueue. When
+  // unset the pipeline still counts keyframes and raises the "frontend/keyframe"
+  // telemetry event. The first keyframe flips the front-end into steady-state deskew,
+  // so emitted groups stop reporting cold_start after it.
   using KeyframeSink = std::function<void(KeyframePacket&&)>;
   void set_keyframe_sink(KeyframeSink sink);
 
@@ -95,7 +96,7 @@ class MeridianPipeline {
   // The sink every module writes to (borrowed; owned by the pipeline).
   TelemetrySink* telemetry();
 
- private:
+private:
   using SensorSample = std::variant<ImuSample, LidarScan, CameraFrame, GnssFix>;
   // What crosses Q_meas into the front-end thread: a finished sweep, or one live IMU
   // sample to advance live_state() between sweeps.
