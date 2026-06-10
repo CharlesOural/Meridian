@@ -10,7 +10,7 @@
 //
 // Usage:
 //   replay_runner <config.yaml> <bag_dir> <out.tum> [max_content_secs]
-//                 [--dump-keyframes <packets.bin>] [--dump-clouds]
+//                 [--dump-keyframes <packets.bin>] [--dump-clouds] [--no-backend]
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -53,7 +53,8 @@ Msg deserialize(const rosbag2_storage::SerializedBagMessageSharedPtr& bag_msg) {
 int usage() {
   std::fprintf(stderr,
                "usage: replay_runner <config.yaml> <bag_dir> <out.tum> [max_content_secs]\n"
-               "                     [--dump-keyframes <packets.bin>] [--dump-clouds]\n");
+               "                     [--dump-keyframes <packets.bin>] [--dump-clouds]\n"
+               "                     [--no-backend]\n");
   return 2;
 }
 
@@ -72,6 +73,7 @@ int main(int argc, char** argv) {
   double max_secs = 0.0;
   std::string dump_path;
   bool dump_clouds = false;
+  bool no_backend = false;
   int arg = 4;
   if (arg < argc && std::string_view(argv[arg]).substr(0, 2) != "--") {
     max_secs = std::stod(argv[arg++]);
@@ -82,6 +84,8 @@ int main(int argc, char** argv) {
       dump_path = argv[++arg];
     } else if (a == "--dump-clouds") {
       dump_clouds = true;
+    } else if (a == "--no-backend") {
+      no_backend = true;
     } else {
       return usage();
     }
@@ -93,6 +97,9 @@ int main(int argc, char** argv) {
 
   Config cfg = load_config_yaml(config_path);
   cfg.pipeline.mode = PipelineMode::Replay;  // synchronous + deterministic, regardless of file
+  if (no_backend) {
+    cfg.backend.enable = false;  // A/B switch: same bag, front-end only
+  }
 
   std::ofstream out(out_path);
   if (!out) {
@@ -191,9 +198,24 @@ int main(int argc, char** argv) {
   pipeline.stop();
   out.flush();
   packet_log.reset();  // flush + close the dump before reporting it
-  std::fprintf(stderr, "replay done: %llu messages, %llu groups -> %s\n",
+  // The back-end's corrected map-frame trajectory next to the front-end TUM, one line
+  // per keyframe, for direct ATE comparison of the two estimates.
+  std::uint64_t kf_corrected = 0;
+  if (pipeline.backend_enabled()) {
+    const std::string backend_path = stem + "_backend.tum";
+    std::ofstream backend_out(backend_path);
+    if (!backend_out) {
+      std::fprintf(stderr, "error: cannot write %s\n", backend_path.c_str());
+      return 1;
+    }
+    for (const StampedPose& sp : pipeline.corrected_trajectory()) {
+      write_tum_line(backend_out, sp.stamp, sp.T_map_body);
+      ++kf_corrected;
+    }
+  }
+  std::fprintf(stderr, "replay done: %llu messages, %llu groups, %llu corrected keyframes -> %s\n",
                static_cast<unsigned long long>(n_msgs), static_cast<unsigned long long>(groups),
-               out_path.c_str());
+               static_cast<unsigned long long>(kf_corrected), out_path.c_str());
   if (!dump_path.empty()) {
     std::fprintf(stderr, "  dumped %llu keyframes -> %s\n",
                  static_cast<unsigned long long>(kf_dumped), dump_path.c_str());

@@ -6,6 +6,7 @@ find_package(meridian_cmake REQUIRED)
 include(MeridianToolchain)
 
 set(MERIDIAN_NEED_GTSAM ON)
+set(MERIDIAN_NEED_YAMLCPP ON)
 include(MeridianDeps)
 
 find_package(meridian_common REQUIRED)
@@ -58,13 +59,20 @@ install(TARGETS meridian_backend
   RUNTIME DESTINATION bin
 )
 
+# Offline iteration harness: packet log -> IBackEnd -> TUM, no pipeline, no ROS.
+add_executable(backend_runner src/backend_runner.cpp)
+target_compile_features(backend_runner PUBLIC cxx_std_20)
+meridian_apply_warnings(backend_runner)
+target_link_libraries(backend_runner meridian_backend yaml-cpp)
+install(TARGETS backend_runner DESTINATION lib/meridian_backend)
+
 if(BUILD_TESTING)
   include(MeridianTesting)
   # Tests exercise the internal graph classes directly, so they see src/ and link
   # GTSAM themselves (it is private to the library and not in its link interface).
   foreach(t test_gtsam_adapter test_tangent_ordering test_gauge_damping
             test_observability_inflation test_chain_covariance test_backend_spine
-            test_determinism)
+            test_determinism test_backend_recovery)
     meridian_add_gtest(${t} test/${t}.cpp)
     target_link_libraries(${t} meridian_backend gtsam)
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

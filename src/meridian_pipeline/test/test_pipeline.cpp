@@ -193,6 +193,21 @@ TEST(MeridianPipeline, BackendTapSeesKeyframesThenAnchoredGnss) {
     }
   }
   EXPECT_EQ(gnss_items, 1);
+
+  // The back-end is on by default and the inline replay driver folds the graph on
+  // every keyframe, so the corrected trajectory is already populated between ingests.
+  EXPECT_TRUE(fx.pipeline->backend_enabled());
+  EXPECT_FALSE(fx.pipeline->corrected_trajectory().empty());
+}
+
+TEST(MeridianPipeline, DisabledBackendReportsEmptyTrajectory) {
+  Config cfg;
+  cfg.pipeline.mode = PipelineMode::Replay;
+  cfg.frontend.kind = meridian::FrontEndKind::IekfOracle;
+  cfg.backend.enable = false;
+  MeridianPipeline pipeline(cfg, nullptr);
+  EXPECT_FALSE(pipeline.backend_enabled());
+  EXPECT_TRUE(pipeline.corrected_trajectory().empty());
 }
 
 TEST(MeridianPipeline, StationaryDeskewIsNearIdentity) {

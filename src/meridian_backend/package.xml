@@ -15,6 +15,7 @@
   <depend>meridian_debug</depend>
   <depend>meridian_calib</depend>
   <depend>eigen</depend>
+  <depend>yaml-cpp</depend>
   <!-- GTSAM is provided by the dev image (docker/install-deps.sh) and found via
        find_package(GTSAM); it has no standard rosdep key, so it is not listed here. -->
 

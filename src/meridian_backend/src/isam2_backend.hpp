@@ -13,6 +13,7 @@
 #include "chain_covariance.hpp"
 #include "kf_record.hpp"
 #include "meridian/backend/ibackend.hpp"
+#include "observability_inflation.hpp"
 
 namespace meridian::backend {
 
@@ -51,6 +52,12 @@ private:
   bool run_update_with_recovery(gtsam::ISAM2Result& result, Timestamp ts);
   GraphUpdate build_graph_update();
   void record_keyframe(KeyframePacket&& kf);
+  // Emits per-axis observability inflation telemetry and a marker when an axis is locked.
+  void publish_observability(std::uint64_t id, const ObservabilityReport& obs,
+                             const InflationResult& inf);
+  // Drops bookkeeping for keyframes whose variables are not in the estimate after an
+  // abandoned batch, restoring chain consistency.
+  void rollback_uncommitted_keyframes();
   Timestamp tele_stamp() const;
 
   BackendConfig cfg_;

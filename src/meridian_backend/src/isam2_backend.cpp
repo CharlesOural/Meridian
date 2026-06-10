@@ -7,6 +7,7 @@
 #include <gtsam/slam/BetweenFactor.h>
 
 #include <Eigen/Core>
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -95,9 +96,37 @@ void Isam2BackEnd::add_keyframe(KeyframePacket&& kf) {
                      tele_stamp());
         return;
       }
-      const InflationResult inf = inflate_by_observability(
-          kf.constraint_cov, kf.observability, cfg_.obs_inflation_max, cfg_.obs_inflation_gamma,
-          cfg_.degenerate_thresh, cfg_.degenerate_lock);
+      // The covariance block crosses the boundary already rotation-first and, by contract,
+      // in covariance form. Audit the form at this one site rather than trust it silently:
+      // an information-form block fed to a covariance noise model inverts every axis.
+      GaussianBlock<6> cov_block = kf.constraint_cov;
+      if (cov_block.form == GaussianBlock<6>::Form::Information) {
+        sink_->event(Level::Warn, kTeleInfoForm,
+                     "kf " + std::to_string(kf.id) + " shipped information-form cov; inverting",
+                     tele_stamp());
+        Eigen::Matrix<double, 6, 6> info = cov_block.M;
+        ensure_psd(info);
+        cov_block.M = info.inverse();
+        cov_block.form = GaussianBlock<6>::Form::Covariance;
+      }
+      // Observability scores are defined in their own named frame; inflation rotates the
+      // covariance about the factor (body) axes, so a non-body, non-eigvec report would
+      // inflate the wrong axes. Skip inflation rather than misapply it.
+      InflationResult inf;
+      if (kf.observability.frame != Frame::Body && !kf.observability.eigvecs) {
+        sink_->event(Level::Warn, kTeleObsFrame,
+                     "kf " + std::to_string(kf.id) +
+                         " observability not in body frame; "
+                         "inflation skipped",
+                     tele_stamp());
+        inf.cov = cov_block.M;
+        inf.lambda = {1, 1, 1, 1, 1, 1};
+      } else {
+        inf = inflate_by_observability(cov_block, kf.observability, cfg_.obs_inflation_max,
+                                       cfg_.obs_inflation_gamma, cfg_.degenerate_thresh,
+                                       cfg_.degenerate_lock);
+      }
+      publish_observability(kf.id, kf.observability, inf);
       Eigen::Matrix<double, 6, 6> cov = inf.cov;  // rotation-first
       if (ensure_psd(cov)) {
         sink_->event(Level::Warn, kTelePsdClamp,
@@ -144,7 +173,7 @@ GraphUpdate Isam2BackEnd::optimize() {
 
   const Clock::time_point t0 = Clock::now();
   gtsam::ISAM2Result result;
-  run_update_with_recovery(result, ts);
+  const bool committed = run_update_with_recovery(result, ts);
 
   const int extra = batch_has_loop_ ? cfg_.extra_iters_loop : cfg_.extra_iters_normal;
   for (int k = 0; k < extra; ++k) {
@@ -162,6 +191,11 @@ GraphUpdate Isam2BackEnd::optimize() {
   marginal_cache_.reset();
   diag_.isam_update_ms = ms_since(t0);
 
+  if (!committed) {
+    // The batch was abandoned; purge the keyframes it staged so the chain stays consistent.
+    rollback_uncommitted_keyframes();
+  }
+
   GraphUpdate update = build_graph_update();
 
   if (last_kf_id_ && estimate_cache_.exists(keyX(*last_kf_id_))) {
@@ -177,6 +211,7 @@ GraphUpdate Isam2BackEnd::optimize() {
 
   sink_->scalar(kTeleChi2, diag_.chi2, ts);
   sink_->scalar(kTeleNFactors, static_cast<double>(isam2_->getFactorsUnsafe().size()), ts);
+  sink_->scalar(kTeleUpdateMs, diag_.isam_update_ms, ts);
   sink_->scalar(kTeleRelinCount, static_cast<double>(diag_.variables_relinearized), ts);
   sink_->scalar(kTeleOptimizeLag, static_cast<double>(folded), ts);
   sink_->timing("backend.optimize", diag_.isam_update_ms, ts);
@@ -321,6 +356,54 @@ void Isam2BackEnd::record_keyframe(KeyframePacket&& kf) {
   kf_order_.push_back(kf.id);
   last_kf_id_ = kf.id;
   ++staged_count_;
+  // A new keyframe outdates the cached "latest" marginal; recompute it lazily next query.
+  marginal_cache_.reset();
+}
+
+void Isam2BackEnd::publish_observability(std::uint64_t id, const ObservabilityReport& obs,
+                                         const InflationResult& inf) {
+  if (sink_->enabled(kTeleObsMin)) {
+    double obs_min = obs.score[0];
+    for (const double s : obs.score) {
+      obs_min = std::min(obs_min, s);
+    }
+    sink_->scalar(kTeleObsMin, obs_min, tele_stamp());
+    // Per-axis inflation multipliers in factor (rotation-first) order, so a degenerate axis
+    // is visible over the whole run, not only inside one keyframe.
+    Eigen::Matrix<double, 6, 1> lam;
+    for (int k = 0; k < 6; ++k) {
+      lam(k) = inf.lambda[static_cast<std::size_t>(k)];
+    }
+    const std::string key = kTeleObservabilityPrefix + std::to_string(id);
+    sink_->vec(key.c_str(), lam, tele_stamp(), "rx,ry,rz,tx,ty,tz");
+  }
+  if (inf.any_locked) {
+    sink_->event(Level::Warn, kTeleDegenerate,
+                 "kf " + std::to_string(id) + " has a degenerate axis locked to max inflation",
+                 tele_stamp());
+  }
+}
+
+void Isam2BackEnd::rollback_uncommitted_keyframes() {
+  // After a recovery path abandons the staged batch, keyframes recorded for that batch have
+  // no variable in the estimate. Drop their bookkeeping so last_kf_id_ points at the newest
+  // committed keyframe; the next packet then fails the contiguity gate cleanly instead of
+  // staging an edge against a variable that was never linearized.
+  std::vector<std::uint64_t> kept;
+  kept.reserve(kf_order_.size());
+  for (const std::uint64_t id : kf_order_) {
+    if (estimate_cache_.exists(keyX(id))) {
+      kept.push_back(id);
+    } else {
+      kf_records_.erase(id);
+      chain_cov_.forget(id);
+    }
+  }
+  if (kept.size() == kf_order_.size()) {
+    return;
+  }
+  kf_order_ = std::move(kept);
+  last_kf_id_ = kf_order_.empty() ? std::nullopt : std::optional<std::uint64_t>(kf_order_.back());
 }
 
 Timestamp Isam2BackEnd::tele_stamp() const {

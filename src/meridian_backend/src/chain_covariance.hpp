@@ -29,6 +29,10 @@ public:
 
   bool known(std::uint64_t id) const;
 
+  // Drops one node (an edge whose keyframe was rolled back). Downstream ids that depended
+  // on it were never appended, so no further repair is needed.
+  void forget(std::uint64_t id);
+
 private:
   struct Node {
     Pose T_chain;                           // anchor -> id

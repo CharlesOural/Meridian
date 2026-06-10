@@ -1154,6 +1154,24 @@ this transform, refreshed each keyframe. (`current_map_to_ref` in §4.2 returns
 exactly this, cached.) The refined extrinsics travel separately as the versioned
 `CalibrationSet` snapshot via `refined_calibration()` (§10, `01 §5.3`).
 
+> **When the front-end actually re-anchors (binding).** A consumer recomputing
+> `T_map_odom` each keyframe is free; a front-end *rebasing its own sliding window
+> onto that transform* is not. The pipeline therefore calls
+> `IFrontEnd::apply_correction` **only when the update carries a real rigid
+> correction** — `GraphUpdate.loop_closed` is set, or the `map→odom` delta since the
+> last applied correction exceeds a material threshold — never on the routine
+> per-keyframe `moved` list (every keyframe's first appearance is "moved" for L4's
+> sake) and never on the floating-gauge drift (§3). The two signals are distinct:
+> `moved` drives L4 re-integration unconditionally; `apply_correction` is the L2
+> re-anchor and fires only on a genuine jump. Feeding L2 the small, time-varying
+> gauge delta every keyframe is not a no-op — `apply_correction` left-acts the spline
+> control points by the delta but the window's **marginalization prior keeps its old
+> linearisation point**, so each tiny re-anchor leaves the prior fighting the shifted
+> knots, and the front-end's per-sweep solve cost climbs without bound. **L2
+> obligation:** when `apply_correction` does re-anchor, it must transport (or rebuild)
+> its marginalization prior by the same rigid delta, not only the control points
+> (`04`); until that holds, corrections must stay gated to genuine loop/GNSS jumps.
+
 ### 9.4 `corrected_trajectory()`
 
 Returns the `map`-frame `StampedPose` list (`01 §7.4`, `01 Appendix A`:

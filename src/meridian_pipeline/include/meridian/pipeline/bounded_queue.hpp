@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -10,11 +11,17 @@
 
 namespace meridian {
 
+// Outcome of a timed pop: an element was delivered, the wait timed out, or the queue
+// is closed and fully drained.
+enum class PopResult { Item, Timeout, Closed };
+
 // Bounded FIFO connecting two pipeline stages. Producers never block: a full queue
-// either rejects the push (try_push) or evicts the oldest element
+// either rejects the push (try_push), evicts the oldest element
 // (push_or_drop_oldest, the lossy-edge policy — keep the freshest data and let the
-// caller count the drop). The consumer blocks in pop() until an element arrives or
-// the queue is closed. Safe for multiple producers and one consumer.
+// caller count the drop), or grows past capacity (push_always, the lossless-edge
+// policy — depth is the overload signal). The consumer blocks in pop() until an
+// element arrives or the queue is closed. Safe for multiple producers and one
+// consumer.
 template <typename T>
 class BoundedQueue {
  public:
@@ -83,6 +90,21 @@ class BoundedQueue {
     return out;
   }
 
+  // Never blocks and never drops: enqueues even past capacity, for elements that must
+  // all reach the consumer. Returns the resulting depth so the caller can report
+  // overload; 0 means the queue was closed and the element was dropped.
+  std::size_t push_always(T&& v) {
+    std::size_t depth = 0;
+    {
+      std::lock_guard<std::mutex> lock(m_);
+      if (closed_) return 0;
+      q_.push_back(std::move(v));
+      depth = q_.size();
+    }
+    cv_.notify_one();
+    return depth;
+  }
+
   // Blocks until an element is available or the queue is closed.
   // Returns false only when the queue is closed AND drained.
   bool pop(T& out) {
@@ -92,6 +114,19 @@ class BoundedQueue {
     out = std::move(q_.front());
     q_.pop_front();
     return true;
+  }
+
+  // Blocks up to `d` for an element. Returns Closed only when the queue is closed AND
+  // drained, so the consumer keeps receiving the remaining elements after close().
+  PopResult pop_for(T& out, std::chrono::milliseconds d) {
+    std::unique_lock<std::mutex> lock(m_);
+    cv_.wait_for(lock, d, [this] { return closed_ || !q_.empty(); });
+    if (!q_.empty()) {
+      out = std::move(q_.front());
+      q_.pop_front();
+      return PopResult::Item;
+    }
+    return closed_ ? PopResult::Closed : PopResult::Timeout;
   }
 
   // Non-blocking pop; false if empty.

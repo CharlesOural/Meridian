@@ -11,10 +11,18 @@ inline constexpr const char* kTeleQueueDepth = "backend/queue_depth";
 inline constexpr const char* kTeleOptimizeLag = "backend/optimize_lag";
 inline constexpr const char* kTeleFallbackCount = "backend/fallback_count";
 
+inline constexpr const char* kTeleObsMin = "backend/obs_min";
+
 // Event tags.
 inline constexpr const char* kTeleContiguity = "backend/contiguity";
 inline constexpr const char* kTelePsdClamp = "backend/psd_clamp";
 inline constexpr const char* kTeleIndeterminate = "backend/indeterminate";
+inline constexpr const char* kTeleDegenerate = "backend/degenerate";
+inline constexpr const char* kTeleInfoForm = "backend/info_form";
+inline constexpr const char* kTeleObsFrame = "backend/obs_frame";
+
+// Per-keyframe vector series; the keyframe id is appended ("backend/observability/<id>").
+inline constexpr const char* kTeleObservabilityPrefix = "backend/observability/";
 
 // Pose key prefix for corrected keyframe poses.
 inline constexpr const char* kTeleMapKeyframe = "map/keyframe";

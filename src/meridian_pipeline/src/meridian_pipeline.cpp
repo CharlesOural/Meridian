@@ -1,5 +1,6 @@
 #include "meridian/pipeline/meridian_pipeline.hpp"
 
+#include <chrono>
 #include <cmath>
 
 #include <cstdio>
@@ -75,6 +76,7 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
       health_(std::make_unique<TelemetryHealthBridge>(sink_.get())),
       q_sensors_(kSensorQueueCapacity),
       q_meas_(kMeasQueueCapacity),
+      q_backend_(static_cast<std::size_t>(cfg.pipeline.queue.kf_capacity)),
       lidar_offset_ns_(static_cast<Timestamp>(std::llround(cfg.sensors.lidar.time_offset_ms * 1e6))),
       camera_offset_ns_(static_cast<Timestamp>(std::llround(cfg.sensors.camera.time_offset_ms * 1e6))) {
   const auto& s = cfg_.sensors;
@@ -131,13 +133,19 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
   // The L2 estimator. A construction failure (bad config, missing vendored kernel) is
   // fatal — the pipeline has no useful output without it — so surface it as a clear
   // exception rather than running a half-wired pipeline.
+  const auto calib = calibrationFromConfig(cfg_.sensors);
   try {
-    frontend_ = makeFrontEnd(cfg_.frontend, calibrationFromConfig(cfg_.sensors),
-                             sink_.get(), /*deterministic=*/sync_mode_);
+    frontend_ = makeFrontEnd(cfg_.frontend, calib, sink_.get(), /*deterministic=*/sync_mode_);
   } catch (const std::exception& e) {
     throw std::runtime_error(std::string("front-end construction failed: ") + e.what());
   }
   frontend_->set_keyframe_sink([this](KeyframePacket&& kf) { on_keyframe(std::move(kf)); });
+
+  // The L3 global optimizer, sharing the front-end's calibration snapshot so both
+  // layers agree on the extrinsics until a refinement publishes a new set.
+  if (cfg_.backend.enable) {
+    backend_ = makeBackEnd(cfg_.backend, calib, sink_.get(), /*deterministic=*/sync_mode_);
+  }
 }
 
 MeridianPipeline::~MeridianPipeline() { stop(); }
@@ -145,17 +153,32 @@ MeridianPipeline::~MeridianPipeline() { stop(); }
 void MeridianPipeline::start() {
   if (sync_mode_ || running_.load()) return;
   running_.store(true);
+  // Consumers spawn upstream-last so every edge has its consumer before any producer.
+  if (backend_) backend_thread_ = std::thread([this] { backend_loop(); });
   frontend_thread_ = std::thread([this] { frontend_loop(); });
   stage_thread_ = std::thread([this] { stage_loop(); });
 }
 
 void MeridianPipeline::stop() {
   // Drain in flow order: close the sensor edge and join its stage first so no new
-  // measurement is produced, then close Q_meas and join the front-end thread.
+  // measurement is produced, then close Q_meas and join the front-end thread. Only then
+  // is Q_backend producer-free, so close it and join the back-end thread, which folds
+  // whatever is still staged on its way out.
   q_sensors_.close();
   if (stage_thread_.joinable()) stage_thread_.join();
   q_meas_.close();
   if (frontend_thread_.joinable()) frontend_thread_.join();
+  q_backend_.close();
+  if (backend_thread_.joinable()) backend_thread_.join();
+  if (sync_mode_ && backend_) {
+    // Inline driver: fold the tail items fed after the last keyframe, then apply any
+    // still-parked correction so the front-end's final state matches the graph.
+    if (staged_since_opt_ > 0) {
+      publish_graph_update(backend_->optimize());
+      staged_since_opt_ = 0;
+    }
+    drain_pending_correction();
+  }
   running_.store(false);
 }
 
@@ -191,6 +214,16 @@ void MeridianPipeline::set_keyframe_sink(KeyframeSink sink) {
 }
 
 void MeridianPipeline::set_backend_tap(BackendTap tap) { backend_tap_ = std::move(tap); }
+
+void MeridianPipeline::set_graph_update_sink(GraphUpdateSink sink) {
+  graph_update_sink_ = std::move(sink);
+}
+
+std::vector<StampedPose> MeridianPipeline::corrected_trajectory() const {
+  return backend_ ? backend_->corrected_trajectory() : std::vector<StampedPose>{};
+}
+
+bool MeridianPipeline::backend_enabled() const { return backend_ != nullptr; }
 
 NavState MeridianPipeline::live_state() const { return frontend_->live_state(); }
 
@@ -271,6 +304,9 @@ void MeridianPipeline::process_meas(MeasSample&& m) {
               feed_backend(BackendItem{GnssForBackend{fix, *last_kf_id_}});
             }
           }
+          // A parked back-end correction folds in here, strictly between ingests, so
+          // the front-end never rebases mid-solve or from inside its keyframe sink.
+          drain_pending_correction();
         } else {  // ImuSample
           frontend_->ingest_imu_live(sample);
         }
@@ -293,8 +329,128 @@ void MeridianPipeline::on_keyframe(KeyframePacket&& kf) {
 }
 
 void MeridianPipeline::feed_backend(BackendItem&& item) {
-  // The single hand-off into the back-end input stream; the consumer attaches here.
+  // The single hand-off into the back-end input stream. The tap observes every item in
+  // feed order even when the back-end itself is disabled.
   if (backend_tap_) backend_tap_(item);
+  if (!backend_) return;
+
+  if (sync_mode_) {
+    // Inline driver: stage, and fold on every keyframe so corrections land at
+    // deterministic points in the stream. GNSS/loop items wait for the next keyframe
+    // (or stop()) — same arrival order as the queue would give the live driver.
+    const bool is_kf = std::holds_alternative<KeyframePacket>(item);
+    stage_backend_item(std::move(item));
+    ++staged_since_opt_;
+    if (is_kf) {
+      const GraphUpdate gu = backend_->optimize();
+      staged_since_opt_ = 0;
+      publish_graph_update(gu);
+    }
+    return;
+  }
+
+  const Timestamp t = std::visit(
+      [](const auto& v) -> Timestamp {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, KeyframePacket>) {
+          return v.stamp;
+        } else if constexpr (std::is_same_v<T, GnssForBackend>) {
+          return v.fix.stamp;
+        } else {  // LoopConstraint carries no stamp of its own
+          return 0;
+        }
+      },
+      item);
+  // Lossless edge: the graph must see every item, so the queue grows instead of
+  // dropping and the resulting depth is the overload signal.
+  const std::size_t depth = q_backend_.push_always(std::move(item));
+  sink_->scalar("backend/queue_depth", static_cast<double>(depth), t);
+  const bool over = static_cast<int>(depth) > cfg_.backend.queue_warn_depth;
+  if (over && !backend_queue_over_) {
+    sink_->event(Level::Warn, "backend/queue_overload",
+                 "back-end input queue depth crossed the warn threshold", t);
+  }
+  backend_queue_over_ = over;
+}
+
+bool MeridianPipeline::stage_backend_item(BackendItem&& item) {
+  std::visit(
+      [this](auto&& v) {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, KeyframePacket>) {
+          backend_->add_keyframe(std::move(v));
+        } else if constexpr (std::is_same_v<T, LoopConstraint>) {
+          backend_->add_loop_constraint(v);
+        } else {  // GnssForBackend
+          backend_->add_absolute(v.fix, v.nearest_kf_id);
+        }
+      },
+      std::move(item));
+  return backend_->wants_immediate_optimize();
+}
+
+void MeridianPipeline::backend_loop() {
+  using Clock = std::chrono::steady_clock;
+  const auto interval =
+      std::chrono::milliseconds(std::llround(cfg_.backend.optimize_interval_ms));
+  auto last_opt = Clock::now();
+  std::uint64_t staged = 0;
+  bool force = false;
+  BackendItem item;
+  for (;;) {
+    const PopResult r = q_backend_.pop_for(item, interval);
+    if (r == PopResult::Closed) break;
+    if (r == PopResult::Item) {
+      // Stage the whole burst in one wake so it folds in a single update.
+      force |= stage_backend_item(std::move(item));
+      ++staged;
+      while (q_backend_.try_pop(item)) {
+        force |= stage_backend_item(std::move(item));
+        ++staged;
+      }
+    }
+    sink_->scalar("backend/queue_depth", static_cast<double>(q_backend_.size()), 0);
+    if (staged == 0) continue;
+    // The cadence timer batches inserts; an immediate request (an admitted loop, a
+    // just-locked datum) bypasses it.
+    if (!force && Clock::now() - last_opt < interval) continue;
+    publish_graph_update(backend_->optimize());
+    staged = 0;
+    force = false;
+    last_opt = Clock::now();
+  }
+  // Closed: stop() joined every producer first, so what remains is the final batch.
+  while (q_backend_.try_pop(item)) {
+    stage_backend_item(std::move(item));
+    ++staged;
+  }
+  if (staged > 0) publish_graph_update(backend_->optimize());
+}
+
+void MeridianPipeline::publish_graph_update(const GraphUpdate& gu) {
+  const BackEndDiagnostics diag = backend_->diagnostics();
+  sink_->scalar("backend/optimize_lag", static_cast<double>(diag.optimize_lag), 0);
+  sink_->scalar("backend/n_keyframes", static_cast<double>(diag.num_keyframes), 0);
+  // The front-end is re-anchored only when the back-end performs a real rigid correction
+  // (a loop closure or GNSS realignment). Routine per-keyframe moves and the floating-gauge
+  // drift are not corrections to fold back: feeding them would repeatedly perturb the spline
+  // against a marginalization prior that stays at its old linearization point, which the
+  // front-end then has to fight on every sweep. L4 still sees every moved keyframe through
+  // the unconditional graph-update sink below.
+  if (gu.loop_closed) {
+    std::lock_guard<std::mutex> lock(correction_mu_);
+    pending_correction_ = gu;
+  }
+  if (graph_update_sink_) graph_update_sink_(gu);
+}
+
+void MeridianPipeline::drain_pending_correction() {
+  std::optional<GraphUpdate> gu;
+  {
+    std::lock_guard<std::mutex> lock(correction_mu_);
+    gu.swap(pending_correction_);
+  }
+  if (gu) frontend_->apply_correction(*gu);
 }
 
 void MeridianPipeline::process(SensorSample&& s) {

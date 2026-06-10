@@ -79,4 +79,8 @@ bool ChainCovariance::known(std::uint64_t id) const {
   return nodes_.count(id) != 0;
 }
 
+void ChainCovariance::forget(std::uint64_t id) {
+  nodes_.erase(id);
+}
+
 }  // namespace meridian::backend
