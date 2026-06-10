@@ -26,9 +26,7 @@ drift/explosion; it's actually starvation. Fix the budget, not the estimator.
   nondeterminism leaked in. LIVE bag replay through the node is NOT run-to-run
   deterministic (threaded solve + arrival timing); compare live runs statistically,
   never bit-wise.
-- Runner defaults to `bags/newer-college/quad-easy` (override with `BAG=`). The old
-  FusionPortable baseline bag is `bags/canteen_day_fixed` (column-clock-repaired —
-  a raw download has unrepaired per-point LiDAR times).
+- Runner defaults to `bags/newer-college/quad-easy` (override with `BAG=`).
 
 ## Triage (first 5 minutes)
 

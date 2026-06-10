@@ -177,8 +177,7 @@ validation result, never as a tuning input.
 
 - Per-point `t` (uint32, ns): zero-based per sweep, monotonic, ~97.7 µs column
   cadence, ~100 ms span — **0 scans needed repair** (quad-easy 1991, math-medium
-  1770, park 5711, quad-hard 1880); no mid-sweep column-clock jumps (a corruption
-  mode other datasets have shown).
+  1770, park 5711, quad-hard 1880).
 - Clouds are stamped in the **os_sensor** frame (so `lidar.extrinsic_*` =
   `os_sensor_to_as_imu` directly).
 - The transforms file quaternions are **(qx, qy, qz, qw)** — qx first. The
