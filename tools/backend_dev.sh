@@ -10,6 +10,8 @@
 #   backend_dev.sh loops <make_loops.py args...>  # generate an injected-loops yaml
 #   backend_dev.sh check <config> <packets.bin>   # byte-determinism + identity property
 #   backend_dev.sh eval <diagnose_run.py args...> # trajectory diagnosis
+#   backend_dev.sh gnss-eval <config> <bag_dir> <max_secs> [gnss_ate.py args...]
+#                                                 # capped replay -> front-end drift vs GNSS (ATE)
 #
 # Do not `build` while a replay/run is in flight: symlink-install swaps .so files under
 # live processes.
@@ -22,7 +24,7 @@ BR=/workspace/install/meridian_backend/lib/meridian_backend/backend_runner
 DX() { docker exec meridian bash -lc "set +u; source /opt/ros/humble/setup.bash; cd /workspace && $*"; }
 DXI() { docker exec meridian bash -lc "set +u; source /opt/ros/humble/setup.bash; source /workspace/install/setup.bash; cd /workspace && $*"; }
 
-cmd="${1:?usage: backend_dev.sh build|test|dump|run|loops|check|eval ...}"
+cmd="${1:?usage: backend_dev.sh build|test|dump|run|loops|check|eval|gnss-eval ...}"
 shift
 case "$cmd" in
   build)
@@ -55,6 +57,13 @@ case "$cmd" in
     ;;
   eval)
     DX "python3 tools/diagnose_run.py $*"
+    ;;
+  gnss-eval)
+    # Capped front-end replay (no back-end) -> packet dump -> GNSS-referenced ATE. The GNSS track
+    # is an independent absolute reference, so this scores front-end drift without a GT file.
+    cfg="${1:?config}" bag="${2:?bag_dir}" secs="${3:?max_secs}"; shift 3
+    DXI "$RR '$cfg' '$bag' /tmp/fe_gnss.tum '$secs' --dump-keyframes /tmp/fe_gnss.packets.bin --no-backend >/dev/null 2>&1"
+    DX "python3 tools/gnss_ate.py /tmp/fe_gnss.packets.bin.index.txt $*"
     ;;
   *)
     echo "unknown subcommand: $cmd" >&2
