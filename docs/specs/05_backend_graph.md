@@ -238,7 +238,7 @@ Appendix R.2):
 
 | Factor | GTSAM class | Connects | Source | Switchable | Robust |
 |--------|-------------|----------|--------|-----------|--------|
-| Gauge anchor | `LinearDampingFactor` | `X(first)` | bootstrap | no | no |
+| Gauge anchor | `GaugeDampingFactor` (custom, below) | `X(first)` | bootstrap | no | no |
 | Odometry (normal) | `BetweenFactor<Pose3>` | `X(rel_to_id), X(id)` | `RelativeBetween` | no | no |
 | Odometry (restart) | `CombinedImuFactor` | `X,V,B(from), X,V,B(to)` | `ImuPreintegration` | no | no |
 | Bias-walk (restart) | folded into `CombinedImuFactor` | `B(from), B(to)` | summary | no | no |
@@ -250,19 +250,32 @@ Appendix R.2):
 The gauge anchor fixes the gauge: a relative-only graph has a 6-DoF null space, so
 without it iSAM2 throws `IndeterminantLinearSystemException` (an unconstrained
 gauge on the first pose is the canonical cause — Appendix R.5). The anchor is a
-`gtsam::LinearDampingFactor` on `X(first)`, **not** a `PriorFactor<Pose3>` toward a
+custom **`GaugeDampingFactor`** on `X(first)`, **not** a `PriorFactor<Pose3>` toward a
 fixed pose value. A hard `PriorFactor` with a tight σ pulls `X(first)` toward its
 bootstrap value with real information, biasing every globally consistent estimate
 toward that arbitrary seed and fighting loop/GNSS corrections that should be free
-to translate and rotate the whole trajectory rigidly. `LinearDampingFactor` instead
+to translate and rotate the whole trajectory rigidly. The damping factor instead
 adds an isotropic damping term `λ I₆` to the first pose's block of the linearised
 Hessian — it removes the null space (so elimination is well-posed) without
 contributing a residual, so the MAP estimate is unbiased and the gauge floats with
-the global corrections. The damping magnitude is `λ = 1 / backend.anchor_sigma²`
-(default `anchor_sigma = 1e-4`, i.e. a strong but value-free regulariser). It is
-added once, at the first keyframe, and **never** re-added. The first keyframe
-normally arrives with `constraint_kind == AbsolutePrior` (`01 §6.4`: "Used for the
-first keyframe … to fix the gauge"); L3 maps that to this damping anchor.
+the global corrections.
+
+GTSAM 4.2 ships **no stock factor with these semantics** (verified against the
+pinned install: no such class in core, and `gtsam_unstable` is not built — spec 11),
+so `meridian_backend` implements it: a `gtsam::NonlinearFactor` over `X(first)`
+whose `error()` is identically zero and whose `linearize()` returns a
+`JacobianFactor(keyX(first), √λ·I₆, 0₆)`. Because the linear factor is rebuilt at
+every relinearisation, the damping re-centres on the *current* linearisation point —
+it never pulls toward a remembered value. The damping magnitude is
+`λ = 1 / backend.anchor_sigma²` (default `anchor_sigma = 1e-4`, i.e. a strong but
+value-free regulariser). It is added once, at the first keyframe, and **never**
+re-added. The first keyframe normally arrives with `constraint_kind ==
+AbsolutePrior` (`01 §6.4`: "Used for the first keyframe … to fix the gauge"); L3
+maps that to this damping anchor. **Mandatory test trio:** (a) a between-only chain
+plus the anchor solves without `IndeterminantLinearSystemException`; (b) translating
+the bootstrap seed translates the whole solution rigidly, changing no relative
+pose; (c) a later loop/GNSS correction moves `X(first)` itself (a `PriorFactor`
+would resist it).
 
 ### 3.1 Why exactly one odometry factor per edge
 
@@ -397,6 +410,20 @@ covariance directly (Appendix R.2): we ship `Σ` (not an information matrix), ta
 `Covariance` by the `GaussianBlock` form (`01 §3.3`), so the conversion is explicit
 and auditable at this one site.
 
+`constraint_cov` may legitimately be a **conservative upper bound** of the true
+relative marginal (`01 §6.4`): the current CT front-end ships the *sum of the two
+endpoint window-marginals*, dropping their (positive) cross-covariance — roughly a
+2× inflation. The direction is safe (odometry is never over-trusted), but every
+covariance-calibrated gate downstream loosens proportionally: the PCM cycle test
+(§7.1) admits more borderline loop pairs and skip-if-confident (§6.4) skips fewer
+fixes. Tightening it to the exact joint marginal is an L2 concern; L3 takes the
+block at face value and must not "compensate".
+
+`store` (the `KeyframeStore`, `01 §7.5`) and `loop_detector` (L5, `01 §7.6`) are
+**optional collaborators**: they integrate later (§18) and are null until then.
+When null, both calls are no-ops — L3's own `kf_record` keeps the cloud/image
+handles regardless, so the back-end builds, runs, and is testable standalone.
+
 ### 4.3 Observability → noise inflation (the degeneracy contract)
 
 The packet's single `ObservabilityReport` (`01 §3.4`) carries per-axis scores
@@ -502,6 +529,44 @@ pim_from_summary(const ImuPreintegrationSummary& s, const BackendConfig::Imu& cf
 `CombinedImuFactor` is preferred over the older `ImuFactor` + separate bias
 between-factor because the bias random-walk is baked in (Appendix R.3).
 
+**The rebuild mechanism (pinned against the GTSAM 4.2 install).** GTSAM is built
+with tangent preintegration (`GTSAM_TANGENT_PREINTEGRATION`), so
+`PreintegrationType = TangentPreintegration`, which stores the preintegrated state
+as a 9-tangent `preintegrated_` ordered **`[θ, p, v]`** (`theta() = head<3>`,
+`deltaPij() = segment<3>(3)`, `deltaVij() = tail<3>`) plus two 9×3 bias Jacobians
+`preintegrated_H_biasAcc_` / `preintegrated_H_biasOmega_`, all `protected`.
+`PreintegratedCombinedMeasurements` exposes a **public constructor
+`(const PreintegrationType& base, const Eigen::Matrix<double,15,15>& preintMeasCov)`**,
+so `pim_from_summary` is: a small builder subclass of `TangentPreintegration` fills
+the protected state, then that constructor wraps it. The field mapping — **this is
+a tangent-ordering boundary in the §12 sense; never rely on memory**:
+
+- `preintegrated_ = [Log(ΔR); Δp; Δv]` — note the summary orders `[ΔR | Δv | Δp]`
+  (`01 §6.5`), so the **v/p blocks swap**.
+- `preintegrated_H_biasOmega_` rows: `[dR_dbg; dp_dbg; dv_dbg]`;
+  `preintegrated_H_biasAcc_` rows: `[0; dp_dba; dv_dba]` (rotation does not depend
+  on accel bias).
+- `biasHat_ = ConstantBias(bias_a_lin, bias_g_lin)`; `deltaTij_ = (t_j − t_i)·1e-9`.
+- The 15×15 `preintMeasCov` is ordered `[θ, p, v, b_a, b_g]` (the header's
+  "PreintROTATION PreintPOSITION PreintVELOCITY BiasAcc BiasOmega"): the top-left
+  9×9 is the summary's `preint_cov` permuted from `[ΔR, Δv, Δp]` to `[θ, p, v]`;
+  the bias diagonal blocks are the random-walk accumulation
+  `σ_ba²·Δt_ij·I₃` / `σ_bg²·Δt_ij·I₃` (§5.3); the preint↔bias cross blocks are
+  zero — the summary does not carry that correlation, and dropping it reproduces
+  the classic `ImuFactor`+bias-between decomposition (a documented, conservative
+  approximation).
+- `PreintegrationCombinedParams` supplies `n_gravity = (0,0,−gravity_mag)` and the
+  §5.3 noise densities; the per-measurement covariances in the params are *not*
+  used by the rebuilt PIM (no `integrateMeasurement` calls) — only the gravity
+  (and Coriolis, unset) enter at evaluation time.
+
+**Mandatory regression test:** hand-integrate a synthetic constant-rate IMU
+segment, build the summary from the closed form, rebuild the PIM, and assert
+(a) `pim.predict(NavState_i, biasHat)` matches the closed-form `NavState_j`, and
+(b) perturbing the bias shifts the prediction by the summary's first-order
+Jacobians. This pins the `[θ,p,v]` ↔ `[ΔR,Δv,Δp]` permutation the moment it
+breaks.
+
 ### 5.2 Adding the edge
 
 ```text
@@ -552,7 +617,11 @@ Meridian's `map` is gravity-aligned ENU, `00 §2.2`).
 > Verify the exact line numbers when implementing; `IMU_Processing.hpp` sets these
 > in the `ImuProcess` constructor and `ouster64.yaml` lists them under the IMU
 > covariance keys. FusionPortable / M2DGR IMU datasheets (`Meridian/docs/DATASET.md`)
-> provide the per-platform overrides that flow in via `CalibrationSet`.
+> provide the per-platform overrides that flow in via `CalibrationSet`. Treat
+> static-calibration Allan floors as a *lower* bound only: under platform vibration
+> (legged locomotion measured at ≈×40 on FusionPortable `legged_underground`) they
+> over-trust the IMU and diverge the estimate. Set the per-platform values from a
+> ground-truth replay sweep, not from the calibration file (`docs/OPTIMIZE.md`).
 
 ### 5.4 Returning to normal
 
@@ -575,6 +644,22 @@ fix-time interpolation (§6.3) — the fix is never bound directly to that keyfr
 pose. (Spec 01 also allows GNSS folded into an `AbsolutePrior` packet; when that
 happens L3 routes it through the same machinery below using `constraint_cov` as the
 position covariance.)
+
+> **The same fixes also enter L2 — bounded double-use, by design.** The CT
+> front-end fuses GNSS inside its window as conservative absolute residuals
+> (spec 04 §3.4), so a fix influences both the keyframe poses/`constraint_cov`
+> shipped to L3 *and* the L3 graph factor built here. This is a deliberate,
+> second-order double-count, acceptable because three mechanisms bound it:
+> (a) L2's per-fix-quality covariance **floors are ≥2× inflated by design**
+> (spec 04 §3.4's floor table), so the in-window weight is deliberately weak;
+> (b) the L2→L3 edge ships only **relative** motion — weak absolute anchoring
+> over a ~1 s keyframe interval barely changes the relative transform or its
+> marginal, so almost none of the GNSS information survives into the
+> between-factor; (c) the **skip-if-confident gate** (§6.4) drops exactly the
+> fixes whose information the graph already holds. Division of labour: L2 uses
+> GNSS for *in-window drift containment* (deskew/association quality during
+> outages); L3 owns the *datum* and the globally consistent alignment. Do not
+> "fix" this by removing either side without re-deriving the budget.
 
 ### 6.1 The origin variable `G`
 
@@ -672,10 +757,11 @@ class GnssFactor : public gtsam::NoiseModelFactor3<gtsam::Pose3, gtsam::Pose3, g
   gtsam::Point3 lever_, meas_enu_;
   double beta_;                                   // fix-time interpolation weight in [0,1]
  public:
+  // boost::optional<Matrix&> is the GTSAM 4.2 Jacobian-out convention (OptionalMatrixType is 4.3+).
   gtsam::Vector evaluateError(const gtsam::Pose3& Xi, const gtsam::Pose3& Xj, const gtsam::Pose3& G,
-                              gtsam::OptionalMatrixType H1,
-                              gtsam::OptionalMatrixType H2,
-                              gtsam::OptionalMatrixType H3) const override {
+                              boost::optional<gtsam::Matrix&> H1 = boost::none,
+                              boost::optional<gtsam::Matrix&> H2 = boost::none,
+                              boost::optional<gtsam::Matrix&> H3 = boost::none) const override {
     gtsam::Matrix6 Hxi, Hxj;  gtsam::Matrix36 Ha, Hg_to;  gtsam::Matrix33 Ham;
     gtsam::Pose3  Xb      = gtsam::interpolate(Xi, Xj, beta_, (H1||H2)?&Hxi:nullptr,
                                                               (H1||H2)?&Hxj:nullptr);
@@ -791,6 +877,17 @@ convention (`cov.M` are `PoseCov6` in Meridian order; combine as covariances, th
 invert). The test $d^2 \le \chi^2_{6,\alpha}$ uses the canonical squared-Mahalanobis
 form of **§3.2** with $\alpha = $ `backend.pcm_chi2_alpha` (default 0.99 → quantile
 $\chi^2_{6,0.99}\approx16.81$ at $n=6$).
+
+**The odometry-chain covariance is composed incrementally, never queried from the
+graph.** At each between-edge insertion (§4.2) L3 extends a cached cumulative chain
+covariance per keyframe: `Σ_chain(j) = Ad(T_ij⁻¹)·Σ_chain(i)·Ad(T_ij⁻¹)ᵀ + Σ_ij`
+(first-order SE(3) compounding of the *factor* covariances, not the optimised
+marginals). The chain block between any two keyframes `a < b` is then recovered by
+transporting `Σ_chain(a)` to `b`'s tangent and subtracting — two lookups and one
+adjoint per PCM pair, O(1) — exactly the Kimera-RPGO bookkeeping. A
+`jointMarginalCovariance` query per pair would be both far costlier and *wrong* for
+PCM: the cycle test needs the uncertainty of the odometry chain alone, not a
+marginal already shaped by other loops.
 
 ### 7.2 Maximum-clique consistent set
 
@@ -993,6 +1090,8 @@ optimiser amortise relinearisation over a batch. A loop closure or a GNSS datum 
 forces an immediate `optimize()` regardless of the timer, so corrections are not
 held back by the cadence. Queue depth and per-batch size are published as telemetry
 (`backend/queue_depth`, `backend/optimize_lag`, §14) so back-pressure is visible.
+This timer-batched cadence is **Live-mode only** — Replay mode replaces it with the
+deterministic cadence of §17.1; no wall clock is read anywhere on the replay path.
 
 **Event-conditional extra iterations.** Because iSAM2 does only **one**
 Gauss-Newton/Dogleg step per `update`, a large rigid correction needs extra passes to
@@ -1148,15 +1247,35 @@ $$
 \Lambda_S^{+} \;=\; \Lambda_{SS} - \Lambda_{SM}\,\Lambda_{MM}^{-1}\,\Lambda_{MS},
 $$
 
-re-added as a `gtsam::LinearContainerFactor` at the current linearisation point
+re-added as a dense linear factor at the current linearisation point
 (marginalization = Schur-complement leaving a dense linear prior; exact for the
 linearisation at marginalization time, but frozen there — Appendix R.5).
-Meridian marginalizes `V`/`B` by **simply not retaining them past the restart
-window** — they are introduced only on fallback intervals (§5), so they are
-naturally transient and need no fixed-lag smoother for the pose graph
-(Appendix R.5). This avoids the documented sharp edges of `gtsam_unstable`'s
+
+The mechanism is **`ISAM2::marginalizeLeaves`**, which performs exactly this Schur
+complement inside the Bayes tree. It requires the marginalized keys to live in
+**leaf cliques**, which L3 arranges at the preceding update: when the first normal
+keyframe after a bridge is folded in (§5.4), that `ISAM2::update` passes
+`constrainedKeys` assigning the bridge's `{V(i), B(i), V(j), B(j)}` to group 0 and
+**every other key in the graph** to group 1 — the complement must be explicit
+because unlisted keys default to group 0 (`Ordering.h`), and CCOLAMD eliminates
+lower groups first, i.e. leaf-ward (the same ordering trick
+`IncrementalFixedLagSmoother` uses internally). The O(n) group map is built only on
+this once-per-bridge update, so the cost is irrelevant. `marginalizeLeaves` reports
+the factor indices it deleted and the
+marginal factors it added; the removable-factor index table (§9.5) is reconciled
+from those lists. If a key is not yet leaf-eligible (the same batch attached
+something else to it), L3 retries at the next update rather than forcing an
+ordering mid-stream; `keep_inertial = true` disables the step entirely. Bridge
+variables connect only to the `CombinedImuFactor`, their seeding priors, and each
+other — never to loops or GNSS — so leaf eligibility is the normal case. Because
+restarts are rare (each one is a divergence event), V/B accumulate at
+O(restarts) even if marginalization is skipped; correctness never depends on it.
+
+This per-variable approach is why no fixed-lag smoother is needed for the pose
+graph, sidestepping the documented sharp edges of `gtsam_unstable`'s
 `IncrementalFixedLagSmoother` (one `update` per timestamp, segfaults marginalizing
-a prior-only variable, key/timestamp drift — Appendix R.5).
+a prior-only variable, key/timestamp drift — Appendix R.5; `gtsam_unstable` is not
+even built in the pinned image, spec 11).
 
 If a *very* long mission makes even the pose graph too large, the escalation is
 **keyframe culling / graph sparsification** (drop redundant keyframes in
@@ -1293,7 +1412,7 @@ regression testing. The pipeline can trigger it through the debug control path
 |----|---------|-----------|----------|
 | FM-1 | Keyframe gap (`rel_to_id != last_kf_id`) | contiguity assert (§4.2) | log fatal; request L2 resync; do **not** fabricate a bridging factor |
 | FM-2 | Indefinite / non-PSD `constraint_cov` | eigen-check on `cov.M` | clamp eigenvalues to `[σ_min², ∞)`; warn; re-check PSD before building the noise model |
-| FM-3 | iSAM2 `IndeterminantLinearSystemException` | GTSAM throw caught in `optimize` | identify the near-null variable from the exception key (Appendix R.5); regularise it with a `LinearDampingFactor` (the same value-free gauge-damping the anchor uses, §3) and/or inflate its connected edges (degeneracy lock §4.3); if it persists, switch `factorization` to QR and retry once; if it still recurs, escalate to FM-3b |
+| FM-3 | iSAM2 `IndeterminantLinearSystemException` | GTSAM throw caught in `optimize` | identify the near-null variable from the exception key (Appendix R.5); regularise it with a `GaugeDampingFactor` (the same value-free gauge-damping the anchor uses, §3) and/or inflate its connected edges (degeneracy lock §4.3); if it persists, switch `factorization` to QR and retry once; if it still recurs, escalate to FM-3b |
 | FM-3b | FM-3 unrecoverable (QR + damping retry still throws) | second `IndeterminantLinearSystemException` after FM-3 escalation | rebuild a fresh `ISAM2` from `isam2_.getFactorsUnsafe()` re-linearised at the last good `calculateEstimate()` (the surviving factors and a known-good linearisation point), dropping the offending pending batch; if the rebuild also throws, freeze the near-null variable, alert (`last_optimize_diverged = true`), and `++fallback_count` (§14) |
 | FM-4 | Loop storm (PCM thrash) | `pending.size() > pcm_max_nodes` | switch to greedy max-clique; back-pressure L5; newest-fitness-first |
 | FM-5 | Extrinsic divergence | `‖E(s) ⊟ prior‖ > extrinsic_max_dev` (§10.2) | reject update; re-pin `E(s)`; disable refine for `s`; warn |
@@ -1328,7 +1447,7 @@ struct BackendConfig {
   std::string kind = "isam2";              // [cold] the IBackEnd impl (00 §8.2)
 
   // --- gauge / anchor ---
-  double anchor_sigma                = 1e-4;  // [cold] LinearDampingFactor sigma on X(first); lambda = 1/sigma^2
+  double anchor_sigma                = 1e-4;  // [cold] GaugeDampingFactor sigma on X(first); lambda = 1/sigma^2
 
   // --- iSAM2 (§9.1; Appendix R.1) ---
   int    isam2_relinearize_skip      = 1;     // [hot]
@@ -1422,10 +1541,11 @@ struct BackendConfig {
 
 ## 17. The back-end thread loop
 
-The back-end runs on its own thread (`01 §2.4`: "a back-end thread (L3 + L5)").
-It owns the `ISAM2` instance exclusively; every graph mutation flows through this
-single loop, the invariant that makes the no-double-counting contract (§3.1)
-enforceable in one place.
+In Live mode the back-end runs on its own thread (`01 §2.4`: "a back-end thread
+(L3 + L5)"); in Replay mode it runs inline with a deterministic cadence (§17.1).
+Either way it owns the `ISAM2` instance exclusively and every graph mutation flows
+through one serial driver — the invariant that makes the no-double-counting
+contract (§3.1) enforceable in one place.
 
 The thread *stages* graph mutations as items arrive but *optimises* on a separate
 cadence (§9.2): it drains every queued item into the pending batch, then calls
@@ -1472,6 +1592,30 @@ are never dropped — losing a keyframe would break the §4.2 contiguity contrac
 `optimize()`, `corrected_trajectory()`, `refined_calibration()`, and
 `diagnostics()` are the `IBackEnd` methods (`01 §7.4`) the pipeline calls; the
 loop above is the internal driver that backs them.
+
+### 17.1 Replay mode: deterministic cadence (no thread, no clock)
+
+The loop above exists **only in Live mode**. In `pipeline.mode: replay` (the spec-10
+replay==live harness) the back-end mirrors the rest of the replay pipeline: **no
+thread, no queue, no timer** — `add_keyframe` / `add_loop_constraint` /
+`add_absolute` run inline on the caller's thread, and the cadence rule is fixed:
+
+- `optimize()` runs after **every** `add_keyframe`. The batch is that keyframe plus
+  every loop/GNSS item staged since the previous keyframe, folded in arrival order.
+- `optimize_interval_ms`, the force-on-loop rule, and the queue/back-pressure
+  machinery (FM-8/FM-9) do not apply; nothing on the replay path reads a wall clock.
+
+With the cadence fixed and the factor insertion order fixed, the whole solve is
+deterministic: GTSAM is pinned TBB-off (spec 11), elimination ordering (COLAMD) is a
+pure function of the graph, and iSAM2 relinearisation decisions depend only on
+deltas. **Two replays of the same bag + config must produce byte-identical
+corrected trajectories**; an A/B difference is attributable to the config alone.
+Live remains timer-batched, so live and replay reach the same factors through
+different batch boundaries (hence different intermediate linearisation points);
+live==replay agreement is therefore statistical, evaluated per spec 10, while
+replay==replay is exact. Replay is the evaluation path; live is integration and
+viz. The nondeterminism class this kills — wall-clock batching flipping pass/fail
+between runs — is the same one the L2 replay harness exists to kill.
 
 ---
 

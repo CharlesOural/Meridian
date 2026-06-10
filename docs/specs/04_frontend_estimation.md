@@ -939,10 +939,11 @@ in debug:
 
 ### 4.3 Flow into the back-end
 
-The scores **modulate the covariance** L2 attaches to the `KeyframePacket`
-(`constraint_cov`, spec 01 §6.1) — degenerate axes get inflated variance — so L3
-naturally down-weights ill-constrained directions (spec 05 maps `observability` to the noise
-model). Under full degeneracy L2 may additionally **clamp** the update along weak
+The scores ship **raw** in the packet's `observability` report; **L3 owns the
+covariance inflation** (spec 05 §4.3 maps the scores into the between-factor noise
+model). One inflation site only: L2 must **not** pre-inflate `constraint_cov` by
+the same scores, or the degeneracy is counted twice and the edge is doubly
+de-weighted. Under full degeneracy L2 may additionally **clamp** the update along weak
 directions (let IMU/GNSS carry them — the X-ICP "solution remapping"), gated by
 `degeneracy_handling` mode (§10). Because LiDAR and visual residuals sum into one
 Hessian *before* inversion, a geometrically degenerate scene that the photometric
@@ -1331,7 +1332,7 @@ How each field is produced from the CT window:
 | `ref_frame`/`T_ref_body` | `Odom` + **spline evaluation** $T_{W\,F_e}(\text{stamp})$. |
 | `kinematics_included`,`v_ref`,`b_g`,`b_a` | **false** on the normal path; `v_ref=\dot p_{W\,F_e}(\text{stamp})$ and the local bias knots are filled as **seeds/telemetry** (L3 ignores them in `RelativeBetween`). `true` only on the `ImuPreintegration` restart (§6.4). |
 | `constraint_kind` | `RelativeBetween` default; `AbsolutePrior` on first KF / fresh GNSS anchor; `ImuPreintegration` on window-restart fallback (§6.4). |
-| `T_relto_this`,`constraint_cov` | $\hat T_{\text{prev}}^{-1}\hat T_{\text{cur}}$ (both spline-evaluated); marginal **relative** covariance read directly from the window posterior / marginalization, **inflated on weak axes by `observability`** (§4.3), reordered once into rotation-first `[rx,ry,rz,tx,ty,tz]` (the GTSAM-boundary exception, §1.5). |
+| `T_relto_this`,`constraint_cov` | $\hat T_{\text{prev}}^{-1}\hat T_{\text{cur}}$ (both spline-evaluated); the **relative** covariance from the window posterior — exact joint marginal when affordable, else a documented conservative upper bound (currently the sum of the two endpoint pose marginals, cross-covariance dropped; spec 01 §6.4) — **not** observability-inflated (L3 owns inflation, §4.3), reordered once into rotation-first `[rx,ry,rz,tx,ty,tz]` (the GTSAM-boundary exception, §1.5). |
 | `observability` | $\Lambda_{\text{pose}}$ pose block (§4). |
 | `cloud_body` | per-point spline-deskewed scan in $F_{e,\text{stamp}}$, retained in `IKeyframeStore` (§6.5). |
 | `image`/`T_body_cam` | the camera frame at this KF + the `CalibrationSet` $T_{F_e\,C}$ snapshot used. |

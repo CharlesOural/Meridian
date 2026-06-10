@@ -620,7 +620,8 @@ struct KeyframePacket {
   // --- (3) Uncertainty: ONE block, tagged covariance-or-information ---
   // Constraint kind tells the back-end how to USE this block (see §6.3, §6.4):
   enum class ConstraintKind {
-    RelativeBetween,    // block is the 6-DoF marginal cov of T_prev_this (the DEFAULT clean contract)
+    RelativeBetween,    // block is the 6-DoF marginal cov of T_prev_this, or a documented
+                        // conservative upper bound of it (§6.4) — the DEFAULT clean contract
     AbsolutePrior,      // block is the 6-DoF marginal cov of T_ref_body in ref_frame (first KF / GNSS-anchored)
     ImuPreintegration   // RESTART-FALLBACK ONLY: block accompanies a raw IMU summary (§6.5), mutually exclusive
   } constraint_kind = ConstraintKind::RelativeBetween;
@@ -730,6 +731,15 @@ Meridian's contract, encoded by `constraint_kind`, **picks one**:
   IMU factor, no separate absolute prior. The IMU measurements have already done
   their work *inside* the front-end and their information is *in* the relative
   covariance. This is the recommended contract and the default.
+
+  A front-end **may ship a conservative upper bound** of this marginal instead of
+  the exact value — e.g. the sum of the two endpoint pose marginals with their
+  (positive) cross-covariance dropped, the current CT implementation — when the
+  exact joint extraction is not affordable per keyframe. The bound's direction is
+  safe (odometry is never over-trusted; the no-double-counting goal is preserved),
+  but it proportionally loosens every covariance-calibrated gate downstream (PCM,
+  GNSS skip-if-confident — spec 05 §4.2/§7.1), so the exact marginal is preferred
+  when available, and the choice must be documented at the packing site.
 
 * **Anchor — `AbsolutePrior`.** Used for the **first** keyframe (to fix the
   gauge) and when an external absolute reference applies (a fresh GNSS-anchored

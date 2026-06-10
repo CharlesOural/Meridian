@@ -245,7 +245,7 @@ The **factory free function** is the only place that names concrete implementati
 | `ISensorSource` | `meridian/sensors/isensor_source.hpp` | `onSample(cb)` | swap: live driver, ROS-bag replay, simulator (same code path for live & offline) |
 | `IDeskewProvider` | `meridian/preprocess/ideskew_provider.hpp` | `Pose poseAt(Timestamp)` | cold-start IMU-only; steady-state CT-trajectory-backed (§7) |
 | `IFrontEnd` | `meridian/frontend/ifrontend.hpp` | `ingest(PreprocessedGroup)`, `ingest_imu_live`, `set_keyframe_sink`, `apply_correction` | **production: CT B-spline LIVO+GNSS** (`src/ct/`). Reference oracle: iEKF (`src/iekf/`), test-only (§5.4) |
-| `IBackEnd` | `meridian/backend/ibackend.hpp` | `addKeyframe(KeyframePacket)`, `addLoop`, `optimize`, `onResult(cb)` | iSAM2 (production); batch LM available for offline debugging only |
+| `IBackEnd` | `meridian/backend/ibackend.hpp` | `add_keyframe(KeyframePacket&&)`, `add_loop_constraint`, `add_absolute`, `optimize()→GraphUpdate`, `corrected_trajectory`, `refined_calibration`, `diagnostics` (canonical: 01 §7.4) | iSAM2 (production); batch LM available for offline debugging only |
 | `IMapLayer` | `meridian/map/imaplayer.hpp` | `integrate(kf)`, `deintegrateRegion(aabb)`, `query`, `extractMesh` | **one impl: nvblox** (GPU TSDF+colour+mesh). Seam left for a deferred ESDF layer (§12) |
 | `IKeyframeStore` | `meridian/map/ikeyframe_store.hpp` | `put(id,cloud,rgb,pose)`, `get(id)`, `clouds(region)` | RAM store (production); mmap'd on-disk store is a future option behind the same seam |
 | `IPlaceRecognizer` | `meridian/place/iplace_recognizer.hpp` | `add(kf)`, `query()→candidates`, `verify()→LoopConstraint` | ScanContext++ → STD/BTC → GICP → PCM |
