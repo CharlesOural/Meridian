@@ -23,12 +23,13 @@ mkdir -p "$OUT"
 
 # $2 (optional): seconds of the bag to play; empty = whole bag.
 PLAY_SECS=${2:-}
-BAG=${BAG:-bags/canteen_day_fixed}
-echo "bag: $BAG  play_secs: ${PLAY_SECS:-all}" | tee "$OUT/run_info.txt"
+BAG=${BAG:-bags/newer-college/quad-easy}
+CONFIG=${CONFIG:-src/meridian_ros/config/newer-college-quad.yaml}
+echo "bag: $BAG  config: $CONFIG  play_secs: ${PLAY_SECS:-all}" | tee "$OUT/run_info.txt"
 
 # Exec the binary directly (no ros2-run wrapper) so $NODE_PID is the node itself.
 "$HOME/Meridian/install/meridian_ros/lib/meridian_ros/odometry_node" --ros-args \
-  -p config_file:=$PWD/src/meridian_ros/config/fusionportable.yaml \
+  -p config_file:=$PWD/$CONFIG \
   -p use_sim_time:=true \
   > "$OUT/node.log" 2>&1 &
 NODE_PID=$!
@@ -45,10 +46,17 @@ TL_PID=$!
 
 # Cap playback with a wall-clock timeout (bag plays ~real-time under --clock); this
 # Humble build lacks --playback-duration. Empty PLAY_SECS plays the whole bag.
+#
+# The QoS override makes the player's LiDAR writer RELIABLE so the node's reliable
+# subscription (sensors.lidar.qos_reliable) gets retransmissions: best-effort loses
+# ~14% of the multi-MB scans in flight under pipeline load. Keep the two in sync.
+QOS_OVERRIDES="$(dirname "$0")/replay_qos_overrides.yaml"
 if [ -n "$PLAY_SECS" ]; then
-  timeout --signal=INT "$PLAY_SECS" ros2 bag play "$BAG" --clock > "$OUT/bagplay.log" 2>&1
+  timeout --signal=INT "$PLAY_SECS" ros2 bag play "$BAG" --clock \
+    --qos-profile-overrides-path "$QOS_OVERRIDES" > "$OUT/bagplay.log" 2>&1
 else
-  ros2 bag play "$BAG" --clock > "$OUT/bagplay.log" 2>&1
+  ros2 bag play "$BAG" --clock \
+    --qos-profile-overrides-path "$QOS_OVERRIDES" > "$OUT/bagplay.log" 2>&1
 fi
 sleep 3
 

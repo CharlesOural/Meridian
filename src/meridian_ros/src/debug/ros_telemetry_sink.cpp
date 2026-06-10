@@ -129,6 +129,7 @@ void RosTelemetrySink::cloud(const char* key, const PointCloudView& view, Frame 
 }
 
 void RosTelemetrySink::pose(const char* key, const Pose& p, Frame f, Timestamp t) {
+  if (!cfg_.publish_odom && std::string(key) == "odom/body") return;
   if (!pass(key, /*heavy=*/false)) return;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub;
   {
