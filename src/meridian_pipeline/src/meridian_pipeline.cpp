@@ -2,7 +2,6 @@
 
 #include <cmath>
 
-#include <cstdio>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -18,8 +17,6 @@
 #include "meridian/preprocess/camera_preprocess.hpp"
 #include "meridian/preprocess/gnss_gate.hpp"
 #include "meridian/preprocess/ilidar_preprocessor.hpp"
-#include "meridian/preprocess/imu_init.hpp"
-#include "meridian/preprocess/imu_only_deskew.hpp"
 #include "meridian/sensors/aggregator.hpp"
 #include "meridian/sensors/sources.hpp"
 #include "meridian/time/clock_model.hpp"
@@ -46,7 +43,7 @@ SensorInfo make_info(std::uint8_t id, Modality modality, Frame frame,
   return info;
 }
 
-// The LiDAR->body extrinsic from config, packaged for the validity filter / deskew.
+// The LiDAR->body extrinsic from config, packaged for the validity filter.
 Extrinsic lidar_extrinsic(const LidarSensorConfig& lidar) {
   Extrinsic ext;
   ext.child = Frame::OsSensor0;
@@ -111,8 +108,6 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
 
   lidar_preprocessor_ = makeLidarPreprocessor(
       cfg_.preprocess, lidar_extrinsic(s.lidar), s.lidar.nominal_rate_hz, sink_.get());
-  imu_init_ = std::make_unique<ImuInitializer>(cfg_.preprocess.imu,
-                                               cfg_.preprocess.deskew.imu_init_count);
   gnss_gate_ = std::make_unique<GnssGate>(cfg_.preprocess.gnss,
                                           /*velocity_source=*/nullptr, sink_.get());
   camera_preprocessor_ = std::make_unique<CameraPreprocessor>(
@@ -128,9 +123,9 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
       [this](CameraFrame&& frame) { enqueue(std::move(frame)); });
   gnss_source_->set_callback([this](GnssFix&& fix) { enqueue(std::move(fix)); });
 
-  // The L2 estimator. A construction failure (bad config, missing vendored kernel) is
-  // fatal — the pipeline has no useful output without it — so surface it as a clear
-  // exception rather than running a half-wired pipeline.
+  // The L2 estimator. A construction failure (bad config) is fatal — the pipeline has
+  // no useful output without it — so surface it as a clear exception rather than
+  // running a half-wired pipeline.
   try {
     // The path-sample cadence is authored under debug: (a telemetry knob, not an
     // estimator parameter); hand it to the front-end through its config copy.
@@ -274,9 +269,6 @@ void MeridianPipeline::process_meas(MeasSample&& m) {
 
 void MeridianPipeline::on_keyframe(KeyframePacket&& kf) {
   const auto n = ++keyframe_count_;
-  // The first keyframe means the front-end's window now spans the sweep, so it deskews
-  // with its own trajectory; later groups are no longer cold_start.
-  if (!spline_active_) spline_active_ = true;
   sink_->event(Level::Info, "frontend/keyframe", "front-end emitted a keyframe", kf.stamp);
   sink_->scalar("frontend/keyframe_count", static_cast<double>(n), kf.stamp);
   if (keyframe_sink_) keyframe_sink_(std::move(kf));
@@ -287,17 +279,6 @@ void MeridianPipeline::process(SensorSample&& s) {
       [this](auto&& sample) {
         using T = std::decay_t<decltype(sample)>;
         if constexpr (std::is_same_v<T, ImuSample>) {
-          if (!imu_init_->done()) {
-            const bool became_done = imu_init_->add(sample);
-            if (became_done) {
-              sink_->event(Level::Info, "preprocess/imu_init_done", "static init converged",
-                           sample.stamp);
-            } else if (imu_init_->failed()) {
-              sink_->event(Level::Warn, "preprocess/imu_init_retry",
-                           "motion gate rejected the static window", sample.stamp);
-              imu_init_->clear();
-            }
-          }
           // The same sample feeds the aggregator (which the next sweep optimises
           // against) and the front-end's live-state advance between sweeps.
           dispatch_to_frontend(MeasSample{std::in_place_type<ImuSample>, sample});
@@ -327,42 +308,6 @@ void MeridianPipeline::process(SensorSample&& s) {
 void MeridianPipeline::on_group(MeasureGroup&& g) {
   sink_->scalar("pipeline/q_sensors_depth", static_cast<double>(q_sensors_.size()),
                 g.t_end);
-
-  if (!imu_init_->done()) {
-    // Surface bootstrap progress so the operator can see why nothing is published yet.
-    const double target = static_cast<double>(cfg_.preprocess.deskew.imu_init_count);
-    sink_->scalar("preprocess/imu_init_progress",
-                  static_cast<double>(imu_init_->state().count) / target, g.t_end);
-    // Hold sweeps until the static init converges; the freshest scans win.
-    const auto cap = static_cast<std::size_t>(cfg_.preprocess.deskew.bootstrap_max_scans);
-    if (bootstrap_groups_.size() >= cap) {
-      bootstrap_groups_.pop_front();
-      sink_->event(Level::Warn, "preprocess/bootstrap_drop",
-                   "bootstrap buffer full, dropped oldest sweep", g.t_end);
-    }
-    bootstrap_groups_.push_back(std::move(g));
-    return;
-  }
-
-  // Init just converged: flush held sweeps in order before the current one.
-  while (!bootstrap_groups_.empty()) {
-    MeasureGroup held = std::move(bootstrap_groups_.front());
-    bootstrap_groups_.pop_front();
-    emit_group(std::move(held));
-  }
-  emit_group(std::move(g));
-}
-
-void MeridianPipeline::emit_group(MeasureGroup&& g) {
-  std::optional<LidarScan> deskewed;
-  {
-    MERIDIAN_SCOPED_TIME(sink_.get(), "preprocess.deskew", g.t_end);
-    deskewed = deskew_group(g);
-  }
-
-  if (deskewed && sink_->enabled("body/scan")) {
-    sink_->cloud("body/scan", PointCloudView{*deskewed->points}, Frame::Body, g.t_end);
-  }
   sink_->scalar("pipeline/group_imu_count", static_cast<double>(g.imu.size()), g.t_end);
   sink_->scalar("pipeline/group_points",
                 static_cast<double>(g.scan.points ? g.scan.points->size() : 0), g.t_end);
@@ -386,36 +331,7 @@ void MeridianPipeline::emit_group(MeasureGroup&& g) {
     }
   }
 
-  PreprocessedGroup pg{std::move(g), std::move(deskewed),
-                       /*cold_start=*/!spline_active_.load()};
-  dispatch_to_frontend(MeasSample{std::move(pg)});
-}
-
-std::optional<LidarScan> MeridianPipeline::deskew_group(const MeasureGroup& g) {
-  if (g.imu.empty() || !g.scan.points) return std::nullopt;
-
-  // Cold-start trajectory: identity start pose and zero initial velocity. The warp uses
-  // only relative motion within the sweep, so the arbitrary start pose cancels; the
-  // zero-velocity seed means within-sweep translation is what the IMU alone integrates.
-  ImuOnlyDeskew provider(imu_init_->state(),
-                         lidar_extrinsic(cfg_.sensors.lidar), Pose{},
-                         Eigen::Vector3d::Zero());
-  // The provider integrates the group's IMU set and pads its valid horizon to the sweep
-  // [t_begin, t_end] with the bounded zero-order holds, setting the warp anchor to t_end.
-  provider.integrateSweep(g.imu, g.t_begin, g.t_end);
-
-  LidarScan out;
-  if (!provider.deskew(g.scan, &out)) {
-    // Positive head: first IMU after t_begin; positive tail: last IMU before t_end.
-    char msg[96];
-    std::snprintf(msg, sizeof(msg),
-                  "imu horizon misses the sweep: head %+.0f us, tail %+.0f us",
-                  static_cast<double>(g.imu.front().stamp - g.t_begin) / 1e3,
-                  static_cast<double>(g.t_end - g.imu.back().stamp) / 1e3);
-    sink_->event(Level::Warn, "preprocess/deskew_horizon", msg, g.t_end);
-    return std::nullopt;
-  }
-  return out;
+  dispatch_to_frontend(MeasSample{PreprocessedGroup{std::move(g)}});
 }
 
 }  // namespace meridian

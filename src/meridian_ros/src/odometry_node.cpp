@@ -217,10 +217,9 @@ class OdometryNode : public rclcpp::Node {
     const auto n = ++group_count_;
     RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 5000,
-        "group #%lu: %zu pts, %zu imu, image=%d, deskewed=%d",
+        "group #%lu: %zu pts, %zu imu, image=%d",
         static_cast<unsigned long>(n), g.group.scan.points ? g.group.scan.points->size() : 0,
-        g.group.imu.size(), g.group.image.has_value() ? 1 : 0,
-        g.deskewed.has_value() ? 1 : 0);
+        g.group.imu.size(), g.group.image.has_value() ? 1 : 0);
 
     // This callback runs on the front-end stage thread, where live_state() is valid, so
     // the odom->body TF tracks the estimate at group rate. The front-end also pushes the

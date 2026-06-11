@@ -94,95 +94,21 @@ meridian:
     surf_max_pts: 1           # one representative per voxel (nearest centre)
     surf_seed: 0              # only used when surf_max_pts > 1
   frontend:
-    kind: ct_livo
-    # Deflates the carried marginalization-prior information each window slide
-    # (exponential forgetting). The unbroken per-sweep prior chain on a complete
-    # input stream is overconfident: it locks in early accel-bias error and fights
-    # later correction (prior residual RMS grows monotonically at 1.0). 0.5 relaxes
-    # the chain enough for the window to keep re-estimating bias/tilt.
-    marg_prior_scale: 0.5
-    init_time_s: 1.0          # static-start window; a longer window tightens the
-                              # gravity/bias init whose residual error the frozen
-                              # accel bias cannot absorb
-    solver_max_iterations: 5
-    solver_epsi: 1.0e-3
-    degeneracy_thresh: 10.0   # eigenvalue floor for the per-axis degeneracy score
-    max_outer_iters: 2        # two association passes (accuracy needs re-assoc)
-    reassoc_steps: 2          # inner LM steps per pass
-    assoc_shift_thresh_m: 0.02
-    assoc_shift_thresh_deg: 0.2
-    solver:
-      time_limit_ms: 90
-      min_iterations: 2
-    bias:
-      gyr_max: 0.5            # [rad/s] gyro bias box bound
-      acc_max: 5.0            # [m/s^2] accel bias box bound
-      knot_dt_ms: 500         # bias random-walk knot cadence
-    motion_reg:
-      enable: true            # gated jerk / ang-accel regularizer on under-excited spans
-      weight: 1.0e-3
-      excitation_floor: 0.05  # engage below ~0.05 rad/s & m/s2 (near-static spans only)
-    spline:
-      knot_dt_ms: 100         # one outer segment per 10 Hz sweep
-      window_knots: 8
-    ncp:
-      # Adaptive knot density: per-segment control-point count geared from the
-      # segment's MEAN |gyro| / | |acc|-g | (raw samples). Off until the validation
-      # campaign passes; flip `enabled` to run it, nothing else changes.
-      enabled: false
-      n_cp_max: 3
-      omega_thresh: [0.5, 1.0, 5.0]   # [rad/s] mean-rate band edges raising gear to 2, 3, 4
-      accel_thresh: [0.5, 1.0, 5.0]   # [m/s^2] mean-|a|-g band edges
-      hysteresis: 0.15
-      warmstart_iters: 4              # IMU-only mini-solve smoothing fresh dense tails
-    lidar:
-      voxel_map_m: 0.6
-      num_match_points: 5
-      max_match_dist_sq: 5.0
-      plane_thresh: 0.1
-      point_cov: 1.0e-3
-      max_lidar_factors: 1000
-      min_factors_per_normal: 50
-      normal_strata: 7
-    visual:
-      # Sparse-direct photometric stage. Gated off automatically whenever the camera
-      # intrinsics are zero/invalid; this is the operator master switch on top of that.
-      # Off: the Alphasense cameras suffer heavy vignetting -- LIO-first; re-enabling
-      # the visual stage on this dataset is a future task. The calibration above is
-      # kept current so that flip is one line.
-      enable: false
-      patch: 8
-      levels: 3
-      img_point_cov: 100.0
-      outlier_threshold: 1000.0
-      ncc_thre: 0.5
-      exposure_estimate_en: true
-      inv_expo_cov: 1.0e-2
-      inv_expo_min: 1.0e-3
-      grid_cell_px: 32
-      warp_det_min: 0.1
-      warp_det_max: 10.0
-      warp_cond_max: 50.0
-      # Active visual-map half-extent [m]. Bounds per-sweep map maintenance to the
-      # local point set; sized to the camera's indoor re-observability range, not the
-      # LiDAR map scale (60 m here grew the map to ~69k points and blew the budget).
-      active_box_m: 20.0
-    gnss:
-      # Conservative absolute-position residual. Off => the GNSS code path is never
-      # entered and the trajectory is bit-identical to a build without it. Floors are
-      # per-fix-type position-std (horizontal, vertical) [m]; cov_enu is floored to at
-      # least these before weighting.
-      use: false
-      floor_fixed_h: 0.05
-      floor_fixed_v: 0.10
-      floor_float_h: 0.50
-      floor_float_v: 1.00
-      floor_dgps_h: 1.50
-      floor_dgps_v: 3.00
-      floor_spp_h: 3.00
-      floor_spp_v: 6.00
-      innovation_k: 3.0         # Mahalanobis k-sigma acceptance gate
-      reacquire_count: 5        # consecutive in-gate fixes to re-admit after a gap
+    kind: lio
+    lio:
+      voxel_size_m: 1.0           # map voxel edge [m]
+      max_points_per_voxel: 20
+      max_range_m: 50.0           # matches preprocess.det_range: keep what the filter keeps
+      keypoint_voxel_factor: 1.5  # keypoint downsample voxel = factor * voxel_size_m
+      min_keypoints: 30           # below this the sweep is rejected for registration
+      icp_max_iterations: 100
+      convergence_eps: 1.0e-5
+      max_corr_dist_m: 0.5
+      min_beta: 200.0             # floor on the gravity-regularizer weight
+      max_expected_jerk: 3.0      # [m/s^3]
+      init_stationary_s: 1.0      # standstill window for static init
+      max_gap_s: 0.5              # sensor gap beyond this triggers a reseed
+      reseed_cov_inflation: 100.0 # constraint-cov inflation on the reseeded keyframe
     keyframe:
       dist_m: 1.0
       rot_deg: 10.0

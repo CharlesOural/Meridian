@@ -74,7 +74,7 @@ class RosTelemetrySink final : public TelemetrySink {
   bool pass(const std::string& key, bool heavy);
   // Default publication rate for a key class.
   double default_hz(bool heavy) const;
-  // PathAggregator: appends one solved-spline sample to the /meridian/path ring and
+  // PathAggregator: appends one odometry pose sample to the /meridian/path ring and
   // republishes the whole path at most cfg.path_publish_hz.
   void append_path(const Pose& p, Timestamp t);
 

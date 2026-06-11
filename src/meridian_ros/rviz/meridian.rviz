@@ -42,7 +42,7 @@ Visualization Manager:
       Use rainbow: true
     - Class: rviz_default_plugins/Path
       Enabled: true
-      Name: SplinePath
+      Name: Path
       Topic:
         Value: /meridian/path
         Depth: 1
@@ -62,18 +62,6 @@ Visualization Manager:
       Color: 255; 60; 60
       Size (m): 0.05
       Style: Points
-    - Class: rviz_default_plugins/PointCloud2
-      Enabled: false
-      Name: DeskewPre
-      Topic:
-        Value: /meridian/cloud_deskew_pre
-        Depth: 5
-        Durability Policy: Volatile
-        Reliability Policy: Best Effort
-      Color Transformer: FlatColor
-      Color: 255; 200; 60
-      Size (m): 0.03
-      Style: Points
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: MeridianMarkers
@@ -85,14 +73,6 @@ Visualization Manager:
       Name: CameraIntensity
       Topic:
         Value: /meridian/image/preprocess_camera_intensity
-        Depth: 5
-        Durability Policy: Volatile
-        Reliability Policy: Best Effort
-    - Class: rviz_default_plugins/Image
-      Enabled: true
-      Name: VisualPatches
-      Topic:
-        Value: /meridian/visual_patches
         Depth: 5
         Durability Policy: Volatile
         Reliability Policy: Best Effort

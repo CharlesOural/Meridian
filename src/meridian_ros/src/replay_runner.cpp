@@ -61,11 +61,9 @@ public:
       : ev_(events_path), tm_(telemetry_path), stage_path_(std::move(stage_path)) {
     prefixes_ = {{"frontend/assoc/", dbg.assoc.enable},
                  {"frontend/solver/", dbg.solver.enable},
-                 {"frontend/deskew/", dbg.deskew.enable},
-                 {"frontend/spline/", dbg.spline.enable},
-                 {"frontend/ncp/", dbg.spline.enable},
+                 {"frontend/lio/", dbg.lio.enable},
                  {"frontend/map/", dbg.map_health.enable}};
-    exact_ = {{"frontend/spline/path_sample", dbg.publish_path}};
+    exact_ = {{"frontend/path_sample", dbg.publish_path}};
   }
 
   ~FileSink() override {

@@ -65,21 +65,16 @@ RosTelemetrySink::RosTelemetrySink(rclcpp::Node* node, const DebugConfig& cfg)
   };
   seed("frontend/assoc/", cfg.assoc);
   seed("frontend/solver/", cfg.solver);
-  seed("frontend/deskew/", cfg.deskew);
-  seed("frontend/spline/", cfg.spline);
-  // Adaptive-knot-density keys ride the spline group: one debug posture covers the
-  // whole trajectory-representation surface.
-  seed("frontend/ncp/", cfg.spline);
+  seed("frontend/lio/", cfg.lio);
   seed("frontend/map/", cfg.map_health);
 
-  // The spline path stream: an exact-key entry (checked before the spline/* wildcard)
-  // so /meridian/path works without the kinematics group. Unlimited key rate — the
-  // front-end already samples at the configured cadence and the aggregator throttles
-  // the republish to path_publish_hz.
+  // The odometry path stream: an exact-key entry so /meridian/path works without any
+  // debug group. Unlimited key rate — the front-end already samples at the configured
+  // cadence and the aggregator throttles the republish to path_publish_hz.
   KeyState path_state;
   path_state.enabled = cfg.publish_path;
   path_state.max_hz = -1.0;  // negative = explicitly unlimited (pass() treats <=0 as no limit)
-  keys_["frontend/spline/path_sample"] = path_state;
+  keys_["frontend/path_sample"] = path_state;
   if (cfg.publish_path) {
     pub_path_ = node_->create_publisher<nav_msgs::msg::Path>("/meridian/path",
                                                              rclcpp::QoS(1).reliable());
@@ -178,9 +173,9 @@ void RosTelemetrySink::cloud(const char* key, const PointCloudView& view, Frame 
 }
 
 void RosTelemetrySink::pose(const char* key, const Pose& p, Frame f, Timestamp t) {
-  // Solved-spline path samples aggregate into one nav_msgs/Path instead of a per-key
+  // Odometry path samples aggregate into one nav_msgs/Path instead of a per-key
   // Odometry topic.
-  if (std::string_view(key) == "frontend/spline/path_sample") {
+  if (std::string_view(key) == "frontend/path_sample") {
     append_path(p, t);
     return;
   }
@@ -205,7 +200,7 @@ void RosTelemetrySink::append_path(const Pose& p, Timestamp t) {
   bool publish_now = false;
   {
     std::lock_guard<std::mutex> lock(m_);
-    if (!flag_enabled("frontend/spline/path_sample")) return;  // runtime toggle
+    if (!flag_enabled("frontend/path_sample")) return;  // runtime toggle
     geometry_msgs::msg::PoseStamped ps;
     ps.header.stamp = to_ros(t);
     ps.header.frame_id = path_.header.frame_id;
@@ -373,12 +368,6 @@ const char* RosTelemetrySink::unit_of(const std::string& key) {
       {"frontend/bias_acc", "m/s^2"},
       {"frontend/bias_gyr", "rad/s"},
       {"frontend/grav_norm", "m/s^2"},
-      {"frontend/spline/vel", "m/s"},
-      {"frontend/spline/acc", "m/s^2"},
-      {"frontend/spline/acc_rms_span", "m/s^2"},
-      {"frontend/spline/omega", "rad/s"},
-      {"frontend/spline/omega_rms_span", "rad/s"},
-      {"frontend/spline/jerk_rms", "m/s^3"},
       {"frontend/window_span_s", "s"},
       {"frontend/lidar/inlier_ratio", "ratio"},
       {"frontend/state/vel_norm", "m/s"},
@@ -410,7 +399,6 @@ std::string RosTelemetrySink::cloud_topic(const std::string& key) const {
   if (key == "map/registered") return "/meridian/cloud_registered";
   if (key == "frontend/lidar/inliers") return "/meridian/cloud_effective";
   if (key == "frontend/assoc/outliers") return "/meridian/cloud_outliers";
-  if (key == "frontend/deskew/pre") return "/meridian/cloud_deskew_pre";
   return "/meridian/cloud/" + sanitize(key);
 }
 
@@ -422,7 +410,6 @@ std::string RosTelemetrySink::pose_topic(const std::string& key) const {
 }
 
 std::string RosTelemetrySink::image_topic(const std::string& key) const {
-  if (key == "frontend/visual/patches") return "/meridian/visual_patches";
   return "/meridian/image/" + sanitize(key);
 }
 

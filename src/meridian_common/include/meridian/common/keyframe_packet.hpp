@@ -63,7 +63,7 @@ struct KeyframePacket {
 
   // provenance
   std::uint32_t calib_version = 0;  // CalibrationSet snapshot that produced this
-  std::uint32_t frontend_kind = 1;  // 1 = CT, the only producer; diagnostics only
+  std::uint32_t frontend_kind = 1;  // 1 = retired CT front-end, 2 = LIO; diagnostics only
 };
 
 }  // namespace meridian
