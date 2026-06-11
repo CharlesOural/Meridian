@@ -150,10 +150,15 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
   // layers agree on the extrinsics until a refinement publishes a new set.
   if (cfg_.backend.enable) {
     backend_ = makeBackEnd(cfg_.backend, calib, sink_.get(), /*deterministic=*/sync_mode_);
+    // The keyframe store feeds two consumers: the loop detector and the assembled map
+    // cloud. Create it when either is live, so the map cloud does not silently require
+    // loop closure to be on.
+    if (cfg_.place.enable || sink_->wants_clouds()) {
+      store_ = std::make_shared<KeyframeStore>();
+    }
     // L5 loop detector, driven on the back-end path. It reads corrected poses and the
     // odometry-chain covariance through read-only callbacks so it never links the back-end.
     if (cfg_.place.enable) {
-      store_ = std::make_shared<KeyframeStore>();
       IBackEnd* be = backend_.get();
       pose_source_.pose = [be](std::uint64_t id) { return be->pose_of(id); };
       pose_source_.chain_cov = [be](std::uint64_t a, std::uint64_t b) {
@@ -411,13 +416,13 @@ bool MeridianPipeline::stage_backend_item(BackendItem&& item) {
       [this](auto&& v) {
         using T = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<T, KeyframePacket>) {
-          if (loop_detector_) {
-            // Retain the cloud for the detector and record the stamp for its time gate,
-            // before the packet is moved into the back-end.
+          if (store_) {
+            // Retain the cloud and stamp before the packet is moved into the back-end;
+            // the map cloud composes from here, and the detector reads the same store.
             store_->put(v.id, v.cloud_body, v.image, v.T_ref_body);
             kf_stamps_[v.id] = v.stamp;
-            pending_kf_for_detector_.emplace_back(v.id, v.cloud_body);
           }
+          if (loop_detector_) pending_kf_for_detector_.emplace_back(v.id, v.cloud_body);
           backend_->add_keyframe(std::move(v));
         } else if constexpr (std::is_same_v<T, LoopConstraint>) {
           backend_->add_loop_constraint(v);
