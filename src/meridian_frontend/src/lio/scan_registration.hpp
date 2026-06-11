@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Core>
+#include <functional>
 #include <vector>
 
 #include "lio/imu_tracker.hpp"
@@ -15,7 +16,9 @@ namespace meridian::lio {
 // One scan-to-map solve. `cov_right` is the pose covariance in the right/body
 // translation-first [rho; phi] tangent; `info_body` is the unscaled data-term
 // information in the same chart (the per-axis observability source). `chi` is the
-// final sum of squared residuals over the n_corr correspondences.
+// final sum of squared residuals over the n_corr correspondences. When the solve
+// fails its gates (zero correspondences, or n_corr below the keypoint floor)
+// `converged` is false and `cov_right` keeps its identity placeholder.
 struct RegistrationResult {
   Pose pose;  // T_world_body at the sweep end
   Eigen::Matrix<double, 6, 6> cov_right = Eigen::Matrix<double, 6, 6>::Identity();
@@ -26,6 +29,11 @@ struct RegistrationResult {
   double chi = 0.0;
   bool converged = false;
 };
+
+// Nearest-map-point lookup: writes the closest stored point to `query_world` and
+// returns true when one lies within the correspondence gate. The lookup owns the gate.
+using NearestLookup =
+    std::function<bool(const Eigen::Vector3d& query_world, Eigen::Vector3d* neighbor)>;
 
 // Stateless per-sweep machinery: constant-screw deskew of the raw sweep and the
 // Gauss-Newton point-to-point alignment against the local map.
@@ -46,6 +54,11 @@ public:
   // keypoint order, so the solve is deterministic.
   RegistrationResult registerScan(const std::vector<Eigen::Vector3d>& keypoints_body,
                                   const VoxelGridMap& map, const Pose& T_world_body_guess,
+                                  const MotionPrior& prior) const;
+
+  // Identical solve driven by a caller-supplied nearest lookup instead of the map.
+  RegistrationResult registerScan(const std::vector<Eigen::Vector3d>& keypoints_body,
+                                  const NearestLookup& nearest, const Pose& T_world_body_guess,
                                   const MotionPrior& prior) const;
 
 private:
