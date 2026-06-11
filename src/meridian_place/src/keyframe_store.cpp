@@ -28,6 +28,14 @@ std::optional<Pose> KeyframeStore::pose(std::uint64_t id) const {
   return it->second.T_map_body;
 }
 
+std::vector<std::uint64_t> KeyframeStore::ids() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<std::uint64_t> out;
+  out.reserve(entries_.size());
+  for (const auto& [id, e] : entries_) out.push_back(id);
+  return out;  // ascending by std::map ordering
+}
+
 std::vector<std::uint64_t> KeyframeStore::within_radius(const Eigen::Vector3f& c,
                                                         float r) const {
   std::lock_guard<std::mutex> lock(mu_);

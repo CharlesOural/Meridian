@@ -11,6 +11,8 @@ find_package(meridian_config REQUIRED)
 
 add_library(meridian_place
   src/keyframe_store.cpp
+  src/sc_descriptor.cpp
+  src/submap_accumulator.cpp
   src/loop_detector_factory.cpp)
 
 target_include_directories(meridian_place PUBLIC
@@ -36,6 +38,13 @@ if(BUILD_TESTING)
   include(MeridianTesting)
   meridian_add_gtest(test_keyframe_store test/test_keyframe_store.cpp)
   target_link_libraries(test_keyframe_store meridian_place)
+  # The descriptor / submap engines are private (src/) headers; tests reach them directly.
+  meridian_add_gtest(test_sc_descriptor test/test_sc_descriptor.cpp)
+  target_include_directories(test_sc_descriptor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_sc_descriptor meridian_place)
+  meridian_add_gtest(test_submap_accumulator test/test_submap_accumulator.cpp)
+  target_include_directories(test_submap_accumulator PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_submap_accumulator meridian_place)
 endif()
 
 ament_package()

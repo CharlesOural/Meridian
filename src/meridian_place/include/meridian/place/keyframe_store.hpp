@@ -29,6 +29,9 @@ class KeyframeStore {
   std::shared_ptr<const CameraFrame> image(std::uint64_t id) const;
   std::optional<Pose> pose(std::uint64_t id) const;
 
+  // All stored keyframe ids, ascending.
+  std::vector<std::uint64_t> ids() const;
+
   // Keyframe ids whose stored pose translation lies within `r` metres of `c`.
   std::vector<std::uint64_t> within_radius(const Eigen::Vector3f& c, float r) const;
 
