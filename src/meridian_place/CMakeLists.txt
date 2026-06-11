@@ -16,6 +16,8 @@ add_library(meridian_place
   src/submap_accumulator.cpp
   src/gicp_verify.cpp
   src/loop_cov.cpp
+  src/pcm_self_test.cpp
+  src/hierarchical_loop_detector.cpp
   src/loop_detector_factory.cpp)
 
 target_include_directories(meridian_place PUBLIC
@@ -57,6 +59,15 @@ if(BUILD_TESTING)
   meridian_add_gtest(test_loop_cov test/test_loop_cov.cpp)
   target_include_directories(test_loop_cov PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test_loop_cov meridian_place)
+  meridian_add_gtest(test_pcm_self_test test/test_pcm_self_test.cpp)
+  target_include_directories(test_pcm_self_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_pcm_self_test meridian_place)
+  meridian_add_gtest(test_loop_detector_e2e test/test_loop_detector_e2e.cpp)
+  target_include_directories(test_loop_detector_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_loop_detector_e2e meridian_place)
+  meridian_add_gtest(test_determinism test/test_determinism.cpp)
+  target_include_directories(test_determinism PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_determinism meridian_place)
 endif()
 
 ament_package()

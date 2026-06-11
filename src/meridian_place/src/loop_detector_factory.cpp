@@ -2,6 +2,7 @@
 #include <utility>
 
 #include "meridian/place/iloop_detector.hpp"
+#include "hierarchical_loop_detector.hpp"
 
 namespace meridian {
 namespace {
@@ -25,10 +26,16 @@ class NullLoopDetector final : public ILoopDetector {
 
 }  // namespace
 
-std::unique_ptr<ILoopDetector> makeLoopDetector(const PlaceConfig& /*cfg*/,
-                                                std::shared_ptr<const KeyframeStore> /*store*/,
-                                                KeyframePoseSource /*pose_source*/,
-                                                bool /*deterministic*/) {
+std::unique_ptr<ILoopDetector> makeLoopDetector(const PlaceConfig& cfg,
+                                                std::shared_ptr<const KeyframeStore> store,
+                                                KeyframePoseSource pose_source,
+                                                bool deterministic) {
+  if (!cfg.enable) return std::make_unique<NullLoopDetector>();
+  switch (cfg.kind) {
+    case PlaceKind::ScanContextPp:
+      return std::make_unique<HierarchicalLoopDetector>(cfg, std::move(store),
+                                                        std::move(pose_source), deterministic);
+  }
   return std::make_unique<NullLoopDetector>();
 }
 
