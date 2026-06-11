@@ -4,7 +4,8 @@ project(meridian_place LANGUAGES CXX)
 find_package(ament_cmake REQUIRED)
 find_package(meridian_cmake REQUIRED)
 include(MeridianToolchain)
-include(MeridianDeps)            # Eigen3::Eigen, Sophus::Sophus
+set(MERIDIAN_NEED_SMALL_GICP ON)  # Stage-C geometric verification
+include(MeridianDeps)            # Eigen3::Eigen, Sophus::Sophus, small_gicp::small_gicp
 
 find_package(meridian_common REQUIRED)
 find_package(meridian_config REQUIRED)
@@ -13,6 +14,8 @@ add_library(meridian_place
   src/keyframe_store.cpp
   src/sc_descriptor.cpp
   src/submap_accumulator.cpp
+  src/gicp_verify.cpp
+  src/loop_cov.cpp
   src/loop_detector_factory.cpp)
 
 target_include_directories(meridian_place PUBLIC
@@ -26,6 +29,9 @@ target_link_libraries(meridian_place PUBLIC
   meridian_common::meridian_common
   meridian_config::meridian_config
   Eigen3::Eigen Sophus::Sophus)
+# small_gicp is an implementation detail of the Stage-C verifier (private src/ header), so
+# it is not exported on the public interface.
+target_link_libraries(meridian_place PRIVATE small_gicp::small_gicp)
 
 install(DIRECTORY include/ DESTINATION include)
 install(TARGETS meridian_place EXPORT meridian_placeTargets
@@ -45,6 +51,12 @@ if(BUILD_TESTING)
   meridian_add_gtest(test_submap_accumulator test/test_submap_accumulator.cpp)
   target_include_directories(test_submap_accumulator PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test_submap_accumulator meridian_place)
+  meridian_add_gtest(test_gicp_verify test/test_gicp_verify.cpp)
+  target_include_directories(test_gicp_verify PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_gicp_verify meridian_place small_gicp::small_gicp)
+  meridian_add_gtest(test_loop_cov test/test_loop_cov.cpp)
+  target_include_directories(test_loop_cov PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_loop_cov meridian_place)
 endif()
 
 ament_package()
