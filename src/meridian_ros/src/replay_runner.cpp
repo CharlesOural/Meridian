@@ -16,6 +16,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialization.hpp>
 #include <rclcpp/serialized_message.hpp>
 #include <rosbag2_cpp/readers/sequential_reader.hpp>
@@ -33,8 +34,10 @@
 #include <vector>
 
 #include "conversions/ros2core.hpp"
+#include "debug/ros_telemetry_sink.hpp"
 #include "meridian/config/config_loader.hpp"
 #include "meridian/debug/file_sink.hpp"
+#include "meridian/debug/multi_sink.hpp"
 #include "meridian/debug/packet_log.hpp"
 #include "meridian/debug/tum_writer.hpp"
 #include "meridian/pipeline/meridian_pipeline.hpp"
@@ -74,6 +77,7 @@ int main(int argc, char** argv) {
   std::string dump_path;
   bool dump_clouds = false;
   bool no_backend = false;
+  bool viz = false;
   int arg = 4;
   if (arg < argc && std::string_view(argv[arg]).substr(0, 2) != "--") {
     max_secs = std::stod(argv[arg++]);
@@ -86,6 +90,8 @@ int main(int argc, char** argv) {
       dump_clouds = true;
     } else if (a == "--no-backend") {
       no_backend = true;
+    } else if (a == "--viz") {
+      viz = true;
     } else {
       return usage();
     }
@@ -111,7 +117,29 @@ int main(int argc, char** argv) {
   const std::string stem = out_path.size() > 4 && out_path.substr(out_path.size() - 4) == ".tum"
                                ? out_path.substr(0, out_path.size() - 4)
                                : out_path;
-  MeridianPipeline pipeline(cfg, make_file_sink(stem));
+  // --viz wraps the file sink in a MultiSink that also publishes ROS topics, so a replay can
+  // drive RViz/Foxglove while still writing the TUM + sidecars. The sink is observe-only, so it
+  // never changes the estimate; the borrowed children must outlive the pipeline that holds the
+  // MultiSink, so they are declared before it. (A --viz replay builds extra payloads and is for
+  // inspection, not the bit-exact baseline — run without --viz for byte-identical output.)
+  std::shared_ptr<rclcpp::Node> viz_node;
+  std::unique_ptr<meridian::RosTelemetrySink> ros_sink;
+  std::unique_ptr<meridian::TelemetrySink> file_sink;
+  std::unique_ptr<meridian::TelemetrySink> sink;
+  if (viz) {
+    if (!rclcpp::ok()) rclcpp::init(0, nullptr);
+    viz_node = std::make_shared<rclcpp::Node>("meridian_replay");
+    ros_sink = std::make_unique<meridian::RosTelemetrySink>(viz_node.get(), cfg.debug);
+    file_sink = make_file_sink(stem);
+    auto multi = std::make_unique<meridian::MultiSink>();
+    multi->add(ros_sink.get());
+    multi->add(file_sink.get());
+    sink = std::move(multi);
+    std::fprintf(stderr, "  --viz: publishing /meridian/* topics from node 'meridian_replay'\n");
+  } else {
+    sink = make_file_sink(stem);
+  }
+  MeridianPipeline pipeline(cfg, std::move(sink));
   std::uint64_t groups = 0;
   pipeline.set_group_sink([&](PreprocessedGroup&&) {
     // Replay runs the group sink on this thread, where live_state() is valid.
@@ -220,5 +248,6 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "  dumped %llu keyframes -> %s\n",
                  static_cast<unsigned long long>(kf_dumped), dump_path.c_str());
   }
+  if (viz && rclcpp::ok()) rclcpp::shutdown();
   return 0;
 }
