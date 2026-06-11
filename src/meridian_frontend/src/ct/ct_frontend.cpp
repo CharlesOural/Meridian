@@ -1838,7 +1838,8 @@ void CtFrontEnd::emitKeyframe(const Pose& T_world_body, Timestamp stamp,
     }
     const Eigen::Vector3d p_world = spline_->pose(t) * (T_fe_lidar_ * p.xyz.cast<double>());
     const Eigen::Vector3d p_body = T_world_body_inv * p_world;
-    LidarPoint lp;
+    // Keep the sensor attributes (intensity/ring/ambient/range); only the position moves.
+    LidarPoint lp = p;
     lp.xyz = p_body.cast<float>();
     cloud->push_back(lp);
   }
