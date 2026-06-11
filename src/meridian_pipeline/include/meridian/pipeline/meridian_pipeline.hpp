@@ -128,6 +128,10 @@ public:
   // Replay: callable between ingests or after stop(). Live: only after stop().
   std::vector<StampedPose> corrected_trajectory() const;
 
+  // T_map_odom: the correction between the back-end map frame and the front-end odom frame
+  // (identity when there is no back-end). For broadcasting the map->odom TF in viz tooling.
+  Pose map_odom() const;
+
   // False when the config disabled the back-end and the pipeline runs without it.
   bool backend_enabled() const;
 
@@ -190,6 +194,10 @@ private:
   // corrected poses) and returns any verified loops. Runs on the back-end driver after a
   // fold, so the poses it reads are deterministic. Empty when L5 is disabled.
   std::vector<LoopConstraint> detect_loops();
+  // Assembles the back-end map: every retained keyframe cloud placed at its corrected map pose,
+  // voxel-downsampled, published in the map frame. Throttled, and forced on a loop closure (when
+  // the map de-warps). No-op without the keyframe store / back-end / an enabled sink key.
+  void publish_map_cloud(Timestamp ts, bool force);
 
   Config cfg_;
   bool sync_mode_ = false;  // Replay: process inline, no thread/queue
@@ -250,6 +258,8 @@ private:
   // Keyframes staged into the back-end since the last fold, with their clouds, awaiting
   // offer to the detector at corrected poses. Confined to the back-end driver.
   std::vector<std::pair<std::uint64_t, PointCloudPtr>> pending_kf_for_detector_;
+  // Folds since the assembled map cloud was last published (throttle). Back-end driver only.
+  std::uint64_t folds_since_map_cloud_ = 0;
   // Items staged into the back-end since its last fold (Replay's inline driver only;
   // the Live count lives in backend_loop()).
   std::uint64_t staged_since_opt_ = 0;

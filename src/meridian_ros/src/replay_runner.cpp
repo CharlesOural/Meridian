@@ -16,9 +16,11 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialization.hpp>
 #include <rclcpp/serialized_message.hpp>
+#include <tf2_ros/transform_broadcaster.h>
 #include <rosbag2_cpp/readers/sequential_reader.hpp>
 #include <rosbag2_storage/storage_filter.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
@@ -126,6 +128,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<meridian::RosTelemetrySink> ros_sink;
   std::unique_ptr<meridian::TelemetrySink> file_sink;
   std::unique_ptr<meridian::TelemetrySink> sink;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_bc;
   if (viz) {
     if (!rclcpp::ok()) rclcpp::init(0, nullptr);
     viz_node = std::make_shared<rclcpp::Node>("meridian_replay");
@@ -135,7 +138,13 @@ int main(int argc, char** argv) {
     multi->add(ros_sink.get());
     multi->add(file_sink.get());
     sink = std::move(multi);
-    std::fprintf(stderr, "  --viz: publishing /meridian/* topics from node 'meridian_replay'\n");
+    // TF tree map->odom->body so RViz/Foxglove place the graph and map cloud (map frame),
+    // the registered clouds (odom), and the body scan (body) in one view. map->odom is the
+    // back-end correction T_map_odom: identity until the first loop folds, then it jumps —
+    // so the whole odom subtree (and the live clouds in it) visibly snaps onto the corrected
+    // map graph. Both edges are broadcast dynamically from the replay thread (below).
+    tf_bc = std::make_unique<tf2_ros::TransformBroadcaster>(*viz_node);
+    std::fprintf(stderr, "  --viz: publishing /meridian/* topics + TF from node 'meridian_replay'\n");
   } else {
     sink = make_file_sink(stem);
   }
@@ -148,6 +157,32 @@ int main(int argc, char** argv) {
       return;  // pre-init groups carry a zero state; a t=0 pose would poison analysis
     }
     write_tum_line(out, s.stamp, s.T_world_body);
+    if (tf_bc) {
+      const rclcpp::Time stamp(s.stamp);
+      auto fill = [](geometry_msgs::msg::TransformStamped& tf, const meridian::Pose& T) {
+        tf.transform.translation.x = T.t.x();
+        tf.transform.translation.y = T.t.y();
+        tf.transform.translation.z = T.t.z();
+        tf.transform.rotation.w = T.q.w();
+        tf.transform.rotation.x = T.q.x();
+        tf.transform.rotation.y = T.q.y();
+        tf.transform.rotation.z = T.q.z();
+      };
+      // map->odom: the back-end correction, jumping when a loop folds.
+      geometry_msgs::msg::TransformStamped mo;
+      mo.header.stamp = stamp;
+      mo.header.frame_id = "map";
+      mo.child_frame_id = "odom";
+      fill(mo, pipeline.map_odom());
+      // odom->body: the live front-end estimate.
+      geometry_msgs::msg::TransformStamped ob;
+      ob.header.stamp = stamp;
+      ob.header.frame_id = "odom";
+      ob.child_frame_id = "body";
+      fill(ob, s.T_world_body);
+      tf_bc->sendTransform(mo);
+      tf_bc->sendTransform(ob);
+    }
     if (++groups % 250 == 0) {
       std::fprintf(stderr, "  %llu groups\n", static_cast<unsigned long long>(groups));
       out.flush();

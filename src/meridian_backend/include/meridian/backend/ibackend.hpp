@@ -56,6 +56,10 @@ public:
   virtual std::optional<Eigen::Matrix<double, 6, 6>> chain_cov_between(std::uint64_t a,
                                                                        std::uint64_t b) const = 0;
 
+  // T_map_odom: the correction between the back-end's globally-consistent map frame and the
+  // front-end's drifting odom frame. Identity until the first fold; jumps when a loop closes.
+  virtual Pose map_odom() const = 0;
+
   // Debug snapshot: writes the current graph (pose vertices + relative edges) to a .g2o file.
   // A best-effort hook for offline inspection; failures are logged, not thrown.
   virtual void write_g2o(const std::string& path) const = 0;

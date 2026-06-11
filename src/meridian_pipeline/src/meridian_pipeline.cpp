@@ -1,12 +1,15 @@
 #include "meridian/pipeline/meridian_pipeline.hpp"
 
+#include <array>
 #include <chrono>
 #include <cmath>
-
+#include <cstdint>
 #include <cstdio>
+#include <map>
 #include <span>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include <Eigen/Geometry>
 
@@ -34,6 +37,12 @@ constexpr std::size_t kSensorQueueCapacity = 512;
 // carries ~20 IMU samples, so a small multiple of that absorbs short stalls without
 // letting the front-end fall far behind real time.
 constexpr std::size_t kMeasQueueCapacity = 8 * 24;
+
+// Assembled map-cloud cadence and resolution. The cloud is rebuilt from all stored
+// keyframes once every kMapCloudFoldPeriod folds (or immediately on a loop fold), then
+// collapsed to a single voxel grid at kMapCloudVoxel metres so its size stays bounded.
+constexpr std::uint64_t kMapCloudFoldPeriod = 10;
+constexpr float kMapCloudVoxel = 0.3f;
 
 SensorInfo make_info(std::uint8_t id, Modality modality, Frame frame,
                      const std::string& model, double rate_hz, StampSource src) {
@@ -239,6 +248,8 @@ void MeridianPipeline::set_graph_update_sink(GraphUpdateSink sink) {
 std::vector<StampedPose> MeridianPipeline::corrected_trajectory() const {
   return backend_ ? backend_->corrected_trajectory() : std::vector<StampedPose>{};
 }
+
+Pose MeridianPipeline::map_odom() const { return backend_ ? backend_->map_odom() : Pose{}; }
 
 bool MeridianPipeline::backend_enabled() const { return backend_ != nullptr; }
 
@@ -489,6 +500,13 @@ void MeridianPipeline::publish_graph_update(const GraphUpdate& gu) {
   // Moved keyframes stale the detector's cached submaps; drop those so the next compose
   // reflects the corrected geometry.
   if (loop_detector_ && !gu.moved.empty()) loop_detector_->on_graph_update(gu);
+  // Assembled map cloud, stamped at the latest keyframe. Forced on a loop fold so the
+  // de-warp is visible the instant the graph snaps; throttled otherwise.
+  if (store_ && last_kf_id_) {
+    const auto it = kf_stamps_.find(*last_kf_id_);
+    const Timestamp ts = it != kf_stamps_.end() ? it->second : 0;
+    publish_map_cloud(ts, /*force=*/gu.loop_closed);
+  }
   if (graph_update_sink_) graph_update_sink_(gu);
 }
 
@@ -507,6 +525,43 @@ std::vector<LoopConstraint> MeridianPipeline::detect_loops() {
   }
   pending_kf_for_detector_.clear();
   return loops;
+}
+
+void MeridianPipeline::publish_map_cloud(Timestamp ts, bool force) {
+  if (!store_ || !backend_ || !sink_->enabled("map/cloud")) return;
+  // Throttle: rebuilding the whole map cloud from every stored keyframe is O(points), so
+  // only do it every few folds — unless a loop just folded, where the whole point is to
+  // show the de-warp the instant it happens.
+  if (!force && ++folds_since_map_cloud_ < kMapCloudFoldPeriod) return;
+  folds_since_map_cloud_ = 0;
+
+  // Compose each keyframe's body-frame cloud at its corrected map pose, then collapse to a
+  // single voxel grid (first return per cell wins) so the assembled cloud stays bounded as
+  // the trajectory grows. The grid key quantises the map-frame position at the voxel pitch.
+  constexpr float kInvVoxel = 1.0f / kMapCloudVoxel;
+  std::map<std::array<std::int64_t, 3>, LidarPoint> grid;
+  for (const std::uint64_t id : store_->ids()) {
+    const std::optional<Pose> p = backend_->pose_of(id);
+    if (!p) continue;
+    const PointCloudPtr cloud = store_->cloud(id);
+    if (!cloud) continue;
+    for (const LidarPoint& src : *cloud) {
+      const Eigen::Vector3d pm = (*p) * src.xyz.cast<double>();
+      const std::array<std::int64_t, 3> key{
+          static_cast<std::int64_t>(std::floor(pm.x() * kInvVoxel)),
+          static_cast<std::int64_t>(std::floor(pm.y() * kInvVoxel)),
+          static_cast<std::int64_t>(std::floor(pm.z() * kInvVoxel))};
+      if (grid.find(key) != grid.end()) continue;
+      LidarPoint out = src;
+      out.xyz = pm.cast<float>();
+      grid.emplace(key, out);
+    }
+  }
+
+  std::vector<LidarPoint> out;
+  out.reserve(grid.size());
+  for (auto& [key, pt] : grid) out.push_back(pt);
+  sink_->cloud("map/cloud", PointCloudView{out}, Frame::Map, ts);
 }
 
 void MeridianPipeline::drain_pending_correction() {

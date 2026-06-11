@@ -120,8 +120,16 @@ void RosTelemetrySink::cloud(const char* key, const PointCloudView& view, Frame 
     std::lock_guard<std::mutex> lock(m_);
     auto& slot = cloud_pubs_[key];
     if (!slot) {
-      slot = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-          cloud_topic(key), rclcpp::QoS(5).best_effort());
+      // The assembled map cloud is published infrequently (every few folds) and carries the
+      // whole accumulated geometry, not a per-sweep view. Latch it (reliable +
+      // transient_local) so a late-joining or reconnecting subscriber gets the current map
+      // at once instead of waiting up to a fold for the next send, and so it persists after
+      // the run ends. Per-sweep clouds stay best-effort: cheap to miss, and a stale one held
+      // by a latch would be worse than a brief gap.
+      const rclcpp::QoS qos = std::string(key) == "map/cloud"
+                                  ? rclcpp::QoS(1).reliable().transient_local()
+                                  : rclcpp::QoS(5).best_effort();
+      slot = node_->create_publisher<sensor_msgs::msg::PointCloud2>(cloud_topic(key), qos);
     }
     pub = slot;
   }

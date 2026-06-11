@@ -176,6 +176,39 @@ meridian:
       dist_m: 1.0
       rot_deg: 10.0
       time_s: 1.0
+  place:
+    # L5 loop closure: Scan Context retrieval -> small_gicp verify -> single-loop self-test.
+    # This sequence accumulates ~4.5 m of front-end drift before returning, so an admitted
+    # revisit loop has real error to correct here (unlike the near-perfect quad sequences).
+    # sc_max_xy is widened past the drift so the true revisit still gates as a candidate; the
+    # verify gates stay as tight as on quad so geometry, not proximity, decides admission.
+    # OFF by default like the quad config: the detector's caller-thread work shifts the
+    # vendored ikd-Tree async-rebuild timing and makes replay non-deterministic until that
+    # rebuild is made synchronous in deterministic mode.
+    enable: false
+    detect_period_kf: 1
+    min_kf_gap: 30
+    min_time_gap: 20.0      # [s]
+    cooldown_kf: 20
+    sc_Nr: 20
+    sc_Ns: 60
+    sc_rmax: 40.0           # indoor/underground usable range
+    sc_knn: 15
+    sc_dist_thresh: 0.13    # tight retrieval: only strong place matches
+    sc_max_xy: 30.0         # past the drift, so the revisit still gates as a candidate
+    sc_topK: 5
+    submap_window: 5
+    submap_voxel: 0.3
+    submap_cache: 64
+    gicp_downsample: 0.3
+    gicp_max_corr_dist: 1.5
+    gicp_fitness_min: 0.8
+    gicp_overlap_min: 0.6
+    gicp_rmse_max: 0.4
+    gicp_cond_max: 1.0e4
+    gicp_fit_sigma: 0.2
+    pcm_chi2_conf: 0.99     # must equal backend.pcm_chi2_alpha
+    cov_lambda: 0.1
   debug:
     level: info
     publish_clouds: true

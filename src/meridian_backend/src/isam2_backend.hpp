@@ -59,6 +59,7 @@ public:
   std::optional<Pose> pose_of(std::uint64_t id) const override;
   std::optional<Eigen::Matrix<double, 6, 6>> chain_cov_between(std::uint64_t a,
                                                                std::uint64_t b) const override;
+  Pose map_odom() const override { return T_map_odom_; }
   void write_g2o(const std::string& path) const override;
 
   // Test seam: appends directly to the staged batch the next optimize() folds.
