@@ -2367,11 +2367,14 @@ void CtFrontEnd::apply_correction(const GraphUpdate& update) {
   live_state_.T_world_body = delta * live_state_.T_world_body;
   live_state_.v_world = delta.q * live_state_.v_world;
 
-  // Re-anchor the LiDAR local map by the same rigid delta. Without this the freshly
-  // shifted trajectory would register the next scan against a map still in the old frame,
-  // and the resulting point-to-plane mismatch compounds sweep over sweep into divergence.
+  // Re-anchor the maps by the same rigid delta. Without this the freshly shifted
+  // trajectory would register the next scan / project the next patch against a map still
+  // in the old frame, and the mismatch compounds sweep over sweep into divergence.
   if (map_ && cfg_.lidar.rebase_local_map) {
     map_->transform(delta);
+  }
+  if (vmap_ && cfg_.visual.rebase_map) {
+    vmap_->transform(delta);
   }
 }
 

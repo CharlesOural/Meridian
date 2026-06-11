@@ -305,6 +305,7 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   get(vis, "warp_det_max", c.visual.warp_det_max);
   get(vis, "warp_cond_max", c.visual.warp_cond_max);
   get(vis, "active_box_m", c.visual.active_box_m);
+  get(vis, "rebase_map", c.visual.rebase_map);
   const YAML::Node g = n["gnss"];
   get(g, "use", c.gnss.use);
   get(g, "floor_fixed_h", c.gnss.floor_fixed_h);

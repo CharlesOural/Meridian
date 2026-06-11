@@ -146,6 +146,13 @@ public:
   // position, and (if enabled) points whose best score fell below the keep floor.
   void evict(const Eigen::Vector3d& p_world_now);
 
+  // Rigidly re-anchor every map point by `delta` (left action) so the visual map stays
+  // consistent with a trajectory just shifted by the same delta (a loop-closure re-anchor):
+  // positions translate+rotate, normals and view directions rotate, stored camera poses
+  // compose, and the voxel index is rebuilt from the shifted positions. Patches and NCC
+  // caches are photometric and rigid-invariant, so they are untouched.
+  void transform(const Pose& delta);
+
   std::size_t size() const { return points_.size(); }
 
   // Deterministic state digest for replay-equivalence tests: order-independent of

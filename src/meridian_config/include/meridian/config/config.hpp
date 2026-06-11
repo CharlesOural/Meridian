@@ -325,6 +325,11 @@ struct FrontendVisual {
   // resident points every sweep, so an over-large box makes per-sweep cost grow with
   // distance travelled and starves the real-time budget.
   double active_box_m = 20.0;
+  // On a back-end correction, rigidly re-anchor the visual map by the same delta as the
+  // trajectory (positions/normals/view-dirs/poses shift, voxel index rebuilds) so the
+  // photometric stage stays in one frame. The LiDAR map has the same switch
+  // (frontend.lidar.rebase_local_map); off leaves the map in the pre-correction frame.
+  bool rebase_map = true;
 };
 // Conservative absolute-position GNSS residual. `use` is the master gate: with it off
 // (or with no fixes present) the GNSS code path is never entered and the trajectory is

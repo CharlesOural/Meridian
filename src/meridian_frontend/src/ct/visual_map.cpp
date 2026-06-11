@@ -617,6 +617,29 @@ void VisualMap::evict(const Eigen::Vector3d& p_world_now) {
   }
 }
 
+void VisualMap::transform(const Pose& delta) {
+  const Eigen::Matrix3d dR = delta.q.toRotationMatrix();
+  for (auto& [id, pt] : points_) {
+    pt->p_world = dR * pt->p_world + delta.t;
+    pt->n_world = dR * pt->n_world;  // unit normal rotates; a zero (uninitialised) stays zero
+    pt->T_w_c_ref = delta * pt->T_w_c_ref;
+    for (VisualObservation& ob : pt->obs) {
+      ob.T_w_c = delta * ob.T_w_c;
+      ob.view_dir = dR * ob.view_dir;
+    }
+  }
+  // Voxel keys are derived from p_world, so the whole spatial index is stale: rebuild it
+  // from the shifted positions. Iterating the id-ordered point map keeps each cell's id
+  // list ascending, matching how the production path builds it.
+  index_.clear();
+  for (const auto& [id, pt] : points_) {
+    addPointAt(voxelKey(pt->p_world), id);
+  }
+  // The per-sweep visible set was selected at the old poses; drop it so the next sweep
+  // reselects against the shifted map.
+  visible_cache_ids_.clear();
+}
+
 VisualMap::StateSummary VisualMap::summary() const {
   // Fold a stable digest over the live points (the ordered map yields them id-
   // ascending) using rounded fields, so the summary is a pure function of state and
