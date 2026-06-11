@@ -42,6 +42,13 @@ not more front-end tuning.
   remaining front-end lever for fast-motion accuracy, but needs a warm-start redesign
   (smooth dense-segment seeding + selectKnotDensity hysteresis), not Jacobian work.
   Do not flip n_cp_max > 1 before that lands.
+- **LiDAR densification on Newer College quad-easy**: REJECTED across the board.
+  voxel 0.5 = neutral (0.197 vs 0.16-0.19 baseline, +11 ms); voxel 0.5 + factors 1500 and
+  + point_filter 1 = budget blown (104-138 ms/sweep, 262-468 Q_meas drops, divergence);
+  voxel 0.4 + factors 2000 = clean delivery (0 bridges, 88 ms) yet **worse accuracy
+  (1.165 m)** — finer voxels give noisier plane normals. The LiDAR term is not the
+  binding error source on this sequence; the levers are prior/bias consistency and the
+  L3 backend.
 
 
 ## System behavior learnings (meta — how this estimator responds to its knobs)
@@ -95,7 +102,7 @@ rows below.
 
 | knob | now | trades |
 |---|---|---|
-| `visual.enable` | true (garden_day); **false (legged_underground)** | false → drop the whole photometric stage (~20 ms), clean LIO ~7.5 cm. Biggest cut. On the legged bag the stage is also an accuracy hazard: in the dark corridor it diverges the estimate (full-bag replay 340–2834 m vs 4.5 m off; the well-lit first 120 s are fine at 1.3 m). Low-light gating needed before re-enabling there. |
+| `visual.enable` | **false** everywhere deployed (newer-college: equidistant cams + vignetting, see DATASET.md; legged_underground: dark-corridor divergence) | false → drop the whole photometric stage (~20 ms), clean LIO ~7.5 cm. Biggest cut. On the legged bag the stage is also an accuracy hazard: in the dark corridor it diverges the estimate (full-bag replay 340–2834 m vs 4.5 m off; the well-lit first 120 s are fine at 1.3 m). Low-light gating needed before re-enabling there. |
 | camera (`sensors.camera`) | FLIR 1024×768 | DAVIS `event_cam00` 346×260 ≈ 8× fewer pixels in the visual stage |
 | `lidar.num_match_points` | 5 | ↓ = fewer NN neighbours per assoc query |
 | (settled) iVox map backend — REMOVED | n/a | A/B benchmarked then removed (don't re-attempt). Exact stencil diverged (1331 voxels at radius 2.236 m / voxel 0.6 m); approx stencil=1 (27 vox) *tied* ikd-Tree (~22 vs ~21 ms, ATE 0.108 vs 0.103). iVox only wins at radius≈voxel (Faster-LIO regime), not our ratio 3.7. The map structure was never the lever — parallel association was. |
