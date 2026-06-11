@@ -36,6 +36,7 @@ class RosTelemetrySink final : public TelemetrySink {
   RosTelemetrySink(rclcpp::Node* node, const DebugConfig& cfg);
 
   bool enabled(const char* key) const override;
+  bool wants_clouds() const override { return cfg_.publish_clouds; }
 
   void scalar(const char* key, double v, Timestamp t) override;
   void vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v, Timestamp t,

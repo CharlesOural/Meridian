@@ -257,6 +257,14 @@ int main(int argc, char** argv) {
   }
   if (realtime) {
     std::fprintf(stderr, "  --realtime: Live mode, threaded, paced to bag clock at %.2gx\n", speed);
+    if (speed > 1.0) {
+      std::fprintf(stderr,
+                   "  WARNING: --realtime %.2gx is faster than real time; the front-end's\n"
+                   "  wall-clock solver budget can be starved by the back-end/detector/map-cloud\n"
+                   "  work on the other threads, which shows up as drift or divergence. Use 1x\n"
+                   "  for a faithful run.\n",
+                   speed);
+    }
   }
   pipeline.start();  // no-op in replay; spawns the front-end/back-end threads in Live mode
 

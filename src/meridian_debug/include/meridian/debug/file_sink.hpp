@@ -26,6 +26,8 @@ class FileSink final : public TelemetrySink {
   ~FileSink() override;
 
   bool enabled(const char*) const override;
+  // Clouds are dropped (cloud() is a no-op), so signal that nothing here renders one.
+  bool wants_clouds() const override { return false; }
 
   void scalar(const char* key, double v, Timestamp t) override;
   void vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v, Timestamp t,

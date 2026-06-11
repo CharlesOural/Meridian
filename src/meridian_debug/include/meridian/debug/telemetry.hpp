@@ -79,6 +79,12 @@ class TelemetrySink {
   virtual void timing(const char* stage, double ms, Timestamp t) = 0;
 
   virtual void event(Level, const char* tag, std::string_view msg, Timestamp t) = 0;
+
+  // Whether any consumer will actually render a cloud payload. Lets the core skip building
+  // an expensive assembled cloud (the map cloud) for sinks that drop clouds (file/null).
+  // Defaults to true; sinks whose cloud() is a no-op override it to false. Appended last so
+  // adding it does not shift the existing vtable slots.
+  virtual bool wants_clouds() const { return true; }
 };
 
 using Clock = std::chrono::steady_clock;
@@ -117,6 +123,7 @@ class ScopedTimer {
 class NullSink final : public TelemetrySink {
  public:
   bool enabled(const char*) const override { return false; }
+  bool wants_clouds() const override { return false; }
 
   void scalar(const char*, double, Timestamp) override {}
   void vec(const char*, const Eigen::Ref<const Eigen::VectorXd>&, Timestamp,

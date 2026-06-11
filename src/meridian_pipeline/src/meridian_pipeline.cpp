@@ -528,7 +528,9 @@ std::vector<LoopConstraint> MeridianPipeline::detect_loops() {
 }
 
 void MeridianPipeline::publish_map_cloud(Timestamp ts, bool force) {
-  if (!store_ || !backend_ || !sink_->enabled("map/cloud")) return;
+  // Skip the O(all-points) rebuild entirely when no sink renders clouds (file/null): the
+  // assembled map cloud is viz-only, so building it just to drop it wastes the whole cost.
+  if (!store_ || !backend_ || !sink_->wants_clouds() || !sink_->enabled("map/cloud")) return;
   // Throttle: rebuilding the whole map cloud from every stored keyframe is O(points), so
   // only do it every few folds — unless a loop just folded, where the whole point is to
   // show the de-warp the instant it happens.

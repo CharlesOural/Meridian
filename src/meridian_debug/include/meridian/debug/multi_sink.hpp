@@ -22,6 +22,12 @@ class MultiSink final : public TelemetrySink {
     return false;
   }
 
+  bool wants_clouds() const override {
+    for (auto* s : sinks_)
+      if (s->wants_clouds()) return true;
+    return false;
+  }
+
   void scalar(const char* key, double v, Timestamp t) override {
     for (auto* s : sinks_) s->scalar(key, v, t);
   }
