@@ -66,15 +66,6 @@ Extrinsic lidar_extrinsic(const LidarSensorConfig& lidar) {
   return ext;
 }
 
-IntrinsicsCamera camera_intrinsics(const CameraSensorConfig& cam) {
-  IntrinsicsCamera k;
-  k.fx = cam.intrinsics[0];
-  k.fy = cam.intrinsics[1];
-  k.cx = cam.intrinsics[2];
-  k.cy = cam.intrinsics[3];
-  return k;
-}
-
 }  // namespace
 
 MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetrySink> sink)
@@ -126,8 +117,14 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
                                                cfg_.preprocess.deskew.imu_init_count);
   gnss_gate_ = std::make_unique<GnssGate>(cfg_.preprocess.gnss,
                                           /*velocity_source=*/nullptr, sink_.get());
+  // The full camera intrinsics (distortion model + coeffs + size) drive the undistort
+  // map; the same calibration snapshot is shared with L2/L3 below.
+  const auto calib = calibrationFromConfig(cfg_.sensors);
+  const auto cam_it = calib->cam_intrinsics.find(static_cast<std::uint8_t>(s.camera.id));
+  const IntrinsicsCamera cam_intr =
+      cam_it != calib->cam_intrinsics.end() ? cam_it->second : IntrinsicsCamera{};
   camera_preprocessor_ = std::make_unique<CameraPreprocessor>(
-      cfg_.preprocess.camera, camera_intrinsics(s.camera), sink_.get());
+      cfg_.preprocess.camera, cam_intr, sink_.get());
   aggregator_ = std::make_unique<Aggregator>(cfg_.aggregation, cfg_.sensors,
                                              health_.get(), sink_.get());
   aggregator_->set_sink([this](MeasureGroup&& g) { on_group(std::move(g)); });
@@ -142,7 +139,6 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
   // The L2 estimator. A construction failure (bad config, missing vendored kernel) is
   // fatal — the pipeline has no useful output without it — so surface it as a clear
   // exception rather than running a half-wired pipeline.
-  const auto calib = calibrationFromConfig(cfg_.sensors);
   try {
     frontend_ = makeFrontEnd(cfg_.frontend, calib, sink_.get(), /*deterministic=*/sync_mode_);
   } catch (const std::exception& e) {
@@ -664,19 +660,24 @@ void MeridianPipeline::emit_group(MeasureGroup&& g) {
     const ProcessedCamera cam = camera_preprocessor_->process(*g.image);
     sink_->scalar("preprocess/camera_pyramid_levels",
                   static_cast<double>(cam.pyramid.size()), g.image->stamp);
-    // The pyramid's base level is what the visual front-end will consume; surface it
-    // so the operator sees the camera path's output, not just a level count.
-    if (!cam.intensity.empty() && cam.intensity.isContinuous() &&
-        cam.intensity.type() == CV_8UC1 &&
-        sink_->enabled("preprocess/camera_intensity")) {
+    // Surface both the decoded original and its undistorted form so the rectification can
+    // be watched side by side. This is an inspection path; the front-end is fed the raw
+    // group image, not this processed buffer.
+    const auto publish_mono = [&](const char* key, const cv::Mat& img) {
+      if (img.empty() || !img.isContinuous() || img.type() != CV_8UC1 ||
+          !sink_->enabled(key)) {
+        return;
+      }
       ImageOverlay ov;
       ov.frame = Frame::CamLink;
-      ov.width = cam.intensity.cols;
-      ov.height = cam.intensity.rows;
+      ov.width = img.cols;
+      ov.height = img.rows;
       ov.encoding = ImageOverlay::Encoding::Mono8;
-      ov.base = std::span<const std::uint8_t>(cam.intensity.data, cam.intensity.total());
-      sink_->image("preprocess/camera_intensity", ov, g.image->stamp);
-    }
+      ov.base = std::span<const std::uint8_t>(img.data, img.total());
+      sink_->image(key, ov, g.image->stamp);
+    };
+    publish_mono("preprocess/camera_raw", cam.intensity_raw);
+    publish_mono("preprocess/camera_intensity", cam.intensity);
   }
 
   PreprocessedGroup pg{std::move(g), std::move(deskewed),

@@ -114,6 +114,25 @@ for f in gt-nc-quad-easy gt-nc-quad-hard gt-nc-math-medium gt-nc-park; do
 done
 ```
 
+**Camera-included quad-easy bag.** The benchmark bags above keep only LiDAR + IMU
+(the camera was dropped at conversion since the visual stage was off). To exercise the
+camera path (L1 undistortion, image telemetry) regenerate a bag that also carries cam0
+straight from the ROS1 source — `--include-topic` does the topic filtering in one pass,
+no post-conversion script:
+
+```bash
+cd ~/Meridian/bags/newer-college
+rosbags-convert --src ros1/2021-07-01-10-37-38-quad-easy.bag --dst quad-easy-cam \
+  --src-typestore ros1_noetic --dst-typestore ros2_humble --dst-version 5 \
+  --include-topic /os_cloud_node/points /alphasense_driver_ros/imu \
+                  /alphasense_driver_ros/cam0/compressed
+```
+
+The other three cams (`cam{1,3,4}`) are available the same way; cam0 is the one the
+config points at. View both feeds live: `replay_runner <config> bags/newer-college/quad-easy-cam
+<out>.tum 0 --realtime 1 --viz` then open `/meridian/image/preprocess_camera_{raw,intensity}`
+in Foxglove.
+
 ## 4. Configs (committed)
 
 One config per collection — the camera was recalibrated between collections
