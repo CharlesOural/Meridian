@@ -5,9 +5,6 @@
 find_package(Eigen3 3.4 REQUIRED NO_MODULE)    # -> Eigen3::Eigen
 find_package(Sophus REQUIRED)                   # -> Sophus::Sophus (header-only, needs Eigen)
 
-if(MERIDIAN_NEED_CERES)
-  find_package(Ceres 2.1 REQUIRED)              # -> Ceres::ceres
-endif()
 if(MERIDIAN_NEED_OPENCV)
   find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc video calib3d)
 endif()

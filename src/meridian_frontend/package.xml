@@ -3,7 +3,7 @@
 <package format="3">
   <name>meridian_frontend</name>
   <version>0.0.0</version>
-  <description>L2 front-end: the continuous-time LIVO+GNSS estimator behind IFrontEnd.</description>
+  <description>L2 front-end: the discrete LiDAR-inertial odometry behind IFrontEnd.</description>
   <maintainer email="dev@meridian.local">Meridian</maintainer>
   <license>Proprietary</license>
 
@@ -14,10 +14,7 @@
   <depend>meridian_config</depend>
   <depend>meridian_debug</depend>
   <depend>meridian_calib</depend>
-  <depend>meridian_preprocess</depend>
   <depend>eigen</depend>
-  <depend>libceres-dev</depend>
-  <depend>libpcl-all-dev</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 
