@@ -145,6 +145,23 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
   // layers agree on the extrinsics until a refinement publishes a new set.
   if (cfg_.backend.enable) {
     backend_ = makeBackEnd(cfg_.backend, calib, sink_.get(), /*deterministic=*/sync_mode_);
+    // L5 loop detector, driven on the back-end path. It reads corrected poses and the
+    // odometry-chain covariance through read-only callbacks so it never links the back-end.
+    if (cfg_.place.enable) {
+      store_ = std::make_shared<KeyframeStore>();
+      IBackEnd* be = backend_.get();
+      pose_source_.pose = [be](std::uint64_t id) { return be->pose_of(id); };
+      pose_source_.chain_cov = [be](std::uint64_t a, std::uint64_t b) {
+        return be->chain_cov_between(a, b);
+      };
+      pose_source_.stamp = [this](std::uint64_t id) -> std::optional<Timestamp> {
+        const auto it = kf_stamps_.find(id);
+        if (it == kf_stamps_.end()) return std::nullopt;
+        return it->second;
+      };
+      loop_detector_ =
+          makeLoopDetector(cfg_.place, store_, pose_source_, /*deterministic=*/sync_mode_);
+    }
   }
 }
 
@@ -345,6 +362,15 @@ void MeridianPipeline::feed_backend(BackendItem&& item) {
       const GraphUpdate gu = backend_->optimize();
       staged_since_opt_ = 0;
       publish_graph_update(gu);
+      // Offer the just-folded keyframe to the detector at its corrected pose; fold any loops
+      // immediately so even a revisit found on the final keyframe lands a correction.
+      const std::vector<LoopConstraint> loops = detect_loops();
+      for (const LoopConstraint& lc : loops) feed_backend(BackendItem{lc});
+      if (!loops.empty()) {
+        const GraphUpdate lu = backend_->optimize();
+        staged_since_opt_ = 0;
+        publish_graph_update(lu);
+      }
     }
     return;
   }
@@ -378,6 +404,13 @@ bool MeridianPipeline::stage_backend_item(BackendItem&& item) {
       [this](auto&& v) {
         using T = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<T, KeyframePacket>) {
+          if (loop_detector_) {
+            // Retain the cloud for the detector and record the stamp for its time gate,
+            // before the packet is moved into the back-end.
+            store_->put(v.id, v.cloud_body, v.image, v.T_ref_body);
+            kf_stamps_[v.id] = v.stamp;
+            pending_kf_for_detector_.emplace_back(v.id, v.cloud_body);
+          }
           backend_->add_keyframe(std::move(v));
         } else if constexpr (std::is_same_v<T, LoopConstraint>) {
           backend_->add_loop_constraint(v);
@@ -418,6 +451,9 @@ void MeridianPipeline::backend_loop() {
     staged = 0;
     force = false;
     last_opt = Clock::now();
+    // Detected loops re-enter through the lossless queue and fold on the next wake (an
+    // admitted loop forces it via wants_immediate_optimize).
+    for (const LoopConstraint& lc : detect_loops()) feed_backend(BackendItem{lc});
   }
   // Closed: stop() joined every producer first, so what remains is the final batch.
   while (q_backend_.try_pop(item)) {
@@ -425,6 +461,15 @@ void MeridianPipeline::backend_loop() {
     ++staged;
   }
   if (staged > 0) publish_graph_update(backend_->optimize());
+  // Final loop detection: the queue is closed, so stage detected loops directly and fold once.
+  const std::vector<LoopConstraint> final_loops = detect_loops();
+  if (!final_loops.empty()) {
+    for (const LoopConstraint& lc : final_loops) {
+      if (backend_tap_) backend_tap_(BackendItem{lc});
+      stage_backend_item(BackendItem{lc});
+    }
+    publish_graph_update(backend_->optimize());
+  }
 }
 
 void MeridianPipeline::publish_graph_update(const GraphUpdate& gu) {
@@ -441,7 +486,27 @@ void MeridianPipeline::publish_graph_update(const GraphUpdate& gu) {
     std::lock_guard<std::mutex> lock(correction_mu_);
     pending_correction_ = gu;
   }
+  // Moved keyframes stale the detector's cached submaps; drop those so the next compose
+  // reflects the corrected geometry.
+  if (loop_detector_ && !gu.moved.empty()) loop_detector_->on_graph_update(gu);
   if (graph_update_sink_) graph_update_sink_(gu);
+}
+
+std::vector<LoopConstraint> MeridianPipeline::detect_loops() {
+  std::vector<LoopConstraint> loops;
+  if (!loop_detector_) {
+    pending_kf_for_detector_.clear();
+    return loops;
+  }
+  for (auto& [id, cloud] : pending_kf_for_detector_) {
+    const std::optional<Pose> p = backend_->pose_of(id);
+    if (!p) continue;
+    loop_detector_->add_keyframe(id, cloud, *p);
+    std::vector<LoopConstraint> found = loop_detector_->detect();
+    for (LoopConstraint& lc : found) loops.push_back(std::move(lc));
+  }
+  pending_kf_for_detector_.clear();
+  return loops;
 }
 
 void MeridianPipeline::drain_pending_correction() {

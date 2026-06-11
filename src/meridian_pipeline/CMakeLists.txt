@@ -16,6 +16,7 @@ find_package(meridian_sensors REQUIRED)
 find_package(meridian_preprocess REQUIRED)
 find_package(meridian_frontend REQUIRED)
 find_package(meridian_backend REQUIRED)
+find_package(meridian_place REQUIRED)
 
 add_library(meridian_pipeline
   src/meridian_pipeline.cpp)
@@ -31,6 +32,7 @@ target_link_libraries(meridian_pipeline PUBLIC
   meridian_common::meridian_common meridian_config::meridian_config meridian_time::meridian_time meridian_debug::meridian_debug
   meridian_calib::meridian_calib meridian_sensors::meridian_sensors meridian_preprocess::meridian_preprocess
   meridian_frontend::meridian_frontend meridian_backend::meridian_backend
+  meridian_place::meridian_place
   Eigen3::Eigen Sophus::Sophus)
 
 
@@ -40,7 +42,7 @@ install(TARGETS meridian_pipeline EXPORT meridian_pipelineTargets
 ament_export_targets(meridian_pipelineTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(meridian_common meridian_config meridian_time meridian_debug
                           meridian_calib meridian_sensors meridian_preprocess
-                          meridian_frontend meridian_backend
+                          meridian_frontend meridian_backend meridian_place
                           Eigen3 Sophus)
 
 if(BUILD_TESTING)

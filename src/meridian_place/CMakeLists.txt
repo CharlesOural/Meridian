@@ -40,7 +40,9 @@ install(TARGETS meridian_place EXPORT meridian_placeTargets
         ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 
 ament_export_targets(meridian_placeTargets HAS_LIBRARY_TARGET)
-ament_export_dependencies(meridian_common meridian_config Eigen3 Sophus)
+# small_gicp is a private link dependency, but a static library propagates it as a link
+# requirement, so downstream packages must be able to resolve the imported target.
+ament_export_dependencies(meridian_common meridian_config Eigen3 Sophus small_gicp)
 
 if(BUILD_TESTING)
   include(MeridianTesting)

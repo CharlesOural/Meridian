@@ -31,7 +31,7 @@ constexpr Timestamp kMs = 1'000'000 * kNs;
 // Replay-mode pipeline (synchronous, deterministic) writing to a recording sink the
 // test holds a borrowed pointer to.
 struct Fixture {
-  Fixture() {
+  explicit Fixture(bool enable_place = false) {
     cfg.pipeline.mode = PipelineMode::Replay;
     cfg.preprocess.deskew.imu_init_count = 10;
     cfg.preprocess.lidar.point_filter_num = 1;
@@ -41,6 +41,7 @@ struct Fixture {
     // Each flushed group carries only its straddling IMU sample, so let the front-end
     // initialise from a single static sample and emit its first keyframe immediately.
     cfg.frontend.init_time_s = 0.0;
+    cfg.place.enable = enable_place;  // L5 loop detector on the back-end path
     auto sink = std::make_unique<RecordingSink>();
     rec = sink.get();
     pipeline = std::make_unique<MeridianPipeline>(cfg, std::move(sink));
@@ -214,6 +215,37 @@ TEST(MeridianPipeline, BackendTapSeesKeyframesThenAnchoredGnss) {
   // every keyframe, so the corrected trajectory is already populated between ingests.
   EXPECT_TRUE(fx.pipeline->backend_enabled());
   EXPECT_FALSE(fx.pipeline->corrected_trajectory().empty());
+}
+
+TEST(MeridianPipeline, LoopDetectorWiringRunsAndStaysDeterministic) {
+  // With L5 enabled the detector runs on the back-end driver after every keyframe fold; the
+  // short fixture produces no revisit, so it emits nothing, but the feed/detect/fold plumbing
+  // must run cleanly and remain bit-reproducible in replay.
+  const auto run = []() {
+    Fixture fx(/*enable_place=*/true);
+    const Timestamp t0 = 1'000 * kMs;
+    for (int i = 0; i < 5; ++i) fx.push_imu(t0 + i * 10 * kMs);
+    fx.push_scan(t0 + 50 * kMs);
+    fx.push_imu(t0 + 150 * kMs);
+    for (int i = 16; i < 20; ++i) fx.push_imu(t0 + i * 10 * kMs);
+    fx.push_scan(t0 + 200 * kMs);
+    fx.push_imu(t0 + 300 * kMs);
+    fx.push_scan(t0 + 350 * kMs);
+    fx.push_imu(t0 + 460 * kMs);
+    fx.push_scan(t0 + 500 * kMs);
+    fx.push_imu(t0 + 610 * kMs);
+    return fx.pipeline->corrected_trajectory();
+  };
+  const std::vector<meridian::StampedPose> a = run();
+  const std::vector<meridian::StampedPose> b = run();
+  EXPECT_FALSE(a.empty());
+  ASSERT_EQ(a.size(), b.size());
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    EXPECT_EQ(a[i].stamp, b[i].stamp);
+    EXPECT_DOUBLE_EQ(a[i].T_map_body.t.x(), b[i].T_map_body.t.x());
+    EXPECT_DOUBLE_EQ(a[i].T_map_body.t.y(), b[i].T_map_body.t.y());
+    EXPECT_DOUBLE_EQ(a[i].T_map_body.t.z(), b[i].T_map_body.t.z());
+  }
 }
 
 TEST(MeridianPipeline, DisabledBackendReportsEmptyTrajectory) {

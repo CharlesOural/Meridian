@@ -7,10 +7,13 @@
 
 #include "meridian/calib/calibration_set.hpp"
 #include "meridian/common/backend_diagnostics.hpp"
+#include <Eigen/Core>
+
 #include "meridian/common/gaussian.hpp"
 #include "meridian/common/graph_update.hpp"
 #include "meridian/common/keyframe_packet.hpp"
 #include "meridian/common/loop_constraint.hpp"
+#include "meridian/common/pose.hpp"
 #include "meridian/common/sample.hpp"
 #include "meridian/common/stamped_pose.hpp"
 #include "meridian/config/config.hpp"
@@ -44,6 +47,14 @@ public:
   // Marginal covariance of the latest keyframe pose, translation-first [rho; phi];
   // nullopt before the first optimize().
   virtual std::optional<PoseCov6> latest_pose_marginal() const = 0;
+
+  // Read-only views of the corrected estimate, supplied to L5 by the pipeline so the loop
+  // detector never links the back-end. pose_of: corrected map pose of a keyframe (nullopt if
+  // unknown). chain_cov_between: covariance of the odometry chain between two keyframes,
+  // translation-first (nullopt if either is unknown).
+  virtual std::optional<Pose> pose_of(std::uint64_t id) const = 0;
+  virtual std::optional<Eigen::Matrix<double, 6, 6>> chain_cov_between(std::uint64_t a,
+                                                                       std::uint64_t b) const = 0;
 
   // Debug snapshot: writes the current graph (pose vertices + relative edges) to a .g2o file.
   // A best-effort hook for offline inspection; failures are logged, not thrown.

@@ -56,6 +56,9 @@ public:
   BackEndDiagnostics diagnostics() const override;
   bool wants_immediate_optimize() const override;
   std::optional<PoseCov6> latest_pose_marginal() const override;
+  std::optional<Pose> pose_of(std::uint64_t id) const override;
+  std::optional<Eigen::Matrix<double, 6, 6>> chain_cov_between(std::uint64_t a,
+                                                               std::uint64_t b) const override;
   void write_g2o(const std::string& path) const override;
 
   // Test seam: appends directly to the staged batch the next optimize() folds.

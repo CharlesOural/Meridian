@@ -8,11 +8,14 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include "meridian/backend/ibackend.hpp"
 #include "meridian/common/bounded_queue.hpp"
+#include "meridian/common/cloud.hpp"
 #include "meridian/common/keyframe_packet.hpp"
 #include "meridian/common/loop_constraint.hpp"
 #include "meridian/common/measure_group.hpp"
@@ -20,6 +23,8 @@
 #include "meridian/common/preprocessed_group.hpp"
 #include "meridian/common/sample.hpp"
 #include "meridian/config/config.hpp"
+#include "meridian/place/iloop_detector.hpp"
+#include "meridian/place/keyframe_store.hpp"
 #include "meridian/sensors/raw_frames.hpp"
 
 namespace meridian {
@@ -181,6 +186,10 @@ private:
   // Applies a parked correction to the front-end. Runs strictly between ingests on the
   // front-end thread (the caller's in Replay), never from inside the keyframe sink.
   void drain_pending_correction();
+  // Offers the keyframes staged since the last fold to the loop detector (with their now
+  // corrected poses) and returns any verified loops. Runs on the back-end driver after a
+  // fold, so the poses it reads are deterministic. Empty when L5 is disabled.
+  std::vector<LoopConstraint> detect_loops();
 
   Config cfg_;
   bool sync_mode_ = false;  // Replay: process inline, no thread/queue
@@ -205,6 +214,12 @@ private:
   std::unique_ptr<Aggregator> aggregator_;
   std::unique_ptr<IFrontEnd> frontend_;
   std::unique_ptr<IBackEnd> backend_;  // null when the config disabled the back-end
+  // L5 loop detection (null when disabled). The store retains keyframe clouds for the
+  // detector; pose_source_ gives it read-only corrected poses/chain-cov so it never links
+  // the back-end. Declared after backend_ so it is destroyed first (it borrows backend_).
+  std::shared_ptr<KeyframeStore> store_;
+  std::unique_ptr<ILoopDetector> loop_detector_;
+  KeyframePoseSource pose_source_;
 
   BoundedQueue<SensorSample> q_sensors_;
   // Front-end ingest edge: sweeps + live IMU. Lossy under overload, oldest dropped, so a
@@ -230,6 +245,11 @@ private:
   // the first keyframe. Thread-confined to the front-end thread (caller's in Replay).
   std::optional<std::uint64_t> last_kf_id_;
   std::atomic<std::uint64_t> keyframe_count_{0};
+  // Keyframe stamps, for the loop detector's time-gap gate; confined to the back-end driver.
+  std::unordered_map<std::uint64_t, Timestamp> kf_stamps_;
+  // Keyframes staged into the back-end since the last fold, with their clouds, awaiting
+  // offer to the detector at corrected poses. Confined to the back-end driver.
+  std::vector<std::pair<std::uint64_t, PointCloudPtr>> pending_kf_for_detector_;
   // Items staged into the back-end since its last fold (Replay's inline driver only;
   // the Live count lives in backend_loop()).
   std::uint64_t staged_since_opt_ = 0;

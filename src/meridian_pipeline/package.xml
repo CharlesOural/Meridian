@@ -22,6 +22,7 @@
   <depend>meridian_preprocess</depend>
   <depend>meridian_frontend</depend>
   <depend>meridian_backend</depend>
+  <depend>meridian_place</depend>
   <depend>eigen</depend>
   <depend>libopencv-dev</depend>
 

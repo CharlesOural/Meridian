@@ -1077,6 +1077,18 @@ std::optional<PoseCov6> Isam2BackEnd::latest_pose_marginal() const {
   return marginal_cache_;
 }
 
+std::optional<Pose> Isam2BackEnd::pose_of(std::uint64_t id) const {
+  if (!estimate_cache_.exists(keyX(id))) {
+    return std::nullopt;
+  }
+  return from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(id)));
+}
+
+std::optional<Eigen::Matrix<double, 6, 6>> Isam2BackEnd::chain_cov_between(
+    std::uint64_t a, std::uint64_t b) const {
+  return chain_cov_.between(a, b);
+}
+
 void Isam2BackEnd::write_g2o(const std::string& path) const {
   // Export only the pose sub-graph: Pose3 vertices for every estimated keyframe plus the
   // relative (between/loop) edges. Velocity/bias/GNSS/gauge factors are not g2o-representable,
