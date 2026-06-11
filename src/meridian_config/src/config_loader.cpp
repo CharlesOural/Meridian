@@ -212,6 +212,17 @@ void load_preprocess(const YAML::Node& root, PreprocessConfig& c) {
   get(n, "point_filter_num", c.lidar.point_filter_num);
   get(n, "det_range", c.lidar.det_range);
 
+  const YAML::Node cam = n["camera"];
+  if (cam) {
+    get(cam, "photometric_calib", c.camera.photometric_calib);
+    get(cam, "vignette_map", c.camera.vignette_map);
+    get(cam, "crf_lut", c.camera.crf_lut);
+    get(cam, "ref_exposure_s", c.camera.ref_exposure_s);
+    get(cam, "ref_gain", c.camera.ref_gain);
+    get(cam, "pyramid_levels", c.camera.pyramid_levels);
+    get(cam, "rectify_balance", c.camera.rectify_balance);
+  }
+
   const YAML::Node g = n["gnss"];
   if (g) {
     get(g, "enable", c.gnss.enable);
@@ -815,6 +826,9 @@ bool Config::validate(std::string* error_out) const {
   // --- camera pyramid ---
   if (preprocess.camera.pyramid_levels < 1) {
     return fail("preprocess.camera.pyramid_levels must be >= 1");
+  }
+  if (preprocess.camera.rectify_balance < 0.0 || preprocess.camera.rectify_balance > 1.0) {
+    return fail("preprocess.camera.rectify_balance must be in [0,1]");
   }
   if (frontend.visual.levels < 1) {
     return fail("frontend.visual.levels must be >= 1");

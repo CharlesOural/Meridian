@@ -261,6 +261,27 @@ TEST(Config, SweepFloorFracOutOfRangeFails) {
   EXPECT_NE(err.find("sweep_floor_frac"), std::string::npos) << err;
 }
 
+TEST(Config, RectifyBalanceOutOfRangeFails) {
+  Config c;
+  c.preprocess.camera.rectify_balance = 1.5;
+  std::string err;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("rectify_balance"), std::string::npos) << err;
+}
+
+TEST(ConfigLoader, LoadsRectifyBalance) {
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_rectify_balance.yaml";
+  {
+    std::ofstream f(path);
+    f << "meridian:\n"
+         "  preprocess:\n"
+         "    camera: { rectify_balance: 0.75, pyramid_levels: 2 }\n";
+  }
+  const Config c = load_config_yaml(path);
+  EXPECT_DOUBLE_EQ(c.preprocess.camera.rectify_balance, 0.75);
+  EXPECT_EQ(c.preprocess.camera.pyramid_levels, 2);
+}
+
 TEST(Config, SurfMaxPtsZeroFails) {
   Config c;
   c.preprocess.lidar.surf_max_pts = 0;

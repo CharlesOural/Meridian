@@ -1,5 +1,8 @@
 #include "meridian/preprocess/camera_preprocess.hpp"
 
+#include <algorithm>
+
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "meridian/debug/log.hpp"
@@ -14,7 +17,50 @@ constexpr const char* kLogModule = "preprocess.camera";
 CameraPreprocessor::CameraPreprocessor(const PreprocCamera& cfg,
                                        const IntrinsicsCamera& intrinsics,
                                        TelemetrySink* telemetry)
-    : cfg_(cfg), intrinsics_(intrinsics), telemetry_(telemetry) {}
+    : cfg_(cfg), intrinsics_(intrinsics), telemetry_(telemetry) {
+  buildRectifyMap();
+}
+
+void CameraPreprocessor::buildRectifyMap() {
+  // Default: no rectification, so the rectified intrinsics equal the source intrinsics.
+  rectified_ = intrinsics_;
+  rectify_valid_ = false;
+
+  const int w = intrinsics_.width;
+  const int h = intrinsics_.height;
+  if (w <= 0 || h <= 0 || intrinsics_.model == IntrinsicsCamera::Distortion::None) {
+    return;
+  }
+
+  const cv::Matx33d K(intrinsics_.fx, 0.0, intrinsics_.cx, 0.0, intrinsics_.fy,
+                      intrinsics_.cy, 0.0, 0.0, 1.0);
+  const cv::Size sz(w, h);
+  const double balance = std::clamp(cfg_.rectify_balance, 0.0, 1.0);
+  cv::Mat new_K;
+
+  if (intrinsics_.model == IntrinsicsCamera::Distortion::Equidistant) {
+    const cv::Vec4d D(intrinsics_.coeffs[0], intrinsics_.coeffs[1], intrinsics_.coeffs[2],
+                      intrinsics_.coeffs[3]);
+    cv::fisheye::estimateNewCameraMatrixForUndistortRectify(K, D, sz, cv::Matx33d::eye(),
+                                                            new_K, balance, sz);
+    cv::fisheye::initUndistortRectifyMap(K, D, cv::Matx33d::eye(), new_K, sz, CV_16SC2,
+                                         map1_, map2_);
+  } else {
+    // RadTan / plumb-bob: alpha plays the same crop-vs-keep role balance does for fisheye.
+    const cv::Mat D = (cv::Mat_<double>(1, 5) << intrinsics_.coeffs[0], intrinsics_.coeffs[1],
+                       intrinsics_.coeffs[2], intrinsics_.coeffs[3], intrinsics_.coeffs[4]);
+    new_K = cv::getOptimalNewCameraMatrix(K, D, sz, balance, sz);
+    cv::initUndistortRectifyMap(K, D, cv::Mat(), new_K, sz, CV_16SC2, map1_, map2_);
+  }
+
+  rectified_.model = IntrinsicsCamera::Distortion::None;
+  rectified_.coeffs = {0, 0, 0, 0, 0};
+  rectified_.fx = new_K.at<double>(0, 0);
+  rectified_.fy = new_K.at<double>(1, 1);
+  rectified_.cx = new_K.at<double>(0, 2);
+  rectified_.cy = new_K.at<double>(1, 2);
+  rectify_valid_ = true;
+}
 
 void CameraPreprocessor::decode(const CameraFrame& frame, cv::Mat* intensity,
                                 cv::Mat* colour) const {
@@ -76,10 +122,13 @@ void CameraPreprocessor::photometric(const CameraFrame& frame, cv::Mat* intensit
 }
 
 cv::Mat CameraPreprocessor::rectify(const cv::Mat& img) const {
-  // Geometric rectification requires a per-camera undistort-rectify map built from
-  // IntrinsicsCamera; that map is not wired here, so this is an identity seam that
-  // returns the input unchanged rather than applying an unbuilt transform.
-  return img;
+  if (!rectify_valid_ || img.empty()) return img;
+  // The map is sized to the configured intrinsics; a frame of a different size cannot be
+  // remapped by it, so pass it through rather than warp against a mismatched grid.
+  if (img.cols != map1_.cols || img.rows != map1_.rows) return img;
+  cv::Mat out;
+  cv::remap(img, out, map1_, map2_, cv::INTER_LINEAR);
+  return out;
 }
 
 std::vector<cv::Mat> CameraPreprocessor::buildPyramid(const cv::Mat& intensity) const {
@@ -105,6 +154,20 @@ ProcessedCamera CameraPreprocessor::process(const CameraFrame& frame) const {
   cv::Mat colour;
   decode(frame, &intensity, &colour);
 
+  // The decoded, un-rectified intensity is the "original" feed surfaced for inspection.
+  // Clone so the in-place photometric scaling below cannot reach back into it.
+  out.intensity_raw = intensity.empty() ? cv::Mat() : intensity.clone();
+
+  // The remap is sized to the configured intrinsics; a frame at any other resolution
+  // stays distorted (rectify() passes it through), so it keeps its source intrinsics
+  // rather than being mislabeled with the rectified pinhole K.
+  const bool size_ok = !intensity.empty() && intensity.cols == intrinsics_.width &&
+                       intensity.rows == intrinsics_.height;
+  if (rectify_valid_ && !intensity.empty() && !size_ok && !warned_size_mismatch_) {
+    MERIDIAN_WARN(kLogModule, "event", "camera/rectify_size_mismatch", "stamp", frame.stamp);
+    warned_size_mismatch_ = true;
+  }
+
   bool applied = false;
   bool exposure_known = false;
   if (!intensity.empty()) {
@@ -117,6 +180,7 @@ ProcessedCamera CameraPreprocessor::process(const CameraFrame& frame) const {
 
   out.intensity = intensity;
   out.colour = colour;
+  out.rectified = (rectify_valid_ && size_ok) ? rectified_ : intrinsics_;
   out.photometric_calibrated = applied;
   out.exposure_known = exposure_known;
   out.pyramid = intensity.empty() ? std::vector<cv::Mat>{} : buildPyramid(intensity);

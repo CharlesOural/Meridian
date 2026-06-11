@@ -158,3 +158,9 @@ rows below.
 | `place.cov_lambda` (loop covariance regulariser) | 0.1 | loop-factor softness. quad-easy barely drifts, so a stiff loop (tight cov from fitness≈1) adds cm-level noise to an already-accurate chain; a large λ keeps loops gentle here while a drifting sequence still accumulates correction through the chain. |
 | `kMapCloudFoldPeriod` (meridian_pipeline.cpp) | 10 | assembled `map/cloud` rebuild cadence: re-composes all keyframe clouds at corrected poses every N folds (forced on a loop fold so the de-warp shows instantly). Rebuild is O(total points); lower = fresher map, more cost. Viz-only — the assembled cloud feeds no estimator decision. |
 | `kMapCloudVoxel` (meridian_pipeline.cpp) | 0.3 m | voxel pitch the assembled `map/cloud` is collapsed to (first return per cell wins). Bounds the published cloud size as the trajectory grows; smaller = denser map, larger payload. Viz-only. |
+
+## L1 camera preprocessing (preprocess.camera.*)
+
+| key | value | trade/effect |
+|---|---|---|
+| `preprocess.camera.rectify_balance` (newer-college-quad.yaml) | 0.0 | fisheye→pinhole undistort framing. 0 crops the rectified image to the all-valid region (no black border, drops peripheral field of view) → cleanest input for direct photometric matching; 1 keeps the full field of view (black corners, heavier edge stretch). Feeds OpenCV's new-camera-matrix estimate (`balance` for equidistant, `alpha` for radtan), which sets the rectified focal length. |

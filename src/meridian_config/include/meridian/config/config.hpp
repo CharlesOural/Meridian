@@ -230,6 +230,11 @@ struct PreprocCamera {
   double ref_exposure_s = 0.01;
   double ref_gain = 1.0;
   int pyramid_levels = 3;
+  // Undistort-rectify framing in [0,1]: 0 crops the rectified image to the region with
+  // only valid pixels (no black border, some peripheral field of view lost); 1 keeps the
+  // full field of view (black corners, stronger edge stretch). It is the balance (fisheye)
+  // / alpha (radtan) the rectify map is built with.
+  double rectify_balance = 0.0;
 };
 struct PreprocImu {
   NoiseSource noise_source = NoiseSource::Allan;
