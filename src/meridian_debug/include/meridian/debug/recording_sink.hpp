@@ -46,6 +46,8 @@ class RecordingSink final : public TelemetrySink {
     std::string ns;
     std::int32_t id;
     Timestamp t;
+    Marker::Type type = Marker::Type::LineList;
+    std::size_t n_points = 0;
   };
   struct ImageRec {
     std::string key;
@@ -80,7 +82,7 @@ class RecordingSink final : public TelemetrySink {
     push(poses, PoseRec{key, p, f, t});
   }
   void marker(const Marker& m, Timestamp t) override {
-    push(markers, MarkerRec{m.ns, m.id, t});
+    push(markers, MarkerRec{m.ns, m.id, t, m.type, m.points.size()});
   }
   void image(const char* key, const ImageOverlay& ov, Timestamp t) override {
     push(images, ImageRec{key, ov.patches.size(), t});

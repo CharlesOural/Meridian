@@ -24,6 +24,7 @@
 
 #include "gauge_damping_factor.hpp"
 #include "gnc_consolidation.hpp"
+#include "graph_markers.hpp"
 #include "gnss_factor.hpp"
 #include "gnss_factor_refined.hpp"
 #include "gtsam_adapter.hpp"
@@ -869,6 +870,8 @@ GraphUpdate Isam2BackEnd::optimize() {
     sink_->pose(kTeleMapKeyframe, X_last, Frame::Map, ts);
   }
 
+  publish_graph_markers(ts);
+
   diag_.num_keyframes = kf_order_.size();
   diag_.chi2 = result.errorAfter ? *result.errorAfter : 0.0;
   diag_.variables_relinearized = static_cast<int>(result.variablesRelinearized);
@@ -1087,6 +1090,29 @@ std::optional<Pose> Isam2BackEnd::pose_of(std::uint64_t id) const {
 std::optional<Eigen::Matrix<double, 6, 6>> Isam2BackEnd::chain_cov_between(
     std::uint64_t a, std::uint64_t b) const {
   return chain_cov_.between(a, b);
+}
+
+void Isam2BackEnd::publish_graph_markers(Timestamp ts) const {
+  if (!sink_->enabled("backend/graph_nodes") && !sink_->enabled("backend/graph_edges")) return;
+  // Same traversal as write_g2o: keyframe pose vertices + the relative (between/loop) edges.
+  std::vector<std::pair<std::uint64_t, Pose>> nodes;
+  nodes.reserve(kf_order_.size());
+  for (const std::uint64_t id : kf_order_) {
+    if (estimate_cache_.exists(keyX(id))) {
+      nodes.emplace_back(id, from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(id))));
+    }
+  }
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> edges;
+  for (const auto& f : isam2_->getFactorsUnsafe()) {
+    const auto bf = boost::dynamic_pointer_cast<gtsam::BetweenFactor<gtsam::Pose3>>(f);
+    if (!bf) continue;
+    const gtsam::Symbol s1(bf->key1());
+    const gtsam::Symbol s2(bf->key2());
+    if (s1.chr() == 'x' && s2.chr() == 'x') {
+      edges.emplace_back(s1.index(), s2.index());
+    }
+  }
+  emitGraphMarkers(sink_, nodes, edges, ts);
 }
 
 void Isam2BackEnd::write_g2o(const std::string& path) const {

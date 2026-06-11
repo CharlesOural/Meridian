@@ -66,6 +66,8 @@ public:
 
 private:
   std::unique_ptr<gtsam::ISAM2> make_isam2(bool use_qr) const;
+  // Publishes the pose graph (keyframe vertices + relative edges) as live markers.
+  void publish_graph_markers(Timestamp ts) const;
   // Folds the staged batch into isam2_, recovering from an indeterminate linear system
   // by rebuilding on QR; returns false if the batch had to be abandoned. constrained, when
   // present, fixes the elimination grouping for the bridge-clearing update (group 0 keys
