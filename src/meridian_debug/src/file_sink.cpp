@@ -20,12 +20,14 @@ FileSink::~FileSink() {
 bool FileSink::enabled(const char*) const { return true; }
 
 void FileSink::scalar(const char* key, double v, Timestamp t) {
+  const std::lock_guard<std::mutex> lock(mu_);
   stamp(tm_, t);
   tm_ << "key: " << key << "\nvalues:\n- " << v << "\naxis_order: ''\n---\n";
 }
 
 void FileSink::vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v, Timestamp t,
                    const char* axis_order) {
+  const std::lock_guard<std::mutex> lock(mu_);
   stamp(tm_, t);
   tm_ << "key: " << key << "\nvalues:\n";
   for (Eigen::Index i = 0; i < v.size(); ++i) {
@@ -40,6 +42,7 @@ void FileSink::marker(const Marker&, Timestamp) {}
 void FileSink::image(const char*, const ImageOverlay&, Timestamp) {}
 
 void FileSink::timing(const char* stage, double ms, Timestamp) {
+  const std::lock_guard<std::mutex> lock(mu_);
   auto& s = stages_[stage];
   s.sum += ms;
   s.maxv = std::max(s.maxv, ms);
@@ -48,6 +51,7 @@ void FileSink::timing(const char* stage, double ms, Timestamp) {
 }
 
 void FileSink::event(Level lvl, const char* tag, std::string_view msg, Timestamp t) {
+  const std::lock_guard<std::mutex> lock(mu_);
   stamp(ev_, t);
   ev_ << "level: " << static_cast<int>(lvl) << "\ntag: " << tag << "\nmessage: " << msg
       << "\n---\n";

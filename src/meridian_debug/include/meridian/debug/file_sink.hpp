@@ -4,6 +4,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -45,6 +46,10 @@ class FileSink final : public TelemetrySink {
     std::uint64_t n = 0;
   };
   static void stamp(std::ofstream& o, Timestamp t);
+  // The live (threaded) path calls a sink from the stage/front-end/back-end threads at
+  // once; this serializes the stream writes and the stage map so they don't interleave or
+  // race. Uncontended on the synchronous replay path (one caller thread).
+  std::mutex mu_;
   std::ofstream ev_, tm_;
   std::string stage_path_;
   std::map<std::string, Stat> stages_;

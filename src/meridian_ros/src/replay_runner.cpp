@@ -8,14 +8,27 @@
 // an A/B difference is attributable to the config alone. It also runs at CPU
 // speed instead of bag-clock speed.
 //
+// --realtime drives the pipeline in Live mode instead: the front-end, back-end,
+// and loop detector run on their own threads, and bag ingest is paced to
+// bag-clock time. This is NOT bit-deterministic (thread scheduling), but it is
+// what you want for watching loop closure: the detector's work no longer
+// serializes onto the front-end thread, so it cannot perturb the front-end's
+// solve timing -- the divergence that synchronous replay suffers when the
+// detector is enabled. Use sync replay for the bit-exact baseline, --realtime
+// to view the live behaviour.
+//
 // Usage:
 //   replay_runner <config.yaml> <bag_dir> <out.tum> [max_content_secs]
 //                 [--dump-keyframes <packets.bin>] [--dump-clouds] [--no-backend]
+//                 [--viz] [--realtime [speed]]
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialization.hpp>
@@ -59,7 +72,7 @@ int usage() {
   std::fprintf(stderr,
                "usage: replay_runner <config.yaml> <bag_dir> <out.tum> [max_content_secs]\n"
                "                     [--dump-keyframes <packets.bin>] [--dump-clouds]\n"
-               "                     [--no-backend]\n");
+               "                     [--no-backend] [--viz] [--realtime [speed]]\n");
   return 2;
 }
 
@@ -80,6 +93,8 @@ int main(int argc, char** argv) {
   bool dump_clouds = false;
   bool no_backend = false;
   bool viz = false;
+  bool realtime = false;
+  double speed = 1.0;
   int arg = 4;
   if (arg < argc && std::string_view(argv[arg]).substr(0, 2) != "--") {
     max_secs = std::stod(argv[arg++]);
@@ -94,9 +109,19 @@ int main(int argc, char** argv) {
       no_backend = true;
     } else if (a == "--viz") {
       viz = true;
+    } else if (a == "--realtime") {
+      realtime = true;
+      // Optional playback-speed multiplier follows the flag (e.g. "--realtime 3" = 3x).
+      if (arg + 1 < argc && std::string_view(argv[arg + 1]).substr(0, 2) != "--") {
+        speed = std::stod(argv[++arg]);
+      }
     } else {
       return usage();
     }
+  }
+  if (speed <= 0.0) {
+    std::fprintf(stderr, "error: --realtime speed must be > 0\n");
+    return usage();
   }
   if (dump_clouds && dump_path.empty()) {
     std::fprintf(stderr, "error: --dump-clouds requires --dump-keyframes\n");
@@ -104,7 +129,9 @@ int main(int argc, char** argv) {
   }
 
   Config cfg = load_config_yaml(config_path);
-  cfg.pipeline.mode = PipelineMode::Replay;  // synchronous + deterministic, regardless of file
+  // Replay: one thread, synchronous, bit-deterministic. --realtime: Live mode, so the
+  // back-end and loop detector run off the front-end thread (paced to bag time below).
+  cfg.pipeline.mode = realtime ? PipelineMode::Live : PipelineMode::Replay;
   if (no_backend) {
     cfg.backend.enable = false;  // A/B switch: same bag, front-end only
   }
@@ -149,9 +176,22 @@ int main(int argc, char** argv) {
     sink = make_file_sink(stem);
   }
   MeridianPipeline pipeline(cfg, std::move(sink));
+  // T_map_odom is written by the back-end thread; the group sink (front-end thread under
+  // --realtime) reads it for the map->odom TF. The graph-update sink runs on the back-end
+  // thread right after the fold, so it snapshots the correction under a lock for the reader.
+  struct {
+    std::mutex mu;
+    meridian::Pose pose;
+  } map_odom_shared;
+  pipeline.set_graph_update_sink([&](const GraphUpdate&) {
+    const meridian::Pose mo = pipeline.map_odom();
+    const std::lock_guard<std::mutex> lock(map_odom_shared.mu);
+    map_odom_shared.pose = mo;
+  });
   std::uint64_t groups = 0;
   pipeline.set_group_sink([&](PreprocessedGroup&&) {
-    // Replay runs the group sink on this thread, where live_state() is valid.
+    // Sync replay runs this on the caller thread; --realtime runs it on the front-end
+    // thread. Either way live_state() is the front-end's own, valid here.
     const NavState s = pipeline.live_state();
     if (s.stamp <= 0) {
       return;  // pre-init groups carry a zero state; a t=0 pose would poison analysis
@@ -169,11 +209,16 @@ int main(int argc, char** argv) {
         tf.transform.rotation.z = T.q.z();
       };
       // map->odom: the back-end correction, jumping when a loop folds.
+      meridian::Pose map_odom;
+      {
+        const std::lock_guard<std::mutex> lock(map_odom_shared.mu);
+        map_odom = map_odom_shared.pose;
+      }
       geometry_msgs::msg::TransformStamped mo;
       mo.header.stamp = stamp;
       mo.header.frame_id = "map";
       mo.child_frame_id = "odom";
-      fill(mo, pipeline.map_odom());
+      fill(mo, map_odom);
       // odom->body: the live front-end estimate.
       geometry_msgs::msg::TransformStamped ob;
       ob.header.stamp = stamp;
@@ -210,7 +255,10 @@ int main(int argc, char** argv) {
           item);
     });
   }
-  pipeline.start();  // no-op in replay; keeps the call sequence identical to live
+  if (realtime) {
+    std::fprintf(stderr, "  --realtime: Live mode, threaded, paced to bag clock at %.2gx\n", speed);
+  }
+  pipeline.start();  // no-op in replay; spawns the front-end/back-end threads in Live mode
 
   rosbag2_cpp::readers::SequentialReader reader;
   reader.open({bag_path, "sqlite3"}, {"cdr", "cdr"});
@@ -223,15 +271,26 @@ int main(int argc, char** argv) {
 
   std::vector<RawPoint> scratch;
   std::int64_t t_first = -1;
+  std::chrono::steady_clock::time_point wall_first;
   std::uint64_t n_msgs = 0;
   while (reader.has_next()) {
     auto bag_msg = reader.read_next();
     const auto recv_ns = static_cast<Timestamp>(bag_msg->time_stamp);
     if (t_first < 0) {
       t_first = bag_msg->time_stamp;
+      wall_first = std::chrono::steady_clock::now();
     }
     if (max_secs > 0.0 && (bag_msg->time_stamp - t_first) * 1e-9 > max_secs) {
       break;
+    }
+    // --realtime: hold each message until its bag-clock offset (scaled by speed) has
+    // elapsed in wall time, so the Live-mode threads see traffic at the real rate and the
+    // lossy live queues are not overrun by a CPU-speed firehose.
+    if (realtime) {
+      const double bag_dt_s = static_cast<double>(bag_msg->time_stamp - t_first) * 1e-9 / speed;
+      const auto target = wall_first + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                           std::chrono::duration<double>(bag_dt_s));
+      std::this_thread::sleep_until(target);
     }
     ++n_msgs;
     const std::string& topic = bag_msg->topic_name;
