@@ -506,7 +506,14 @@ struct MapConfig {
 // ---- place (L5) ----
 struct PlaceConfig {
   PlaceKind kind = PlaceKind::ScanContextPp;
+  bool enable = false;  // L5 master switch; off => the pipeline builds no detector
   bool pcm = true;
+  // submap accumulator (geometry granularity for retrieval + GICP)
+  int submap_window = 5;       // last-N keyframes composed into the anchor frame
+  double submap_voxel = 0.25;  // [m] downsample edge after composition
+  int submap_cache = 32;       // anchor-keyed LRU size
+  bool gicp_source_submap = false;  // GICP source is the anchor submap (else its single cloud)
+  double cov_psd_floor = 1e-9;      // floor added to the emitted loop covariance diagonal
   // cadence / gating
   int detect_period_kf = 1;
   double min_time_gap = 30.0;  // [s]

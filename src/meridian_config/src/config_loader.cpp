@@ -419,9 +419,47 @@ void load_place(const YAML::Node& root, PlaceConfig& c) {
     c.kind = parse_enum<PlaceKind>(n["kind"], "place.kind",
                                    {{"scan_context_pp", PlaceKind::ScanContextPp}});
   }
+  get(n, "enable", c.enable);
   get(n, "pcm", c.pcm);
+  // submap accumulator
+  get(n, "submap_window", c.submap_window);
+  get(n, "submap_voxel", c.submap_voxel);
+  get(n, "submap_cache", c.submap_cache);
+  get(n, "gicp_source_submap", c.gicp_source_submap);
+  get(n, "cov_psd_floor", c.cov_psd_floor);
+  // cadence / gating
+  get(n, "detect_period_kf", c.detect_period_kf);
+  get(n, "min_time_gap", c.min_time_gap);
+  get(n, "min_kf_gap", c.min_kf_gap);
+  get(n, "cooldown_kf", c.cooldown_kf);
+  // Scan Context++
+  get(n, "sc_Nr", c.sc_Nr);
+  get(n, "sc_Ns", c.sc_Ns);
+  get(n, "sc_rmax", c.sc_rmax);
+  get(n, "sc_knn", c.sc_knn);
+  get(n, "sc_dist_thresh", c.sc_dist_thresh);
+  get(n, "sc_max_xy", c.sc_max_xy);
+  get(n, "sc_yaw_search_band", c.sc_yaw_search_band);
+  get(n, "sc_topK", c.sc_topK);
+  // GICP / small_gicp
+  get(n, "gicp_downsample", c.gicp_downsample);
+  get(n, "gicp_max_corr_dist", c.gicp_max_corr_dist);
+  get(n, "gicp_num_threads", c.gicp_num_threads);
+  get(n, "gicp_voxel_res", c.gicp_voxel_res);
+  get(n, "gicp_fitness_min", c.gicp_fitness_min);
+  get(n, "gicp_overlap_min", c.gicp_overlap_min);
+  get(n, "gicp_rmse_max", c.gicp_rmse_max);
+  get(n, "gicp_cond_max", c.gicp_cond_max);
+  get(n, "gicp_fit_sigma", c.gicp_fit_sigma);
   // The top-level YAML key gicp_fitness_max is the loose RMSE accept band.
   get(n, "gicp_fitness_max", c.gicp_rmse_max);
+  // PCM
+  get(n, "pcm_chi2_conf", c.pcm_chi2_conf);
+  get(n, "pcm_maxclique_ms", c.pcm_maxclique_ms);
+  // covariance shaping
+  get(n, "cov_lambda", c.cov_lambda);
+  get(n, "cov_degenerate_eig", c.cov_degenerate_eig);
+  get(n, "cov_degenerate_mult", c.cov_degenerate_mult);
 }
 
 void load_debug(const YAML::Node& root, DebugConfig& c) {
@@ -644,6 +682,44 @@ bool Config::validate(std::string* error_out) const {
   }
   if (backend.pcm_max_nodes < 1) {
     return fail("backend.pcm_max_nodes must be >= 1");
+  }
+
+  // --- place (L5) ---
+  if (place.sc_Nr < 1 || place.sc_Ns < 1) {
+    return fail("place.sc_Nr / place.sc_Ns must be >= 1");
+  }
+  if (place.sc_rmax <= 0.0) {
+    return fail("place.sc_rmax must be > 0");
+  }
+  if (place.submap_window < 1) {
+    return fail("place.submap_window must be >= 1");
+  }
+  if (place.submap_voxel <= 0.0) {
+    return fail("place.submap_voxel must be > 0");
+  }
+  if (place.submap_cache < 1) {
+    return fail("place.submap_cache must be >= 1");
+  }
+  if (place.detect_period_kf < 1) {
+    return fail("place.detect_period_kf must be >= 1");
+  }
+  if (place.gicp_num_threads < 1) {
+    return fail("place.gicp_num_threads must be >= 1");
+  }
+  if (place.gicp_fitness_min <= 0.0 || place.gicp_fitness_min > 1.0) {
+    return fail("place.gicp_fitness_min must be in (0, 1]");
+  }
+  if (place.gicp_overlap_min < 0.0 || place.gicp_overlap_min > 1.0) {
+    return fail("place.gicp_overlap_min must be in [0, 1]");
+  }
+  if (place.pcm_chi2_conf <= 0.0 || place.pcm_chi2_conf >= 1.0) {
+    return fail("place.pcm_chi2_conf must be in (0, 1)");
+  }
+  // The L5 single-loop self-test and the L3 cross-loop clique must judge consistency on
+  // the same chi-square scale, or a loop the detector trusts gets re-rejected (or vice
+  // versa) at the back-end boundary.
+  if (place.pcm_chi2_conf != backend.pcm_chi2_alpha) {
+    return fail("place.pcm_chi2_conf must equal backend.pcm_chi2_alpha");
   }
   if (backend.loop_huber_k <= 0.0 || backend.gnss_huber_k <= 0.0) {
     return fail("backend.{loop,gnss}_huber_k must be > 0");
