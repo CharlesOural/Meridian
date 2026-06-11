@@ -40,6 +40,40 @@ Visualization Manager:
       Size (m): 0.03
       Style: Points
       Use rainbow: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: SplinePath
+      Topic:
+        Value: /meridian/path
+        Depth: 1
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Line Style: Lines
+      Color: 255; 255; 255
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: false
+      Name: AssocOutliers
+      Topic:
+        Value: /meridian/cloud_outliers
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Color Transformer: FlatColor
+      Color: 255; 60; 60
+      Size (m): 0.05
+      Style: Points
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: false
+      Name: DeskewPre
+      Topic:
+        Value: /meridian/cloud_deskew_pre
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Color Transformer: FlatColor
+      Color: 255; 200; 60
+      Size (m): 0.03
+      Style: Points
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: MeridianMarkers

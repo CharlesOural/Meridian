@@ -112,9 +112,8 @@ TEST(ConfigLoader, RoundTripsNewKeys) {
          "    bias: { gyr_max: 0.6, acc_max: 4.0 }\n"
          "    motion_reg: { enable: false, weight: 5.0e-3, excitation_floor: 0.2 }\n"
          "    spline:\n"
-         "      knot_omega_thresh: [0.5, 1.0, 2.0]\n"
-         "      knot_accel_thresh: [1.0, 3.0]\n"
-         "      knot_density_hysteresis: 0.2\n"
+         "      knot_dt_ms: 50\n"
+         "      window_knots: 16\n"
          "    lidar: { max_lidar_factors: 2000, min_factors_per_normal: 40, normal_strata: 6 }\n";
   }
 
@@ -151,10 +150,8 @@ TEST(ConfigLoader, RoundTripsNewKeys) {
   EXPECT_FALSE(c.frontend.motion_reg.enable);
   EXPECT_DOUBLE_EQ(c.frontend.motion_reg.weight, 5.0e-3);
   EXPECT_DOUBLE_EQ(c.frontend.motion_reg.excitation_floor, 0.2);
-  ASSERT_EQ(c.frontend.spline.knot_omega_thresh.size(), 3u);
-  EXPECT_DOUBLE_EQ(c.frontend.spline.knot_omega_thresh[2], 2.0);
-  ASSERT_EQ(c.frontend.spline.knot_accel_thresh.size(), 2u);
-  EXPECT_DOUBLE_EQ(c.frontend.spline.knot_density_hysteresis, 0.2);
+  EXPECT_DOUBLE_EQ(c.frontend.spline.knot_dt_ms, 50.0);
+  EXPECT_EQ(c.frontend.spline.window_knots, 16);
   EXPECT_EQ(c.frontend.lidar.max_lidar_factors, 2000);
   EXPECT_EQ(c.frontend.lidar.min_factors_per_normal, 40);
   EXPECT_EQ(c.frontend.lidar.normal_strata, 6);
@@ -304,20 +301,203 @@ TEST(Config, StratumFloorExceedingCapFails) {
   EXPECT_NE(err.find("max_lidar_factors"), std::string::npos) << err;
 }
 
-TEST(Config, KnotThreshNonMonotoneFails) {
+TEST(Config, NcpThreshNonMonotoneFailsOnlyWhenEnabled) {
   Config c;
-  c.frontend.spline.knot_omega_thresh = {1.0, 0.5};  // decreasing
+  c.frontend.ncp.omega_thresh = {1.0, 0.5};  // decreasing
   std::string err;
+  // Disabled: the thresholds are inert, so the config stays valid.
+  EXPECT_TRUE(c.validate(&err)) << err;
+  c.frontend.ncp.enabled = true;
   EXPECT_FALSE(c.validate(&err));
-  EXPECT_NE(err.find("knot_omega_thresh"), std::string::npos) << err;
+  EXPECT_NE(err.find("omega_thresh"), std::string::npos) << err;
+
+  c = Config{};
+  c.frontend.ncp.enabled = true;
+  c.frontend.ncp.accel_thresh = {0.0, 1.0};  // non-positive edge
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("accel_thresh"), std::string::npos) << err;
 }
 
-TEST(Config, KnotHysteresisOutOfRangeFails) {
+TEST(Config, NcpHysteresisOutOfRangeFails) {
   Config c;
-  c.frontend.spline.knot_density_hysteresis = 1.0;
+  c.frontend.ncp.hysteresis = 1.0;
   std::string err;
   EXPECT_FALSE(c.validate(&err));
   EXPECT_NE(err.find("hysteresis"), std::string::npos) << err;
+}
+
+TEST(Config, NcpCapAndWarmstartBoundsFail) {
+  Config c;
+  c.frontend.ncp.n_cp_max = 0;
+  std::string err;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("n_cp_max"), std::string::npos) << err;
+
+  c = Config{};
+  c.frontend.ncp.warmstart_iters = -1;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("warmstart_iters"), std::string::npos) << err;
+}
+
+TEST(Config, GravityRefineAlwaysRejected) {
+  // The marginalization prior cannot carry a freed gravity block (no sphere-manifold
+  // tangent lift in the prior cost; the keyframe worker's prior clone would alias
+  // live gravity storage), and the prior is active once the window slides -- so the
+  // flag is rejected on its own, not just in combination with prior forgetting.
+  Config c;
+  c.frontend.gravity_refine = true;
+  std::string err;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("gravity_refine"), std::string::npos) << err;
+
+  c = Config{};
+  c.frontend.prior_forgetting.enabled = true;
+  c.frontend.gravity_refine = true;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("gravity_refine"), std::string::npos) << err;
+
+  // Prior forgetting alone stays valid.
+  c = Config{};
+  c.frontend.prior_forgetting.enabled = true;
+  EXPECT_TRUE(c.validate(&err)) << err;
+}
+
+}  // namespace
+}  // namespace meridian
+
+// ---- loader round-trips: debug groups, path aggregation, prior forgetting ----
+
+namespace meridian {
+namespace {
+
+TEST(ConfigLoader, RoundTripsDebugGroupKeys) {
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_debug_groups.yaml";
+  {
+    std::ofstream f(path);
+    f << "meridian:\n"
+         "  debug:\n"
+         "    assoc: { enable: true, max_hz: 5.0 }\n"
+         "    solver: { enable: true }\n"
+         "    deskew: { max_hz: 2.0 }\n"
+         "    spline: { enable: true, max_hz: 20.0 }\n"
+         "    map_health: { enable: false }\n"
+         "    publish_path: false\n"
+         "    path_sample_hz: 15.0\n"
+         "    path_publish_hz: 2.0\n"
+         "    path_max_poses: 1000\n";
+  }
+  const Config c = load_config_yaml(path);
+  EXPECT_TRUE(c.debug.assoc.enable);
+  EXPECT_DOUBLE_EQ(c.debug.assoc.max_hz, 5.0);
+  EXPECT_TRUE(c.debug.solver.enable);
+  EXPECT_DOUBLE_EQ(c.debug.solver.max_hz, 0.0);
+  EXPECT_FALSE(c.debug.deskew.enable);  // enable absent -> default off
+  EXPECT_DOUBLE_EQ(c.debug.deskew.max_hz, 2.0);
+  EXPECT_TRUE(c.debug.spline.enable);
+  EXPECT_DOUBLE_EQ(c.debug.spline.max_hz, 20.0);
+  EXPECT_FALSE(c.debug.map_health.enable);
+  EXPECT_FALSE(c.debug.publish_path);
+  EXPECT_DOUBLE_EQ(c.debug.path_sample_hz, 15.0);
+  EXPECT_DOUBLE_EQ(c.debug.path_publish_hz, 2.0);
+  EXPECT_EQ(c.debug.path_max_poses, 1000);
+}
+
+TEST(ConfigLoader, RoundTripsPriorForgettingKeys) {
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_prior_forgetting.yaml";
+  {
+    std::ofstream f(path);
+    f << "meridian:\n"
+         "  frontend:\n"
+         "    prior_forgetting:\n"
+         "      enabled: true\n"
+         "      use_imu_walk: false\n"
+         "      q_bias_gyr: 1.5e-9\n"
+         "      q_bias_acc: 2.5e-7\n"
+         "      q_gravity: 3.5e-11\n"
+         "      q_knot: 4.5e-5\n";
+  }
+  const Config c = load_config_yaml(path);
+  EXPECT_TRUE(c.frontend.prior_forgetting.enabled);
+  EXPECT_FALSE(c.frontend.prior_forgetting.use_imu_walk);
+  EXPECT_DOUBLE_EQ(c.frontend.prior_forgetting.q_bias_gyr, 1.5e-9);
+  EXPECT_DOUBLE_EQ(c.frontend.prior_forgetting.q_bias_acc, 2.5e-7);
+  EXPECT_DOUBLE_EQ(c.frontend.prior_forgetting.q_gravity, 3.5e-11);
+  EXPECT_DOUBLE_EQ(c.frontend.prior_forgetting.q_knot, 4.5e-5);
+}
+
+TEST(Config, PriorForgettingDefaultsOffWithImuWalk) {
+  const Config c;
+  EXPECT_FALSE(c.frontend.prior_forgetting.enabled);
+  EXPECT_TRUE(c.frontend.prior_forgetting.use_imu_walk);
+}
+
+TEST(ConfigLoader, RoundTripsNcpKeys) {
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_ncp.yaml";
+  {
+    std::ofstream f(path);
+    f << "meridian:\n"
+         "  frontend:\n"
+         "    ncp:\n"
+         "      enabled: true\n"
+         "      n_cp_max: 3\n"
+         "      omega_thresh: [0.4, 1.1, 4.0]\n"
+         "      accel_thresh: [0.6, 1.2, 6.0]\n"
+         "      hysteresis: 0.2\n"
+         "      warmstart_iters: 6\n";
+  }
+  const Config c = load_config_yaml(path);
+  EXPECT_TRUE(c.frontend.ncp.enabled);
+  EXPECT_EQ(c.frontend.ncp.n_cp_max, 3);
+  ASSERT_EQ(c.frontend.ncp.omega_thresh.size(), 3u);
+  EXPECT_DOUBLE_EQ(c.frontend.ncp.omega_thresh[0], 0.4);
+  EXPECT_DOUBLE_EQ(c.frontend.ncp.omega_thresh[2], 4.0);
+  ASSERT_EQ(c.frontend.ncp.accel_thresh.size(), 3u);
+  EXPECT_DOUBLE_EQ(c.frontend.ncp.accel_thresh[1], 1.2);
+  EXPECT_DOUBLE_EQ(c.frontend.ncp.hysteresis, 0.2);
+  EXPECT_EQ(c.frontend.ncp.warmstart_iters, 6);
+  std::string err;
+  EXPECT_TRUE(c.validate(&err)) << err;
+}
+
+TEST(Config, NcpDefaultsOffWithUnitCap) {
+  const Config c;
+  EXPECT_FALSE(c.frontend.ncp.enabled);
+  EXPECT_EQ(c.frontend.ncp.n_cp_max, 1);
+  EXPECT_EQ(c.frontend.ncp.warmstart_iters, 4);
+  ASSERT_EQ(c.frontend.ncp.omega_thresh.size(), 3u);
+  ASSERT_EQ(c.frontend.ncp.accel_thresh.size(), 3u);
+  std::string err;
+  EXPECT_TRUE(c.validate(&err)) << err;
+}
+
+TEST(Config, DebugGroupDefaultsAreOffExceptMapHealth) {
+  const Config c;
+  EXPECT_FALSE(c.debug.assoc.enable);
+  EXPECT_FALSE(c.debug.solver.enable);
+  EXPECT_FALSE(c.debug.deskew.enable);
+  EXPECT_FALSE(c.debug.spline.enable);
+  EXPECT_TRUE(c.debug.map_health.enable);  // cheap counters keep the legacy default-on
+  EXPECT_TRUE(c.debug.publish_path);
+  std::string err;
+  EXPECT_TRUE(c.validate(&err)) << err;
+}
+
+TEST(Config, DebugPathValidation) {
+  Config c;
+  c.debug.path_sample_hz = 0.0;
+  std::string err;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("path_sample_hz"), std::string::npos) << err;
+
+  c = Config{};
+  c.debug.assoc.max_hz = -1.0;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("assoc.max_hz"), std::string::npos) << err;
+
+  c = Config{};
+  c.debug.path_max_poses = 0;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("path_max_poses"), std::string::npos) << err;
 }
 
 }  // namespace

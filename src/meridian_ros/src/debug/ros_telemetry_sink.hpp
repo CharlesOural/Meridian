@@ -13,6 +13,7 @@
 #include <meridian_msgs/msg/stage_timing.hpp>
 #include <meridian_msgs/msg/telemetry.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -73,6 +74,9 @@ class RosTelemetrySink final : public TelemetrySink {
   bool pass(const std::string& key, bool heavy);
   // Default publication rate for a key class.
   double default_hz(bool heavy) const;
+  // PathAggregator: appends one solved-spline sample to the /meridian/path ring and
+  // republishes the whole path at most cfg.path_publish_hz.
+  void append_path(const Pose& p, Timestamp t);
 
   static std::string sanitize(const std::string& key);  // '/' -> '_' for topic suffixes
   static const char* unit_of(const std::string& key);
@@ -89,12 +93,18 @@ class RosTelemetrySink final : public TelemetrySink {
   rclcpp::Publisher<meridian_msgs::msg::StageTiming>::SharedPtr pub_timing_;
   rclcpp::Publisher<meridian_msgs::msg::Event>::SharedPtr pub_events_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_markers_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;  // null when publish_path off
 
   mutable std::mutex m_;
   std::unordered_map<std::string, KeyState> keys_;
   std::vector<std::pair<std::string, KeyState>> wildcards_;  // prefix (sans '*') -> state
   double default_rate_hz_;
   std::map<std::string, StageStats> stages_;
+
+  // PathAggregator state (guarded by m_): the growing nav_msgs/Path ring plus the
+  // steady-clock stamp of the last republish.
+  nav_msgs::msg::Path path_;
+  Clock::time_point path_last_pub_{};
 
   std::unordered_map<std::string, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr>
       cloud_pubs_;

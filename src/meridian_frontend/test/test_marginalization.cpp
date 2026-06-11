@@ -1,6 +1,7 @@
 #include "ct/marginalization.hpp"
 
 #include <array>
+#include <cmath>
 #include <memory>
 #include <vector>
 
@@ -517,6 +518,155 @@ TEST(Marginalization, ResidualBlockSlicingByInsertionOrder) {
                 family_ids[static_cast<std::size_t>(f)][static_cast<std::size_t>(k - begin)])
           << "insertion-order slice broken at family " << f << " element " << (k - begin);
     }
+  }
+}
+
+namespace {
+
+// Deterministic full-rank system over the kept stack [SO3 knot (4/3), r3 knot
+// (3/3), bias gyro (3/3), bias accel (3/3)] plus one dropped r3 block: identity
+// rows give every coordinate information, dense extra rows couple all blocks.
+// `zero_col` (>= 0) removes every measurement of that kept tangent coordinate,
+// making it a null direction of the marginal.
+void buildKeptBiasSystem(Eigen::MatrixXd* H, Eigen::VectorXd* b, int zero_col = -1) {
+  const int total = 15;  // 12 kept tangent coords + 3 dropped
+  Eigen::MatrixXd J(total + 6, total);
+  J.setZero();
+  J.topRows(total).setIdentity();
+  for (int r = 0; r < 6; ++r) {
+    for (int c = 0; c < total; ++c) {
+      J(total + r, c) = 0.2 * std::sin(1.0 + 0.7 * r + 0.31 * c);
+    }
+  }
+  if (zero_col >= 0) {
+    J.col(zero_col).setZero();
+  }
+  Eigen::VectorXd r(total + 6);
+  for (int i = 0; i < r.size(); ++i) {
+    r(i) = 0.05 * std::cos(0.4 * i + 0.2);
+  }
+  *H = J.transpose() * J;
+  *b = J.transpose() * r;
+}
+
+std::vector<Block> keptBiasBlocks(std::array<double, 4>& so3, Eigen::Vector3d& r3,
+                                  Eigen::Vector3d& bg, Eigen::Vector3d& ba) {
+  return {{so3.data(), 4, 3}, {r3.data(), 3, 3}, {bg.data(), 3, 3}, {ba.data(), 3, 3}};
+}
+
+// Gauss-Newton step the prior alone induces on the kept tangent: the minimizer of
+// ||J0 dx + r0||^2 (full-rank information assumed by the caller).
+Eigen::VectorXd priorGnStep(const MarginalizationPrior& prior) {
+  return -prior.information().ldlt().solve(prior.sqrtInfoJacobian().transpose() *
+                                           prior.residual0());
+}
+
+}  // namespace
+
+// Structured forgetting with q on the bias coordinates only: the prior COVARIANCE
+// obeys P' = P + diag(q) exactly -- bias diagonal grown by exactly q, knot marginal
+// covariance unchanged -- and the prior mean (its Gauss-Newton minimizer) is
+// preserved. The information matrix legitimately changes in every block through
+// the off-diagonal coupling, so the assertions are on P, not on H.
+TEST(Marginalization, StructuredForgettingInflatesBiasCovarianceOnly) {
+  Eigen::MatrixXd H;
+  Eigen::VectorXd b;
+  buildKeptBiasSystem(&H, &b);
+
+  std::array<double, 4> so3 = {0.0, 0.0, 0.0, 1.0};
+  Eigen::Vector3d r3(0.1, 0.2, 0.3), bg(0.01, -0.02, 0.005), ba(0.1, -0.05, 0.2);
+  std::vector<Block> kept = keptBiasBlocks(so3, r3, bg, ba);
+
+  const double qg = 1e-3, qa = 1e-2;
+  Eigen::VectorXd q = Eigen::VectorXd::Zero(12);
+  q.segment(6, 3).setConstant(qg);
+  q.segment(9, 3).setConstant(qa);
+
+  auto legacy = MarginalizationPrior::fromSchur(H, b, kept, 3);
+  auto forget = MarginalizationPrior::fromSchur(H, b, kept, 3, 1.0, &q);
+  ASSERT_NE(legacy, nullptr);
+  ASSERT_NE(forget, nullptr);
+
+  const Eigen::MatrixXd P0 = legacy->information().inverse();
+  const Eigen::MatrixXd P1 = forget->information().inverse();
+  const Eigen::MatrixXd dP = P1 - P0;
+
+  // Knot subspace (coords 0..5) of the covariance is untouched.
+  EXPECT_LT(dP.topLeftCorner(6, 6).cwiseAbs().maxCoeff(), 1e-12);
+  // The whole covariance change is exactly the q diagonal.
+  const Eigen::MatrixXd q_mat = Eigen::MatrixXd(q.asDiagonal());
+  EXPECT_LT((dP - q_mat).cwiseAbs().maxCoeff(), 1e-10);
+  // Bias variances strictly larger, by exactly q.
+  for (int i = 6; i < 12; ++i) {
+    EXPECT_GT(P1(i, i), P0(i, i)) << "bias coord " << i << " did not inflate";
+    EXPECT_NEAR(dP(i, i), q(i), 1e-10);
+  }
+
+  // Mean preservation: the prior's Gauss-Newton minimizer is unchanged.
+  EXPECT_LT((priorGnStep(*forget) - priorGnStep(*legacy)).cwiseAbs().maxCoeff(), 1e-10);
+}
+
+// The disabled paths execute no new arithmetic: a null q_diag and an all-zero
+// q_diag must both produce J0/r0 bit-identical to a legacy build (here with a
+// non-trivial scalar scale, so the legacy scalar path is also exercised).
+TEST(Marginalization, StructuredForgettingDisabledBitExact) {
+  Eigen::MatrixXd H;
+  Eigen::VectorXd b;
+  buildKeptBiasSystem(&H, &b);
+
+  std::array<double, 4> so3 = {0.0, 0.0, 0.0, 1.0};
+  Eigen::Vector3d r3(0.1, 0.2, 0.3), bg(0.01, -0.02, 0.005), ba(0.1, -0.05, 0.2);
+  std::vector<Block> kept = keptBiasBlocks(so3, r3, bg, ba);
+
+  auto legacy = MarginalizationPrior::fromSchur(H, b, kept, 3, 0.7);
+  auto null_q = MarginalizationPrior::fromSchur(H, b, kept, 3, 0.7, nullptr);
+  const Eigen::VectorXd zeros = Eigen::VectorXd::Zero(12);
+  auto zero_q = MarginalizationPrior::fromSchur(H, b, kept, 3, 0.7, &zeros);
+
+  for (const auto* other : {null_q.get(), zero_q.get()}) {
+    ASSERT_EQ(other->sqrtInfoJacobian().rows(), legacy->sqrtInfoJacobian().rows());
+    for (int i = 0; i < legacy->sqrtInfoJacobian().rows(); ++i) {
+      for (int j = 0; j < legacy->sqrtInfoJacobian().cols(); ++j) {
+        EXPECT_EQ(other->sqrtInfoJacobian()(i, j), legacy->sqrtInfoJacobian()(i, j))
+            << "J0 differs at (" << i << "," << j << ")";
+      }
+    }
+    for (int i = 0; i < legacy->residual0().size(); ++i) {
+      EXPECT_EQ(other->residual0()(i), legacy->residual0()(i)) << "r0 differs at " << i;
+    }
+  }
+}
+
+// Inflating a coordinate the marginal carries NO information about must not
+// manufacture information: a covariance round trip would resurrect the null
+// direction at strength 1/q; the information-space update must leave it null.
+TEST(Marginalization, StructuredForgettingPreservesNullSpace) {
+  Eigen::MatrixXd H;
+  Eigen::VectorXd b;
+  buildKeptBiasSystem(&H, &b, /*zero_col=*/6);  // first gyro-bias coord unmeasured
+
+  std::array<double, 4> so3 = {0.0, 0.0, 0.0, 1.0};
+  Eigen::Vector3d r3(0.1, 0.2, 0.3), bg(0.01, -0.02, 0.005), ba(0.1, -0.05, 0.2);
+  std::vector<Block> kept = keptBiasBlocks(so3, r3, bg, ba);
+
+  const double qg = 1e-3;
+  Eigen::VectorXd q = Eigen::VectorXd::Zero(12);
+  q.segment(6, 3).setConstant(qg);
+
+  auto forget = MarginalizationPrior::fromSchur(H, b, kept, 3, 1.0, &q);
+  ASSERT_NE(forget, nullptr);
+
+  const Eigen::MatrixXd info = forget->information();
+  EXPECT_TRUE(info.allFinite());
+  // The unmeasured coordinate stays unconstrained: nowhere near the 1/q = 1000
+  // a covariance round trip would assign it.
+  EXPECT_LT(info.row(6).cwiseAbs().maxCoeff(), 1e-9);
+  EXPECT_LT(info.col(6).cwiseAbs().maxCoeff(), 1e-9);
+  // The measured inflated coordinates still relax (information non-increasing on
+  // their diagonal versus the un-inflated build).
+  auto legacy = MarginalizationPrior::fromSchur(H, b, kept, 3);
+  for (int i = 7; i < 9; ++i) {
+    EXPECT_LE(info(i, i), legacy->information()(i, i) + 1e-12);
   }
 }
 

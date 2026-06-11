@@ -1,6 +1,13 @@
 #include "ct/residuals_visual.hpp"
 
+// The vendored coefficient helpers return through const-ref outputs (const_cast
+// inside), which GCC's flow analysis flags as maybe-uninitialized once they inline
+// into the Jet-instantiated functors below; every entry is in fact overwritten.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #include <basalt/spline/ceres_spline_helper.h>
+#pragma GCC diagnostic pop
+
 #include <ceres/autodiff_cost_function.h>
 #include <ceres/cost_function.h>
 #include <ceres/dynamic_autodiff_cost_function.h>
@@ -230,7 +237,9 @@ struct VisualPatchResidual {
                       const Eigen::Vector3d& p_world, const Eigen::Matrix<double, 2, 3>& Jpi,
                       double u, double inv_dt, double tau_ref, double weight,
                       std::vector<double> ref_patch, std::vector<double> cur_I0,
-                      std::vector<Eigen::Vector2d> cur_grad)
+                      std::vector<Eigen::Vector2d> cur_grad,
+                      const Eigen::Matrix4d* blend = nullptr,
+                      const Eigen::Matrix4d* cum_blend = nullptr)
       : q_fe_c_(q_fe_c),
         t_fe_c_(t_fe_c),
         p_world_(p_world),
@@ -241,7 +250,13 @@ struct VisualPatchResidual {
         weight_(weight),
         ref_patch_(std::move(ref_patch)),
         cur_I0_(std::move(cur_I0)),
-        cur_grad_(std::move(cur_grad)) {}
+        cur_grad_(std::move(cur_grad)),
+        non_uniform_(blend != nullptr && cum_blend != nullptr) {
+    if (non_uniform_) {
+      blend_ = *blend;
+      cum_blend_ = *cum_blend;
+    }
+  }
 
   template <class T>
   bool operator()(T const* const* params, T* residual) const {
@@ -250,11 +265,16 @@ struct VisualPatchResidual {
     using SO3T = Sophus::SO3<T>;
 
     SO3T R_w_fe;
-    basalt::CeresSplineHelper<kSplineOrder>::template evaluate_lie<T, Sophus::SO3>(
-        params, u_, inv_dt_, &R_w_fe);
     Vec3T p_w_fe;
-    basalt::CeresSplineHelper<kSplineOrder>::template evaluate<T, 3, 0>(params + kSplineOrder, u_,
-                                                                        inv_dt_, &p_w_fe);
+    if (non_uniform_) {
+      evaluateLieWithMatrix<T, Sophus::SO3>(params, u_, inv_dt_, cum_blend_, &R_w_fe);
+      evaluateRdWithMatrix<T, 3, 0>(params + kSplineOrder, u_, inv_dt_, blend_, &p_w_fe);
+    } else {
+      basalt::CeresSplineHelper<kSplineOrder>::template evaluate_lie<T, Sophus::SO3>(
+          params, u_, inv_dt_, &R_w_fe);
+      basalt::CeresSplineHelper<kSplineOrder>::template evaluate<T, 3, 0>(params + kSplineOrder, u_,
+                                                                          inv_dt_, &p_w_fe);
+    }
 
     // World point -> current camera frame: P_c = R_cf (R_wfe^T (P_w - p_wfe)) + t_cf.
     const SO3T R_fe_c = SO3T(q_fe_c_.cast<T>());
@@ -293,6 +313,11 @@ struct VisualPatchResidual {
   std::vector<double> ref_patch_;
   std::vector<double> cur_I0_;
   std::vector<Eigen::Vector2d> cur_grad_;
+  // Per-interval blending matrices copied by value (the functor outlives the segment
+  // reference it was built from); false selects the uniform cardinal matrices.
+  bool non_uniform_ = false;
+  Eigen::Matrix4d blend_ = Eigen::Matrix4d::Zero();
+  Eigen::Matrix4d cum_blend_ = Eigen::Matrix4d::Zero();
 };
 
 }  // namespace
@@ -315,7 +340,10 @@ namespace {
 // coordinates via tangentToQuatJac for the EigenQuaternionManifold blocks.
 class AnalyticVisualPatchCost final : public ceres::CostFunction {
 public:
-  explicit AnalyticVisualPatchCost(const VisualPatchParams& p) : p_(p) {
+  explicit AnalyticVisualPatchCost(const VisualPatchParams& p,
+                                   const Eigen::Matrix4d* blend = nullptr,
+                                   const Eigen::Matrix4d* cum_blend = nullptr)
+      : p_(p) {
     set_num_residuals(kPatchArea);
     for (int j = 0; j < kSplineOrder; ++j) {
       mutable_parameter_block_sizes()->push_back(4);
@@ -325,8 +353,15 @@ public:
     }
     mutable_parameter_block_sizes()->push_back(1);  // tau_cur
     const Eigen::Vector4d up(1.0, p.u, p.u * p.u, p.u * p.u * p.u);
-    lambda_r_ = basalt::CeresSplineHelper<kSplineOrder>::cumulative_blending_matrix_ * up;
-    lambda_p_ = basalt::CeresSplineHelper<kSplineOrder>::blending_matrix_ * up;
+    // Null pointers bind the uniform cardinal matrix objects themselves, so the
+    // expressions below run on the same operands as always; non-null substitutes the
+    // per-interval (non-uniform) matrices into the identical expressions.
+    const Eigen::Matrix4d& CM =
+        cum_blend ? *cum_blend : basalt::CeresSplineHelper<kSplineOrder>::cumulative_blending_matrix_;
+    const Eigen::Matrix4d& M =
+        blend ? *blend : basalt::CeresSplineHelper<kSplineOrder>::blending_matrix_;
+    lambda_r_ = CM * up;
+    lambda_p_ = M * up;
   }
 
   bool Evaluate(double const* const* parameters, double* residuals,
@@ -413,14 +448,17 @@ private:
 
 }  // namespace
 
-ceres::CostFunction* makeVisualPatchCost(const VisualPatchParams& p) {
-  return new AnalyticVisualPatchCost(p);
+ceres::CostFunction* makeVisualPatchCost(const VisualPatchParams& p, const Eigen::Matrix4d* blend,
+                                         const Eigen::Matrix4d* cum_blend) {
+  return new AnalyticVisualPatchCost(p, blend, cum_blend);
 }
 
-ceres::CostFunction* makeVisualPatchCostAutodiff(const VisualPatchParams& p) {
+ceres::CostFunction* makeVisualPatchCostAutodiff(const VisualPatchParams& p,
+                                                 const Eigen::Matrix4d* blend,
+                                                 const Eigen::Matrix4d* cum_blend) {
   auto* functor = new VisualPatchResidual(p.q_fe_c, p.t_fe_c, p.p_world, p.Jpi, p.u,
                                           /*inv_dt=*/1.0, p.tau_ref, p.weight, p.ref_patch,
-                                          p.cur_I0, p.cur_grad);
+                                          p.cur_I0, p.cur_grad, blend, cum_blend);
   functor->p_c0_ = p.p_c0;
   auto* cost = new ceres::DynamicAutoDiffCostFunction<VisualPatchResidual, 4>(functor);
   for (int i = 0; i < 2 * kSplineOrder; ++i) {
@@ -602,7 +640,7 @@ VisualAssocStats addVisualResiduals(ceres::Problem& problem, SplineWindow& splin
     vp.ref_patch = ref_warp;
     vp.cur_I0 = cur_I0;
     vp.cur_grad = cur_grad;
-    ceres::CostFunction* cost = makeVisualPatchCost(vp);
+    ceres::CostFunction* cost = makeVisualPatchCost(vp, seg.blend, seg.cum_blend);
 
     std::vector<double*> blocks;
     blocks.reserve(2 * kSplineOrder + 1);
@@ -649,7 +687,7 @@ int replayVisualResiduals(ceres::Problem& problem, SplineWindow& spline, Timesta
   const SplineWindow::SegmentRef seg = spline.segmentFor(t_mid_expo);
   int added = 0;
   for (const VisualPatchParams& vp : patches) {
-    ceres::CostFunction* cost = makeVisualPatchCost(vp);
+    ceres::CostFunction* cost = makeVisualPatchCost(vp, seg.blend, seg.cum_blend);
     std::vector<double*> blocks;
     blocks.reserve(2 * kSplineOrder + 1);
     for (double* p : seg.so3_knots) {

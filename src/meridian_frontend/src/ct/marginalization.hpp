@@ -36,10 +36,23 @@ public:
   // information (J0 and r0 each by sqrt(scale)), deflating the prior's confidence
   // while preserving its Gauss-Newton step direction; the default 1.0 leaves
   // every stored double bit-identical to an unscaled build.
+  //
+  // `q_diag` (optional) is structured per-coordinate forgetting: a length-k vector
+  // over the kept tangent stack (same block order and local_size widths as `kept`)
+  // of covariance inflations. The marginal covariance becomes P + diag(q) exactly --
+  // each coordinate with q > 0 relaxes by q, coordinates with q == 0 keep their
+  // marginal covariance bit-for-bit unchanged in covariance space -- while the prior
+  // mean is preserved. Implemented in information space (Woodbury), so null
+  // directions of the marginal stay null: no information is manufactured for a
+  // direction the prior never knew. A null pointer or an all-zero vector performs
+  // no extra arithmetic, keeping the legacy path bit-identical. Callers should not
+  // combine q_diag with scale != 1.0 (the scalar deflation is the legacy knob this
+  // replaces).
   static std::unique_ptr<MarginalizationPrior> fromSchur(const Eigen::MatrixXd& H,
                                                          const Eigen::VectorXd& b,
                                                          const std::vector<Block>& kept,
-                                                         int dropped_dim, double scale = 1.0);
+                                                         int dropped_dim, double scale = 1.0,
+                                                         const Eigen::VectorXd* q_diag = nullptr);
 
   // Ceres cost: residual = J0 * (x boxminus x0) + r0 over the kept blocks. The
   // returned object is owned by the caller (hand it to ceres::Problem, which

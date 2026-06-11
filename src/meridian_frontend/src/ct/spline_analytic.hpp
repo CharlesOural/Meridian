@@ -1,11 +1,12 @@
 #pragma once
 
-#include <array>
+#include <basalt/spline/ceres_spline_helper.h>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
-#include <basalt/spline/ceres_spline_helper.h>
+#include <array>
 #include <basalt/utils/sophus_utils.hpp>
+#include <cmath>
 #include <sophus/so3.hpp>
 
 namespace meridian::ct {
@@ -168,9 +169,9 @@ struct So3DerivJac {
   std::array<Eigen::Matrix3d, kSplineJacOrder> dalpha_dR;
 };
 
-inline So3DerivJac evaluateSo3VelAccelJac(
-    const std::array<Sophus::SO3d, kSplineJacOrder>& knot, double u, double inv_dt,
-    bool want_accel) {
+inline So3DerivJac evaluateSo3VelAccelJac(const std::array<Sophus::SO3d, kSplineJacOrder>& knot,
+                                          double u, double inv_dt, bool want_accel,
+                                          const Eigen::Matrix4d* cum_blend = nullptr) {
   using SO3 = Sophus::SO3d;
   using Mat3 = Eigen::Matrix3d;
   using Vec3 = Eigen::Vector3d;
@@ -179,14 +180,24 @@ inline So3DerivJac evaluateSo3VelAccelJac(
   using VecN = Eigen::Matrix<double, N, 1>;
   using Helper = basalt::CeresSplineHelper<N>;
 
-  VecN p, coeff, dcoeff, ddcoeff;
+  // A null cum_blend binds the uniform cumulative matrix object itself, so the
+  // coefficient expressions below run on the same operands as always; a non-null
+  // pointer substitutes a per-interval (non-uniform) matrix into the same
+  // expressions unchanged.
+  const Eigen::Matrix4d& C = cum_blend ? *cum_blend : Helper::cumulative_blending_matrix_;
+
+  // Zero-init: baseCoeffsWithTime takes its output by const-ref (and const_casts
+  // internally), which GCC's flow analysis cannot see through once inlined into a
+  // Jet-instantiated caller; the helper overwrites every entry, so this is free.
+  VecN p = VecN::Zero();
+  VecN coeff, dcoeff, ddcoeff;
   Helper::template baseCoeffsWithTime<0>(p, u);
-  coeff = Helper::cumulative_blending_matrix_ * p;
+  coeff = C * p;
   Helper::template baseCoeffsWithTime<1>(p, u);
-  dcoeff = inv_dt * Helper::cumulative_blending_matrix_ * p;
+  dcoeff = inv_dt * C * p;
   if (want_accel) {
     Helper::template baseCoeffsWithTime<2>(p, u);
-    ddcoeff = inv_dt * inv_dt * Helper::cumulative_blending_matrix_ * p;
+    ddcoeff = inv_dt * inv_dt * C * p;
   }
 
   So3DerivJac out;
@@ -312,6 +323,134 @@ inline So3DerivJac evaluateSo3VelAccelJac(
         dl_a[static_cast<std::size_t>(k)] * knot[static_cast<std::size_t>(k)].matrix();
   }
   return out;
+}
+
+// Cumulative Lie-group cubic B-spline evaluation with a caller-supplied cumulative
+// blending matrix (per-interval, for non-uniform knot spacing). Value and body-frame
+// derivatives follow the same recursion as the uniform helper:
+//   R(u) = R_0 * prod_{j=1..3} exp(c_j(u) * Log(R_{j-1}^-1 R_j)),
+// with c(u) = cum * (1, u, u^2, u^3)^T. inv_dt is 1 over this interval's real span
+// in seconds, so vel/accel/jerk come out as real-time derivatives. The blending
+// coefficients stay double throughout -- u and the matrix never carry autodiff
+// scalars; only the knots do.
+template <class T, template <class> class GroupT>
+inline void evaluateLieWithMatrix(T const* const* knots, double u, double inv_dt,
+                                  const Eigen::Matrix4d& cum, GroupT<T>* transform_out = nullptr,
+                                  typename GroupT<T>::Tangent* vel_out = nullptr,
+                                  typename GroupT<T>::Tangent* accel_out = nullptr,
+                                  typename GroupT<T>::Tangent* jerk_out = nullptr) {
+  using Group = GroupT<T>;
+  using Tangent = typename Group::Tangent;
+  using Adjoint = typename Group::Adjoint;
+  using Helper = basalt::CeresSplineHelper<kSplineJacOrder>;
+
+  // Zero-init (see evaluateSo3VelAccelJac): the const-ref-output helper overwrites
+  // every entry, so this only silences flow analysis in Jet-instantiated callers.
+  Eigen::Vector4d p = Eigen::Vector4d::Zero();
+  Eigen::Vector4d coeff, dcoeff, ddcoeff, dddcoeff;
+  Helper::template baseCoeffsWithTime<0>(p, u);
+  coeff = cum * p;
+  if (vel_out || accel_out || jerk_out) {
+    Helper::template baseCoeffsWithTime<1>(p, u);
+    dcoeff = inv_dt * cum * p;
+    if (accel_out || jerk_out) {
+      Helper::template baseCoeffsWithTime<2>(p, u);
+      ddcoeff = inv_dt * inv_dt * cum * p;
+      if (jerk_out) {
+        Helper::template baseCoeffsWithTime<3>(p, u);
+        dddcoeff = inv_dt * inv_dt * inv_dt * cum * p;
+      }
+    }
+  }
+
+  if (transform_out) {
+    Eigen::Map<Group const> const p00(knots[0]);
+    *transform_out = p00;
+  }
+
+  Tangent rot_vel, rot_accel, rot_jerk;
+  if (vel_out || accel_out || jerk_out) {
+    rot_vel.setZero();
+  }
+  if (accel_out || jerk_out) {
+    rot_accel.setZero();
+  }
+  if (jerk_out) {
+    rot_jerk.setZero();
+  }
+
+  for (int i = 0; i < kSplineJacOrder - 1; ++i) {
+    Eigen::Map<Group const> const p0(knots[i]);
+    Eigen::Map<Group const> const p1(knots[i + 1]);
+
+    const Group r01 = p0.inverse() * p1;
+    const Tangent delta = r01.log();
+    const Group exp_kdelta = Group::exp(delta * coeff[i + 1]);
+
+    if (transform_out) {
+      (*transform_out) *= exp_kdelta;
+    }
+
+    if (vel_out || accel_out || jerk_out) {
+      const Adjoint A = exp_kdelta.inverse().Adj();
+
+      rot_vel = A * rot_vel;
+      const Tangent rot_vel_current = delta * dcoeff[i + 1];
+      rot_vel += rot_vel_current;
+
+      if (accel_out || jerk_out) {
+        rot_accel = A * rot_accel;
+        const Tangent accel_lie_bracket = Group::lieBracket(rot_vel, rot_vel_current);
+        rot_accel += ddcoeff[i + 1] * delta + accel_lie_bracket;
+
+        if (jerk_out) {
+          rot_jerk = A * rot_jerk;
+          rot_jerk += dddcoeff[i + 1] * delta +
+                      Group::lieBracket(ddcoeff[i + 1] * rot_vel + 2.0 * dcoeff[i + 1] * rot_accel -
+                                            dcoeff[i + 1] * accel_lie_bracket,
+                                        delta);
+        }
+      }
+    }
+  }
+
+  if (vel_out) {
+    *vel_out = rot_vel;
+  }
+  if (accel_out) {
+    *accel_out = rot_accel;
+  }
+  if (jerk_out) {
+    *jerk_out = rot_jerk;
+  }
+}
+
+// Euclidean cubic B-spline value or time derivative with a caller-supplied blending
+// matrix (per-interval, for non-uniform knot spacing). DERIV selects the derivative
+// order; the inv_dt^DERIV factor converts the d/du derivative into d/dt for the
+// interval whose real span is 1/inv_dt seconds. Coefficients stay double; only the
+// knots carry T.
+template <class T, int DIM, int DERIV>
+inline void evaluateRdWithMatrix(T const* const* knots, double u, double inv_dt,
+                                 const Eigen::Matrix4d& blend, Eigen::Matrix<T, DIM, 1>* vec_out) {
+  if (!vec_out) {
+    return;
+  }
+  using VecD = Eigen::Matrix<T, DIM, 1>;
+  using Helper = basalt::CeresSplineHelper<kSplineJacOrder>;
+
+  // Zero-init (see evaluateSo3VelAccelJac): the const-ref-output helper overwrites
+  // every entry, so this only silences flow analysis in Jet-instantiated callers.
+  Eigen::Vector4d p = Eigen::Vector4d::Zero();
+  Eigen::Vector4d coeff;
+  Helper::template baseCoeffsWithTime<DERIV>(p, u);
+  coeff = std::pow(inv_dt, DERIV) * blend * p;
+
+  vec_out->setZero();
+  for (int i = 0; i < kSplineJacOrder; ++i) {
+    Eigen::Map<VecD const> const knot_i(knots[i]);
+    (*vec_out) += coeff[i] * knot_i;
+  }
 }
 
 }  // namespace meridian::ct

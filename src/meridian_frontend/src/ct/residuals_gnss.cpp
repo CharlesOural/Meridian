@@ -1,6 +1,13 @@
 #include "residuals_gnss.hpp"
 
+// The vendored coefficient helpers return through const-ref outputs (const_cast
+// inside), which GCC's flow analysis flags as maybe-uninitialized once they inline
+// into the Jet-instantiated functor below; every entry is in fact overwritten.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #include <basalt/spline/ceres_spline_helper.h>
+#pragma GCC diagnostic pop
+
 #include <ceres/dynamic_autodiff_cost_function.h>
 #include <ceres/loss_function.h>
 #include <ceres/problem.h>
@@ -10,6 +17,8 @@
 #include <limits>
 #include <sophus/so3.hpp>
 #include <vector>
+
+#include "spline_analytic.hpp"
 
 namespace meridian::ct {
 
@@ -28,8 +37,19 @@ constexpr double kDeg2Rad = M_PI / 180.0;
 // 3x3 whitening matrix are fixed data.
 struct GnssResidual {
   GnssResidual(const Eigen::Vector3d& z_world, const Eigen::Vector3d& t_fe_ant, double u,
-               double inv_dt, const Eigen::Matrix3d& sqrt_info)
-      : z_world_(z_world), t_fe_ant_(t_fe_ant), u_(u), inv_dt_(inv_dt), sqrt_info_(sqrt_info) {}
+               double inv_dt, const Eigen::Matrix3d& sqrt_info,
+               const Eigen::Matrix4d* blend = nullptr, const Eigen::Matrix4d* cum_blend = nullptr)
+      : z_world_(z_world),
+        t_fe_ant_(t_fe_ant),
+        u_(u),
+        inv_dt_(inv_dt),
+        sqrt_info_(sqrt_info),
+        non_uniform_(blend != nullptr && cum_blend != nullptr) {
+    if (non_uniform_) {
+      blend_ = *blend;
+      cum_blend_ = *cum_blend;
+    }
+  }
 
   template <class T>
   bool operator()(T const* const* params, T* residual_ptr) const {
@@ -37,12 +57,16 @@ struct GnssResidual {
     using SO3T = Sophus::SO3<T>;
 
     SO3T R_w_fe;
-    basalt::CeresSplineHelper<kSplineOrder>::template evaluate_lie<T, Sophus::SO3>(
-        params, u_, inv_dt_, &R_w_fe);
-
     Vec3T p_w_fe;
-    basalt::CeresSplineHelper<kSplineOrder>::template evaluate<T, 3, 0>(params + kSplineOrder, u_,
-                                                                        inv_dt_, &p_w_fe);
+    if (non_uniform_) {
+      evaluateLieWithMatrix<T, Sophus::SO3>(params, u_, inv_dt_, cum_blend_, &R_w_fe);
+      evaluateRdWithMatrix<T, 3, 0>(params + kSplineOrder, u_, inv_dt_, blend_, &p_w_fe);
+    } else {
+      basalt::CeresSplineHelper<kSplineOrder>::template evaluate_lie<T, Sophus::SO3>(
+          params, u_, inv_dt_, &R_w_fe);
+      basalt::CeresSplineHelper<kSplineOrder>::template evaluate<T, 3, 0>(params + kSplineOrder, u_,
+                                                                          inv_dt_, &p_w_fe);
+    }
 
     const Vec3T p_w_ant = R_w_fe * t_fe_ant_.cast<T>() + p_w_fe;
     const Vec3T r = z_world_.cast<T>() - p_w_ant;
@@ -56,6 +80,11 @@ struct GnssResidual {
   double u_;
   double inv_dt_;
   Eigen::Matrix3d sqrt_info_;
+  // Per-interval blending matrices copied by value (the functor outlives the segment
+  // reference it was built from); false selects the uniform cardinal matrices.
+  bool non_uniform_ = false;
+  Eigen::Matrix4d blend_ = Eigen::Matrix4d::Zero();
+  Eigen::Matrix4d cum_blend_ = Eigen::Matrix4d::Zero();
 };
 
 }  // namespace
@@ -179,7 +208,8 @@ bool addGnssResidual(ceres::Problem& problem, SplineWindow& spline, const Eigen:
   }
   const SplineWindow::SegmentRef seg = spline.segmentFor(t_fix);
 
-  auto* functor = new GnssResidual(z_world, t_fe_ant, seg.u, 1.0 / seg.dt_s, sqrt_info);
+  auto* functor = new GnssResidual(z_world, t_fe_ant, seg.u, 1.0 / seg.dt_s, sqrt_info, seg.blend,
+                                   seg.cum_blend);
   auto* cost = new ceres::DynamicAutoDiffCostFunction<GnssResidual, 4>(functor);
   for (int i = 0; i < 2 * kSplineOrder; ++i) {
     cost->AddParameterBlock(i < kSplineOrder ? 4 : 3);

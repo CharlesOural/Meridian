@@ -261,14 +261,26 @@ struct FrontendSpline {
   SplineOrder order = SplineOrder::Cubic;
   double knot_dt_ms = 25.0;  // outer-knot spacing [ms]
   int window_knots = 8;
-  int n_cp_max = 0;  // adaptive control-point cap; <=1 disables adaptive density
   bool time_offset_estimate = false;
-  // Adaptive-knot band edges: each crossed threshold adds one control point. The
-  // rising edges are matched against peak per-sample IMU excitation in the segment;
-  // a band-down requires falling below the edge by knot_density_hysteresis (fraction).
-  std::vector<double> knot_omega_thresh{};  // [rad/s] angular-rate band edges
-  std::vector<double> knot_accel_thresh{};  // [m/s^2] specific-force band edges
-  double knot_density_hysteresis = 0.15;
+};
+// Adaptive knot density ("ncp"): each outer spline segment may carry 1..n_cp_max
+// control points, chosen per segment from the MEAN per-sample IMU magnitudes over
+// that segment's raw samples (mean of norms — a vector mean would cancel under fast
+// rotation). Each band edge crossed by mean ||gyro|| (omega_thresh, raw, no bias
+// correction) or by |mean ||acc|| - g| (accel_thresh) adds one control point;
+// stepping down out of a held band requires falling below the edge by `hysteresis`
+// (fractional) so density does not chatter. With enabled=false the spline runs the
+// uniform one-control-point grid bit-identically to a build without this block.
+struct FrontendNcp {
+  bool enabled = false;
+  int n_cp_max = 1;                                  // per-segment control-point cap
+  std::vector<double> omega_thresh{0.5, 1.0, 5.0};   // [rad/s] mean-rate band edges
+  std::vector<double> accel_thresh{0.5, 1.0, 5.0};   // [m/s^2] mean-|a|-g band edges
+  double hysteresis = 0.15;                          // fractional band-down hysteresis
+  // LM iterations of the IMU-only warm-start mini-solve that smooths freshly laid
+  // dense-knot segments before association (0 disables it). Without it a wiggly
+  // dense-knot IMU seed corrupts data association and the solve diverges.
+  int warmstart_iters = 4;
 };
 struct FrontendLidar {
   double voxel_map_m = 0.5;
@@ -286,6 +298,10 @@ struct FrontendLidar {
   // bounding map RAM and nearest-neighbour search depth. Non-positive disables trimming
   // (the map grows for the whole trajectory).
   double local_map_cube_m = 500.0;
+  // Upper bound on the voxel-coarseness widening of the whitened Huber knee.
+  // 1.0 places the knee at 1 sigma (aggressive outlier down-weighting); 4.0 keeps
+  // near-quadratic pull out to ~4 sigma on coarse maps.
+  double huber_clamp_max = 4.0;
 };
 struct FrontendVisual {
   // Master gate for the sparse-direct photometric stage. When off (or when the
@@ -356,6 +372,26 @@ struct FrontendBias {
   double acc_max = 5.0;     // [m/s^2]
   double knot_dt_ms = 500;  // bias knot cadence [ms]
 };
+// Structured per-state forgetting on the marginalization prior. Each window slide
+// relaxes the carried prior's covariance per block class instead of deflating the
+// whole information matrix by one scalar: bias blocks by their random-walk variance
+// integrated over the slide interval (Q = density * dt), a kept gravity block by a
+// tiny per-slide constant (near-constant state), pose/velocity knots by q_knot * dt
+// (default zero: knot uncertainty is managed by the measurement model, not by
+// structural decay). When enabled, marg_prior_scale is ignored (effective 1.0);
+// when disabled, the prior build executes the legacy scalar path bit-identically.
+struct FrontendPriorForgetting {
+  bool enabled = false;
+  // Take the bias inflation densities from sensors.imu.b_gyr_cov / b_acc_cov
+  // (continuous-time variances), keeping prior forgetting consistent with the
+  // random-walk ties inside the window. The explicit q_bias_* overrides apply only
+  // when this is false.
+  bool use_imu_walk = true;
+  double q_bias_gyr = 0.0;   // [(rad/s)^2 per s] explicit gyro-bias inflation density
+  double q_bias_acc = 0.0;   // [(m/s^2)^2 per s] explicit accel-bias inflation density
+  double q_gravity = 1e-10;  // [rad^2] per-slide tangent inflation of a kept gravity block
+  double q_knot = 0.0;       // [tangent^2 per s] structural forgetting on pose/velocity knots
+};
 // Off-by-default low-weight jerk / angular-acceleration regularizer; engaged only on
 // under-excited spans (excitation below the floor and a degenerate eigenaxis).
 struct FrontendMotionReg {
@@ -383,14 +419,36 @@ struct FrontendConfig {
   // step direction is preserved while its confidence is deflated). 1.0 leaves the
   // prior untouched and is bit-identical to a build without the knob.
   double marg_prior_scale = 1.0;
+  FrontendPriorForgetting prior_forgetting{};
+  // Frees the gravity direction on its unit-sphere manifold after init instead of
+  // pinning it. The static-init direction carries the unobservable accel-bias tilt
+  // (~0.3-1 deg); held constant, that tilt forces a compensating bias/orientation
+  // pair every window. Currently rejected by validate(): the marginalization prior
+  // would keep the freed block but has no sphere-manifold tangent lift for it, and
+  // the keyframe worker's prior clone would alias live gravity storage.
+  bool gravity_refine = false;
+  // Moving-start fallback: if the static-init motion gate has not passed within this
+  // many seconds of front-end data, initialize anyway from the current sweep's IMU
+  // mean (gravity = normalized mean specific force, gyro bias = window mean, accel
+  // bias = 0). The mean carries the platform's acceleration as a gravity tilt of a
+  // few degrees, which the joint solve absorbs.
+  // 0 disables the fallback (strict static init).
+  double init_force_after_s = 0.0;
   FrontendSolver solver{};
   FrontendBias bias{};
   FrontendMotionReg motion_reg{};
   FrontendSpline spline{};
+  FrontendNcp ncp{};
   FrontendLidar lidar{};
   FrontendVisual visual{};
   FrontendGnss gnss{};
   FrontendKeyframe keyframe{};
+  // Debug-only: sampling cadence of the solved-spline pose stream
+  // (frontend/spline/path_sample, the /meridian/path source). Copied from
+  // debug.path_sample_hz by the pipeline at construction; it gates no estimator
+  // computation and the stream itself is enabled()-gated, so it is not a tuning
+  // constant.
+  double debug_path_sample_hz = 30.0;
 };
 
 // ---- backend (L3) ----
@@ -516,6 +574,16 @@ struct PlaceConfig {
 };
 
 // ---- debug ----
+// One config-seeded debug-key group. Each group maps to one key-prefix wildcard in
+// the telemetry sink's gate table (e.g. assoc -> "frontend/assoc/*"), so the same
+// runtime set_debug_key service that flips a single key can flip the whole group
+// live. enable seeds the flag; max_hz seeds the group's publication rate limit
+// (0 = the sink's class default: telemetry_rate_hz for scalars, 2 Hz for heavy
+// payloads).
+struct DebugGroup {
+  bool enable = false;
+  double max_hz = 0.0;
+};
 struct DebugConfig {
   LogLevel level = LogLevel::Info;
   bool publish_clouds = true;
@@ -523,6 +591,21 @@ struct DebugConfig {
   bool publish_odom = true;  // /meridian/odom (the rviz pose arrow); TF is published regardless
   bool timing = true;
   double telemetry_rate_hz = 10.0;
+  // Front-end debug groups (key prefix each one gates). All emission under a group is
+  // hoisted behind one enabled() check per sweep, so an off group costs one hash
+  // lookup; the always-on basics (counts, residual means, biases, ...) stay ungrouped.
+  DebugGroup assoc{};       // frontend/assoc/*  — association-quality detail + outlier cloud
+  DebugGroup solver{};      // frontend/solver/* — per-LM-iteration trace + per-family cost shares
+  DebugGroup deskew{};      // frontend/deskew/* — CT correction stats + frozen-pose 'pre' cloud
+  DebugGroup spline{};      // frontend/spline/* — kinematics profiles (vel/acc/omega/jerk)
+  DebugGroup map_health{/*enable=*/true, 0.0};  // frontend/map/* — size/insert counters (cheap)
+  // /meridian/path: the solved B-spline sampled at path_sample_hz and aggregated by
+  // the wrapper into one nav_msgs/Path, republished at most path_publish_hz and
+  // ring-capped at path_max_poses.
+  bool publish_path = true;
+  double path_sample_hz = 30.0;
+  double path_publish_hz = 1.0;
+  int path_max_poses = 40000;
 };
 
 // The root configuration tree, loaded once and held const for the pipeline's life.

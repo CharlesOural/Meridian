@@ -62,7 +62,9 @@ void buildWindowProblem(ceres::Problem& problem, WindowProblemInputs& in,
     if (problem.GetManifold(gravity.data()) == nullptr) {
       problem.SetManifold(gravity.data(), makeGravityManifold());
     }
-    problem.SetParameterBlockConstant(gravity.data());
+    if (!in.gravity_refine) {
+      problem.SetParameterBlockConstant(gravity.data());
+    }
   }
 
   // Hold the unsupported tail knots constant from the first pinned index onward.
@@ -113,6 +115,24 @@ void buildWindowProblem(ceres::Problem& problem, WindowProblemInputs& in,
       }
       return ptrs;
     }());
+  } else if (in.gauge_knot_idx >= 0) {
+    // Index-based gauge pins (adaptive-density mode): so3[idx], r3[idx..idx+1] by
+    // deque index, the same blocks the live solve pinned (clone index i == live i).
+    const int idx = in.gauge_knot_idx;
+    if (idx < spline.numKnots()) {
+      double* sp = spline.so3KnotData(idx);
+      if (problem.HasParameterBlock(sp)) {
+        problem.SetParameterBlockConstant(sp);
+      }
+    }
+    for (int j = idx; j <= idx + 1; ++j) {
+      if (j < spline.numKnots()) {
+        double* rp = spline.r3KnotData(j);
+        if (problem.HasParameterBlock(rp)) {
+          problem.SetParameterBlockConstant(rp);
+        }
+      }
+    }
   } else {
     const SplineWindow::SegmentRef seg = spline.segmentFor(in.gauge_seg_t);
     if (problem.HasParameterBlock(seg.so3_knots[1])) {

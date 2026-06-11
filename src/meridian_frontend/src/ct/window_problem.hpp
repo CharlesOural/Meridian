@@ -39,6 +39,8 @@ struct GnssFactor {
 // may be the live window (on the hot thread) or worker-owned clones; either way the
 // builder reads their current knot values as the linearization point.
 struct WindowProblemInputs {
+  // Mirrors FrontendConfig::gravity_refine so the rebuilt problem matches the live one.
+  bool gravity_refine = false;
   // Trajectory state (mutated in place: gravity gets its manifold, knots get bounds /
   // manifolds / const pins). On the worker these are clones, so no live state moves.
   SplineWindow* spline = nullptr;
@@ -95,6 +97,11 @@ struct WindowProblemInputs {
 
   // Leading-active-segment t for the gauge pins when no prior exists.
   Timestamp gauge_seg_t = 0;
+  // Index-based gauge pin (adaptive-density mode): when >= 0 and no prior exists, the
+  // gauge is pinned on so3 knot [idx] and r3 knots [idx, idx+1] by deque index (the
+  // clone's index i matches the live index i), instead of resolving segment-relative
+  // pointers through gauge_seg_t. -1 selects the legacy segment-relative path.
+  int gauge_knot_idx = -1;
   // First knot index held constant as an unsupported lever-arm tail (>= numKnots
   // disables the tail pin). Both classes of pin in solveWindow collapse to this index.
   int first_pinned_knot = 0;

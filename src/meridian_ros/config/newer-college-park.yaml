@@ -125,15 +125,16 @@ meridian:
     spline:
       knot_dt_ms: 100         # one outer segment per 10 Hz sweep
       window_knots: 8
-      # Adaptive density is mathematically validated (transition test + bag at
-      # parity with unbounded solve time), but density-2 segments inflate the
-      # autodiff problem past the 90 ms budget (0.123 m starved vs 0.039 m
-      # unbounded). Ship 1 until analytic Jacobians buy the headroom, then flip
-      # to 3.
-      n_cp_max: 1
-      knot_omega_thresh: [0.5, 1.5]   # [rad/s] N_omega band edges raising n_cp to 2, 3
-      knot_accel_thresh: [1.0, 3.0]   # [m/s^2] N_a band edges raising n_cp to 2, 3
-      knot_density_hysteresis: 0.15
+    ncp:
+      # Adaptive knot density: per-segment control-point count geared from the
+      # segment's MEAN |gyro| / | |acc|-g | (raw samples). Off until the validation
+      # campaign passes; flip `enabled` to run it, nothing else changes.
+      enabled: false
+      n_cp_max: 3
+      omega_thresh: [0.5, 1.0, 5.0]   # [rad/s] mean-rate band edges raising gear to 2, 3, 4
+      accel_thresh: [0.5, 1.0, 5.0]   # [m/s^2] mean-|a|-g band edges
+      hysteresis: 0.15
+      warmstart_iters: 4              # IMU-only mini-solve smoothing fresh dense tails
     lidar:
       voxel_map_m: 0.6
       num_match_points: 5

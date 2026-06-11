@@ -244,6 +244,15 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   get(n, "assoc_shift_thresh_m", c.assoc_shift_thresh_m);
   get(n, "assoc_shift_thresh_deg", c.assoc_shift_thresh_deg);
   get(n, "marg_prior_scale", c.marg_prior_scale);
+  const YAML::Node pf = n["prior_forgetting"];
+  get(pf, "enabled", c.prior_forgetting.enabled);
+  get(pf, "use_imu_walk", c.prior_forgetting.use_imu_walk);
+  get(pf, "q_bias_gyr", c.prior_forgetting.q_bias_gyr);
+  get(pf, "q_bias_acc", c.prior_forgetting.q_bias_acc);
+  get(pf, "q_gravity", c.prior_forgetting.q_gravity);
+  get(pf, "q_knot", c.prior_forgetting.q_knot);
+  get(n, "gravity_refine", c.gravity_refine);
+  get(n, "init_force_after_s", c.init_force_after_s);
   const YAML::Node solver = n["solver"];
   // max_iterations / epsi keep their legacy flat keys; the solver block carries the
   // deadline bracket. Accept max_iterations under the block too for spec-name parity.
@@ -267,17 +276,21 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
     }
     get(sp, "knot_dt_ms", c.spline.knot_dt_ms);
     get(sp, "window_knots", c.spline.window_knots);
-    get(sp, "n_cp_max", c.spline.n_cp_max);
     get(sp, "time_offset_estimate", c.spline.time_offset_estimate);
-    get_vec(sp, "knot_omega_thresh", c.spline.knot_omega_thresh);
-    get_vec(sp, "knot_accel_thresh", c.spline.knot_accel_thresh);
-    get(sp, "knot_density_hysteresis", c.spline.knot_density_hysteresis);
   }
+  const YAML::Node ncp = n["ncp"];
+  get(ncp, "enabled", c.ncp.enabled);
+  get(ncp, "n_cp_max", c.ncp.n_cp_max);
+  get_vec(ncp, "omega_thresh", c.ncp.omega_thresh);
+  get_vec(ncp, "accel_thresh", c.ncp.accel_thresh);
+  get(ncp, "hysteresis", c.ncp.hysteresis);
+  get(ncp, "warmstart_iters", c.ncp.warmstart_iters);
   const YAML::Node lid = n["lidar"];
   get(lid, "voxel_map_m", c.lidar.voxel_map_m);
   get(lid, "num_match_points", c.lidar.num_match_points);
   get(lid, "max_match_dist_sq", c.lidar.max_match_dist_sq);
   get(lid, "plane_thresh", c.lidar.plane_thresh);
+  get(lid, "huber_clamp_max", c.lidar.huber_clamp_max);
   get(lid, "point_cov", c.lidar.point_cov);
   get(lid, "max_lidar_factors", c.lidar.max_lidar_factors);
   get(lid, "min_factors_per_normal", c.lidar.min_factors_per_normal);
@@ -376,6 +389,21 @@ void load_debug(const YAML::Node& root, DebugConfig& c) {
   get(n, "publish_odom", c.publish_odom);
   get(n, "timing", c.timing);
   get(n, "telemetry_rate_hz", c.telemetry_rate_hz);
+  // Debug groups: each block seeds one key-prefix wildcard in the sink's gate table.
+  const auto group = [&n](const char* key, DebugGroup& g) {
+    const YAML::Node b = n[key];
+    get(b, "enable", g.enable);
+    get(b, "max_hz", g.max_hz);
+  };
+  group("assoc", c.assoc);
+  group("solver", c.solver);
+  group("deskew", c.deskew);
+  group("spline", c.spline);
+  group("map_health", c.map_health);
+  get(n, "publish_path", c.publish_path);
+  get(n, "path_sample_hz", c.path_sample_hz);
+  get(n, "path_publish_hz", c.path_publish_hz);
+  get(n, "path_max_poses", c.path_max_poses);
 }
 
 }  // namespace
@@ -412,11 +440,6 @@ bool Config::validate(std::string* error_out) const {
   }
   if (frontend.spline.window_knots < 1) {
     return fail("frontend.spline.window_knots must be >= 1");
-  }
-  // 0 (or 1) disables adaptive density to one control point per segment; a negative
-  // cap is invalid.
-  if (frontend.spline.n_cp_max < 0) {
-    return fail("frontend.spline.n_cp_max must be >= 0 (<=1 disables adaptive density)");
   }
 
   // --- front-end solver ---
@@ -455,6 +478,28 @@ bool Config::validate(std::string* error_out) const {
   }
   if (frontend.marg_prior_scale <= 0.0 || frontend.marg_prior_scale > 1.0) {
     return fail("frontend.marg_prior_scale must be in (0, 1]");
+  }
+  if (frontend.prior_forgetting.q_bias_gyr < 0.0 || frontend.prior_forgetting.q_bias_acc < 0.0) {
+    return fail("frontend.prior_forgetting.q_bias_{gyr,acc} must be >= 0");
+  }
+  if (frontend.prior_forgetting.q_gravity < 0.0) {
+    return fail("frontend.prior_forgetting.q_gravity must be >= 0");
+  }
+  if (frontend.prior_forgetting.q_knot < 0.0) {
+    return fail("frontend.prior_forgetting.q_knot must be >= 0");
+  }
+  // A freed gravity block cannot ride the marginalization prior, and that prior is
+  // always active once the window slides (with or without forgetting): the prior
+  // cost has no sphere-manifold tangent lift for a 3-vector block constrained to
+  // the sphere (its Euclidean fallback linearizes the wrong tangent), and the
+  // keyframe worker's prior clone never remaps the gravity pointer, so the worker
+  // would read live gravity storage while the solver thread writes it. Reject the
+  // flag outright until both exist.
+  if (frontend.gravity_refine) {
+    return fail(
+        "frontend.gravity_refine is not supported: the marginalization prior cannot carry a "
+        "freed gravity block (no sphere-manifold tangent lift in the prior cost, and the "
+        "keyframe worker's prior clone would alias live gravity storage)");
   }
   if (frontend.bias.gyr_max <= 0.0 || frontend.bias.acc_max <= 0.0) {
     return fail("frontend.bias.{gyr_max,acc_max} must be > 0");
@@ -504,23 +549,30 @@ bool Config::validate(std::string* error_out) const {
         ")");
   }
 
-  // --- adaptive-knot density ---
-  if (frontend.spline.knot_density_hysteresis < 0.0 ||
-      frontend.spline.knot_density_hysteresis >= 1.0) {
-    return fail("frontend.spline.knot_density_hysteresis must be in [0, 1)");
+  // --- adaptive knot density (ncp) ---
+  if (frontend.ncp.n_cp_max < 1) {
+    return fail("frontend.ncp.n_cp_max must be >= 1");
   }
-  const auto monotone_nonneg = [](const std::vector<double>& v) {
-    for (std::size_t i = 0; i < v.size(); ++i) {
-      if (v[i] < 0.0) return false;
-      if (i > 0 && v[i] <= v[i - 1]) return false;
+  if (frontend.ncp.hysteresis < 0.0 || frontend.ncp.hysteresis >= 1.0) {
+    return fail("frontend.ncp.hysteresis must be in [0, 1)");
+  }
+  if (frontend.ncp.warmstart_iters < 0) {
+    return fail("frontend.ncp.warmstart_iters must be >= 0");
+  }
+  if (frontend.ncp.enabled) {
+    const auto monotone_pos = [](const std::vector<double>& v) {
+      for (std::size_t i = 0; i < v.size(); ++i) {
+        if (v[i] <= 0.0) return false;
+        if (i > 0 && v[i] <= v[i - 1]) return false;
+      }
+      return true;
+    };
+    if (!monotone_pos(frontend.ncp.omega_thresh)) {
+      return fail("frontend.ncp.omega_thresh must be strictly increasing and > 0");
     }
-    return true;
-  };
-  if (!monotone_nonneg(frontend.spline.knot_omega_thresh)) {
-    return fail("frontend.spline.knot_omega_thresh must be strictly increasing and >= 0");
-  }
-  if (!monotone_nonneg(frontend.spline.knot_accel_thresh)) {
-    return fail("frontend.spline.knot_accel_thresh must be strictly increasing and >= 0");
+    if (!monotone_pos(frontend.ncp.accel_thresh)) {
+      return fail("frontend.ncp.accel_thresh must be strictly increasing and > 0");
+    }
   }
 
   // --- front-end visual ---
@@ -618,6 +670,27 @@ bool Config::validate(std::string* error_out) const {
   if (sensors.camera.shutter != "global") {
     return fail("sensors.camera.shutter must be 'global' (got '" + sensors.camera.shutter +
                 "'); the rolling-shutter path is not built");
+  }
+
+  // --- debug groups & path aggregation ---
+  for (const auto& [name, g] :
+       {std::pair<const char*, const DebugGroup*>{"assoc", &debug.assoc},
+        {"solver", &debug.solver},
+        {"deskew", &debug.deskew},
+        {"spline", &debug.spline},
+        {"map_health", &debug.map_health}}) {
+    if (g->max_hz < 0.0) {
+      return fail(std::string("debug.") + name + ".max_hz must be >= 0");
+    }
+  }
+  if (debug.path_sample_hz <= 0.0 || debug.path_sample_hz > 200.0) {
+    return fail("debug.path_sample_hz must be in (0, 200]");
+  }
+  if (debug.path_publish_hz <= 0.0) {
+    return fail("debug.path_publish_hz must be > 0");
+  }
+  if (debug.path_max_poses < 1) {
+    return fail("debug.path_max_poses must be >= 1");
   }
 
   // --- camera distortion model (closed string set; reject unknowns loudly) ---

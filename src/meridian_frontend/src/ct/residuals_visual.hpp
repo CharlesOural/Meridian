@@ -135,12 +135,18 @@ struct VisualPatchParams {
 // cumulative-spline chain (ct/spline_analytic.hpp); mathematically identical to the
 // autodiff functor but with the per-factor chain computed once and reused across all
 // patch pixels. SO(3) knot Jacobians are returned in ambient quaternion coordinates,
-// compatible with ceres::EigenQuaternionManifold on the knot blocks.
-ceres::CostFunction* makeVisualPatchCost(const VisualPatchParams& p);
+// compatible with ceres::EigenQuaternionManifold on the knot blocks. `blend` /
+// `cum_blend` are the segment's per-interval (non-uniform) blending matrices; nullptr
+// selects the uniform cardinal matrices bit-identically. Read only inside the call.
+ceres::CostFunction* makeVisualPatchCost(const VisualPatchParams& p,
+                                         const Eigen::Matrix4d* blend = nullptr,
+                                         const Eigen::Matrix4d* cum_blend = nullptr);
 
 // The autodiff equivalent (linearized-intensity functor), exposed for the
-// derivative-correctness tests as the parity reference.
-ceres::CostFunction* makeVisualPatchCostAutodiff(const VisualPatchParams& p);
+// derivative-correctness tests as the parity reference. Matrices are copied by value.
+ceres::CostFunction* makeVisualPatchCostAutodiff(const VisualPatchParams& p,
+                                                 const Eigen::Matrix4d* blend = nullptr,
+                                                 const Eigen::Matrix4d* cum_blend = nullptr);
 
 // `out_patches`, when non-null, receives the VisualPatchParams of every accepted patch
 // in build order -- the self-contained inputs makeVisualPatchCost consumed. Replaying

@@ -95,12 +95,17 @@ meridian:
     surf_seed: 0              # only used when surf_max_pts > 1
   frontend:
     kind: ct_livo
-    # Deflates the carried marginalization-prior information each window slide
-    # (exponential forgetting). The unbroken per-sweep prior chain on a complete
-    # input stream is overconfident: it locks in early accel-bias error and fights
-    # later correction (prior residual RMS grows monotonically at 1.0). 0.5 relaxes
-    # the chain enough for the window to keep re-estimating bias/tilt.
+    # Legacy scalar prior forgetting; ignored while prior_forgetting.enabled below.
+    # Re-activates (at this validated value) only if prior_forgetting is disabled.
     marg_prior_scale: 0.5
+    # Structured per-state forgetting on the carried marginalization prior: each
+    # window slide relaxes the prior's covariance per block class — bias blocks by
+    # the configured IMU random-walk variance over the slide (b_*_cov * dt), pose
+    # knots and gravity essentially not at all — instead of deflating the whole
+    # information matrix by one scalar. Fixes the scalar's sequence-dependence
+    # (one rate cannot fit bias drift and knot retention at once).
+    prior_forgetting:
+      enabled: true
     init_time_s: 1.0          # static-start window; a longer window tightens the
                               # gravity/bias init whose residual error the frozen
                               # accel bias cannot absorb
@@ -125,15 +130,16 @@ meridian:
     spline:
       knot_dt_ms: 100         # one outer segment per 10 Hz sweep
       window_knots: 8
-      # Adaptive density is mathematically validated (transition test + bag at
-      # parity with unbounded solve time), but density-2 segments inflate the
-      # autodiff problem past the 90 ms budget (0.123 m starved vs 0.039 m
-      # unbounded). Ship 1 until analytic Jacobians buy the headroom, then flip
-      # to 3.
-      n_cp_max: 1
-      knot_omega_thresh: [0.5, 1.5]   # [rad/s] N_omega band edges raising n_cp to 2, 3
-      knot_accel_thresh: [1.0, 3.0]   # [m/s^2] N_a band edges raising n_cp to 2, 3
-      knot_density_hysteresis: 0.15
+    ncp:
+      # Adaptive knot density: per-segment control-point count geared from the
+      # segment's MEAN |gyro| / | |acc|-g | (raw samples). Off until the validation
+      # campaign passes; flip `enabled` to run it, nothing else changes.
+      enabled: false
+      n_cp_max: 3
+      omega_thresh: [0.5, 1.0, 5.0]   # [rad/s] mean-rate band edges raising gear to 2, 3, 4
+      accel_thresh: [0.5, 1.0, 5.0]   # [m/s^2] mean-|a|-g band edges
+      hysteresis: 0.15
+      warmstart_iters: 4              # IMU-only mini-solve smoothing fresh dense tails
     lidar:
       voxel_map_m: 0.6
       num_match_points: 5
@@ -192,4 +198,25 @@ meridian:
     publish_markers: true
     publish_odom: true      # /meridian/odom feeds the ATE recorder (tools/record_tum.py); the rviz arrow is removed at the display layer
     timing: true
-    telemetry_rate_hz: 10.0
+    # Scalar token-bucket rate. Keep this WELL ABOVE the 10 Hz sweep cadence: a limit
+    # at exactly the emission cadence beats against per-key jitter and decimates keys
+    # unevenly (measured: 1..98% capture per key at 10). 50 captures every sweep's
+    # scalars; heavy payloads (clouds/images) keep their own 2 Hz class default.
+    telemetry_rate_hz: 50.0
+    # Front-end debug groups (key-prefix wildcards; see docs/REALTIME_DEBUGGING.md
+    # "Debug groups & costs"). ON here: this config is the accuracy-hunt exemplar;
+    # other configs leave them at the default (off, except map_health). max_hz 0 =
+    # class default per key (scalars at telemetry_rate_hz, heavy at 2 Hz). Toggle live:
+    #   ros2 service call /meridian/set_debug_key meridian_msgs/SetDebugKey \
+    #       "{key: 'frontend/assoc/*', enable: false, max_hz: 0.0}"
+    assoc:      { enable: true, max_hz: 0.0 }   # association funnel/quality + outlier cloud
+    solver:     { enable: true, max_hz: 0.0 }   # per-LM-iteration trace + per-family cost shares
+    deskew:     { enable: true, max_hz: 0.0 }   # CT-correction stats + frozen 'pre' cloud
+    spline:     { enable: true, max_hz: 0.0 }   # kinematics profiles (vibration/aliasing)
+    map_health: { enable: true, max_hz: 0.0 }   # map growth counters (cheap; default-on)
+    # /meridian/path: the solved B-spline sampled at path_sample_hz, republished as
+    # one nav_msgs/Path at path_publish_hz, ring-capped at path_max_poses.
+    publish_path: true
+    path_sample_hz: 30.0
+    path_publish_hz: 1.0
+    path_max_poses: 40000

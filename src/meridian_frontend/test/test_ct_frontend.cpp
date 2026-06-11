@@ -822,6 +822,85 @@ TEST(CtFrontEnd, NoMarginalizationWhenWindowNeverSlides) {
   EXPECT_EQ(diag.knots_marginalized, 0) << "window should never have slid";
 }
 
+// (d3) Structured prior forgetting actually engages: the identical deterministic
+// stream solved with forgetting off vs on (exaggerated explicit bias inflation) must
+// (i) produce diverging trajectories — the relaxed prior changes the solve — and
+// (ii) carry strictly less prior information in the bias-knot subspace once the
+// window has slid, while non-bias coordinates remain finitely informed.
+TEST(CtFrontEnd, PriorForgettingRelaxesBiasSubspaceAndDivergesTrajectory) {
+  std::mt19937 rng(5);
+  const std::vector<Plane> walls = boxRoom(2.5);
+  // Slow straight x-crawl, the same regime the marginalization-continuity test uses:
+  // window_knots = 6 at one knot per sweep slides from sweep ~7-8 onward.
+  const GtFn gt = [](Timestamp t) {
+    Pose p;
+    p.t = Eigen::Vector3d(0.5 * to_seconds(t), 0.0, 0.0);
+    return p;
+  };
+  const int sweeps = 16;
+  // One stream, ingested by both runs, so the forgetting flag is the only variable.
+  const auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+
+  // Runs the stream and reports the per-sweep trajectory plus the carried prior's
+  // information trace over the bias-knot coordinates after the final sweep.
+  auto run = [&](bool forgetting, std::vector<Pose>* traj, double* bias_info_trace) {
+    FrontendConfig cfg = ctCfg();
+    cfg.prior_forgetting.enabled = forgetting;
+    // Exaggerated explicit inflation: with q = 0.1 per second over a 0.1 s slide, the
+    // Woodbury cap 1/(q*dt) = 100 sits far below the random-walk-tied bias marginal,
+    // so the relaxation must dominate the bias subspace if the path is engaged.
+    cfg.prior_forgetting.use_imu_walk = false;
+    cfg.prior_forgetting.q_bias_gyr = 0.1;
+    cfg.prior_forgetting.q_bias_acc = 0.1;
+    CtFrontEnd fe(cfg, identityCalib(), nullptr, /*deterministic=*/true);
+    for (const auto& g : stream) {
+      fe.ingest(g);
+      traj->push_back(fe.live_state().T_world_body);
+    }
+    const meridian::FrontEndDiagnostics diag = fe.diagnostics();
+    ASSERT_GT(diag.knots_marginalized, 0) << "window never slid; the prior path is untested";
+    const auto* prior = fe.prior_for_test();
+    ASSERT_NE(prior, nullptr);
+    const Eigen::VectorXd info_diag = prior->information().diagonal();
+    double trace = 0.0;
+    int bias_coords = 0;
+    int off = 0;
+    for (const auto& blk : prior->blocks()) {
+      if (fe.is_bias_block_for_test(blk.ptr)) {
+        trace += info_diag.segment(off, blk.local_size).sum();
+        bias_coords += blk.local_size;
+      }
+      off += blk.local_size;
+    }
+    ASSERT_GT(bias_coords, 0) << "no bias knot among the prior's kept blocks";
+    *bias_info_trace = trace;
+  };
+
+  std::vector<Pose> traj_off;
+  std::vector<Pose> traj_on;
+  double bias_info_off = 0.0;
+  double bias_info_on = 0.0;
+  run(false, &traj_off, &bias_info_off);
+  run(true, &traj_on, &bias_info_on);
+
+  // (i) The runs are bit-reproducible individually (deterministic path, shared
+  // stream), so any trajectory difference is attributable to the forgetting alone.
+  ASSERT_EQ(traj_off.size(), traj_on.size());
+  double max_diff = 0.0;
+  for (std::size_t i = 0; i < traj_off.size(); ++i) {
+    max_diff = std::max(max_diff, (traj_off[i].t - traj_on[i].t).norm());
+  }
+  EXPECT_GT(max_diff, 1e-6) << "forgetting enabled changed nothing in the trajectory";
+
+  // (ii) The bias subspace relaxed hard: the inflated run's diagonal information over
+  // the bias coordinates must sit far below the legacy run's (capped at 1/q per
+  // coordinate vs the unrelaxed random-walk-tied marginal).
+  ASSERT_GT(bias_info_off, 0.0);
+  EXPECT_LT(bias_info_on, 0.5 * bias_info_off)
+      << "bias-subspace prior information did not relax: on=" << bias_info_on
+      << " off=" << bias_info_off;
+}
+
 namespace {
 
 // Last recorded value for a scalar key, or NaN if it was never recorded.
@@ -1002,9 +1081,10 @@ TEST(CtFrontEnd, AdaptiveKnotDensityTracksThroughTransitions) {
 
   std::mt19937 rng(11);
   FrontendConfig cfg = ctCfg();
-  cfg.spline.n_cp_max = 3;
-  cfg.spline.knot_omega_thresh = {0.5, 1.5};
-  cfg.spline.knot_accel_thresh = {1.0, 3.0};
+  cfg.ncp.enabled = true;
+  cfg.ncp.n_cp_max = 3;
+  cfg.ncp.omega_thresh = {0.5, 1.5};
+  cfg.ncp.accel_thresh = {1.0, 3.0};
   meridian::RecordingSink sink;
   CtFrontEnd fe(cfg, identityCalib(), &sink, /*deterministic=*/false);
 
@@ -1021,7 +1101,7 @@ TEST(CtFrontEnd, AdaptiveKnotDensityTracksThroughTransitions) {
   // returned to 1 once calm (downward hysteresis included).
   std::vector<double> ncp;
   for (const auto& r : sink.scalars) {
-    if (r.key == "frontend/spline/n_cp") ncp.push_back(r.v);
+    if (r.key == "frontend/ct/n_cp") ncp.push_back(r.v);
   }
   ASSERT_FALSE(ncp.empty()) << "n_cp telemetry never emitted";
   const double peak = *std::max_element(ncp.begin(), ncp.end());
@@ -1037,6 +1117,357 @@ TEST(CtFrontEnd, AdaptiveKnotDensityTracksThroughTransitions) {
   // Continuous for the same characteristic).
   const double final_err = (fe.live_state().T_world_body.t - gtAtSweepEnd(gt, sweeps - 1).t).norm();
   EXPECT_LT(final_err, 0.25) << "final error after the density ramp: " << final_err;
+}
+
+// With the control-point cap pinned at one (adaptive density enabled, n_cp_max == 1)
+// the steady-state extend must reduce to the legacy uniform extend knot-for-knot:
+// every segment is forced to gear 1, so the production dispatch routes to the uniform
+// path and never re-lays a knot the previous solve refined. The window is driven to a
+// real steady state where the trailing knots carry values that differ from this sweep's
+// raw IMU extrapolation (so a stray re-lay would change them); then the same inertial
+// input is run through the production dispatch and the uniform reference on independent
+// clones, and the resulting spline knot vector (times AND values) and the bias timeline
+// must be bit-identical. A regression that routed the clamp back through the adaptive
+// re-knot would diverge here.
+TEST(CtFrontEnd, CappedAtOneExtendReducesToLegacyExtend) {
+  std::mt19937 rng(2026);
+  FrontendConfig cfg = ctCfg();
+  cfg.ncp.enabled = true;
+  cfg.ncp.n_cp_max = 1;  // every segment clamps to gear 1
+  CtFrontEnd fe(cfg, identityCalib(), nullptr, /*deterministic=*/true);
+
+  const std::vector<Plane> walls = boxRoom(2.5);
+  const GtFn gt = yawCrawlGt();  // continuous motion: per-sweep seeds genuinely differ
+  const int sweeps = 10;
+  auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+  for (auto& g : stream) {
+    fe.ingest(g);
+  }
+
+  // The next sweep's inertial input, exactly as the steady-state loop would consume it:
+  // the extend opens at the last solved time and runs to the new sweep end.
+  const Timestamp t_begin = fe.last_solved_t_for_test();
+  const Timestamp t_end = t_begin + kNsPerS / 10;
+  MeasureGroup mg;
+  mg.imu = imuFromGt(gt, t_begin, t_end, rng, 0.01, 0.001);
+
+  const CtFrontEnd::ExtendKnots a =
+      fe.probe_extend_for_test(mg, t_begin, t_end, /*use_production=*/true);
+  const CtFrontEnd::ExtendKnots b =
+      fe.probe_extend_for_test(mg, t_begin, t_end, /*use_production=*/false);
+
+  ASSERT_EQ(a.knot_t.size(), b.knot_t.size()) << "the two paths laid a different knot count";
+  ASSERT_EQ(a.bias_t.size(), b.bias_t.size());
+  for (std::size_t i = 0; i < a.knot_t.size(); ++i) {
+    EXPECT_EQ(a.knot_t[i], b.knot_t[i]) << "knot time " << i;
+    for (int c = 0; c < 4; ++c) {
+      EXPECT_EQ(a.so3[i][c], b.so3[i][c]) << "so3 knot " << i << " coeff " << c;
+    }
+    for (int c = 0; c < 3; ++c) {
+      EXPECT_EQ(a.r3[i][c], b.r3[i][c]) << "r3 knot " << i << " coeff " << c;
+    }
+  }
+  for (std::size_t k = 0; k < a.bias_t.size(); ++k) {
+    EXPECT_EQ(a.bias_t[k], b.bias_t[k]) << "bias knot time " << k;
+    for (int c = 0; c < 3; ++c) {
+      EXPECT_EQ(a.bias_gyro[k][c], b.bias_gyro[k][c]) << "bias gyro " << k << " coeff " << c;
+      EXPECT_EQ(a.bias_accel[k][c], b.bias_accel[k][c]) << "bias accel " << k << " coeff " << c;
+    }
+  }
+}
+
+// Drain regression: with 50 ms outer segments every sweep advances t_begin by TWO
+// segments, the regime that wedged the one-segment-per-sweep slide (resident knots,
+// prior dimension, and bias knots all grew without bound and the front-trim stalled).
+// The drain slide must reach a bounded fixpoint: resident knots, prior dimension, and
+// the covered span all stay flat over 20+ sweeps.
+TEST(CtFrontEnd, DrainSlideBoundedAcrossMultiSegmentSweeps) {
+  std::mt19937 rng(13);
+  FrontendConfig cfg = ctCfg();
+  cfg.spline.knot_dt_ms = 50.0;  // two outer segments per 100 ms sweep
+  cfg.spline.window_knots = 12;  // same 0.6 s warm-up horizon as the 100 ms config
+  cfg.ncp.enabled = true;
+  cfg.ncp.n_cp_max = 3;
+  cfg.ncp.omega_thresh = {0.5, 1.5};
+  cfg.ncp.accel_thresh = {1.0, 3.0};
+  // Structured forgetting on: the q_diag stack is rebuilt against the drain's
+  // per-slide variable kept layout, so a width mismatch would corrupt or crash here.
+  cfg.prior_forgetting.enabled = true;
+  meridian::RecordingSink sink;
+  CtFrontEnd fe(cfg, identityCalib(), &sink, /*deterministic=*/true);
+
+  const std::vector<Plane> walls = boxRoom(2.5);
+  const GtFn gt = yawCrawlGt();
+  const int sweeps = 24;
+  auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+  for (auto& g : stream) {
+    fe.ingest(g);
+    ASSERT_LT(fe.live_state().T_world_body.t.norm(), 5.0) << "trajectory exploded";
+  }
+
+  // The prior chain engaged across the multi-knot, multi-segment slides.
+  const meridian::FrontEndDiagnostics diag = fe.diagnostics();
+  EXPECT_GT(diag.knots_marginalized, 0) << "drain slide never marginalized a knot";
+  EXPECT_GT(diag.prior_residual_dim, 0) << "no prior was ever seeded";
+
+  // Boundedness over the steady-state half of the run: a wedge grows the resident
+  // knot count by ~2/sweep and the span by 0.1 s/sweep, so flat bounds catch it.
+  double max_knots = 0.0;
+  double max_prior = 0.0;
+  double max_span = 0.0;
+  const Timestamp steady_after = static_cast<Timestamp>(sweeps / 2) * kNsPerS / 10;
+  for (const auto& r : sink.scalars) {
+    if (r.t < steady_after) continue;
+    if (r.key == "frontend/ncp/window_knots") max_knots = std::max(max_knots, r.v);
+    if (r.key == "frontend/prior/dim") max_prior = std::max(max_prior, r.v);
+    if (r.key == "frontend/window_span_s") max_span = std::max(max_span, r.v);
+  }
+  ASSERT_GT(max_knots, 0.0) << "window_knots telemetry never emitted";
+  EXPECT_LE(max_knots, 24.0) << "resident knots grew unboundedly: " << max_knots;
+  ASSERT_GT(max_prior, 0.0) << "prior dim telemetry never emitted";
+  EXPECT_LE(max_prior, 120.0) << "prior dimension grew unboundedly: " << max_prior;
+  EXPECT_LE(max_span, 1.5) << "covered span grew unboundedly: " << max_span;
+}
+
+// One-segment byte-identity of the drop set: with the fixed cadence equal to the
+// sweep period exactly one outer segment departs per slide, and the unified slide must
+// retire the identical knots, in the identical order, as the single-segment reference
+// [leadingKnotIndex(t_begin), knotTime(lead)+knot_dt). The pointers, not just the
+// count, must match -- a divergence here is a byte-identity break against the
+// disabled build.
+TEST(CtFrontEnd, SlideDropSetMatchesLegacyAtSingleSegment) {
+  std::mt19937 rng(31);
+  FrontendConfig cfg = ctCfg();  // 100 ms cadence == 100 ms sweep: one segment per slide
+  CtFrontEnd fe(cfg, identityCalib(), nullptr, /*deterministic=*/true);
+  fe.set_record_slide_drops_for_test(true);
+
+  const std::vector<Plane> walls = boxRoom(2.5);
+  const GtFn gt = yawCrawlGt();
+  const int sweeps = 18;
+  auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+  for (auto& g : stream) {
+    fe.ingest(g);
+  }
+
+  const auto& recs = fe.slide_drop_records_for_test();
+  ASSERT_FALSE(recs.empty()) << "no window slide ever fired";
+  bool any_dropped = false;
+  for (std::size_t s = 0; s < recs.size(); ++s) {
+    const auto& r = recs[s];
+    ASSERT_EQ(r.unified.size(), r.legacy_oracle.size())
+        << "slide " << s << " dropped a different knot count than the single-segment reference";
+    for (std::size_t i = 0; i < r.unified.size(); ++i) {
+      EXPECT_EQ(r.unified[i], r.legacy_oracle[i])
+          << "slide " << s << " drop pointer/order differs at index " << i;
+    }
+    if (!r.unified.empty()) any_dropped = true;
+  }
+  EXPECT_TRUE(any_dropped) << "every recorded slide dropped nothing; the test is vacuous";
+  EXPECT_GT(fe.diagnostics().knots_marginalized, 0) << "no knot was ever marginalized";
+}
+
+// Multi-segment departure: a cadence half the sweep period advances t_begin past TWO
+// outer segments every sweep -- the regime that wedged the original single-segment
+// slide (the second departed segment was never marginalized, the kept-set recurrence
+// re-kept it, and the window grew without bound). The unified slide must retire BOTH
+// departed segments in one Schur build: at least one slide drops strictly more than the
+// single-segment reference, and the resident knot count / prior dimension stay flat.
+TEST(CtFrontEnd, SlideDropsEveryDepartedSegmentAtMultiSegmentStep) {
+  std::mt19937 rng(37);
+  FrontendConfig cfg = ctCfg();
+  cfg.spline.knot_dt_ms = 50.0;  // two outer segments per 100 ms sweep
+  cfg.spline.window_knots = 12;  // same 0.6 s warm-up horizon as the 100 ms config
+  cfg.ncp.enabled = true;
+  cfg.ncp.n_cp_max = 1;  // gear 1 everywhere: the byte-identity regime, multi-segment
+  meridian::RecordingSink sink;
+  CtFrontEnd fe(cfg, identityCalib(), &sink, /*deterministic=*/true);
+  fe.set_record_slide_drops_for_test(true);
+
+  const std::vector<Plane> walls = boxRoom(2.5);
+  const GtFn gt = yawCrawlGt();
+  const int sweeps = 24;
+  auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+  for (auto& g : stream) {
+    fe.ingest(g);
+    ASSERT_LT(fe.live_state().T_world_body.t.norm(), 5.0) << "trajectory exploded";
+  }
+
+  // At least one slide retired more knots than the single-segment reference would --
+  // i.e. it marginalized a second departed segment the legacy bound missed.
+  const auto& recs = fe.slide_drop_records_for_test();
+  ASSERT_FALSE(recs.empty()) << "no window slide ever fired";
+  bool multi_segment = false;
+  for (const auto& r : recs) {
+    // Each gear-1 segment contributes one so3 + one r3 pointer; two segments => four.
+    if (r.unified.size() > r.legacy_oracle.size() && r.unified.size() >= 4) {
+      multi_segment = true;
+    }
+  }
+  EXPECT_TRUE(multi_segment)
+      << "no slide ever dropped a second departed segment; the generalization is untested";
+  EXPECT_GT(fe.diagnostics().knots_marginalized, 0) << "no knot was ever marginalized";
+
+  // Bounded fixpoint over the steady-state half: a missed segment grows the resident
+  // knot count ~2/sweep, so a flat bound catches the wedge the legacy slide produced.
+  double max_knots = 0.0;
+  const Timestamp steady_after = static_cast<Timestamp>(sweeps / 2) * kNsPerS / 10;
+  for (const auto& r : sink.scalars) {
+    if (r.t < steady_after) continue;
+    if (r.key == "frontend/ncp/window_knots") max_knots = std::max(max_knots, r.v);
+  }
+  ASSERT_GT(max_knots, 0.0) << "window_knots telemetry never emitted";
+  EXPECT_LE(max_knots, 24.0) << "resident knots grew unboundedly: " << max_knots;
+}
+
+// No-prior first slide at gear >= 2: a rotation fast enough to gear up from the very
+// first steady-state segments means the FIRST slide must marginalize a whole
+// multi-knot group while the gauge is still index-pinned -- the legacy
+// segment-relative pins landed inside the departing group there, refused the
+// constant drop every sweep, and no prior was ever seeded.
+TEST(CtFrontEnd, NoPriorFirstSlideAtGearTwoSeedsPrior) {
+  std::mt19937 rng(17);
+  FrontendConfig cfg = ctCfg();
+  cfg.ncp.enabled = true;
+  cfg.ncp.n_cp_max = 3;
+  cfg.ncp.omega_thresh = {0.5, 1.5};
+  cfg.ncp.accel_thresh = {1.0, 3.0};
+  CtFrontEnd fe(cfg, identityCalib(), nullptr, /*deterministic=*/true);
+
+  // Still for the init window, then a steady 1.2 rad/s yaw: every finalized segment
+  // from t = 0.1 s onward gears to 2.
+  const double spin_start_s = 0.1;
+  const GtFn gt = [&](Timestamp t) {
+    const double ts = to_seconds(t);
+    const double ang = ts <= spin_start_s ? 0.0 : 1.2 * (ts - spin_start_s);
+    Pose p;
+    p.q = Eigen::Quaterniond(Eigen::AngleAxisd(ang, Eigen::Vector3d::UnitZ())).normalized();
+    return p;
+  };
+
+  const std::vector<Plane> walls = boxRoom(2.5);
+  const int sweeps = 14;
+  auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+  for (auto& g : stream) {
+    fe.ingest(g);
+    ASSERT_LT(fe.live_state().T_world_body.t.norm(), 2.0) << "trajectory exploded";
+  }
+
+  const meridian::FrontEndDiagnostics diag = fe.diagnostics();
+  EXPECT_GT(diag.knots_marginalized, 0) << "the gear-2 group was never marginalized";
+  EXPECT_GT(diag.prior_residual_dim, 0) << "the first slide failed to seed a prior";
+  // The prior may only keep blocks this class owns across sweeps: spline knots
+  // (global 4 or 3), bias knots (3), gravity (3). The per-sweep exposure scalar
+  // (global 1) must always land on the dropped side.
+  const auto* prior = fe.prior_for_test();
+  ASSERT_NE(prior, nullptr);
+  for (const auto& blk : prior->blocks()) {
+    EXPECT_TRUE(blk.global_size == 3 || blk.global_size == 4)
+        << "prior kept a non-persistent block of global size " << blk.global_size;
+  }
+}
+
+// The warm-start mini-solve is what makes dense-knot seeding usable: on a fast yaw
+// sway the IMU-propagated knot placement alone leaves a wiggly tail whose round-0
+// problem cost is measurably higher. Identical deterministic streams, the only
+// variable is ncp.warmstart_iters (0 vs 4): the warm-started run must enter the main
+// solve cheaper on aggregate.
+TEST(CtFrontEnd, WarmstartMiniSolveLowersInitialCostOnSway) {
+  const std::vector<Plane> walls = boxRoom(2.5);
+  // 2.5 Hz yaw sway, ~2.4 rad/s peak rate: mean per-segment rate straddles the
+  // second band so the sway runs at gear 2-3.
+  const GtFn gt = [](Timestamp t) {
+    const double ts = to_seconds(t);
+    Pose p;
+    p.q = Eigen::Quaterniond(
+              Eigen::AngleAxisd(0.15 * std::sin(2.0 * M_PI * 2.5 * ts), Eigen::Vector3d::UnitZ()))
+              .normalized();
+    return p;
+  };
+  const int sweeps = 12;
+
+  auto run = [&](int warmstart_iters) -> double {
+    std::mt19937 rng(19);
+    FrontendConfig cfg = ctCfg();
+    cfg.ncp.enabled = true;
+    cfg.ncp.n_cp_max = 3;
+    cfg.ncp.omega_thresh = {0.5, 1.5};
+    cfg.ncp.accel_thresh = {1.0, 3.0};
+    cfg.ncp.warmstart_iters = warmstart_iters;
+    meridian::RecordingSink sink;
+    CtFrontEnd fe(cfg, identityCalib(), &sink, /*deterministic=*/true);
+    auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+    for (auto& g : stream) fe.ingest(g);
+    double sum = 0.0;
+    int n = 0;
+    for (const auto& r : sink.scalars) {
+      if (r.key == "frontend/solver/cost_initial") {
+        sum += r.v;
+        ++n;
+      }
+    }
+    EXPECT_GT(n, 0) << "cost_initial telemetry never emitted";
+    return sum;
+  };
+
+  const double cost_raw = run(0);
+  const double cost_warm = run(4);
+  EXPECT_LT(cost_warm, cost_raw)
+      << "the mini-solve did not lower the aggregate round-0 cost: warm " << cost_warm
+      << " vs raw " << cost_raw;
+}
+
+// Exposure-block-to-dropped: with the visual stage active and the inverse exposure a
+// FREE state, the per-sweep stack-owned exposure scalar enters the slide's Markov
+// blanket (the photometric residuals share the boundary segment's knots). Keeping it
+// would dangle the prior into a dead stack frame on the next solve; the drain must
+// marginalize it to the dropped side, so the carried prior never holds a size-1
+// block, and the run stays healthy.
+TEST(CtFrontEnd, DrainSlideDropsExposureBlock) {
+  std::mt19937 rng(23);
+  FrontendConfig cfg = ctCfg();
+  cfg.ncp.enabled = true;
+  cfg.ncp.n_cp_max = 3;
+  cfg.ncp.omega_thresh = {0.5, 1.5};
+  cfg.ncp.accel_thresh = {1.0, 3.0};
+  meridian::RecordingSink sink;
+  // inv_expo_std > 0 keeps the exposure block a free state in every sweep's problem.
+  CtFrontEnd fe(cfg, vis::cameraCalib(/*inv_expo_std=*/0.1), &sink, /*deterministic=*/true);
+
+  const std::vector<Plane> walls = boxRoom(2.5);
+  // Yaw fast enough to hold gear 2 once moving, slow enough for the photometric
+  // warp gates to keep accepting patches.
+  const double spin_start_s = 0.1;
+  const GtFn gt = [&](Timestamp t) {
+    const double ts = to_seconds(t);
+    const double ang = ts <= spin_start_s ? 0.0 : 0.8 * (ts - spin_start_s);
+    Pose p;
+    p.q = Eigen::Quaterniond(Eigen::AngleAxisd(ang, Eigen::Vector3d::UnitZ())).normalized();
+    return p;
+  };
+  const int sweeps = 16;
+  auto stream = vis::buildVisualStream(walls, sweeps, gt, rng, 0.01, 0.001,
+                                       /*with_image=*/true, nullptr);
+  for (auto& g : stream) {
+    fe.ingest(g);
+    ASSERT_TRUE(fe.live_state().T_world_body.t.allFinite());
+  }
+
+  // The visual stage genuinely contributed residuals (otherwise the exposure block
+  // never met the blanket and the test is vacuous).
+  double converged = 0.0;
+  for (const auto& r : sink.scalars) {
+    if (r.key == "frontend/visual/n_converged") converged = std::max(converged, r.v);
+  }
+  ASSERT_GT(converged, 0.0) << "no photometric residual ever converged";
+
+  const meridian::FrontEndDiagnostics diag = fe.diagnostics();
+  ASSERT_GT(diag.knots_marginalized, 0) << "window never slid";
+  const auto* prior = fe.prior_for_test();
+  ASSERT_NE(prior, nullptr);
+  for (const auto& blk : prior->blocks()) {
+    EXPECT_TRUE(blk.global_size == 3 || blk.global_size == 4)
+        << "prior kept the per-sweep exposure scalar (global size " << blk.global_size << ")";
+  }
 }
 
 TEST(CtFrontEnd, BiasBoxBoundsAndRecovery) {
@@ -1760,4 +2191,243 @@ TEST(CtFrontEnd, BootstrapDeskewedSeedMatchesRawFallbackSeed) {
       << p_raw.t.transpose();
   EXPECT_LT(rotErr(p_dsk.q, p_raw.q), 1e-4)
       << "deskewed seed orientation disagrees with the raw-fallback seed";
+}
+
+// ---------------------------------------------------------------------------
+// Debug-surface contract: the always-on spec-checklist keys land every steady
+// sweep, the funnel counters are monotone, the histogram is consistent, and the
+// spline path samples walk the configured cadence — all with a sink that enables
+// everything. The gating twin below proves the group keys cost nothing when off.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Per-key time series pulled from a RecordingSink.
+std::vector<std::pair<Timestamp, double>> seriesOf(const meridian::RecordingSink& sink,
+                                                   const std::string& key) {
+  std::vector<std::pair<Timestamp, double>> out;
+  for (const auto& r : sink.scalars) {
+    if (r.key == key) {
+      out.emplace_back(r.t, r.v);
+    }
+  }
+  return out;
+}
+
+double lastOf(const meridian::RecordingSink& sink, const std::string& key) {
+  const auto s = seriesOf(sink, key);
+  return s.empty() ? std::numeric_limits<double>::quiet_NaN() : s.back().second;
+}
+
+}  // namespace
+
+TEST(CtFrontEnd, DebugTelemetryFullSurface) {
+  std::mt19937 rng(7);
+  meridian::RecordingSink sink;
+  FrontendConfig cfg = ctCfg();
+  cfg.debug_path_sample_hz = 30.0;
+  CtFrontEnd fe(cfg, identityCalib(), &sink);
+
+  const std::vector<Plane> walls = boxRoom(2.5);
+  const GtFn gt = circleGt();
+  const int sweeps = 20;
+  auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+  for (auto& g : stream) {
+    fe.ingest(g);
+  }
+  ASSERT_GT(fe.live_state().stamp, 0);
+
+  // Every steady sweep emits the always-on checklist scalars (sweep 0 bootstraps).
+  const int steady = sweeps - 1;
+  for (const char* key :
+       {"frontend/lidar/n_input", "frontend/lidar/inlier_ratio", "frontend/lidar/res_mean",
+        "frontend/lidar/res_max", "frontend/lidar/n_inlier", "frontend/imu/res_acc",
+        "frontend/imu/res_gyr", "frontend/grav_norm", "frontend/cost_total",
+        "frontend/dx_norm", "frontend/window_span_s"}) {
+    EXPECT_EQ(static_cast<int>(seriesOf(sink, key).size()), steady) << key;
+  }
+
+  // Funnel monotonicity per sweep: n_input >= attempted >= matched >= accepted.
+  const auto n_input = seriesOf(sink, "frontend/lidar/n_input");
+  const auto attempted = seriesOf(sink, "frontend/assoc/n_attempted");
+  const auto matched = seriesOf(sink, "frontend/assoc/n_matched");
+  const auto accepted = seriesOf(sink, "frontend/lidar/n_inlier");
+  ASSERT_EQ(n_input.size(), attempted.size());
+  ASSERT_EQ(attempted.size(), matched.size());
+  ASSERT_EQ(matched.size(), accepted.size());
+  for (std::size_t i = 0; i < n_input.size(); ++i) {
+    EXPECT_GE(n_input[i].second, attempted[i].second) << "sweep " << i;
+    EXPECT_GE(attempted[i].second, matched[i].second) << "sweep " << i;
+    EXPECT_GE(matched[i].second, accepted[i].second) << "sweep " << i;
+    EXPECT_GT(accepted[i].second, 0.0) << "sweep " << i;
+  }
+
+  // Residual stats are coherent and the histogram counts exactly the scored hits.
+  EXPECT_LE(lastOf(sink, "frontend/lidar/res_mean"), lastOf(sink, "frontend/lidar/res_max"));
+  EXPECT_GE(lastOf(sink, "frontend/lidar/inlier_ratio"), 0.0);
+  EXPECT_LE(lastOf(sink, "frontend/lidar/inlier_ratio"), 1.0);
+  bool saw_hist = false;
+  for (const auto& v : sink.vecs) {
+    if (v.key != "frontend/assoc/res_hist") {
+      continue;
+    }
+    saw_hist = true;
+    EXPECT_EQ(v.v.size(), 16);
+    double sum = 0.0;
+    for (Eigen::Index i = 0; i < v.v.size(); ++i) {
+      sum += v.v[i];
+    }
+    // Every accepted hit of that sweep is scored into exactly one bin.
+    double acc_at_t = -1.0;
+    for (const auto& [t, a] : accepted) {
+      if (t == v.t) {
+        acc_at_t = a;
+      }
+    }
+    EXPECT_EQ(sum, acc_at_t);
+  }
+  EXPECT_TRUE(saw_hist);
+
+  // IMU consistency in physical units: small residuals on a consistent synthetic
+  // trajectory, gravity pinned at |g|, bias vectors present with the stated order.
+  EXPECT_LT(lastOf(sink, "frontend/imu/res_gyr"), 0.1);
+  EXPECT_LT(lastOf(sink, "frontend/imu/res_acc"), 1.0);
+  EXPECT_NEAR(lastOf(sink, "frontend/grav_norm"), kG, 1e-2);
+  bool saw_bias = false;
+  for (const auto& v : sink.vecs) {
+    if (v.key == "frontend/bias_acc" || v.key == "frontend/bias_gyr") {
+      saw_bias = true;
+      EXPECT_EQ(v.v.size(), 3);
+      EXPECT_EQ(v.axis_order, "bx,by,bz");
+    }
+  }
+  EXPECT_TRUE(saw_bias);
+
+  // Deskew stats: non-negative, mean <= max, and a moving platform has a non-zero
+  // sweep translation span.
+  const auto corr_mean = seriesOf(sink, "frontend/deskew/corr_mean_m");
+  const auto corr_max = seriesOf(sink, "frontend/deskew/corr_max_m");
+  ASSERT_FALSE(corr_mean.empty());
+  ASSERT_EQ(corr_mean.size(), corr_max.size());
+  for (std::size_t i = 0; i < corr_mean.size(); ++i) {
+    EXPECT_GE(corr_mean[i].second, 0.0);
+    EXPECT_LE(corr_mean[i].second, corr_max[i].second + 1e-12);
+  }
+  EXPECT_GT(lastOf(sink, "frontend/deskew/sweep_trans_m"), 0.0);
+
+  // Spline kinematics + solver internals are present with the full-surface sink.
+  EXPECT_FALSE(seriesOf(sink, "frontend/spline/acc_rms_span").empty());
+  EXPECT_FALSE(seriesOf(sink, "frontend/solver/termination").empty());
+  bool saw_iter_cost = false;
+  for (const auto& v : sink.vecs) {
+    if (v.key == "frontend/solver/iter_cost") {
+      saw_iter_cost = true;
+      EXPECT_GT(v.v.size(), 0);
+    }
+  }
+  EXPECT_TRUE(saw_iter_cost);
+  // The solver group also upgrades the per-family probe to every sweep with shares.
+  EXPECT_FALSE(seriesOf(sink, "frontend/resid/lidar/cost_frac").empty());
+
+  // Path samples: strictly monotone stamps on the configured 1/30 s cadence, poses
+  // tracking the trajectory the estimator solved.
+  std::vector<meridian::RecordingSink::PoseRec> path;
+  for (const auto& p : sink.poses) {
+    if (p.key == "frontend/spline/path_sample") {
+      path.push_back(p);
+    }
+  }
+  ASSERT_GT(path.size(), 10u);
+  const Duration step = meridian::from_seconds(1.0 / 30.0);
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    EXPECT_EQ(path[i].t - path[i - 1].t, step) << "sample " << i;
+    EXPECT_EQ(path[i].frame, Frame::Odom);
+  }
+  // Spot-check the last sample against ground truth (the tracker holds ~0.25 m).
+  const Pose gt_last = circleGt()(path.back().t);
+  EXPECT_LT((path.back().pose.t - gt_last.t).norm(), 0.35);
+}
+
+namespace {
+
+// Forwards every record into an inner RecordingSink but reports the debug-group
+// prefixes (and the path stream) as disabled — the "groups off" posture. Any record
+// arriving under a gated prefix means a group emission was not hoisted behind
+// enabled() and would burn cycles in production.
+class GroupGateSink final : public meridian::TelemetrySink {
+ public:
+  static bool gated(const char* key) {
+    const std::string_view k(key);
+    for (const std::string_view p :
+         {"frontend/assoc/", "frontend/solver/", "frontend/deskew/", "frontend/spline/",
+          "frontend/map/"}) {
+      if (k.substr(0, p.size()) == p) {
+        return true;
+      }
+    }
+    return false;
+  }
+  bool enabled(const char* key) const override { return !gated(key); }
+
+  void scalar(const char* key, double v, Timestamp t) override { rec.scalar(key, v, t); }
+  void vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v, Timestamp t,
+           const char* axis_order) override {
+    rec.vec(key, v, t, axis_order);
+  }
+  void cloud(const char* key, const meridian::PointCloudView& v, Frame f,
+             Timestamp t) override {
+    rec.cloud(key, v, f, t);
+  }
+  void pose(const char* key, const Pose& p, Frame f, Timestamp t) override {
+    rec.pose(key, p, f, t);
+  }
+  void marker(const meridian::Marker& m, Timestamp t) override { rec.marker(m, t); }
+  void image(const char* key, const meridian::ImageOverlay& ov, Timestamp t) override {
+    rec.image(key, ov, t);
+  }
+  void timing(const char* stage, double ms, Timestamp t) override { rec.timing(stage, ms, t); }
+  void event(meridian::Level level, const char* tag, std::string_view msg,
+             Timestamp t) override {
+    rec.event(level, tag, msg, t);
+  }
+
+  meridian::RecordingSink rec;
+};
+
+}  // namespace
+
+TEST(CtFrontEnd, DebugGroupKeysSilentWhenGated) {
+  std::mt19937 rng(7);
+  GroupGateSink sink;
+  CtFrontEnd fe(ctCfg(), identityCalib(), &sink);
+
+  const std::vector<Plane> walls = boxRoom(2.5);
+  const GtFn gt = circleGt();
+  auto stream = buildStream(walls, 10, gt, rng, 0.01, 0.001);
+  for (auto& g : stream) {
+    fe.ingest(g);
+  }
+  ASSERT_GT(fe.live_state().stamp, 0);
+
+  // Zero-cost-when-off: nothing under a gated prefix may have been emitted.
+  for (const auto& r : sink.rec.scalars) {
+    EXPECT_FALSE(GroupGateSink::gated(r.key.c_str())) << r.key;
+  }
+  for (const auto& r : sink.rec.vecs) {
+    EXPECT_FALSE(GroupGateSink::gated(r.key.c_str())) << r.key;
+  }
+  for (const auto& r : sink.rec.clouds) {
+    EXPECT_FALSE(GroupGateSink::gated(r.key.c_str())) << r.key;
+  }
+  for (const auto& r : sink.rec.poses) {
+    EXPECT_FALSE(GroupGateSink::gated(r.key.c_str())) << r.key;
+  }
+
+  // The always-on basics still flow.
+  EXPECT_FALSE(seriesOf(sink.rec, "frontend/lidar/n_input").empty());
+  EXPECT_FALSE(seriesOf(sink.rec, "frontend/lidar/res_mean").empty());
+  EXPECT_FALSE(seriesOf(sink.rec, "frontend/imu/res_acc").empty());
+  EXPECT_FALSE(seriesOf(sink.rec, "frontend/cost_total").empty());
+  // The gated solver group must not have upgraded the per-family probe.
+  EXPECT_TRUE(seriesOf(sink.rec, "frontend/resid/lidar/cost_frac").empty());
 }

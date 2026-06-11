@@ -6,6 +6,7 @@
 #include <ceres/problem.h>
 
 #include <Eigen/Eigenvalues>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <utility>
@@ -125,7 +126,7 @@ private:
 
 std::unique_ptr<MarginalizationPrior> MarginalizationPrior::fromSchur(
     const Eigen::MatrixXd& H, const Eigen::VectorXd& b, const std::vector<Block>& kept,
-    int dropped_dim, double scale) {
+    int dropped_dim, double scale, const Eigen::VectorXd* q_diag) {
   int k = 0;
   for (const Block& blk : kept) {
     k += blk.local_size;
@@ -163,11 +164,67 @@ std::unique_ptr<MarginalizationPrior> MarginalizationPrior::fromSchur(
     b_marg = b.head(k);
   }
 
-  // Symmetrise and factor the marginal information into sqrt-information J0 with
-  // J0^T J0 = H_marg (negative eigenvalues, from round-off, clamped to zero). The
-  // residual r0 is chosen so J0^T r0 = b_marg on the supported subspace, making
-  // the prior's Gauss-Newton step solve H_marg dx = -b_marg.
-  const Eigen::MatrixXd sym = 0.5 * (h_marg + h_marg.transpose());
+  // One symmetrization feeds the mean solve, the structured-forgetting update, and
+  // the final factorization, so all three agree on the marginal's rank.
+  Eigen::MatrixXd sym = 0.5 * (h_marg + h_marg.transpose());
+  Eigen::VectorXd b_fact = b_marg;
+
+  // Structured forgetting: relax the marginal covariance by diag(q) on the
+  // coordinates with q > 0, computed entirely in information space. With E the
+  // selection matrix of those m coordinates and Q_e = diag(q_e), the exact
+  // information form of P' = P + E Q_e E^T is the Woodbury identity
+  //   H' = H - (H E) (Q_e^{-1} + E^T H E)^{-1} (H E)^T,
+  // which never inverts H itself: a null direction of H stays null (H x = 0
+  // implies (H E)^T x = 0, hence H' x = 0), so a direction the prior carries no
+  // information about cannot be resurrected at strength 1/q by a covariance
+  // round trip. Along an inflated direction the information maps
+  // lambda -> lambda / (1 + q * lambda) <= 1/q, the steady-state cap of a filter
+  // with process noise q. The prior mean is preserved by carrying the
+  // Gauss-Newton step dx* = -H^+ b across the update: b' = -H' dx*, so the
+  // relaxed prior still minimises at the same kept-state estimate, only with
+  // wider uncertainty. Coordinates with q == 0 keep their marginal covariance
+  // exactly (covariance addition touches only the inflated diagonal of P even
+  // though H and b change in every coordinate through the coupling).
+  // q_diag must cover the kept tangent stack exactly; a mismatched length means the
+  // caller's per-block bookkeeping diverged from `kept`, and inflating a prefix would
+  // relax the wrong coordinates. Fail loud in debug, skip the inflation in release.
+  assert(q_diag == nullptr || q_diag->size() == k);
+  if (q_diag != nullptr && q_diag->size() != k) {
+    q_diag = nullptr;
+  }
+  if (q_diag != nullptr) {
+    std::vector<int> infl;
+    infl.reserve(static_cast<std::size_t>(k));
+    for (int i = 0; i < k; ++i) {
+      if ((*q_diag)(i) > 0.0) {
+        infl.push_back(i);
+      }
+    }
+    if (!infl.empty()) {
+      const int m = static_cast<int>(infl.size());
+      Eigen::MatrixXd he(k, m);  // H E: the inflated coordinates' columns of H
+      Eigen::MatrixXd M(m, m);   // Q_e^{-1} + E^T H E
+      for (int j = 0; j < m; ++j) {
+        const int cj = infl[static_cast<std::size_t>(j)];
+        he.col(j) = sym.col(cj);
+        for (int r = 0; r < m; ++r) {
+          M(r, j) = sym(infl[static_cast<std::size_t>(r)], cj);
+        }
+        // diag(1/q) dominates whatever round-off indefiniteness the PSD Schur
+        // complement carries, so M is safely positive definite for finite q > 0.
+        M(j, j) += 1.0 / (*q_diag)(cj);
+      }
+      const Eigen::VectorXd dx_star = -robustInverse(sym) * b_marg;
+      const Eigen::MatrixXd update = he * M.ldlt().solve(he.transpose());
+      sym -= 0.5 * (update + update.transpose());
+      b_fact = -sym * dx_star;
+    }
+  }
+
+  // Factor the marginal information into sqrt-information J0 with J0^T J0 = sym
+  // (negative eigenvalues, from round-off, clamped to zero). The residual r0 is
+  // chosen so J0^T r0 = b on the supported subspace, making the prior's
+  // Gauss-Newton step solve sym dx = -b.
   Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(sym);
   const Eigen::VectorXd& lambda = es.eigenvalues();
   Eigen::VectorXd s_sqrt(k);
@@ -179,7 +236,7 @@ std::unique_ptr<MarginalizationPrior> MarginalizationPrior::fromSchur(
   }
   const Eigen::MatrixXd Vt = es.eigenvectors().transpose();
   prior->j0_ = s_sqrt.asDiagonal() * Vt;
-  prior->r0_ = s_inv_sqrt.asDiagonal() * (Vt * b_marg);
+  prior->r0_ = s_inv_sqrt.asDiagonal() * (Vt * b_fact);
   // Information deflation: J0^T J0 becomes scale * H_marg while J0^T r0 becomes
   // scale * b_marg, so the prior's Gauss-Newton step H_marg dx = -b_marg is
   // unchanged in direction and magnitude -- only its weight against other factors

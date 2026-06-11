@@ -95,6 +95,51 @@ total `map_points` — if `frontend.ct.visual_map` climbs with run length, that
 regressed (see `VisualMap::selectVisibleIds`). `visual.active_box_m` bounds memory,
 not per-sweep cost.
 
+## Debug groups & costs (the deep front-end surface)
+
+Spec 09 §5.1/§11 owns the design; this is the operator card. Five config-seeded
+key-prefix wildcard groups under `debug:` gate the deep instrumentation; everything
+else (counts, residual means, biases, innovation, observability, IMU consistency)
+is always on and cheap. Off cost per group = **one hash lookup per sweep** (nothing
+is built). All stamps are measurement time, so plots align across runs and rates.
+
+| group (`debug.<g>.enable`) | keys | what it answers | cost when ON |
+|---|---|---|---|
+| `assoc` | `frontend/assoc/*`: attempted/matched funnel, reject_{nn,dist,plane,score}, res_p95 + res_hist(16), nn_dist_*, plane_rms_*, strata_kept, outliers cloud | where association loses points; misfit distribution vs time; directional balance of the factor set | ~0.1–0.3 ms/sweep stats + one rejected-cloud build (2 Hz publish) |
+| `solver` | `frontend/solver/*`: iter_cost/step/grad/tr_radius vecs, cost_initial, termination; upgrades `frontend/resid/*` to every sweep + cost_frac | is the solve converging, what terminates it, which residual family dominates the cost | ~1–3 ms/sweep (post-solve `Problem::Evaluate`; cannot starve the solve, but mind the Jetson budget) |
+| `deskew` | `frontend/deskew/*`: corr_{mean,p95,max}_m, sweep_{trans_m,rot_deg}, 'pre' cloud | how much CT motion compensation actually moves points; before/after deskew view vs `map/registered` | ~0.1 ms + one cloud build (2 Hz publish) |
+| `spline` | `frontend/spline/*`: vel/acc/omega vec3, acc/omega span-RMS, jerk_rms | vibration & knot-cadence aliasing (gait frequency beating the knot grid) | ~0.2 ms (≈40 analytic spline evals/sweep) |
+| `map_health` (default ON) | `frontend/map/*`: size, n_inserted, insert_rejected | map growth rate / insert pathology | negligible |
+
+Live toggle (no restart, same wildcard the config seeds):
+
+```bash
+ros2 service call /meridian/set_debug_key meridian_msgs/SetDebugKey \
+    "{key: 'frontend/assoc/*', enable: true, max_hz: 10.0}"
+ros2 service call /meridian/set_debug_key meridian_msgs/SetDebugKey \
+    "{key: 'frontend/deskew/pre', enable: true, max_hz: 2.0}"   # single key works too
+```
+
+`src/meridian_ros/config/newer-college-quad.yaml` ships all groups ON (it is the
+accuracy-hunt exemplar); every other config keeps the default-off posture. The
+deterministic replay (`replay_runner`) honours the same `debug:` groups from the
+same YAML — a replay records exactly what the live posture would (no rate limit:
+every sample lands in `*_telemetry.txt`).
+
+**The spline path:** `/meridian/path` (nav_msgs/Path) is the solved B-spline
+sampled at `debug.path_sample_hz` (30 Hz default), republished at
+`path_publish_hz`, capped at `path_max_poses`. Add a Path display in rviz (fixed
+frame `odom`) to see the continuous trajectory — inter-sweep jitter shows here
+that keyframe-rate displays hide. Poses near the window's leading edge are still
+being refined, so small kinks vs. the final trajectory are expected.
+
+**One figure per run:** `tools/plot_frontend.py` renders the whole surface
+(12 panels: funnel, per-family RMS, residual heatmap, solver, innovation, deskew,
+kinematics, IMU consistency + biases, observability, queues, stage timing,
+visual/GNSS) from the run artifacts; `tools/run_eval.sh --diagnose` writes
+`<name>_frontend.png` automatically. Panels for off groups render as "group off",
+so figures stay comparable across postures.
+
 ## Autodiff vs analytic Jacobians
 
 LiDAR, visual **and IMU** factors use hand-derived analytic Jacobians; the autodiff

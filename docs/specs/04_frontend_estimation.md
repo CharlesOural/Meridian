@@ -168,9 +168,18 @@ $$
 $$
 
 Control points are non-uniformly spaced (adaptive knots, §5.5); the non-uniform
-behaviour is realised by running the uniform basalt kernels over a **virtual time**
-remapping (Coco-LIC's engineering pattern; Appendix R.1), so the analytic
-Jacobians stay the vendored, battle-tested ones.
+behaviour is realised by **true non-uniform B-spline evaluation**: each knot interval
+carries its own blending matrix $M^{(4)}_i$ (and cumulative form $\tilde M^{(4)}_i$)
+computed by the symbolic Cox–de Boor recurrence from the six real knot times its four
+live bases depend on, cached per interval with knot-pointer lifetime. Every factor
+evaluates through the same expressions as the uniform case with the per-interval
+matrix substituted for the cardinal one and $1/\Delta t$ the interval's exact real
+span, so the trajectory is $C^2$ in **real** time across density changes and the
+analytic Jacobians remain closed-form. With adaptive density disabled no per-interval
+matrix code runs and evaluation is bit-identical to the uniform kernels. (The earlier
+virtual-time warp — uniform kernels over a piecewise-linear time remap, Coco-LIC's
+engineering pattern — is retained only as the disabled-mode degenerate case; it was
+$C^1$ in real time at density changes, which the IMU residual had to absorb.)
 
 > **Considered and rejected: the Point-LIO per-point-update model** (angular
 > velocity/acceleration as filter states, sparse Kalman update at every point's
@@ -738,8 +747,12 @@ keeps under-determined control points (§10, failure 2) regularised.
 > residual $r^{\dot\omega} = \dot{\boldsymbol\omega}_{W\,F_e}(t)$ on the SO(3) spline,
 > each evaluated at the segment's knot midpoints. It is **off unless** the segment is
 > flagged under-excited (`motion_reg.enable`, default on; engaged only when the
-> peak excitation statistics $N_\omega,N_a$ of §5.5 are below
-> `motion_reg.excitation_floor` *and* a §4 eigenvalue is below $\kappa_{\text{deg}}$),
+> **peak per-sample excitation statistics**
+> $N_\omega=\max_i\|\boldsymbol\omega_{m,i}-b_g\|$ and
+> $N_a=\max_i\big|\|\mathbf a_{m,i}-b_a\|-|g|\big|$ are below
+> `motion_reg.excitation_floor` *and* a §4 eigenvalue is below $\kappa_{\text{deg}}$
+> — the peak form, distinct from §5.5's mean-of-norms gearing statistic, because a
+> single excited sample is enough evidence that the span is not degenerate),
 > and its weight `motion_reg.weight` (default 1e-3, relative to the IMU accel weight)
 > is small enough to bias nothing once any real measurement constrains the span.
 > Because it is a pull toward *constant velocity / constant rate*, not toward a
@@ -1134,72 +1147,84 @@ single-representation discipline is carried to the L2→L3 boundary in §6.4.
 ### 5.5 Adaptive knots (Coco-LIC)
 
 Knot density follows motion (Coco-LIC's adaptive scheme; Appendix R.1). Fixed **outer cadence**
-`knot_dt ≈ 0.1 s`; within each outer segment, the number of control points
-`n_cp ∈ {1..n_cp_max}` is chosen from IMU-measured dynamics over the **raw samples
-of that segment** — never from a summed-then-normed aggregate. The gating statistic
-is the **peak per-sample excitation in the segment**, taken on quantities that are
-frame-invariant so attitude change never hides motion:
+`knot_dt ≈ 0.1 s`; within each outer segment, the number of control points (the
+segment's **gear**) `n_cp ∈ {1..ncp.n_cp_max}` is chosen from IMU-measured dynamics
+over the **raw samples of that segment** — a mean of per-sample norms, never a
+summed-then-normed aggregate. The gating statistics are the **segment-mean
+magnitudes**, frame-invariant so attitude change never hides motion:
 $$
-N_\omega = \max_{i\in\text{seg}}\,\big\|\boldsymbol\omega_{m,i}-b_g\big\|,\qquad
-N_a = \max_{i\in\text{seg}}\,\big|\,\|\mathbf a_{m,i}-b_a\| - |g|\,\big|,
+\bar N_\omega = \tfrac1n\sum_{i\in\text{seg}}\big\|\boldsymbol\omega_{m,i}\big\|,\qquad
+\bar N_a = \Big|\,\tfrac1n\sum_{i\in\text{seg}}\|\mathbf a_{m,i}\| - |g|\,\Big|,
 $$
-the bias-corrected **body angular rate magnitude** and the **gravity-removed
-specific-force magnitude** ($|g|=9.81$). `n_cp` is the larger of the two mapped
-thresholds. Both statistics use the *magnitude of each sample taken individually*,
-so a fast pure rotation — where the world-frame vectors $R_i\boldsymbol\omega_i$
-sweep through every direction and a vector sum cancels toward zero — produces a
-**large** $N_\omega$ and correctly raises the knot density. (Removing gravity by
-subtracting its *magnitude* from $\|\mathbf a_m-b_a\|$, rather than subtracting the
-world vector $g_W$ after rotating each sample, keeps $N_a$ exact under any attitude
-without needing the current orientation estimate; it slightly under-reads when
-specific force is near-orthogonal to gravity, which the angular term $N_\omega$ and
-the IMU residual itself then cover.)
+the **raw body angular-rate magnitude mean** (no bias correction: the bias sits
+orders below the band edges, and a stale bias estimate must never gate density) and
+the **gravity-removed mean specific-force magnitude** ($|g|=9.81$). The gear is the
+larger of the two mapped thresholds. Both statistics average the *magnitude of each
+sample taken individually*, so a fast pure rotation — where the world-frame vectors
+$R_i\boldsymbol\omega_i$ sweep through every direction and a vector sum cancels
+toward zero — still produces a **large** $\bar N_\omega$ and correctly raises the
+knot density; the mean (vs the earlier peak form) makes a single spike unable to
+over-gear a calm segment. (Removing gravity by subtracting its *magnitude* from the
+mean of $\|\mathbf a_m\|$ keeps $\bar N_a$ exact under any attitude without an
+orientation estimate; it slightly under-reads when specific force is
+near-orthogonal to gravity, which the angular term and the IMU residual then cover.)
 
-The mapping is monotone and piecewise-constant with hysteresis: $N_\omega$ is
-compared against the rising thresholds `knot_omega_thresh[]` (rad/s) and $N_a$
-against `knot_accel_thresh[]` (m/s²), each band adding one control point up to
-`n_cp_max`; a transition down a band requires the statistic to fall **below** the
-band edge by `knot_density_hysteresis` (default 0.15, fractional) so density does
-not chatter at a threshold. Knots are placed uniformly within the segment in
-**virtual time** so the uniform basalt kernels apply (Appendix R.1). Net effect:
-more control points under aggressive motion, fewer when smooth — accuracy when
-needed, cheap when not. The default thresholds are tuned against the released
-Coco-LIC code (Appendix R.1) but the gating *quantity* is fixed normatively as the
-peak per-sample form above.
+The mapping is monotone and piecewise-constant with hysteresis: $\bar N_\omega$ is
+compared against the rising thresholds `ncp.omega_thresh[]` (rad/s) and $\bar N_a$
+against `ncp.accel_thresh[]` (m/s²), each band adding one control point up to
+`ncp.n_cp_max`; a transition down a band requires the statistic to fall **below**
+the band edge by `ncp.hysteresis` (default 0.15, fractional) so density does not
+chatter at a threshold. A segment whose samples have not yet arrived **holds the
+previous finalized gear** and is provisional: the next sweep's ingest truncates the
+provisional tail segments (`reknot`) and re-lays them at the gear their own data
+selects, so every segment's *final* gear is decided on its real samples. Knots are
+placed at uniform **real-time** steps within the segment and evaluated through the
+per-interval non-uniform basis (§1.2). A freshly laid dense tail is smoothed by an
+**IMU-only warm-start mini-solve** (`ncp.warmstart_iters` LM iterations over this
+sweep's IMU residuals + tail anchors, only the fresh tail knots free) before
+association — without it the raw IMU-propagated knot placement leaves a wiggly
+curve whose deskew corrupts association (the measured divergence in
+`docs/OPTIMIZE.md`). Net effect: more control points under aggressive motion, fewer
+when smooth — accuracy when needed, cheap when not. The default thresholds follow
+the released Coco-LIC mean-rate ladder (Appendix R.1) and the gating *quantity* is
+fixed normatively as the mean-of-norms form above.
 
-> **Adaptive density is mathematically validated; shipped at `n_cp_max = 1`
-> (deferred) pending a warm-start redesign.** The window slide Schur-marginalizes
-> the departing outer segment's **whole knot group** (1..`n_cp` knots; each is
-> inside the 4-knot support of the `t_begin` residuals, so each has a live Markov
-> blanket) — never one knot per sweep, which is correct only for the uniform
-> spline. The math is validated end-to-end: density-ramp test (`n_cp` 1→2→3→1
-> with hysteresis, bounded tracking through every transition), uniform-spline
-> parity on the validation bag with an unbounded solver, and the analytic
-> Jacobians are n_cp-correct (autodiff parity ~3e-11). The remaining blocker is
-> the **dense-knot warm start**: on real data a wiggly dense-knot IMU seed
-> corrupts data association and the solve diverges. `n_cp_max` stays at 1 until a
-> warm-start redesign lands (smooth dense-segment seeding + `selectKnotDensity`
-> hysteresis); it is **not** a Jacobian or solver-budget issue, and flipping
-> `n_cp_max > 1` before that fix is forbidden (measured divergence in
-> `docs/OPTIMIZE.md`).
+> **Window slide under adaptive density (the drain).** One sweep may advance the
+> window across several outer segments and each segment may carry several knots, so
+> the slide Schur-marginalizes **every resident knot whose 4-knot support has fully
+> left the window** in one build — never "one segment per sweep", which is correct
+> only for the uniform one-knot-per-sweep grid and otherwise grows the prior's kept
+> set, and hence the marginalization cost, without bound. Two additional drain
+> rules keep the carried prior coherent with the re-knot: (i) a free knot **past
+> the data front** (`knotTime > t_end`) is always marginalized, never kept — the
+> next ingest's re-knot pops exactly those knots, and a prior keeping one would
+> either dangle or block the re-knot forever (the cubic support always reaches two
+> knots past the sweep end); (ii) a blanket block whose storage does not persist
+> across sweeps (the per-sweep exposure scalar) is marginalized for the same
+> reason. Gauge pins are index-based under adaptive density (the first kept knot of
+> the departing boundary), constants are skipped — not refused — so multi-knot
+> groups drain cleanly, and the front-trim reserves enough resident knots that the
+> tail re-knot never hits the four-knot cubic floor.
 
-> **Continuity across a knot-density transition.** The virtual→real time map is a
-> monotone piecewise-linear stretch whose slope $\mathrm dv/\mathrm dt$ is constant
-> *within* one outer segment but **jumps** at a boundary where `n_cp` changes (the
-> local knot spacing changes by the `n_cp` ratio). The spline is $C^2$ in *virtual*
-> time everywhere, but real-time derivatives are the virtual ones scaled by powers of
-> that slope ($\dot p_{\text{real}}=\dot p_v\,s$, $\ddot p_{\text{real}}=\ddot p_v\,s^2$),
-> so at a density change the slope discontinuity makes the trajectory only $C^1$ in
-> **real** time across that join: real velocity stays continuous, but real
-> acceleration and body angular acceleration step. Two consequences the rest of this
-> spec relies on: (i) a **constant-rate motion is exactly representable only within a
-> run of uniform-density segments** — across a slope break a constant real velocity/
-> rate incurs a small representation residual until the four supporting knots are all
-> on one side of the transition; (ii) place density changes where motion is benign,
-> and let the IMU residual (§3.3), which is evaluated in real time, absorb the
-> $C^2$-in-real-time deficit at the seam rather than fighting it. Within any
-> uniform-density run (including the `n_cp ≡ 1` uniform-spline case) the map is linear
-> with constant slope and full $C^2$-in-real-time continuity is recovered.
+> **Adaptive density shipped (task #72), default-off pending the validation
+> campaign.** The blockers recorded against the earlier peak-geared design are
+> resolved: the slide drains whole knot groups and multi-segment advances (above),
+> the analytic Jacobians are non-uniform-correct (autodiff parity ~1e-10 on
+> mixed-density grids), and the dense-knot warm start is redesigned (tail re-knot +
+> mini-solve). `ncp.enabled: false` runs the uniform spline **bit-identically** to a
+> build without the feature — that equivalence is a merge gate (replay diff against
+> a pre-change capture).
+
+> **Continuity across a knot-density transition.** With true non-uniform evaluation
+> (§1.2) the basis matrices are exact functions of the real knot times, so the
+> trajectory is $C^2$ in **real** time across density changes — real velocity,
+> acceleration, and body angular acceleration are all continuous at the seam, and a
+> constant-rate motion remains exactly representable across a transition. (Under
+> the retired virtual-time warp the seam was only $C^1$ in real time and the IMU
+> residual had to absorb the acceleration step; that caveat no longer applies.)
+> Derivative magnitudes still scale with the local knot spacing — a gear-`g`
+> segment's intervals span `knot_dt / g` — which is precisely the bandwidth the
+> density buys.
 
 ### 5.6 Cross-checking CT: direct ground-truth tracking (the iEKF oracle is removed)
 
@@ -1516,11 +1541,13 @@ retuned there does not amend this table's semantics.
 | `spline.order` | `cubic` ($k=4$, $C^2$) | §1.2; App. R.1 |
 | `spline.knot_dt_ms` | 25 (code); 100 deployed | outer cadence; deployed ≈ 0.1 s = one segment per 10 Hz sweep, §5.1 |
 | `spline.window_knots` | 8 | fixed-lag window length in knots (≈ 0.8 s at 100 ms), §5.3 |
-| `spline.n_cp_max` | 0 (code); 1 deployed | adaptive knot cap; ≤1 disables; **deferred** pending the warm-start redesign (§5.5) |
 | `spline.time_offset_estimate` | false | per-sensor $t_d$ hook (§2.2) |
-| `spline.knot_omega_thresh[]` | tune (rad/s) | adaptive-knot $N_\omega$ band edges (§5.5) |
-| `spline.knot_accel_thresh[]` | tune (m/s²) | adaptive-knot $N_a$ band edges (§5.5) |
-| `spline.knot_density_hysteresis` | 0.15 (frac) | band-down hysteresis (§5.5) |
+| `ncp.enabled` | false | adaptive knot density master gate (§5.5); false = uniform spline, bit-identical to a build without the feature |
+| `ncp.n_cp_max` | 1 (code); 3 deployed | per-segment control-point cap ("gear"), §5.5 |
+| `ncp.omega_thresh[]` | [0.5, 1.0, 5.0] rad/s | mean-rate $\bar N_\omega$ band edges (§5.5) |
+| `ncp.accel_thresh[]` | [0.5, 1.0, 5.0] m/s² | mean-deviation $\bar N_a$ band edges (§5.5) |
+| `ncp.hysteresis` | 0.15 (frac) | band-down hysteresis (§5.5) |
+| `ncp.warmstart_iters` | 4 | IMU-only warm-start mini-solve iterations over fresh dense tails (§5.5); 0 disables |
 | `motion_reg.enable` | true | gated jerk / ang-accel regularizer (§3.3) |
 | `motion_reg.weight` | 1e-3 (rel.) | regularizer weight vs accel weight (§3.3) |
 | `motion_reg.excitation_floor` | tune | engage-below excitation level (§3.3) |
@@ -1702,12 +1729,14 @@ realised via virtual-time remapping over the uniform kernels (NURBS variants).
 inter-sensor offset $t_d$ is silently baked in unless added as an optimised
 parameter (`T(t+t_d)`, differentiable). (ii) Coco-LIC's published $(N_g,N_a)\to n_{cp}$ adaptive
 thresholds are graphical in the paper — tune against the released code. (Meridian's
-*normative* gating statistic is the peak per-sample $\,N_\omega,N_a$ form of §5.5,
-not Coco-LIC's summed-then-normed aggregate, which cancels under fast rotation.)
+*normative* gating statistic is the mean-of-per-sample-norms $\bar N_\omega,\bar N_a$
+form of §5.5 — each sample's magnitude taken individually before averaging, never a
+summed-then-normed vector aggregate, which cancels under fast rotation.)
 (iii) Covariance weights $\Sigma_L,\Sigma_I,\Sigma_C$ are not numerically given in
-the CT papers — tune empirically. (iv) Across a knot-density change the real-time
-trajectory is only $C^1$ (the virtual→real slope jumps); a constant-rate motion is
-exactly representable only within a uniform-density run.
+the CT papers — tune empirically. (iv) Under a virtual-time warp (Coco-LIC's
+engineering pattern) the real-time trajectory is only $C^1$ across a knot-density
+change; Meridian therefore evaluates the true non-uniform basis per interval (§1.2),
+which restores $C^2$ in real time at the seam.
 
 ### R.2 ikd-Tree incremental map internals (the registration-oracle contract)
 

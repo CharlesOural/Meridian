@@ -112,11 +112,11 @@ struct ImuWeights {
 // to the unit sphere. Ownership transfers to the caller (hand it to the Problem).
 ceres::Manifold* makeGravityManifold();
 
-// Peak per-sample IMU excitation over a set of samples, the gating statistic for
-// adaptive knot density. n_omega is the max bias-corrected body angular-rate magnitude
-// ||omega_m - b_g||; n_accel is the max gravity-removed specific-force magnitude
-// | ||a_m - b_a|| - |g| |. Both are frame-invariant per-sample magnitudes, so a fast
-// pure rotation (whose world-frame vector sum cancels) still reads large.
+// Peak per-sample IMU excitation over a set of samples, the gating statistic for the
+// under-excitation regularizer. n_omega is the max bias-corrected body angular-rate
+// magnitude ||omega_m - b_g||; n_accel is the max gravity-removed specific-force
+// magnitude | ||a_m - b_a|| - |g| |. Both are frame-invariant per-sample magnitudes,
+// so a fast pure rotation (whose world-frame vector sum cancels) still reads large.
 struct ImuExcitation {
   double n_omega = 0.0;  // [rad/s]
   double n_accel = 0.0;  // [m/s^2]
@@ -124,16 +124,35 @@ struct ImuExcitation {
 ImuExcitation imuExcitation(const std::vector<ImuSample>& samples, const Eigen::Vector3d& b_g,
                             const Eigen::Vector3d& b_a, double gravity_mag);
 
-// Maps the excitation statistics to a control-point count in [1, n_cp_max] with
-// hysteresis. Each rising threshold crossed in omega_thresh / accel_thresh adds one
-// control point (n_cp = 1 + bands crossed); the two mappings are combined by the
-// larger. The mapping is monotone and piecewise-constant: stepping DOWN a band
-// requires the statistic to fall below that band edge by `hysteresis` (fractional), so
-// density does not chatter at a threshold. `prev_n_cp` is the previous segment's count
-// (1 on the first segment). Same inputs always yield the same output.
-int knotDensityFromExcitation(const ImuExcitation& exc, const std::vector<double>& omega_thresh,
-                              const std::vector<double>& accel_thresh, double hysteresis,
-                              int n_cp_max, int prev_n_cp);
+// Mean per-sample IMU statistics over one segment's samples (t0 < stamp <= t1), the
+// gearing statistic for adaptive knot density. mean_omega is the mean of the RAW
+// per-sample gyro norms ||omega_m|| (no bias correction: the bias is orders below the
+// band edges and a stale bias estimate must never gate density) -- a mean of NORMS,
+// so a fast rotation that sweeps the sample vectors through every direction (whose
+// vector mean cancels toward zero) still reads its full rate. mean_accel_dev is
+// | ||mean of a_m|| - g |, the deviation of the mean specific-force VECTOR's norm
+// from gravity: zero-mean vibration (step impacts while walking) cancels in the
+// vector mean instead of inflating a norm mean (E||g+n|| > g for zero-mean n), while
+// sustained acceleration shifts the mean vector and reads through. n is the sample
+// count; n == 0 means the segment carries no data yet.
+struct ImuMeanExcitation {
+  double mean_omega = 0.0;      // [rad/s]
+  double mean_accel_dev = 0.0;  // [m/s^2]
+  int n = 0;
+};
+ImuMeanExcitation segmentMeanExcitation(const std::vector<ImuSample>& samples, Timestamp t0,
+                                        Timestamp t1, double gravity_mag);
+
+// Maps the segment-mean statistics to a control-point count ("gear") in [1, n_cp_max]
+// with hysteresis. Each rising threshold crossed in omega_thresh / accel_thresh adds
+// one control point (gear = 1 + bands crossed); the two mappings are combined by the
+// larger. Stepping DOWN out of a band held last segment requires the statistic to
+// fall below that band edge by `hysteresis` (fractional), so density does not chatter
+// at a threshold. A segment with no samples (stats.n == 0) holds prev_gear: its data
+// has not arrived, so there is no evidence to change on. Pure function of its inputs.
+int gearFromMeanExcitation(const ImuMeanExcitation& stats, const std::vector<double>& omega_thresh,
+                           const std::vector<double>& accel_thresh, double hysteresis,
+                           int n_cp_max, int prev_gear);
 
 // Analytic cost-function factories for the IMU factor family. Each returns a freshly
 // allocated ceres::CostFunction whose ownership transfers to the AddResidualBlock
@@ -142,27 +161,45 @@ int knotDensityFromExcitation(const ImuExcitation& exc, const std::vector<double
 // the assemblers: 4 SO(3) knots (size 4), 4 R^3 knots (size 3), then bias blocks, then
 // the gravity direction (size 3). kSharedBias selects 2 bias blocks (b_g, b_a) vs 4
 // (bg_left, bg_right, ba_left, ba_right) interpolated by alpha.
+//
+// `blend` / `cum_blend` are the per-interval (non-uniform) blending matrices of the
+// segment the cost evaluates on; nullptr selects the uniform cardinal matrices and is
+// bit-identical to a build without the parameters. The pointers are only read inside
+// the factory call (analytic costs bake the blended coefficients; autodiff twins copy
+// the matrices by value), so no lifetime extends past it.
 template <bool kSharedBias>
 ceres::CostFunction* makeImuCost(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel,
                                  double u, double inv_dt, double alpha, double gravity_mag,
-                                 double w_gyro, double w_accel);
+                                 double w_gyro, double w_accel,
+                                 const Eigen::Matrix4d* blend = nullptr,
+                                 const Eigen::Matrix4d* cum_blend = nullptr);
 template <bool kSharedBias>
 ceres::CostFunction* makeImuCostAutodiff(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel,
                                          double u, double inv_dt, double alpha, double gravity_mag,
-                                         double w_gyro, double w_accel);
+                                         double w_gyro, double w_accel,
+                                         const Eigen::Matrix4d* blend = nullptr,
+                                         const Eigen::Matrix4d* cum_blend = nullptr);
 
-ceres::CostFunction* makeJerkCost(double u, double inv_dt, double weight);
-ceres::CostFunction* makeJerkCostAutodiff(double u, double inv_dt, double weight);
+ceres::CostFunction* makeJerkCost(double u, double inv_dt, double weight,
+                                  const Eigen::Matrix4d* blend = nullptr);
+ceres::CostFunction* makeJerkCostAutodiff(double u, double inv_dt, double weight,
+                                          const Eigen::Matrix4d* blend = nullptr);
 ceres::CostFunction* makeVelocityAnchorCost(const Eigen::Vector3d& v_pred, double u, double inv_dt,
-                                            double weight);
+                                            double weight,
+                                            const Eigen::Matrix4d* blend = nullptr);
 ceres::CostFunction* makeVelocityAnchorCostAutodiff(const Eigen::Vector3d& v_pred, double u,
-                                                    double inv_dt, double weight);
-ceres::CostFunction* makeAngularAccelCost(double u, double inv_dt, double weight);
-ceres::CostFunction* makeAngularAccelCostAutodiff(double u, double inv_dt, double weight);
+                                                    double inv_dt, double weight,
+                                                    const Eigen::Matrix4d* blend = nullptr);
+ceres::CostFunction* makeAngularAccelCost(double u, double inv_dt, double weight,
+                                          const Eigen::Matrix4d* cum_blend = nullptr);
+ceres::CostFunction* makeAngularAccelCostAutodiff(double u, double inv_dt, double weight,
+                                                  const Eigen::Matrix4d* cum_blend = nullptr);
 ceres::CostFunction* makeRateAnchorCost(const Eigen::Vector3d& w_pred, double u, double inv_dt,
-                                        double weight);
+                                        double weight,
+                                        const Eigen::Matrix4d* cum_blend = nullptr);
 ceres::CostFunction* makeRateAnchorCostAutodiff(const Eigen::Vector3d& w_pred, double u,
-                                                double inv_dt, double weight);
+                                                double inv_dt, double weight,
+                                                const Eigen::Matrix4d* cum_blend = nullptr);
 ceres::CostFunction* makeBiasTieCost(double w_gyro, double w_accel);
 ceres::CostFunction* makeBiasTieCostAutodiff(double w_gyro, double w_accel);
 

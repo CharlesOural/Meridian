@@ -50,11 +50,23 @@ Msg deserialize(const rosbag2_storage::SerializedBagMessageSharedPtr& bag_msg) {
 // files in the same block layout `ros2 topic echo` produces, so the offline
 // analyzers parse a replay exactly like a live capture. Heavy payloads
 // (clouds/markers/images) are dropped.
+//
+// The per-key gate mirrors the live RosTelemetrySink's config-seeded wildcard table
+// (debug groups as key prefixes) so a replay records exactly what the live posture
+// would emit — but with no rate limiting, since a replay wants every sample.
 class FileSink final : public meridian::TelemetrySink {
 public:
   FileSink(const std::string& events_path, const std::string& telemetry_path,
-           std::string stage_path)
-      : ev_(events_path), tm_(telemetry_path), stage_path_(std::move(stage_path)) {}
+           std::string stage_path, const meridian::DebugConfig& dbg)
+      : ev_(events_path), tm_(telemetry_path), stage_path_(std::move(stage_path)) {
+    prefixes_ = {{"frontend/assoc/", dbg.assoc.enable},
+                 {"frontend/solver/", dbg.solver.enable},
+                 {"frontend/deskew/", dbg.deskew.enable},
+                 {"frontend/spline/", dbg.spline.enable},
+                 {"frontend/ncp/", dbg.spline.enable},
+                 {"frontend/map/", dbg.map_health.enable}};
+    exact_ = {{"frontend/spline/path_sample", dbg.publish_path}};
+  }
 
   ~FileSink() override {
     std::ofstream st(stage_path_);
@@ -64,15 +76,34 @@ public:
     }
   }
 
-  bool enabled(const char*) const override { return true; }
+  bool enabled(const char* key) const override {
+    const std::string_view k(key);
+    for (const auto& [exact, on] : exact_) {
+      if (k == exact) {
+        return on;
+      }
+    }
+    for (const auto& [prefix, on] : prefixes_) {
+      if (k.substr(0, prefix.size()) == prefix) {
+        return on;
+      }
+    }
+    return true;  // ungrouped keys are the always-on basics
+  }
 
   void scalar(const char* key, double v, meridian::Timestamp t) override {
+    if (!enabled(key)) {
+      return;
+    }
     stamp(tm_, t);
     tm_ << "key: " << key << "\nvalues:\n- " << v << "\naxis_order: ''\n---\n";
   }
 
   void vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v, meridian::Timestamp t,
            const char* axis_order) override {
+    if (!enabled(key)) {
+      return;
+    }
     stamp(tm_, t);
     tm_ << "key: " << key << "\nvalues:\n";
     for (Eigen::Index i = 0; i < v.size(); ++i) {
@@ -114,6 +145,8 @@ private:
   std::ofstream ev_, tm_;
   std::string stage_path_;
   std::map<std::string, Stat> stages_;
+  std::vector<std::pair<std::string, bool>> prefixes_;  // debug-group gates
+  std::vector<std::pair<std::string, bool>> exact_;
 };
 
 }  // namespace
@@ -145,7 +178,7 @@ int main(int argc, char** argv) {
                                : out_path;
   MeridianPipeline pipeline(
       cfg, std::make_unique<FileSink>(stem + "_events.txt", stem + "_telemetry.txt",
-                                      stem + "_stage.txt"));
+                                      stem + "_stage.txt", cfg.debug));
   std::uint64_t groups = 0;
   pipeline.set_group_sink([&](PreprocessedGroup&&) {
     // Replay runs the group sink on this thread, where live_state() is valid.

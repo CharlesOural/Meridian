@@ -23,15 +23,18 @@ using meridian::ImuSample;
 using meridian::Pose;
 using meridian::SplineWindow;
 using meridian::Timestamp;
+using meridian::to_seconds;
 using meridian::ct::addBiasRandomWalk;
 using meridian::ct::addImuResiduals;
 using meridian::ct::addMotionRegularizer;
 using meridian::ct::BiasKnots;
 using meridian::ct::GravityBlock;
+using meridian::ct::gearFromMeanExcitation;
 using meridian::ct::ImuExcitation;
 using meridian::ct::imuExcitation;
+using meridian::ct::ImuMeanExcitation;
 using meridian::ct::ImuWeights;
-using meridian::ct::knotDensityFromExcitation;
+using meridian::ct::segmentMeanExcitation;
 using meridian::ct::makeAngularAccelCost;
 using meridian::ct::makeAngularAccelCostAutodiff;
 using meridian::ct::makeBiasTieCost;
@@ -544,116 +547,204 @@ TEST(ResidualsImu, ZeroResidualOnDenseKnots) {
   }
 }
 
-// ---- F5: adaptive knot density from peak per-sample IMU excitation ----
+// ---- F5: adaptive knot density geared from segment-mean IMU magnitudes ----
 
-// imuExcitation reads peak per-sample magnitudes. A fast pure rotation whose world-
-// frame angular velocity vectors sum toward zero still yields a large N_omega because
-// each sample's magnitude is taken individually.
-TEST(KnotDensity, ExcitationIsPeakPerSampleMagnitude) {
-  std::vector<ImuSample> imu;
-  // Body angular rate of constant magnitude 2.0 rad/s but sweeping direction, so any
-  // vector sum cancels; the per-sample magnitude is a flat 2.0.
-  for (int i = 0; i < 16; ++i) {
-    ImuSample s;
-    const double a = 2.0 * M_PI * i / 16.0;
-    s.gyro = Eigen::Vector3d(2.0 * std::cos(a), 2.0 * std::sin(a), 0.0);
-    s.acc = kGravityWorld * -1.0;  // a stationary specific force of magnitude |g|
-    imu.push_back(s);
-  }
-  const ImuExcitation exc =
-      imuExcitation(imu, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), kGravityMag);
-  EXPECT_NEAR(exc.n_omega, 2.0, 1e-9);
-  // Specific force magnitude == |g| everywhere, so the gravity-removed accel is ~0.
-  EXPECT_NEAR(exc.n_accel, 0.0, 1e-9);
+namespace {
+
+// One IMU sample at `t_ms` milliseconds with the given gyro and acc vectors.
+ImuSample sampleAt(double t_ms, const Eigen::Vector3d& gyro, const Eigen::Vector3d& acc) {
+  ImuSample s;
+  s.stamp = static_cast<Timestamp>(t_ms * 1e6);
+  s.gyro = gyro;
+  s.acc = acc;
+  return s;
 }
 
-// The angular threshold ladder adds one control point per crossed band, the larger of
-// the two axis mappings wins, and the result clamps to n_cp_max.
-TEST(KnotDensity, BandLadderAddsOneCpPerThreshold) {
-  const std::vector<double> omega_thresh = {0.5, 1.0, 2.0};  // 3 rising bands
+}  // namespace
+
+// Rotation-cancellation guard: a fast pure rotation whose gyro vectors sweep through
+// every direction (so a vector mean cancels toward zero) must still read its full
+// rate, because the statistic is the mean of per-sample NORMS.
+TEST(NcpGearing, MeanOfNormsNeverCancelsUnderRotation) {
+  std::vector<ImuSample> imu;
+  for (int i = 0; i < 16; ++i) {
+    const double a = 2.0 * M_PI * i / 16.0;
+    imu.push_back(sampleAt(10.0 * (i + 1),
+                           Eigen::Vector3d(2.0 * std::cos(a), 2.0 * std::sin(a), 0.0),
+                           -kGravityWorld));
+  }
+  const ImuMeanExcitation stats =
+      segmentMeanExcitation(imu, 0, static_cast<Timestamp>(200e6), kGravityMag);
+  EXPECT_EQ(stats.n, 16);
+  EXPECT_NEAR(stats.mean_omega, 2.0, 1e-9);
+  // Constant specific force -g: its vector mean's norm is exactly g, so the
+  // deviation reads ~0.
+  EXPECT_NEAR(stats.mean_accel_dev, 0.0, 1e-9);
+}
+
+// Walking-vibration guard: zero-mean impact noise around gravity must read ~0 on the
+// accel axis. The statistic is the deviation of the VECTOR mean's norm from g, so the
+// alternating +/-n sample pairs cancel exactly; a mean of per-sample norms would read
+// ||g+n|| > g (Jensen) and gear up on plain unaccelerated walking. A sustained
+// specific-force offset still reads through at its full value.
+TEST(NcpGearing, AccelVibrationCancelsSustainedReadsThrough) {
+  const Eigen::Vector3d vib(3.0, 2.0, 4.0);  // well above the usual band edges
+  std::vector<ImuSample> shaking;
+  for (int i = 0; i < 20; ++i) {
+    const double sgn = (i % 2 == 0) ? 1.0 : -1.0;
+    shaking.push_back(sampleAt(5.0 * (i + 1), Eigen::Vector3d::Zero(), -kGravityWorld + sgn * vib));
+  }
+  const ImuMeanExcitation v =
+      segmentMeanExcitation(shaking, 0, static_cast<Timestamp>(100e6), kGravityMag);
+  EXPECT_EQ(v.n, 20);
+  EXPECT_NEAR(v.mean_accel_dev, 0.0, 1e-9);
+
+  // 2 m/s^2 sustained along the gravity axis, vibration on top: the vector mean's
+  // norm shifts by exactly the offset.
+  std::vector<ImuSample> accelerating;
+  for (int i = 0; i < 20; ++i) {
+    const double sgn = (i % 2 == 0) ? 1.0 : -1.0;
+    accelerating.push_back(sampleAt(
+        5.0 * (i + 1), Eigen::Vector3d::Zero(),
+        -kGravityWorld + Eigen::Vector3d(0.0, 0.0, 2.0) + sgn * vib));
+  }
+  const ImuMeanExcitation s =
+      segmentMeanExcitation(accelerating, 0, static_cast<Timestamp>(100e6), kGravityMag);
+  EXPECT_EQ(s.n, 20);
+  EXPECT_NEAR(s.mean_accel_dev, 2.0, 1e-9);
+}
+
+// Spike-vs-mean: one outlier sample at 5 rad/s among 19 calm ones moves the MEAN to
+// ~0.34 rad/s (the peak statistic would read 5.0 and over-gear); also only samples in
+// (t0, t1] count.
+TEST(NcpGearing, MeanIsSpikeRobustAndWindowed) {
+  std::vector<ImuSample> imu;
+  for (int i = 0; i < 19; ++i) {
+    imu.push_back(sampleAt(5.0 * (i + 1), Eigen::Vector3d(0.1, 0.0, 0.0), -kGravityWorld));
+  }
+  imu.push_back(sampleAt(99.0, Eigen::Vector3d(0.0, 5.0, 0.0), -kGravityWorld));
+  const ImuMeanExcitation stats =
+      segmentMeanExcitation(imu, 0, static_cast<Timestamp>(100e6), kGravityMag);
+  EXPECT_EQ(stats.n, 20);
+  EXPECT_NEAR(stats.mean_omega, (19 * 0.1 + 5.0) / 20.0, 1e-9);
+  EXPECT_LT(stats.mean_omega, 0.5);  // a single spike does not cross the first band
+
+  // The half-open window (t0, t1]: a sample exactly at t0 is excluded, at t1 included.
+  std::vector<ImuSample> two = {sampleAt(0.0, Eigen::Vector3d(1.0, 0, 0), -kGravityWorld),
+                                sampleAt(50.0, Eigen::Vector3d(3.0, 0, 0), -kGravityWorld)};
+  const ImuMeanExcitation w =
+      segmentMeanExcitation(two, 0, static_cast<Timestamp>(50e6), kGravityMag);
+  EXPECT_EQ(w.n, 1);
+  EXPECT_NEAR(w.mean_omega, 3.0, 1e-12);
+}
+
+// Raw statistic: the gyro norms enter WITHOUT bias correction, so the stats are a
+// pure function of the samples (a stale bias estimate can never gate density).
+TEST(NcpGearing, GyroIsRawNoBiasCorrection) {
+  std::vector<ImuSample> imu = {
+      sampleAt(10.0, Eigen::Vector3d(0.6, 0.0, 0.0), -kGravityWorld),
+      sampleAt(20.0, Eigen::Vector3d(0.6, 0.0, 0.0), -kGravityWorld)};
+  const ImuMeanExcitation stats =
+      segmentMeanExcitation(imu, 0, static_cast<Timestamp>(100e6), kGravityMag);
+  // 0.6 rad/s reads as 0.6 regardless of what any bias estimate claims.
+  EXPECT_NEAR(stats.mean_omega, 0.6, 1e-12);
+}
+
+// The band ladder adds one control point per crossed edge, the larger of the two axis
+// mappings wins, and the result clamps to n_cp_max.
+TEST(NcpGearing, BandLadderAddsOneGearPerEdge) {
+  const std::vector<double> omega_thresh = {0.5, 1.0, 2.0};
   const std::vector<double> accel_thresh = {1.0, 3.0};
   const double hys = 0.15;
   const int n_cp_max = 4;
+  auto stats = [](double w, double a) {
+    ImuMeanExcitation s;
+    s.mean_omega = w;
+    s.mean_accel_dev = a;
+    s.n = 10;
+    return s;
+  };
 
-  // Below the first band: a single control point.
-  EXPECT_EQ(knotDensityFromExcitation({0.1, 0.1}, omega_thresh, accel_thresh, hys,
-                                      n_cp_max, 1),
+  EXPECT_EQ(gearFromMeanExcitation(stats(0.1, 0.1), omega_thresh, accel_thresh, hys, n_cp_max, 1),
             1);
-  // Omega in the first band -> +1 cp.
-  EXPECT_EQ(knotDensityFromExcitation({0.7, 0.0}, omega_thresh, accel_thresh, hys,
-                                      n_cp_max, 1),
+  EXPECT_EQ(gearFromMeanExcitation(stats(0.7, 0.0), omega_thresh, accel_thresh, hys, n_cp_max, 1),
             2);
-  // Omega clears all three bands -> 1 + 3 = 4 (== n_cp_max).
-  EXPECT_EQ(knotDensityFromExcitation({3.0, 0.0}, omega_thresh, accel_thresh, hys,
-                                      n_cp_max, 1),
+  EXPECT_EQ(gearFromMeanExcitation(stats(3.0, 0.0), omega_thresh, accel_thresh, hys, n_cp_max, 1),
             4);
-  // The accel axis is the binding one here (2 bands -> 3 cp) over a 1-band omega.
-  EXPECT_EQ(knotDensityFromExcitation({0.7, 4.0}, omega_thresh, accel_thresh, hys,
-                                      n_cp_max, 1),
+  // The accel axis is the binding one here (2 bands -> gear 3) over a 1-band omega.
+  EXPECT_EQ(gearFromMeanExcitation(stats(0.7, 4.0), omega_thresh, accel_thresh, hys, n_cp_max, 1),
             3);
-  // Well past every band still clamps to n_cp_max.
-  EXPECT_EQ(knotDensityFromExcitation({100.0, 100.0}, omega_thresh, accel_thresh, hys,
-                                      n_cp_max, 1),
-            4);
+  EXPECT_EQ(
+      gearFromMeanExcitation(stats(100.0, 100.0), omega_thresh, accel_thresh, hys, n_cp_max, 1),
+      4);
 }
 
-// Hysteresis: a statistic hovering just under a band edge it already held stays in the
-// band (no chatter); it only steps down once it falls below the edge by the hysteresis
+// Hysteresis down: a statistic hovering just under a band edge it already held stays
+// in the band; it only steps down once it falls below the edge by the hysteresis
 // fraction. Same inputs always give the same output (determinism).
-TEST(KnotDensity, HysteresisPreventsChatter) {
-  const std::vector<double> omega_thresh = {1.0};  // one band at 1.0 rad/s
+TEST(NcpGearing, HysteresisPreventsChatter) {
+  const std::vector<double> omega_thresh = {1.0};
   const std::vector<double> accel_thresh = {};
   const double hys = 0.15;  // drop edge at 0.85
   const int n_cp_max = 2;
+  auto stats = [](double w) {
+    ImuMeanExcitation s;
+    s.mean_omega = w;
+    s.n = 10;
+    return s;
+  };
 
-  // Rise into the band: 1 -> 2 cp.
-  EXPECT_EQ(knotDensityFromExcitation({1.2, 0.0}, omega_thresh, accel_thresh, hys,
-                                      n_cp_max, 1),
-            2);
-  // Dip just below the rising edge but above the drop edge while already holding the
-  // band: density holds at 2 (no chatter down).
-  EXPECT_EQ(knotDensityFromExcitation({0.9, 0.0}, omega_thresh, accel_thresh, hys,
-                                      n_cp_max, 2),
-            2);
-  // Fall below the drop edge: now step down to 1 cp.
-  EXPECT_EQ(knotDensityFromExcitation({0.8, 0.0}, omega_thresh, accel_thresh, hys,
-                                      n_cp_max, 2),
-            1);
-  // From the low state, 0.9 is below the rising edge so density does not re-enter.
-  EXPECT_EQ(knotDensityFromExcitation({0.9, 0.0}, omega_thresh, accel_thresh, hys,
-                                      n_cp_max, 1),
-            1);
-  // Determinism: same inputs, repeated, same answer.
+  EXPECT_EQ(gearFromMeanExcitation(stats(1.2), omega_thresh, accel_thresh, hys, n_cp_max, 1), 2);
+  // Dip below the rising edge but above the drop edge while holding the band: holds.
+  EXPECT_EQ(gearFromMeanExcitation(stats(0.9), omega_thresh, accel_thresh, hys, n_cp_max, 2), 2);
+  // Below the drop edge: step down.
+  EXPECT_EQ(gearFromMeanExcitation(stats(0.8), omega_thresh, accel_thresh, hys, n_cp_max, 2), 1);
+  // From the low state, 0.9 is below the rising edge so the gear does not re-enter.
+  EXPECT_EQ(gearFromMeanExcitation(stats(0.9), omega_thresh, accel_thresh, hys, n_cp_max, 1), 1);
   for (int i = 0; i < 5; ++i) {
-    EXPECT_EQ(knotDensityFromExcitation({0.9, 0.0}, omega_thresh, accel_thresh, hys,
-                                        n_cp_max, 2),
-              2);
+    EXPECT_EQ(gearFromMeanExcitation(stats(0.9), omega_thresh, accel_thresh, hys, n_cp_max, 2), 2);
   }
 }
 
-// A full excitation series mapped to its expected n_cp sequence under hysteresis,
-// feeding each step's output back as the next step's prev_n_cp (as the front-end does).
-TEST(KnotDensity, ExcitationSeriesProducesExpectedSequence) {
-  const std::vector<double> omega_thresh = {0.5, 1.5};  // bands at 0.5 and 1.5
+// Empty-hold: a segment with no samples holds the previous gear (clamped to the cap),
+// whatever the stale statistic fields claim.
+TEST(NcpGearing, EmptySegmentHoldsPreviousGear) {
+  const std::vector<double> omega_thresh = {0.5, 1.0};
+  const std::vector<double> accel_thresh = {0.5, 1.0};
+  ImuMeanExcitation empty;
+  empty.mean_omega = 100.0;  // stale garbage must be ignored when n == 0
+  empty.n = 0;
+  EXPECT_EQ(gearFromMeanExcitation(empty, omega_thresh, accel_thresh, 0.15, 3, 2), 2);
+  EXPECT_EQ(gearFromMeanExcitation(empty, omega_thresh, accel_thresh, 0.15, 3, 1), 1);
+  // Held gear above the cap clamps.
+  EXPECT_EQ(gearFromMeanExcitation(empty, omega_thresh, accel_thresh, 0.15, 2, 3), 2);
+}
+
+// A full mean-rate series mapped to its expected gear sequence under hysteresis,
+// feeding each step's output back as the next step's prev_gear (as the front-end does
+// per finalized segment).
+TEST(NcpGearing, SeriesProducesExpectedSequence) {
+  const std::vector<double> omega_thresh = {0.5, 1.5};
   const std::vector<double> accel_thresh = {};
   const double hys = 0.2;  // drop edges at 0.4 and 1.2
   const int n_cp_max = 3;
 
-  // omega series and the n_cp it should yield with feedback hysteresis.
   const std::vector<double> series = {0.1, 0.6, 1.6, 1.3, 0.45, 0.3, 2.0};
   const std::vector<int> expected = {1, 2, 3, 3, 2, 1, 3};
   //  0.10 -> below band0          -> 1
   //  0.60 -> band0 (>=0.5)        -> 2
   //  1.60 -> band0+band1 (>=1.5)  -> 3
-  //  1.30 -> holds band1 (>=1.2)  -> 3   (1.3 < 1.5 rising, but >= 1.2 drop edge)
-  //  0.45 -> band1 lost, holds b0 -> 2   (0.45 >= 0.4 drop edge of band0)
+  //  1.30 -> holds band1 (>=1.2)  -> 3
+  //  0.45 -> band1 lost, holds b0 -> 2
   //  0.30 -> below 0.4 drop edge  -> 1
   //  2.00 -> both bands           -> 3
   int prev = 1;
   std::vector<int> got;
   for (double w : series) {
-    prev = knotDensityFromExcitation({w, 0.0}, omega_thresh, accel_thresh, hys,
-                                     n_cp_max, prev);
+    ImuMeanExcitation s;
+    s.mean_omega = w;
+    s.n = 10;
+    prev = gearFromMeanExcitation(s, omega_thresh, accel_thresh, hys, n_cp_max, prev);
     got.push_back(prev);
   }
   EXPECT_EQ(got, expected);
@@ -990,6 +1081,150 @@ TEST(AnalyticImuCost, JacobiansMatchAutodiff_NonShared) {
       for (int c = 0; c < 2; ++c)
         EXPECT_NEAR(lga(row, c), lgr(row, c), 1e-9 + 1e-9 * std::abs(lgr(row, c)))
             << "trial " << trial << " gravity sphere row " << row << " col " << c;
+  }
+}
+
+// Non-uniform-interval parity: on a mixed-density window the per-interval blending
+// matrices replace the cardinal ones inside every factor. The analytic Jacobians must
+// match the autodiff twin fed the SAME matrices, across intervals of different real
+// spans, for the main IMU factor and all four spline companions.
+TEST(AnalyticImuCost, JacobiansMatchAutodiffOnNonUniformIntervals) {
+  ceres::EigenQuaternionManifold quat_manifold;
+
+  // Mixed-density window: gears 1 -> 3 -> 2 over 100 ms outer segments, so the
+  // evaluable intervals span 100 / 33.3 / 50 ms and the cached matrices genuinely
+  // differ from the cardinal ones.
+  const Eigen::Vector3d w_seed(0.8, -0.5, 1.1);
+  auto seed = [&](Timestamp t) {
+    const double ts = to_seconds(t);
+    Pose p;
+    p.q = Sophus::SO3d::exp(w_seed * ts).unit_quaternion();
+    p.t = Eigen::Vector3d(0.7 * std::sin(1.3 * ts), 0.5 * std::cos(0.9 * ts), 0.4 * ts);
+    return p;
+  };
+  SplineWindow win(static_cast<Duration>(100'000'000), 3, /*non_uniform=*/true);
+  win.initialize(0, seed(0));
+  const std::vector<int> gears = {1, 3, 2, 3, 1, 2};
+  std::size_t lay = 0;
+  win.extendTo(static_cast<Timestamp>(500'000'000), seed,
+               [&](Timestamp, Timestamp) { return gears[(lay++) % gears.size()]; });
+
+  std::mt19937 rng(404);
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  auto randVec3 = [&] { return Eigen::Vector3d(uni(rng), uni(rng), uni(rng)); };
+
+  const std::vector<double> probe_ts = {0.05, 0.32, 0.38, 0.45, 0.21};
+  int trial = 0;
+  for (const double ts : probe_ts) {
+    const Timestamp t = static_cast<Timestamp>(ts * 1e9);
+    ASSERT_TRUE(win.covers(t));
+    SplineWindow::SegmentRef seg = win.segmentFor(t);
+    // A probe may land in a uniformly-spaced interval (e.g. the bootstrap run), which
+    // routes to cardinal and reports null matrix pointers; every factory below accepts
+    // null and falls back to the cardinal matrices, so analytic and autodiff still see
+    // the identical blending on each probed interval, varying-density or not.
+    const double inv_dt = 1.0 / seg.dt_s;
+
+    // --- main IMU factor (shared-bias layout) ---
+    {
+      const Eigen::Vector3d gyro = randVec3();
+      const Eigen::Vector3d accel = 3.0 * randVec3();
+      Eigen::Vector3d b_g = 0.05 * randVec3();
+      Eigen::Vector3d b_a = 0.1 * randVec3();
+      Eigen::Vector3d g_dir = randVec3().normalized();
+      std::unique_ptr<ceres::CostFunction> analytic(makeImuCost<true>(
+          gyro, accel, seg.u, inv_dt, 0.0, 9.81, 1.7, 0.9, seg.blend, seg.cum_blend));
+      std::unique_ptr<ceres::CostFunction> reference(makeImuCostAutodiff<true>(
+          gyro, accel, seg.u, inv_dt, 0.0, 9.81, 1.7, 0.9, seg.blend, seg.cum_blend));
+
+      std::vector<const double*> params;
+      for (double* p : seg.so3_knots) params.push_back(p);
+      for (double* p : seg.r3_knots) params.push_back(p);
+      params.push_back(b_g.data());
+      params.push_back(b_a.data());
+      params.push_back(g_dir.data());
+
+      double ja_so3[4][24], jr_so3[4][24];
+      double ja_r3[4][18], jr_r3[4][18];
+      double ja_bg[18], jr_bg[18], ja_ba[18], jr_ba[18], ja_g[18], jr_g[18];
+      std::vector<double*> ja, jr;
+      for (int j = 0; j < 4; ++j) { ja.push_back(ja_so3[j]); jr.push_back(jr_so3[j]); }
+      for (int j = 0; j < 4; ++j) { ja.push_back(ja_r3[j]); jr.push_back(jr_r3[j]); }
+      ja.push_back(ja_bg); jr.push_back(jr_bg);
+      ja.push_back(ja_ba); jr.push_back(jr_ba);
+      ja.push_back(ja_g); jr.push_back(jr_g);
+
+      double r_a[6], r_r[6];
+      ASSERT_TRUE(analytic->Evaluate(params.data(), r_a, ja.data()));
+      ASSERT_TRUE(reference->Evaluate(params.data(), r_r, jr.data()));
+      expectResMatch(r_a, r_r, 6, 1e-10, trial);
+      for (int j = 0; j < 4; ++j)
+        expectSo3BlockMatch<6>(params[j], ja_so3[j], jr_so3[j], quat_manifold, 1e-7, trial, j);
+      for (int j = 0; j < 4; ++j)
+        expectR3BlockMatch(ja_r3[j], jr_r3[j], 6, 1e-9, trial, j, "nu_r3");
+      expectR3BlockMatch(ja_bg, jr_bg, 6, 1e-10, trial, 0, "nu_bg");
+      expectR3BlockMatch(ja_ba, jr_ba, 6, 1e-10, trial, 0, "nu_ba");
+      expectR3BlockMatch(ja_g, jr_g, 6, 1e-10, trial, 0, "nu_g");
+    }
+
+    // --- spline companions: jerk + velocity anchor (R^3), angular accel + rate
+    // anchor (SO(3)) ---
+    {
+      const Eigen::Vector3d v_pred = randVec3();
+      const Eigen::Vector3d w_pred = randVec3();
+      struct Pair {
+        std::unique_ptr<ceres::CostFunction> a;
+        std::unique_ptr<ceres::CostFunction> r;
+        bool so3;
+        const char* tag;
+      };
+      std::vector<Pair> pairs;
+      pairs.push_back({std::unique_ptr<ceres::CostFunction>(
+                           makeJerkCost(seg.u, inv_dt, 0.7, seg.blend)),
+                       std::unique_ptr<ceres::CostFunction>(
+                           makeJerkCostAutodiff(seg.u, inv_dt, 0.7, seg.blend)),
+                       false, "jerk"});
+      pairs.push_back({std::unique_ptr<ceres::CostFunction>(
+                           makeVelocityAnchorCost(v_pred, seg.u, inv_dt, 1.3, seg.blend)),
+                       std::unique_ptr<ceres::CostFunction>(
+                           makeVelocityAnchorCostAutodiff(v_pred, seg.u, inv_dt, 1.3, seg.blend)),
+                       false, "vel_anchor"});
+      pairs.push_back({std::unique_ptr<ceres::CostFunction>(
+                           makeAngularAccelCost(seg.u, inv_dt, 0.5, seg.cum_blend)),
+                       std::unique_ptr<ceres::CostFunction>(
+                           makeAngularAccelCostAutodiff(seg.u, inv_dt, 0.5, seg.cum_blend)),
+                       true, "ang_accel"});
+      pairs.push_back({std::unique_ptr<ceres::CostFunction>(
+                           makeRateAnchorCost(w_pred, seg.u, inv_dt, 1.1, seg.cum_blend)),
+                       std::unique_ptr<ceres::CostFunction>(
+                           makeRateAnchorCostAutodiff(w_pred, seg.u, inv_dt, 1.1, seg.cum_blend)),
+                       true, "rate_anchor"});
+
+      for (Pair& pr : pairs) {
+        std::vector<const double*> params;
+        if (pr.so3) {
+          for (double* p : seg.so3_knots) params.push_back(p);
+        } else {
+          for (double* p : seg.r3_knots) params.push_back(p);
+        }
+        double ja_blk[4][12], jr_blk[4][12];
+        std::vector<double*> ja, jr;
+        for (int j = 0; j < 4; ++j) { ja.push_back(ja_blk[j]); jr.push_back(jr_blk[j]); }
+        double r_a[3], r_r[3];
+        ASSERT_TRUE(pr.a->Evaluate(params.data(), r_a, ja.data()));
+        ASSERT_TRUE(pr.r->Evaluate(params.data(), r_r, jr.data()));
+        expectResMatch(r_a, r_r, 3, 1e-10, trial);
+        for (int j = 0; j < 4; ++j) {
+          if (pr.so3) {
+            expectSo3BlockMatch<3>(params[j], ja_blk[j], jr_blk[j], quat_manifold, 1e-7,
+                                   trial, j);
+          } else {
+            expectR3BlockMatch(ja_blk[j], jr_blk[j], 3, 1e-9, trial, j, pr.tag);
+          }
+        }
+      }
+    }
+    ++trial;
   }
 }
 

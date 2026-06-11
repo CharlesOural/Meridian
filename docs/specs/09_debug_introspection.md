@@ -586,6 +586,9 @@ failing, not just *that* the estimate is.
 | `frontend/deadline_hit` | `scalar` | `/meridian/telemetry` (`ratio`) | on | NEW. On the live wall-clock path only, the fraction (sliding-count EWMA) of window solves that returned early because they hit `solver.time_limit_ms` rather than converging — i.e. ran the deadline-bounded fallback after `min_iters`. The determinism path is fixed-iteration and never sets this. A sustained non-zero value is the runtime real-time-pressure signal that the post-hoc p99 gate (spec 10 §5.5) only sees after the run. |
 | `frontend/observability` | `vec` | `/meridian/telemetry` (6, `ratio`) + `/meridian/markers` | **on** | **NEW. None in FAST-LIO** (only binary `flg_EKF_inited` `:898`). The 6 per-axis scores $s\in[0,1]^6$ (spec 01 §3.4) from the windowed Hessian; drives back-end noise inflation. Rendered as the observability hexagon (§7.1). |
 | `frontend/cov_diag` | `vec` | `/meridian/telemetry` (6) | on | The 6 diagonal entries of the marginal keyframe-pose covariance, `axis_order` stated. Replaces FAST-LIO's hand-packed `pose.covariance` `:597-606`. |
+| `frontend/spline/path_sample` | `pose`×N → Path | `/meridian/path` `nav_msgs/Path` | on (`debug.publish_path`) | NEW. The **solved B-spline itself** sampled at `debug.path_sample_hz` (default 30 Hz) and aggregated by the wrapper's `PathAggregator` (§10) into one `nav_msgs/Path`, ring-capped at `debug.path_max_poses` and republished at `debug.path_publish_hz`. Unlike FAST-LIO's `/path` `:622` (keyframe-rate, discrete poses) this shows the *continuous trajectory the spline actually solved*, exposing inter-sweep jitter invisible at keyframe rate. Samples near the window's leading edge are still refined by later sweeps, so small kinks vs. the final spline are expected (same property as `odom/body`). |
+| `frontend/resid/<fam>/{rms,mean_abs,n_rows}` | `scalar` | `/meridian/telemetry` | on, sampled | NEW. Per-residual-family statistics of the converged window problem (raw whitened residuals, loss off, so families are comparable): families `lidar, imu, bias, anchor, motionreg, visual, gnss, prior`. Run ~1-in-5 sweeps + keyframe sweeps; every sweep when the `solver` debug group is on. |
+| `frontend/resid/<fam>/cost_frac` | `scalar` | `/meridian/telemetry` (`ratio`) | group `solver` | NEW. The family's share of the total (squared, unweighted-by-loss) window cost — which stream dominates the solve. |
 
 **LiDAR stream (direct point-to-plane at true point time):**
 
@@ -600,6 +603,61 @@ failing, not just *that* the estimate is.
 | `frontend/lidar/res_max` | `scalar` | `/meridian/telemetry` (`m`) | on | NEW. Tail residual — catches a few wild correspondences a mean hides. |
 | `frontend/lidar/n_factors_kept` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Point-to-plane residuals actually built after the bounded-factor cap (normal-stratified subsample, spec 04 §3.1). With `n_factors_dropped` it shows how hard the cap is biting; a high drop fraction with a falling `inlier_ratio` is the bounded-solve warning. |
 | `frontend/lidar/n_factors_dropped` | `scalar` | `/meridian/telemetry` (`count`) | on | NEW. Inlier hits discarded by the factor cap this step (`kept + dropped` = inlier count; zero when the inlier set fit the budget). |
+
+**Deep-debug groups (config-seeded key-prefix wildcards, default off — §11).** Each
+group below is one wildcard entry (`frontend/assoc/*`, `frontend/solver/*`,
+`frontend/deskew/*`, `frontend/spline/*`, `frontend/map/*`) seeded into the sink's
+gate table from `debug.<group>.{enable,max_hz}` and flippable live through
+`SetDebugKey` with the same wildcard. In the core, each group's entire computation is
+hoisted behind **one** `enabled()` probe per sweep, so an off group costs one hash
+lookup and builds nothing (§12). `map_health` defaults **on** (cheap counters); the
+other four default **off**.
+
+*`assoc` — LiDAR association quality (the registration-accuracy instrument):*
+
+| key | call | unit | what it shows |
+|---|---|---|---|
+| `frontend/assoc/n_attempted`, `n_matched` | `scalar` | count | the funnel between `n_input` and `n_inlier`: points whose time the spline covers, and those that passed the plane gates. |
+| `frontend/assoc/reject_nn`, `reject_dist`, `reject_plane`, `reject_score` | `scalar` | count | per-reason rejections (too few neighbours / farthest-NN gate / non-planar fit / range-aware score gate). `attempted = matched + reject_nn + reject_dist + reject_plane`; `matched = accepted + reject_score`. |
+| `frontend/assoc/res_p95` | `scalar` | m | tail of the post-solve point-to-plane misfit \|n·p_w + d\| over the final hit set. |
+| `frontend/assoc/res_hist` | `vec`(16) | count | fixed-bin \|r\| histogram over [0, 2·`plane_thresh`] (overflow in the last bin); the residual-vs-time heatmap source — distribution fattening precedes an RMS move. |
+| `frontend/assoc/nn_dist_mean`, `nn_dist_p95` | `scalar` | m | farthest-fit-neighbour distance of accepted plane fits (match locality). |
+| `frontend/assoc/plane_rms_mean`, `plane_rms_p95` | `scalar` | m | RMS point-to-fitted-plane distance of the 5-NN fits (map surface quality). |
+| `frontend/assoc/strata_kept` | `vec`(`normal_strata`) | count | kept factors per plane-normal stratum (`+x,-x,+y,-y,+z,-z,obl` at the default 7) — the directional balance of the constraint set after the cap. |
+| `frontend/assoc/outliers` | `cloud` | — | `/meridian/cloud_outliers`: scan points that attempted association but produced no hit, at their solved poses (heavy, rate-limited). |
+
+*`solver` — window-solve internals:*
+
+| key | call | unit | what it shows |
+|---|---|---|---|
+| `frontend/solver/iter_cost`, `iter_step`, `iter_grad`, `iter_tr_radius` | `vec`(N) | — | per-LM-iteration cost / step norm / gradient norm / trust-region radius, concatenated across the outer re-association schedule. |
+| `frontend/solver/cost_initial` | `scalar` | — | round-0 entry cost (the IMU-seeded problem); with `frontend/cost_total` it gives the per-sweep cost reduction. |
+| `frontend/solver/termination` | `scalar` | enum | Ceres `TerminationType` of the final round (0 convergence, 1 no-convergence, 2 failure). |
+| (side effect) | | | the `frontend/resid/*` probe runs **every** sweep and emits `cost_frac` (≈1–3 ms post-solve `Problem::Evaluate`). |
+
+*`deskew` — continuous-time placement quality:*
+
+| key | call | unit | what it shows |
+|---|---|---|---|
+| `frontend/deskew/corr_mean_m`, `corr_p95_m`, `corr_max_m` | `scalar` | m | per-point CT correction ‖T(t_i)·p − T(t_end)·p‖ over the downsampled sweep — how much motion compensation is actually doing. |
+| `frontend/deskew/sweep_trans_m`, `sweep_rot_deg` | `scalar` | m, deg | body motion span across the sweep, T(t_begin)→T(t_end). |
+| `frontend/deskew/pre` | `cloud` | — | `/meridian/cloud_deskew_pre`: the sweep frozen at the end pose (heavy); pairs with `map/registered` as the deskew before/after view. |
+
+*`spline` — trajectory kinematics profiles:*
+
+| key | call | unit | what it shows |
+|---|---|---|---|
+| `frontend/spline/vel`, `acc`, `omega` | `vec`(3) | m/s, m/s², rad/s | analytic spline derivatives at t_end (`x,y,z` world for vel/acc; `wx,wy,wz` body for omega). |
+| `frontend/spline/acc_rms_span`, `omega_rms_span` | `scalar` | m/s², rad/s | RMS magnitude over ~100 Hz samples across the solved span. |
+| `frontend/spline/jerk_rms` | `scalar` | m/s³ | forward-difference jerk RMS over the span samples — the vibration / knot-cadence-aliasing instrument (gait frequency beating the knot grid shows here first). |
+
+*`map_health` — local-map growth (default on):*
+
+| key | call | unit | what it shows |
+|---|---|---|---|
+| `frontend/map/size` | `scalar` | count | resident ikd-Tree point count. |
+| `frontend/map/n_inserted` | `scalar` | count | points offered to the tree this sweep (growth rate). |
+| `frontend/map/insert_rejected` | `scalar` | count | world points discarded by the insert range guard (a non-zero value flags a pathological trajectory warp). |
 
 **Visual stream (FAST-LIVO2-style sparse-direct photometric, LiDAR-depth):**
 
@@ -1068,8 +1126,15 @@ Key properties:
 - **Per-key publishers created lazily** on first enabled use, with QoS from config:
   clouds/images use *best-effort, depth 5* (drop under load, never block the
   estimator — FAST-LIO uses a depth-100000 reliable queue, `laserMapping.cpp:849`,
-  which can back-pressure; we do not); telemetry/events use *reliable, depth 50*; TF
-  uses the standard TF QoS.
+  which can back-pressure; we do not); the multiplexed telemetry topic uses
+  *reliable, depth 512* (the per-sweep burst is ~60 messages with every debug group
+  on, so the history must hold several full bursts or the earliest-emitted keys of
+  each burst are silently dropped toward a slow subscriber — measured as chaotic
+  1–98 % per-key capture at depth 50), stage timing *reliable, depth 256*, events
+  *reliable, depth 50*; TF uses the standard TF QoS. A burst-rate consumer
+  (`ros2 topic echo` capture) must likewise deepen its subscription queue
+  (`--qos-depth`, as the run scripts do) — the default depth 10 overflows on every
+  sweep.
 - **`unit_of(key)`** is a static table so units are consistent and self-documenting.
 
 The wrapper also runs a `PathAggregator` that turns the stream of `odom/body` and
@@ -1107,6 +1172,19 @@ ros2 service call /meridian/set_log_level meridian_msgs/SetLogLevel "{module: 'f
 
 A `*` wildcard key (`"frontend/visual/*"`) toggles a whole stream. The gate state is
 queryable (`/meridian/debug_state` latched topic) so a UI can show what is on.
+
+**Config-seeded wildcard groups are the flag taxonomy.** The deep-debug groups of
+§5.1 (`assoc`, `solver`, `deskew`, `spline`, `map_health`) introduce **no new
+mechanism**: each is exactly one wildcard entry in this same gate table, seeded at
+construction from `Config.debug.<group>.{enable, max_hz}` (immutable defaults, spec
+00 §8.3) and flipped live with the same `SetDebugKey` call
+(`{key: 'frontend/assoc/*', enable: true, max_hz: 10}`). A group `max_hz` of `0`
+keeps each key's class default (scalars at `debug.telemetry_rate_hz`, heavy payloads
+at 2 Hz). The replay `FileSink` seeds the identical prefix gate from the same
+`DebugConfig` (no rate limit — a replay wants every sample), preserving §13
+replay==live for the recorded key set. `debug.publish_path` plus
+`path_sample_hz`/`path_publish_hz`/`path_max_poses` configure the
+`frontend/spline/path_sample` → `/meridian/path` aggregation the same way.
 
 ### 11.1 Production posture vs. forensic posture
 
@@ -1461,6 +1539,21 @@ frontend/lidar/inliers         cloud   → /meridian/cloud_effective  PC2  /clou
 frontend/lidar/n_inlier        scalar  → /meridian/telemetry        Tel  effct_feat_num                :695  (NEW topic)
 frontend/lidar/n_input|inlier_ratio|res_mean|res_max  scalar → /meridian/telemetry  Tel  res_mean_last :715 + NEW
 frontend/lidar/n_factors_kept|n_factors_dropped       scalar → /meridian/telemetry  Tel  NEW (bounded-factor cap)
+frontend/resid/<fam>/rms|mean_abs|n_rows|cost_frac    scalar → /meridian/telemetry  Tel  NEW (per-family probe; cost_frac under solver group)
+# --- L2 deep-debug groups (config-seeded wildcards, default off; §5.1/§11) ---
+frontend/assoc/n_attempted|n_matched|reject_nn|reject_dist|reject_plane|reject_score  scalar → /meridian/telemetry  Tel  NEW (assoc group)
+frontend/assoc/res_p95|nn_dist_mean|nn_dist_p95|plane_rms_mean|plane_rms_p95          scalar → /meridian/telemetry  Tel  NEW (assoc group)
+frontend/assoc/res_hist        vec(16) → /meridian/telemetry        Tel  NEW (|r| histogram, heatmap source)
+frontend/assoc/strata_kept     vec(7)  → /meridian/telemetry        Tel  NEW (kept factors per normal stratum)
+frontend/assoc/outliers        cloud   → /meridian/cloud_outliers   PC2  NEW (rejected points, world frame)
+frontend/solver/iter_cost|iter_step|iter_grad|iter_tr_radius  vec(N) → /meridian/telemetry  Tel  NEW (per-LM-iteration trace)
+frontend/solver/cost_initial|termination               scalar → /meridian/telemetry  Tel  NEW
+frontend/deskew/corr_mean_m|corr_p95_m|corr_max_m|sweep_trans_m|sweep_rot_deg  scalar → /meridian/telemetry  Tel  NEW (CT placement)
+frontend/deskew/pre            cloud   → /meridian/cloud_deskew_pre PC2  NEW (frozen sweep-end pose)
+frontend/spline/vel|acc|omega  vec(3)  → /meridian/telemetry        Tel  NEW (analytic derivatives at t_end)
+frontend/spline/acc_rms_span|omega_rms_span|jerk_rms   scalar → /meridian/telemetry  Tel  NEW (span-RMS / aliasing)
+frontend/spline/path_sample    pose×N  → /meridian/path             Path NEW (solved spline @ path_sample_hz; cf /path :622/:859)
+frontend/map/size|n_inserted|insert_rejected           scalar → /meridian/telemetry  Tel  NEW (map_health group, default on)
 # --- L2 visual stream (FAST-LIVO2 sparse-direct photometric) ---
 frontend/visual/patches        image   → /meridian/visual_patches   Img  NEW (patch overlay, residual-coloured)
 frontend/visual/n_tracked|n_converged|res_mean        scalar → /meridian/telemetry  Tel  NEW

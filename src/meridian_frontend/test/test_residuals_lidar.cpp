@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <sophus/so3.hpp>
 
+#include "ct/spline_analytic.hpp"
 #include "ct/spline_window.hpp"
 #include "meridian/common/point.hpp"
 #include "meridian/common/pose.hpp"
@@ -1081,6 +1082,129 @@ TEST(AnalyticLidarCost, ResidualMatchesAutodiffFunctor) {
   }
 }
 
+namespace {
+
+// Autodiff reference for the non-uniform parity test: identical point-to-plane math
+// evaluated through the same per-interval matrices.
+struct NuLidarFunctor {
+  NuLidarFunctor(const AnalyticProbe& pr, double inv_dt, const Eigen::Matrix4d& blend,
+                 const Eigen::Matrix4d& cum_blend)
+      : pr_(pr), inv_dt_(inv_dt), blend_(blend), cum_blend_(cum_blend) {}
+  template <class T>
+  bool operator()(T const* const* params, T* residual) const {
+    Sophus::SO3<T> R_w_fe;
+    meridian::ct::evaluateLieWithMatrix<T, Sophus::SO3>(params, pr_.u, inv_dt_, cum_blend_,
+                                                        &R_w_fe);
+    Eigen::Matrix<T, 3, 1> p_w_fe;
+    meridian::ct::evaluateRdWithMatrix<T, 3, 0>(params + 4, pr_.u, inv_dt_, blend_, &p_w_fe);
+    const Eigen::Matrix<T, 3, 1> q_fe = (pr_.q_ext * pr_.point + pr_.t_ext).cast<T>();
+    residual[0] = T(pr_.weight) * (pr_.n.cast<T>().dot(R_w_fe * q_fe + p_w_fe) + T(pr_.d));
+    return true;
+  }
+  AnalyticProbe pr_;
+  double inv_dt_;
+  Eigen::Matrix4d blend_;
+  Eigen::Matrix4d cum_blend_;
+};
+
+}  // namespace
+
+// Non-uniform-interval parity: the analytic point-to-plane cost fed a mixed-density
+// window's per-interval matrices must match (a) an autodiff reference evaluated
+// through the same matrices and (b) the residual recomputed from the window's own
+// pose evaluation -- so the baked lambdas agree with the trajectory the rest of the
+// estimator samples.
+TEST(AnalyticLidarCost, JacobiansMatchAutodiffOnNonUniformIntervals) {
+  ceres::EigenQuaternionManifold quat_manifold;
+
+  const Eigen::Vector3d w_seed(0.9, -0.4, 0.7);
+  auto seed = [&](Timestamp t) {
+    const double ts = tSec(t);
+    Pose p;
+    p.q = Sophus::SO3d::exp(w_seed * ts).unit_quaternion();
+    p.t = Eigen::Vector3d(0.6 * std::sin(1.1 * ts), 0.4 * std::cos(0.8 * ts), 0.3 * ts);
+    return p;
+  };
+  SplineWindow win(static_cast<Duration>(100'000'000), 3, /*non_uniform=*/true);
+  win.initialize(0, seed(0));
+  const std::vector<int> gears = {2, 3, 1, 3, 2, 1};
+  std::size_t lay = 0;
+  win.extendTo(static_cast<Timestamp>(500'000'000), seed,
+               [&](Timestamp, Timestamp) { return gears[(lay++) % gears.size()]; });
+
+  std::mt19937 rng(37);
+  const std::vector<double> probe_ts = {0.04, 0.13, 0.36, 0.42, 0.27};
+  for (std::size_t k = 0; k < probe_ts.size(); ++k) {
+    const Timestamp t = static_cast<Timestamp>(probe_ts[k] * 1e9);
+    ASSERT_TRUE(win.covers(t));
+    SplineWindow::SegmentRef seg = win.segmentFor(t);
+    // A probe may land in a uniformly-spaced interval (e.g. the bootstrap run), which
+    // routes to cardinal and reports null matrix pointers. The analytic cost takes the
+    // pointers and falls back to cardinal on null; the autodiff reference takes matrices
+    // by value, so resolve null to the same cardinal matrices, leaving both paths fed
+    // identical blending whether the interval is uniform or varying-density.
+    const Eigen::Matrix4d& blend =
+        seg.blend ? *seg.blend : basalt::CeresSplineHelper<4>::blending_matrix_;
+    const Eigen::Matrix4d& cum_blend =
+        seg.cum_blend ? *seg.cum_blend : basalt::CeresSplineHelper<4>::cumulative_blending_matrix_;
+
+    AnalyticProbe pr = randomProbe(rng, 0.3);
+    pr.u = seg.u;
+
+    std::unique_ptr<ceres::CostFunction> analytic(
+        meridian::ct::makeLidarPlaneCost(pr.point, pr.n, pr.d, pr.q_ext, pr.t_ext, pr.u,
+                                         pr.weight, seg.blend, seg.cum_blend));
+    auto* ref = new ceres::DynamicAutoDiffCostFunction<NuLidarFunctor, 4>(
+        new NuLidarFunctor(pr, 1.0 / seg.dt_s, blend, cum_blend));
+    for (int i = 0; i < 8; ++i) ref->AddParameterBlock(i < 4 ? 4 : 3);
+    ref->SetNumResiduals(1);
+    std::unique_ptr<ceres::CostFunction> reference(ref);
+
+    // Evaluate on the WINDOW's knot blocks so the same parameters also feed the
+    // window's own pose evaluation below.
+    std::vector<const double*> params;
+    for (double* p : seg.so3_knots) params.push_back(p);
+    for (double* p : seg.r3_knots) params.push_back(p);
+
+    double ja_q[4][4], jr_q[4][4], ja_p[4][3], jr_p[4][3];
+    std::vector<double*> ja, jr;
+    for (int j = 0; j < 4; ++j) ja.push_back(ja_q[j]);
+    for (int j = 0; j < 4; ++j) ja.push_back(ja_p[j]);
+    for (int j = 0; j < 4; ++j) jr.push_back(jr_q[j]);
+    for (int j = 0; j < 4; ++j) jr.push_back(jr_p[j]);
+
+    double r_a = 0.0;
+    double r_r = 0.0;
+    ASSERT_TRUE(analytic->Evaluate(params.data(), &r_a, ja.data()));
+    ASSERT_TRUE(reference->Evaluate(params.data(), &r_r, jr.data()));
+    EXPECT_NEAR(r_a, r_r, 1e-10 + 1e-10 * std::abs(r_r)) << "probe " << k;
+
+    // The residual recomputed from the window's pose at t (the trajectory the
+    // associator and map updates sample) must agree with the baked-lambda cost.
+    const Pose T_t = win.pose(t);
+    const Eigen::Vector3d q_fe = pr.q_ext * pr.point + pr.t_ext;
+    const double r_win = pr.weight * (pr.n.dot(T_t.q * q_fe + T_t.t) + pr.d);
+    EXPECT_NEAR(r_a, r_win, 1e-9 + 1e-9 * std::abs(r_win)) << "probe " << k;
+
+    for (int j = 0; j < 4; ++j) {
+      Eigen::Matrix<double, 4, 3, Eigen::RowMajor> plus_jac;
+      quat_manifold.PlusJacobian(params[j], plus_jac.data());
+      const Eigen::Map<Eigen::Matrix<double, 1, 4, Eigen::RowMajor>> Ja(ja_q[j]);
+      const Eigen::Map<Eigen::Matrix<double, 1, 4, Eigen::RowMajor>> Jr(jr_q[j]);
+      const Eigen::Matrix<double, 1, 3> la = Ja * plus_jac;
+      const Eigen::Matrix<double, 1, 3> lr = Jr * plus_jac;
+      for (int c = 0; c < 3; ++c) {
+        EXPECT_NEAR(la(0, c), lr(0, c), 1e-9 + 1e-9 * std::abs(lr(0, c)))
+            << "probe " << k << " so3 knot " << j << " col " << c;
+      }
+      for (int c = 0; c < 3; ++c) {
+        EXPECT_NEAR(ja_p[j][c], jr_p[j][c], 1e-10 + 1e-10 * std::abs(jr_p[j][c]))
+            << "probe " << k << " r3 knot " << j << " col " << c;
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // iVox / ikd-Tree backend equivalence: the same stored point set must yield the
 // same plane fit through both backends.
@@ -1090,3 +1214,165 @@ namespace {
 
 }  // namespace
 
+
+// ---------------------------------------------------------------------------
+// Association-quality diagnostics: fit-quality stats, reject reasons, and the
+// per-stratum kept histogram. All output-only — they must never change which
+// hits are produced or kept.
+// ---------------------------------------------------------------------------
+
+// A successful fit fills rms / nn_max_dist consistently with the gates that
+// admitted it; each reject path tags its reason.
+TEST(ResidualsLidar, PlaneFitFillsQualityStatsAndRejectReasons) {
+  FrontendLidar cfg = makeCfg();
+  cfg.voxel_map_m = 1e-3;
+  cfg.plane_thresh = 0.05;
+
+  const Eigen::Vector3d n_true = Eigen::Vector3d(0.3, -0.5, 1.0).normalized();
+  const double d_true = -0.7;
+  const Eigen::Vector3d e1 = n_true.unitOrthogonal();
+  const Eigen::Vector3d e2 = n_true.cross(e1);
+  const Eigen::Vector3d p0 = -d_true * n_true;
+
+  std::mt19937 rng(7);
+  std::normal_distribution<double> jitter(0.0, 0.002);
+  std::vector<Eigen::Vector3d> patch;
+  for (int i = -8; i <= 8; ++i) {
+    for (int j = -8; j <= 8; ++j) {
+      patch.push_back(p0 + (0.15 * i) * e1 + (0.15 * j) * e2 + jitter(rng) * n_true);
+    }
+  }
+  LidarLocalMap map(cfg);
+  map.insert(patch);
+
+  PlaneFit fit;
+  ASSERT_TRUE(map.fitPlane(p0 + 0.03 * e1, &fit));
+  EXPECT_TRUE(fit.valid);
+  EXPECT_EQ(fit.reject, PlaneFit::Reject::None);
+  // Every neighbour passed the planarity gate, so the RMS is bounded by it; the
+  // farthest fit neighbour passed the distance gate.
+  EXPECT_GT(fit.rms, 0.0);
+  EXPECT_LE(fit.rms, cfg.plane_thresh);
+  EXPECT_GT(fit.nn_max_dist, 0.0);
+  EXPECT_LE(fit.nn_max_dist * fit.nn_max_dist, cfg.max_match_dist_sq + 1e-9);
+
+  // Distance gate: a query several metres past the patch corner finds neighbours
+  // only beyond sqrt(max_match_dist_sq).
+  PlaneFit far;
+  EXPECT_FALSE(map.fitPlane(p0 + (0.15 * 8 + 6.0) * e1, &far));
+  EXPECT_FALSE(far.valid);
+  EXPECT_EQ(far.reject, PlaneFit::Reject::TooFar);
+
+  // Planarity gate: a volumetric cube cluster leaves some neighbour beyond
+  // plane_thresh of any candidate plane.
+  std::vector<Eigen::Vector3d> blob;
+  const Eigen::Vector3d c(5.0, 5.0, 5.0);
+  for (int sx : {-1, 1}) {
+    for (int sy : {-1, 1}) {
+      for (int sz : {-1, 1}) {
+        blob.emplace_back(c + 0.2 * Eigen::Vector3d(sx, sy, sz));
+      }
+    }
+  }
+  blob.push_back(c);
+  LidarLocalMap blob_map(cfg);
+  blob_map.insert(blob);
+  PlaneFit bad;
+  EXPECT_FALSE(blob_map.fitPlane(c, &bad));
+  EXPECT_EQ(bad.reject, PlaneFit::Reject::NotPlanar);
+
+  // Neighbour-count gate: fewer stored points than num_match_points.
+  LidarLocalMap tiny(cfg);
+  tiny.insert({p0, p0 + 0.1 * e1, p0 + 0.1 * e2});
+  PlaneFit few;
+  EXPECT_FALSE(tiny.fitPlane(p0, &few));
+  EXPECT_EQ(few.reject, PlaneFit::Reject::NoNeighbors);
+}
+
+// The reject counters partition the association funnel exactly:
+// attempted == matched + plane-gate rejects and matched == accepted + score rejects,
+// so attempted - accepted equals the sum of all four reject counters.
+TEST(ResidualsLidar, AssocRejectCountersPartitionFunnel) {
+  const GroundTruth gt;
+  const FrontendLidar cfg = makeCfg();
+  const Duration knot_dt = 25'000'000;
+  const Timestamp t0 = 0;
+  const Timestamp t_end = 100'000'000;
+  const Pose T_fe_lidar;
+
+  BoxRoom room;
+  LidarLocalMap map(cfg);
+  map.insert(room.wallPoints(0.1));
+
+  SplineWindow spline = makeSpline(gt, t0, t_end, knot_dt);
+  const auto kts = knotTimes(t0, t_end, knot_dt, 1);
+  ASSERT_EQ(static_cast<int>(kts.size()), spline.numKnots());
+  reseedToGroundTruth(spline, gt, kts);
+
+  // A clean wall scan plus two guaranteed rejects (room centre: no plane support;
+  // far outside the walls: distance gate).
+  std::vector<LidarPoint> scan = makeScan(gt, T_fe_lidar, room, t0, t_end);
+  const Timestamp t_mid = t_end / 2;
+  const Pose T_w_l = gt.pose(tSec(t_mid)) * T_fe_lidar;
+  for (const Eigen::Vector3d& pw :
+       {Eigen::Vector3d(0.0, 0.0, 0.0), Eigen::Vector3d(room.hx + 6.0, room.hy + 6.0, 0.0)}) {
+    LidarPoint lp;
+    lp.xyz = (T_w_l.inverse() * pw).cast<float>();
+    lp.t_offset_ns = static_cast<std::int32_t>(t_mid - t0);
+    scan.push_back(lp);
+  }
+
+  std::vector<LidarHit> hits;
+  const LidarAssocStats s = associate(spline, T_fe_lidar, scan, t0, map, cfg, &hits);
+
+  ASSERT_GT(s.attempted, 0);
+  EXPECT_EQ(s.attempted,
+            s.matched + s.reject_no_neighbors + s.reject_too_far + s.reject_not_planar);
+  EXPECT_EQ(s.matched, s.accepted + s.reject_score);
+  EXPECT_EQ(s.attempted - s.accepted, s.reject_no_neighbors + s.reject_too_far +
+                                          s.reject_not_planar + s.reject_score);
+  // The two injected bad points must land in the plane-gate counters.
+  EXPECT_GE(s.reject_no_neighbors + s.reject_too_far + s.reject_not_planar, 2);
+}
+
+// kept_per_stratum sums to kept on both cap paths (within budget and capped), and
+// its filling changes neither the selection nor the counts.
+TEST(ResidualsLidarCap, KeptPerStratumSumsToKept) {
+  FrontendLidar cfg = makeCfg();
+  cfg.normal_strata = 7;
+  cfg.min_factors_per_normal = 10;
+
+  std::vector<LidarHit> hits;
+  const std::array<Eigen::Vector3d, 6> axes = {
+      Eigen::Vector3d(1, 0, 0),  Eigen::Vector3d(-1, 0, 0), Eigen::Vector3d(0, 1, 0),
+      Eigen::Vector3d(0, -1, 0), Eigen::Vector3d(0, 0, 1),  Eigen::Vector3d(0, 0, -1)};
+  for (int i = 0; i < 1200; ++i) {
+    hits.push_back(makeHit(axes[static_cast<std::size_t>(i % 6)], i,
+                           static_cast<std::uint16_t>(i % 64)));
+  }
+  // An oblique normal so the seventh bin is also exercised.
+  for (int i = 0; i < 30; ++i) {
+    hits.push_back(makeHit(Eigen::Vector3d(1, 1, 1), 10000 + i, 0));
+  }
+
+  // Within budget: pass-through.
+  cfg.max_lidar_factors = 10000;
+  std::vector<LidarHit> out;
+  LidarCapStats s = capHitsByNormalStrata(hits, cfg, 0, {}, 0.966, &out);
+  ASSERT_EQ(static_cast<int>(s.kept_per_stratum.size()), cfg.normal_strata);
+  int sum = 0;
+  for (const int k : s.kept_per_stratum) sum += k;
+  EXPECT_EQ(sum, s.kept);
+  EXPECT_EQ(s.kept, static_cast<int>(hits.size()));
+  EXPECT_GT(s.kept_per_stratum[6], 0);  // the oblique bin saw the diagonal normals
+
+  // Capped: the histogram tracks the post-cap selection.
+  cfg.max_lidar_factors = 300;
+  s = capHitsByNormalStrata(hits, cfg, 0, {}, 0.966, &out);
+  ASSERT_EQ(static_cast<int>(s.kept_per_stratum.size()), cfg.normal_strata);
+  sum = 0;
+  for (const int k : s.kept_per_stratum) sum += k;
+  EXPECT_EQ(sum, s.kept);
+  EXPECT_EQ(s.kept, 300);
+  EXPECT_EQ(static_cast<int>(out.size()), 300);
+}

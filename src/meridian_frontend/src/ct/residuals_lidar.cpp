@@ -302,10 +302,16 @@ bool LidarLocalMap::fitPlane(const Eigen::Vector3d& p_world, PlaneFit* out) cons
   }
 
   if (static_cast<int>(nbrs.size()) < k) {
+    if (out != nullptr) {
+      out->reject = PlaneFit::Reject::NoNeighbors;
+    }
     return false;
   }
   // Distances are squared and sorted ascending, so the last is the farthest.
   if (dists.back() > impl_->max_match_dist_sq) {
+    if (out != nullptr) {
+      out->reject = PlaneFit::Reject::TooFar;
+    }
     return false;
   }
 
@@ -320,21 +326,33 @@ bool LidarLocalMap::fitPlane(const Eigen::Vector3d& p_world, PlaneFit* out) cons
   const Eigen::Vector3d u = A.colPivHouseholderQr().solve(b);
   const double norm = u.norm();
   if (!(norm > 0.0)) {
+    if (out != nullptr) {
+      out->reject = PlaneFit::Reject::NotPlanar;
+    }
     return false;
   }
   const double inv = 1.0 / norm;
   const Eigen::Vector3d n = u * inv;
   const double d = inv;
 
+  double sum_sq = 0.0;
   for (int i = 0; i < m; ++i) {
-    if (std::abs(n.dot(nbrs[i]) + d) > impl_->plane_thresh) {
+    const double dist = std::abs(n.dot(nbrs[i]) + d);
+    if (dist > impl_->plane_thresh) {
+      if (out != nullptr) {
+        out->reject = PlaneFit::Reject::NotPlanar;
+      }
       return false;
     }
+    sum_sq += dist * dist;
   }
   if (out != nullptr) {
     out->n = n;
     out->d = d;
+    out->rms = std::sqrt(sum_sq / static_cast<double>(m));
+    out->nn_max_dist = std::sqrt(static_cast<double>(dists.back()));
     out->valid = true;
+    out->reject = PlaneFit::Reject::None;
   }
   return true;
 }
@@ -355,6 +373,11 @@ struct AssocOutcome {
   bool attempted = false;
   bool matched = false;
   bool accepted = false;
+  // Which gate rejected an attempted-but-not-accepted point (None when accepted or
+  // never attempted). The plane-fit reasons pass through from PlaneFit; ScoreGate
+  // covers the range-aware acceptance score (and the degenerate zero-range point).
+  enum class Reject : std::uint8_t { None = 0, NoNeighbors, TooFar, NotPlanar, ScoreGate };
+  Reject reject = Reject::None;
 };
 
 AssocOutcome associateOne(const SplineWindow& spline, const Eigen::Quaterniond& q_fe_l,
@@ -373,6 +396,11 @@ AssocOutcome associateOne(const SplineWindow& spline, const Eigen::Quaterniond& 
 
   PlaneFit plane;
   if (!map.fitPlane(p_world, &plane)) {
+    switch (plane.reject) {
+      case PlaneFit::Reject::NoNeighbors: out.reject = AssocOutcome::Reject::NoNeighbors; break;
+      case PlaneFit::Reject::TooFar: out.reject = AssocOutcome::Reject::TooFar; break;
+      default: out.reject = AssocOutcome::Reject::NotPlanar; break;
+    }
     return out;
   }
   out.matched = true;
@@ -381,12 +409,14 @@ AssocOutcome associateOne(const SplineWindow& spline, const Eigen::Quaterniond& 
   const double range = p_lidar.norm();
   // A point at the sensor origin has no usable bearing and is rejected.
   if (range <= 0.0) {
+    out.reject = AssocOutcome::Reject::ScoreGate;
     return out;
   }
   // Range-aware acceptance: the tolerance grows with sqrt(range), so distant
   // returns are gated more leniently than near ones.
   const double s = 1.0 - 0.9 * std::abs(r) / std::sqrt(range);
   if (!(s > 0.9)) {
+    out.reject = AssocOutcome::Reject::ScoreGate;
     return out;
   }
   out.accepted = true;
@@ -460,6 +490,13 @@ LidarAssocStats associate(const SplineWindow& spline, const Pose& T_fe_lidar,
     if (o.matched) {
       ++ts.matched;
     }
+    switch (o.reject) {
+      case AssocOutcome::Reject::NoNeighbors: ++ts.reject_no_neighbors; break;
+      case AssocOutcome::Reject::TooFar: ++ts.reject_too_far; break;
+      case AssocOutcome::Reject::NotPlanar: ++ts.reject_not_planar; break;
+      case AssocOutcome::Reject::ScoreGate: ++ts.reject_score; break;
+      case AssocOutcome::Reject::None: break;
+    }
     if (o.accepted) {
       ++ts.accepted;
       thread_hits[tid].push_back(hit);
@@ -471,6 +508,10 @@ LidarAssocStats associate(const SplineWindow& spline, const Pose& T_fe_lidar,
     stats.attempted += ts.attempted;
     stats.matched += ts.matched;
     stats.accepted += ts.accepted;
+    stats.reject_no_neighbors += ts.reject_no_neighbors;
+    stats.reject_too_far += ts.reject_too_far;
+    stats.reject_not_planar += ts.reject_not_planar;
+    stats.reject_score += ts.reject_score;
     if (hits != nullptr) {
       const std::vector<LidarHit>& tb = thread_hits[static_cast<std::size_t>(tid)];
       hits->insert(hits->end(), tb.begin(), tb.end());
@@ -542,6 +583,19 @@ LidarCapStats capHitsByNormalStrata(const std::vector<LidarHit>& hits,
   }
   out->clear();
 
+  // Output-only diagnostic: bin the kept set by normal stratum so the per-direction
+  // constraint distribution is visible. Shared by both return paths below.
+  const auto fillStrataHist = [&cfg](const std::vector<LidarHit>& kept,
+                                     std::vector<int>* hist) {
+    const int n = std::max(1, cfg.normal_strata);
+    hist->assign(static_cast<std::size_t>(n), 0);
+    for (const LidarHit& h : kept) {
+      if (h.plane.valid) {
+        ++(*hist)[static_cast<std::size_t>(normalStratum(h.plane.n, n))];
+      }
+    }
+  };
+
   const int cap = cfg.max_lidar_factors;
   // A non-positive or slack cap means every inlier is built; copy through unchanged so
   // the within-budget path costs nothing beyond the copy.
@@ -549,6 +603,7 @@ LidarCapStats capHitsByNormalStrata(const std::vector<LidarHit>& hits,
     *out = hits;
     stats.kept = static_cast<int>(out->size());
     stats.dropped = 0;
+    fillStrataHist(*out, &stats.kept_per_stratum);
     return stats;
   }
 
@@ -700,6 +755,7 @@ LidarCapStats capHitsByNormalStrata(const std::vector<LidarHit>& hits,
   if (stats.dropped < 0) {
     stats.dropped = 0;
   }
+  fillStrataHist(*out, &stats.kept_per_stratum);
   return stats;
 }
 
@@ -773,7 +829,8 @@ class AnalyticLidarPlaneCost final : public ceres::CostFunction {
  public:
   AnalyticLidarPlaneCost(const Eigen::Vector3d& p_lidar, const Eigen::Vector3d& n, double d,
                          const Eigen::Quaterniond& q_fe_l, const Eigen::Vector3d& t_fe_l,
-                         double u, double weight)
+                         double u, double weight, const Eigen::Matrix4d* blend = nullptr,
+                         const Eigen::Matrix4d* cum_blend = nullptr)
       : n_(n), d_(d), q_fe_(q_fe_l * p_lidar + t_fe_l), weight_(weight) {
     set_num_residuals(1);
     for (int j = 0; j < kSplineOrder; ++j) {
@@ -783,8 +840,15 @@ class AnalyticLidarPlaneCost final : public ceres::CostFunction {
       mutable_parameter_block_sizes()->push_back(3);
     }
     const Eigen::Vector4d up(1.0, u, u * u, u * u * u);
-    lambda_r_ = basalt::CeresSplineHelper<kSplineOrder>::cumulative_blending_matrix_ * up;
-    lambda_p_ = basalt::CeresSplineHelper<kSplineOrder>::blending_matrix_ * up;
+    // Null pointers bind the uniform cardinal matrix objects themselves, so the
+    // expressions below run on the same operands as always; non-null substitutes the
+    // per-interval (non-uniform) matrices into the identical expressions.
+    const Eigen::Matrix4d& CM =
+        cum_blend ? *cum_blend : basalt::CeresSplineHelper<kSplineOrder>::cumulative_blending_matrix_;
+    const Eigen::Matrix4d& M =
+        blend ? *blend : basalt::CeresSplineHelper<kSplineOrder>::blending_matrix_;
+    lambda_r_ = CM * up;
+    lambda_p_ = M * up;
   }
 
   bool Evaluate(double const* const* parameters, double* residuals,
@@ -845,8 +909,9 @@ ceres::CostFunction* makeLidarPlaneCost(const Eigen::Vector3d& p_lidar,
                                         const Eigen::Vector3d& n, double d,
                                         const Eigen::Quaterniond& q_fe_l,
                                         const Eigen::Vector3d& t_fe_l, double u,
-                                        double weight) {
-  return new AnalyticLidarPlaneCost(p_lidar, n, d, q_fe_l, t_fe_l, u, weight);
+                                        double weight, const Eigen::Matrix4d* blend,
+                                        const Eigen::Matrix4d* cum_blend) {
+  return new AnalyticLidarPlaneCost(p_lidar, n, d, q_fe_l, t_fe_l, u, weight, blend, cum_blend);
 }
 
 int addLidarResiduals(ceres::Problem& problem, SplineWindow& spline,
@@ -860,7 +925,7 @@ int addLidarResiduals(ceres::Problem& problem, SplineWindow& spline,
   // before clamping. The widening is clamped so a fine map keeps the nominal band.
   const double base_std = std::sqrt(cfg.point_cov > 0.0 ? cfg.point_cov : 1.0);
   const double coarseness = cfg.voxel_map_m > 0.0 ? cfg.voxel_map_m / base_std : 1.0;
-  const double huber = kHuberWhitened * std::max(1.0, std::min(coarseness, 4.0));
+  const double huber = kHuberWhitened * std::max(1.0, std::min(coarseness, cfg.huber_clamp_max));
   int added = 0;
   for (const LidarHit& hit : hits) {
     if (!spline.covers(hit.t)) {
@@ -870,7 +935,7 @@ int addLidarResiduals(ceres::Problem& problem, SplineWindow& spline,
 
     ceres::CostFunction* cost = makeLidarPlaneCost(hit.p_lidar, hit.plane.n, hit.plane.d,
                                                    T_fe_lidar.q, T_fe_lidar.t, seg.u,
-                                                   hit.weight);
+                                                   hit.weight, seg.blend, seg.cum_blend);
 
     std::vector<double*> blocks;
     blocks.reserve(2 * kSplineOrder);

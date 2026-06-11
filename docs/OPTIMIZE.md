@@ -34,14 +34,15 @@ not more front-end tuning.
 - `solver.time_limit_ms` 90→**60**: REJECTED. Starves convergence — `deadline_hit`
   ~0.05→~1.0, ATE 0.10→**0.56 m**. After parallel association the solve finishes well
   inside 90 ms, so lowering the cap buys nothing. Keep 90.
-- `spline.n_cp_max` **2 and 3**: DIVERGES (ATE **1173 m** / **413 m**, visual map
-  collapses). Diagnosis (adversarially verified): the analytic Jacobians ARE
-  n_cp-correct (parity ~3e-11); the failure is the **dense-knot warm start** — a wiggly
-  dense-knot seed corrupts data association on real data. **DEFERRED ACCURACY LEVER
-  (task #62)**: adaptive knot density is mathematically validated and the principal
-  remaining front-end lever for fast-motion accuracy, but needs a warm-start redesign
-  (smooth dense-segment seeding + selectKnotDensity hysteresis), not Jacobian work.
-  Do not flip n_cp_max > 1 before that lands.
+- `spline.n_cp_max` **2 and 3** (legacy peak-geared path): DIVERGED (ATE **1173 m** /
+  **413 m**, visual map collapses). Diagnosis (adversarially verified): the analytic
+  Jacobians ARE n_cp-correct (parity ~3e-11); the failure was the **dense-knot warm
+  start** — a wiggly dense-knot seed corrupts data association on real data, with
+  per-round re-association already present. RESOLVED by #72: the redesign shipped as
+  `frontend.ncp.*` (true non-uniform basis, mean-of-norms gearing, tail re-knot, and
+  the `warmstart_iters` IMU-only mini-solve that irons fresh dense tails before
+  association). The legacy peak-geared path is deleted; do not re-grow it. `ncp.enabled`
+  stays false until the validation campaign passes.
 - **LiDAR densification on Newer College quad-easy**: REJECTED across the board.
   voxel 0.5 = neutral (0.197 vs 0.16-0.19 baseline, +11 ms); voxel 0.5 + factors 1500 and
   + point_filter 1 = budget blown (104-138 ms/sweep, 262-468 Q_meas drops, divergence);
@@ -83,6 +84,43 @@ rows below.
   Cheaper derivatives improve accuracy at fixed budget; lowering the budget to cash
   them as speed starves convergence unless `deadline_hit` is already ~0.
 
+## Overnight accuracy campaign (2026-06-12, deterministic replay, full sequences)
+
+Per-sequence optima found by coordinate descent on the deterministic harness
+(bit-exact; one run per point). Headline: quad-easy 0.16→**0.073 m**; math-medium
+first-ever working runs 291→**~1.0 m**; park unblocked (moving-start init).
+
+- **Retention re-tuned offline**: `marg_prior_scale` sweep on quad is monotonic to 1.0
+  (0.5=0.219 → 1.0=0.086) — the 0.5 default was medicine for LIVE-timing nondeterminism,
+  not the estimator. SEQUENCE-DEPENDENT: math-medium prefers 0.5 (fast-motion
+  linearization error); keep per-sequence values, pursue per-state forgetting later.
+- **`max_outer_iters` 2→4**: quad 0.086→0.075; saturates at 4 (6/reassoc3/inner8 all ≤1 mm).
+- **`huber_clamp_max` 4→1**: quad 0.075→0.073 BUT math diverges (763 m) — the tight knee
+  starves the solve during fast turns. Default stays 4.0; 1.0 only on gentle sequences.
+- **`gravity_refine` (free gravity block): REJECTED — measurement CONFOUNDED, flag now
+  hard-blocked by `validate()`** — quad 0.073→1.70 m, but the run went through a broken
+  prior path: the marginalization prior keeps the freed gravity block with no
+  sphere-manifold tangent lift (Euclidean fallback linearizes the wrong tangent) AND the
+  keyframe worker's prior clone aliases live gravity storage across threads. 1.70 m
+  indicts that path, not per-window gravity observability. Config validation rejects the
+  flag outright until the prior cost grows the sphere lift and the capture remap covers
+  gravity; re-measure only after both. The init-tilt mechanism wants a SOFT prior (future).
+- **THE ROTATION-RATE WALL**: math-medium's 291 m failure = a 2.6 Hz yaw SWAY (not a
+  turn) at t≈10-14 s exceeding the 100 ms-knot spline bandwidth (deskew/sweep_trans_m
+  exploded to 3.9 m/sweep on clean IMU data; bias pegged its box corner; map poisoned
+  permanently — n_matched halved). `knot_dt_ms` 100→50 (+window_knots 8→16) was the
+  stopgap (291→5.8→1.0 m with scale 0.5) at ~2x solve cost on fast sequences;
+  **STOPGAP RETIRED** — the YAMLs are back at 100/8 and the fix is excitation-geared
+  knot density (`frontend.ncp`, #72), which densifies only the excited segments. 33 ms
+  global knots still diverge (dense seeding everywhere); do not re-try global densification.
+- **Moving-start init (`init_force_after_s`)**: structural parity gap vs FAST-LIO2 —
+  our bootstrap demanded a static window forever and silently discarded ALL of park
+  (5,711 groups, zero telemetry). The fallback (sweep-mean init after N s) unblocks
+  park; pair with the static gate, never free gravity to compensate.
+- **IMU noise on quad: SATURATED at current values** (everything ±1 mm); datasheet-tight
+  accel (cov 2.25e-06) DIVERGES (28 km) — over-trusting the IMU is fatal in both
+  directions (cf. the legged ×40 row). The corrected NC values stand.
+
 ## Real-time budget levers (tuned this session)
 
 | knob (config `meridian.frontend.*`) | now | trades | effect (measured) |
@@ -97,6 +135,7 @@ rows below.
 | (structural) **parallel association** (OpenMP, residuals_lidar.cpp `associate()`) | live: `min(8, cores)` | `schedule(static)` over points + per-thread buffers merged in thread order → BIT-IDENTICAL to serial (parity-tested), no determinism cost; ikd-Tree guarded by `shared_mutex` (shared on fitPlane, exclusive on insert/trim) | **the headline win:** assoc ~21→~7 ms/pass (~28 ms/sweep saved); solve_ms ~98→~85, deadline_hit 0.7→~0.05, drops 205→7, 0 restarts, ATE held (mean 0.098 m) |
 | (structural) visual NCC-matrix cache (visual_map.cpp) | on | recompute per-point pairwise NCC only on viewpoint change (`obs_dirty`) vs every sweep | NEUTRAL: visual_map stayed ~11 ms — NCC re-score was not the dominant cost (projection/eviction is). No harm; behaviour-equivalent (digest test green) |
 | (structural) frustum-bounded visible scan (`VisualMap::selectVisibleIds` via `frustumCandidateIds`) | on | walk only voxels intersecting the view frustum (spatial index + 5 world planes, side rays widened ×1.25 for distortion) instead of projecting every map point; per-point test unchanged so the candidate set is identical | `vmap.select` **9.06→3.43 ms** at ~55k map points / ~480 candidates (scales with frustum, not map size); visual_map total 13.5→12.6 ms. The ×1.25 margin is pinned by gtest (`VisualMapFrustum.*`): byte-identical to a full-map scan for pinhole + RadTan up to k1≈1.2; ×1.0 breaks at k1=0.4 pincushion, ×1.25 holds to k1≈3.0. Sub-timers `frontend.ct.vmap.{select,update,promote,evict}` are permanent telemetry |
+| `debug.telemetry_rate_hz` (newer-college-quad debug posture) | 50 (was 10) | scalar token-bucket rate on /meridian/telemetry; ↑ = more wrapper publish load (debug path only, estimator untouched). At 10 the limit sits exactly on the 10 Hz sweep cadence and beats against per-key jitter | measured: per-key live capture 1–98% (chaotic aliasing) at 10 → every-sweep capture at 50; replay/FileSink path unaffected (always exact) |
 
 ## Other compute levers (available, not yet pulled)
 
@@ -115,8 +154,13 @@ rows below.
 | knob | now | role |
 |---|---|---|
 | `sensors.imu.cov_*` (legged_underground) | ≈×40 the calib Allan densities | IMU-vs-LiDAR trust. Static-calib Allan floors over-trust the IMU under locomotion vibration: calib values diverge (448 m ATE / 120 s), ×10 still diverges (116 m), ×20 holds (0.5 m), ×40 holds (0.6 m; shipped values 0.2 m, full bag 4.5 m / 161 m). Set per platform from a GT replay sweep, not from the calib file. |
-| `spline.n_cp_max` | 1 | adaptive knot density; >1 DIVERGES until the warm-start redesign lands (task #62) — see tested-and-rejected above |
-| `marg_prior_scale` | **0.5** (all deployed configs, `newer-college-*.yaml`; code default 1.0) | multiplier in (0,1] on the marginalization-prior information at build time (sqrt(scale) on J0/r0: GN step direction preserved, confidence deflated = exponential forgetting per slide; 1.0 skips the multiply, bit-identical to pre-knob builds). **THE complete-stream fix.** Attribution matrix (complete 10 Hz, 0 bridges): 1.0 = 0.894 m rmse, prior RMS growing 3.7→7.4, accel bias locked ~0.16 m/s² (unbroken prior chain bakes in early bias/tilt error); **0.5 = 0.083 rmse / 0.064 mean**, prior RMS flat ~1.3-2.5, accel bias relaxes to 0.01-0.09; 0.1 = 0.087 (plateau). Cross-checks: `max_lidar_factors` 1500 = nil (0.951); LIO-only = partial (0.498); **`voxel_map_m` 0.5's apparent win (0.089) is CONFOUNDED — its load re-thinned the stream (313 bridges); do not re-tune voxel from that run.** Newer College full-bag A/B (quad-easy, LIO-only, corrected IMU noise): 0.5 = consistent {0.193, 0.159} rmse; 1.0 = **bimodal lottery {0.078, 1.172}** across identical runs — the overconfident chain makes accuracy depend on nondeterministic live-replay timing. Keep 0.5: forgetting buys run-to-run consistency, the property a benchmark baseline needs. Short-clip A/Bs of this knob are invalid (effects are cumulative; a 90 s A/B inverted the verdict twice). |
+| `ncp.enabled` / `ncp.n_cp_max` | **false** / 3 (all YAMLs) | adaptive knot density (#72): per-outer-segment control-point count geared from segment IMU stats; off = uniform spline, bit-identical to the pre-ncp build (merge gate: quad-easy replay diff — PASSED, byte-identical at both the outer-4 and deployed parameterizations). Flip `enabled` for the validation campaign (knot_dt 100 / window 8, n_cp_max 3); a gear-g segment multiplies that segment's knot count (solve cost) by g only where excitation demands it. **Validation campaign #1 FAILED — keep false**: quad-easy 0.084→**206 m**, math-medium **4980 m** (vs 0.30 gate). Mechanism (telemetry + raw-bag recompute agree): the *accel* axis mis-gears plain walking — step-impact vibration folds into the norm so mean‖a‖ sits ~1 m/s² above g (quad p50 0.98, p90 1.78; math p50 1.75) and crosses both 0.5/1.0 edges ⇒ gear 3 on 53-77% of segments = the dense-knots-everywhere divergence class. The gearing *concept* works: gear 3 held through the math sway and moved the rotation-wall onset 10.3 s→~17 s (max err 0.49 m through the sway vs instant 240 m before); solve cost stayed flat (12.4 vs 11.7 ms/pass; warmstart ~1 ms). Fix is the accel statistic/edges, not the spline machinery — accel statistic since reworked to the vector mean (see `ncp.accel_thresh`); re-run the campaign before flipping |
+| `ncp.omega_thresh` | [0.5, 1.0, 5.0] rad/s | mean-of-norms gyro band edges raising the gear to 2/3/4 (Coco-LIC's mean-rate ladder, retained: math-medium's mean rate straddles the 0.5 edge so the sway gears up while quad-easy stays at 1); RAW gyro, no bias correction |
+| `ncp.accel_thresh` | [0.5, 1.0, 5.0] m/s² (edges unchanged; **statistic re-based post-campaign-#1**) | accel band edges, same ladder on the accel axis; the larger of the two axes wins. Statistic is now ‖vector-mean(a)‖ deviation from g — was \|mean‖a‖−g\|, **MEASURED BROKEN for handheld walking**: impact vibration inflates a mean of norms (Jensen: E‖g+n‖>g), p50 ~1.0-1.8 m/s² mid-walk on quad/math (raw 200 Hz bag windows, independent of estimator) ⇒ permanent gear 3 and the campaign-#1 divergence. The vector mean cancels zero-mean vibration (gtest-pinned: alternating ±n reads 0, sustained 2 m/s² reads 2.0) so unaccelerated walking should read ~0 — bag-level floor NOT yet re-measured; confirm in campaign #2 before trusting the edges. Trades: perpendicular-to-g sustained accel under-reads (~a²/2g) under either statistic; in-segment attitude change shrinks the mean by O(θ²)≈0.1 at 5 rad/s — both invisible at these edges, and rotation is the omega axis's job (omega measured exactly as designed: quad p50 0.24/p90 0.41 stays gear 1; math sway crosses to gear 3) |
+| `ncp.hysteresis` | 0.15 (frac) | band-down hysteresis: a held band's drop edge is `edge*(1−h)`, so the gear cannot chatter at a threshold; trades a slightly sticky high gear for solve-cost stability |
+| `ncp.warmstart_iters` | 4 | LM iterations of the IMU-only mini-solve smoothing freshly laid dense tails before association (1 thread, no deadline; timer `frontend.ct.warmstart`). 0 disables = the recorded 1173/413 m dense-seed divergence class; more buys little (the main solve re-fits) |
+| `marg_prior_scale` | **legacy fallback** — superseded by `prior_forgetting.*` (next row), which ignores it while enabled; still 0.5 on `newer-college-park.yaml` (forgetting unvalidated there; code default 1.0) | multiplier in (0,1] on the marginalization-prior information at build time (sqrt(scale) on J0/r0: GN step direction preserved, confidence deflated = exponential forgetting per slide; 1.0 skips the multiply, bit-identical to pre-knob builds). **THE complete-stream fix.** Attribution matrix (complete 10 Hz, 0 bridges): 1.0 = 0.894 m rmse, prior RMS growing 3.7→7.4, accel bias locked ~0.16 m/s² (unbroken prior chain bakes in early bias/tilt error); **0.5 = 0.083 rmse / 0.064 mean**, prior RMS flat ~1.3-2.5, accel bias relaxes to 0.01-0.09; 0.1 = 0.087 (plateau). Cross-checks: `max_lidar_factors` 1500 = nil (0.951); LIO-only = partial (0.498); **`voxel_map_m` 0.5's apparent win (0.089) is CONFOUNDED — its load re-thinned the stream (313 bridges); do not re-tune voxel from that run.** Newer College full-bag A/B (quad-easy, LIO-only, corrected IMU noise): 0.5 = consistent {0.193, 0.159} rmse; 1.0 = **bimodal lottery {0.078, 1.172}** across identical runs — the overconfident chain makes accuracy depend on nondeterministic live-replay timing. Keep 0.5: forgetting buys run-to-run consistency, the property a benchmark baseline needs. Short-clip A/Bs of this knob are invalid (effects are cumulative; a 90 s A/B inverted the verdict twice). |
+| `prior_forgetting.*` | **enabled** (`newer-college-quad/math.yaml`; park still legacy scalar — unvalidated there; code default off) | **Structured per-state replacement for `marg_prior_scale`** (which is ignored while enabled): each slide relaxes the carried prior's *covariance* per block class — bias blocks by the configured IMU random-walk variance over the slide (`use_imu_walk: true` ⇒ `Q = b_*_cov * dt`, NC math/quad: acc 1.85e-6, gyr 1.6e-12 per 100 ms), kept gravity by `q_gravity` 1e-10/slide, pose/velocity knots by `q_knot * dt` (default **0** — knot uncertainty belongs to the measurement model). Woodbury form in information space: null directions preserved, info capped at 1/q (EKF steady state), prior mean preserved; `enabled: false` is bit-identical legacy. The accumulated forgetting dt (spans since the last *successful* prior build, so slides that skipped a rebuild accumulate) is **clamped to 1.0 s** (`ct_frontend.cpp` slide path): trades outage-proportional forgetting (exact up to 1 s of skipped builds) against one-step prior erasure — unclamped, a long bridge/outage would inflate the bias blocks by the whole gap and wipe the carried prior in a single build. Measured (deterministic suite, knot-100, outer4): quad-easy **0.075 rmse** = scalar-best 1.0 (vs deployed 0.5 = 0.219); math-medium pre-wall (12 s) **12.5 m** vs 12.1 scalar-0.7 / 14.7 scalar-1.0 with deeper accel-bias relaxation; math full-bag **4691 m** vs 16666 deployed-0.5 but > the lucky scalar-0.7 261 — the t≈10.2 s rotation wall poisons the prior's knot blocks and the post-wall runaway magnitude is chaotic in every arm (scalar family spans 261→16666). One config now serves both collections where no single scalar did (0.5: 0.219/16666; 0.7: 0.125/261; 1.0: 0.075/4690-class). `q_knot` **1e-4 and 1e-3 tested-and-rejected** on math (4405 / 17837 — post-wall lottery, no systematic gain); the wall itself is knot-density (#72) + prior-feed outlier gating (#74) work, not forgetting. |
 | `spline.window_knots` / `knot_dt_ms` | 8 / 100 | window length (knots) / one knot per 10 Hz sweep |
 | `bias.gyr_max` / `acc_max` / `knot_dt_ms` | 0.5 / 5.0 / 500 | bias box bounds [rad/s, m/s²] + random-walk knot cadence [ms] |
 | `init_time_s` | 1.0 | static-init window; longer tightens gravity/bias init (frozen accel bias can't absorb its error) |

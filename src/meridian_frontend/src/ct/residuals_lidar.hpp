@@ -28,11 +28,18 @@ std::vector<LidarPoint> voxelDownsample(const std::vector<LidarPoint>& pts,
                                         double voxel_m);
 
 // A least-squares plane n.x + d = 0 with a unit normal. `valid` is false when the
-// fit was rejected by the distance or planarity gates.
+// fit was rejected by the distance or planarity gates; `reject` then carries which
+// gate fired. rms / nn_max_dist are output-only fit-quality diagnostics filled on
+// success: the RMS point-to-fitted-plane distance over the k neighbours and the
+// distance to the farthest neighbour used in the fit [m].
 struct PlaneFit {
+  enum class Reject : std::uint8_t { None = 0, NoNeighbors, TooFar, NotPlanar };
   Eigen::Vector3d n = Eigen::Vector3d::Zero();  // unit normal
   double d = 0.0;                               // offset: n.x + d = 0
+  double rms = 0.0;                             // plane-fit RMS over the neighbours [m]
+  double nn_max_dist = 0.0;                     // farthest fit neighbour [m]
   bool valid = false;
+  Reject reject = Reject::None;
 };
 
 // ikd-Tree-backed local map of points expressed in the world/odom frame. The
@@ -97,10 +104,13 @@ struct LidarHit {
 
 // Outcome of the bounded-factor-count selection: how many hits were kept (built as
 // residuals this step) and how many were dropped by the cap. kept + dropped equals
-// the inlier count; both are zero when no cap applied.
+// the inlier count; both are zero when no cap applied. kept_per_stratum is the kept
+// count binned by normal stratum (size = cfg.normal_strata; weak-axis-exempt hits
+// are counted in their own normal's bin) — output-only, never read back.
 struct LidarCapStats {
   int kept = 0;
   int dropped = 0;
+  std::vector<int> kept_per_stratum;
 };
 
 // Caps the residual count at cfg.max_lidar_factors by normal-stratified subsampling
@@ -133,11 +143,18 @@ std::vector<Eigen::Vector3d> weakTranslationAxes(const std::vector<LidarHit>& hi
 
 // Per-scan association bookkeeping. `attempted` counts points whose time the spline
 // covers, `matched` those that passed the plane gates, `accepted` those that also
-// passed the range-aware acceptance score and became hits.
+// passed the range-aware acceptance score and became hits. The reject_* counters
+// break attempted - accepted down by reason: the three plane-fit gates plus the
+// score gate (attempted == matched + reject_no_neighbors + reject_too_far +
+// reject_not_planar, and matched == accepted + reject_score).
 struct LidarAssocStats {
   int attempted = 0;
   int matched = 0;
   int accepted = 0;
+  int reject_no_neighbors = 0;  // fewer than num_match_points neighbours found
+  int reject_too_far = 0;       // farthest neighbour beyond max_match_dist_sq
+  int reject_not_planar = 0;    // a neighbour beyond plane_thresh of the fit
+  int reject_score = 0;         // plane ok, range-aware acceptance score failed
 };
 
 // Associates a (time-sorted, downsampled) scan against `map` at the current spline
@@ -163,12 +180,17 @@ LidarAssocStats associate(const SplineWindow& spline, const Pose& T_fe_lidar,
 // Exposed for the derivative-correctness tests; addLidarResiduals uses it
 // internally. `u` is the normalized segment position; the SO(3) knot Jacobians are
 // returned in ambient quaternion coordinates, compatible with
-// ceres::EigenQuaternionManifold on the knot blocks.
+// ceres::EigenQuaternionManifold on the knot blocks. `blend` / `cum_blend` are the
+// segment's per-interval (non-uniform) blending matrices; nullptr selects the uniform
+// cardinal matrices bit-identically. They are read only inside the factory call (the
+// blended coefficients are baked into the cost).
 ceres::CostFunction* makeLidarPlaneCost(const Eigen::Vector3d& p_lidar,
                                         const Eigen::Vector3d& n, double d,
                                         const Eigen::Quaterniond& q_fe_l,
                                         const Eigen::Vector3d& t_fe_l, double u,
-                                        double weight);
+                                        double weight,
+                                        const Eigen::Matrix4d* blend = nullptr,
+                                        const Eigen::Matrix4d* cum_blend = nullptr);
 
 int addLidarResiduals(ceres::Problem& problem, SplineWindow& spline,
                       const Pose& T_fe_lidar, const std::vector<LidarHit>& hits,

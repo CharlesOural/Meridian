@@ -361,6 +361,56 @@ TEST(KeyframeFinalizer, PoseMarginalBitExactSyncVsWorker) {
   EXPECT_GE(relative, 1) << "the RelativeBetween branch was never exercised";
 }
 
+// The same bit-exact merge gate with adaptive knot density engaged: a yaw fast
+// enough to hold gear >= 2 exercises multi-knot segments, the tail re-knot between
+// capture and the next solve, the index-based gauge pins, and the drain slide --
+// every pointer the capture remaps must keep matching its clone by deque index, or
+// the rebuilt marginal silently diverges. Bit-identical, not a tolerance.
+TEST(KeyframeFinalizer, PoseMarginalBitExactSyncVsWorkerAtHighGear) {
+  std::mt19937 rng(31);
+  const auto walls = boxRoom(2.5);
+  // Still through the init window, then a steady 1.2 rad/s yaw: gear 2 from the
+  // first finalized segment onward (mean rate above the 0.5 edge, below 1.5).
+  const double spin_start_s = 0.1;
+  const GtFn gt = [&](Timestamp t) {
+    const double ts = to_seconds(t);
+    const double ang = ts <= spin_start_s ? 0.0 : 1.2 * (ts - spin_start_s);
+    Pose p;
+    p.q = Eigen::Quaterniond(Eigen::AngleAxisd(ang, Eigen::Vector3d::UnitZ())).normalized();
+    return p;
+  };
+  const int sweeps = 20;
+  auto stream = buildVisualStream(walls, sweeps, gt, rng, /*with_image=*/true);
+
+  FrontendConfig cfg = ctCfg();
+  cfg.ncp.enabled = true;
+  cfg.ncp.n_cp_max = 3;
+  cfg.ncp.omega_thresh = {0.5, 1.5};
+  cfg.ncp.accel_thresh = {1.0, 3.0};
+  CtFrontEnd fe(cfg, cameraCalib(), nullptr, /*deterministic=*/false);
+  fe.set_force_single_thread_for_test(true);
+  fe.set_parity_probe_for_test(true);
+  std::atomic<int> emitted{0};
+  fe.set_keyframe_sink([&](KeyframePacket&&) { ++emitted; });
+
+  for (const auto& g : stream) fe.ingest(g);
+
+  const auto& results = fe.parity_probe_results_for_test();
+  ASSERT_GE(results.size(), 2u) << "stream produced too few keyframes to exercise the gate";
+
+  int compared = 0;
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    const auto& r = results[i];
+    EXPECT_EQ(r.sync_ok, r.worker_ok) << "sync/worker disagreed on success at keyframe " << i;
+    if (r.sync_ok && r.worker_ok) {
+      EXPECT_EQ(maxAbsDiff(r.sync_cov, r.worker_cov), 0.0)
+          << "marginal diverged at keyframe " << i << " at gear > 1";
+      ++compared;
+    }
+  }
+  EXPECT_GE(compared, 1) << "no keyframe produced a comparable window posterior";
+}
+
 // The async live path emits every keyframe with a filled covariance, in id order, and
 // the chain has no holes: a worker run reproduces the rel_cov chain end to end.
 TEST(KeyframeFinalizer, LivePathEmitsAllKeyframesInOrderWithFilledCov) {

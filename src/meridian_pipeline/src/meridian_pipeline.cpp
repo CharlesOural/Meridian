@@ -132,7 +132,11 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
   // fatal — the pipeline has no useful output without it — so surface it as a clear
   // exception rather than running a half-wired pipeline.
   try {
-    frontend_ = makeFrontEnd(cfg_.frontend, calibrationFromConfig(cfg_.sensors),
+    // The path-sample cadence is authored under debug: (a telemetry knob, not an
+    // estimator parameter); hand it to the front-end through its config copy.
+    FrontendConfig fe_cfg = cfg_.frontend;
+    fe_cfg.debug_path_sample_hz = cfg_.debug.path_sample_hz;
+    frontend_ = makeFrontEnd(fe_cfg, calibrationFromConfig(cfg_.sensors),
                              sink_.get(), /*deterministic=*/sync_mode_);
   } catch (const std::exception& e) {
     throw std::runtime_error(std::string("front-end construction failed: ") + e.what());

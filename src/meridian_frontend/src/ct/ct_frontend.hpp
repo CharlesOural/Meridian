@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -92,6 +93,52 @@ public:
     if (finalizer_) finalizer_->drain_for_test();
   }
 
+  // Test-only: the carried marginalization prior (null until the first window slide)
+  // plus a bias-block classifier over parameter-block pointers, so a test can measure
+  // the prior's information restricted to the bias-knot subspace.
+  const ct::MarginalizationPrior* prior_for_test() const { return prior_.get(); }
+  bool is_bias_block_for_test(const double* p) const {
+    for (int i = 0; bias_ && i < bias_->numKnots(); ++i) {
+      if (p == bias_->gyroBlock(i) || p == bias_->accelBlock(i)) return true;
+    }
+    return false;
+  }
+
+  // Test-only: the spline and bias knot timeline laid by one steady-state extend.
+  struct ExtendKnots {
+    std::vector<Timestamp> knot_t;
+    std::vector<std::array<double, 4>> so3;  // quaternion storage (x, y, z, w)
+    std::vector<std::array<double, 3>> r3;
+    std::vector<Timestamp> bias_t;
+    std::vector<std::array<double, 3>> bias_gyro;
+    std::vector<std::array<double, 3>> bias_accel;
+  };
+
+  // Test-only: run one steady-state extend on a clone of the live window, returning the
+  // resulting knot timeline. With use_production the production dispatch (steadyState-
+  // Extend) runs; otherwise the uniform legacyExtend reference runs. The live window and
+  // all extend bookkeeping are left untouched, so a test can invoke both from one
+  // identical state and assert the dispatched path equals the uniform path knot-for-knot
+  // whenever the control-point cap is one.
+  ExtendKnots probe_extend_for_test(const MeasureGroup& mg, Timestamp t_begin, Timestamp t_end,
+                                    bool use_production);
+  Timestamp last_solved_t_for_test() const { return last_solved_t_; }
+
+  // Test-only: the spline-knot drop set each slide computed, paired with the
+  // single-segment reference [leadingKnotIndex(t_begin), knotTime(lead)+knot_dt) it
+  // must reduce to when exactly one outer segment departs. Both are captured at the
+  // identical pre-slide spline state, so a test can assert one-segment byte-identity
+  // (unified == legacy) and multi-segment coverage (unified spans every departed
+  // segment) directly. Recording is off in production.
+  struct SlideDropRecord {
+    std::vector<double*> unified;        // [lower, D) so3/r3 knot pointers, in drop order
+    std::vector<double*> legacy_oracle;  // [lead, seg_end) so3/r3 knot pointers, in drop order
+  };
+  void set_record_slide_drops_for_test(bool on) { record_slide_drops_ = on; }
+  const std::vector<SlideDropRecord>& slide_drop_records_for_test() const {
+    return slide_drop_records_;
+  }
+
 private:
   // Integrate the group's IMU forward from the spline's last solved pose/velocity
   // using the current bias and gravity estimates (constant body rate, constant
@@ -164,19 +211,48 @@ private:
   // Bias knot cadence from config, floored at one millisecond.
   Duration biasKnotDt() const;
 
-  // Configured per-segment control-point cap, floored at 1 (a non-positive config
-  // value disables adaptive density and yields the uniform single-knot spline).
+  // Per-segment control-point cap: cfg_.ncp.n_cp_max (floored at 1) when adaptive
+  // density is enabled, 1 otherwise (the uniform single-knot spline).
   int maxControlPoints() const;
+
+  // Adaptive-density (ncp) window extension for one steady-state sweep: IMU warm
+  // start, tail re-knot of the provisional segments, reseed of surviving pinned
+  // knots, gear-driven extension, bias extension, and the IMU-only warm-start
+  // mini-solve over the freshly laid tail. Replaces the uniform extend block when
+  // cfg_.ncp.enabled.
+  void ncpExtend(const MeasureGroup& mg, Timestamp t_begin, Timestamp t_end);
+
+  // One steady-state sweep's window extension. Dispatches to ncpExtend when adaptive
+  // density is enabled AND the cap permits more than one control point; otherwise the
+  // segment count is pinned at one and this routes to the uniform legacyExtend, which
+  // is bit-identical to a disabled build.
+  void steadyStateExtend(const MeasureGroup& mg, Timestamp t_begin, Timestamp t_end);
+
+  // Uniform single-knot window extension for one steady-state sweep: IMU warm start,
+  // one outer segment per nominal cadence, and a reseed of the unsupported trailing
+  // knots. The extend the disabled and capped-at-one builds use.
+  void legacyExtend(const MeasureGroup& mg, Timestamp t_begin, Timestamp t_end);
+
+  // First resident knot index at or past the end of the segment containing t_begin.
+  // Every knot strictly before it leaves the residual support once the window steps
+  // past t_begin: the slide marginalizes the departing group up to (not including)
+  // this index, and the no-prior gauge pins anchor on it. Enumerates indices; never
+  // time-samples.
+  int firstKeptKnotIndex(Timestamp t_begin) const;
 
   // Warp the downsampled scan to world at each point's solved spline time and
   // insert it into the local map. `t0_scan` is the scan-start time the per-point
   // offsets are relative to.
   void updateMap(const std::vector<LidarPoint>& scan_ds, Timestamp t0_scan);
 
-  // Marginalize the oldest control-point knot still touched by the just-solved
-  // sweep's residuals (the leading knot of the segment at t_begin), building the new
-  // prior from the residuals and old prior that touch it via linearizeBlocks +
-  // fromSchur. Fires only once the trajectory has grown past the window length.
+  // Marginalize every control-point knot whose cubic support has fully left the
+  // window this sweep -- from the oldest knot the carried prior still anchors up to
+  // (not including) firstKeptKnotIndex(t_begin) -- folding their LiDAR/IMU/prior
+  // information into the new prior via linearizeBlocks + fromSchur. One departing
+  // outer segment collapses the bound to that segment's knots (the fixed-cadence
+  // drop); a sweep crossing several outer segments retires them all in one Schur
+  // build, so the kept set cannot grow without bound. Fires only once the trajectory
+  // has grown past the window length.
   void slideWindow(ceres::Problem& problem, Timestamp t_begin, Timestamp t_end);
 
   // Per-axis observability of the just-solved keyframe pose from the LiDAR hits'
@@ -209,7 +285,8 @@ private:
                          const std::vector<ct::VisualPatchParams>& patches,
                          const VisualContext* vis, const GnssContext* gnss, bool motion_reg_engaged,
                          const std::vector<Timestamp>& motion_reg_times,
-                         const std::vector<Timestamp>& tail_times, int first_pinned_knot);
+                         const std::vector<Timestamp>& tail_times, int first_pinned_knot,
+                         int gauge_knot_idx);
 
   // Package the captured final round + partial packet into a KeyframeJob and submit it to
   // the finalizer; the worker fills constraint_cov. Live path only.
@@ -257,11 +334,6 @@ private:
   // scarce evidence on a weak axis and is exempted from the factor cap.
   std::vector<Eigen::Vector3d> weakTranslationAxes(const std::vector<ct::LidarHit>& hits) const;
 
-  // Adaptive control-point count for the next outer segment from the group's peak
-  // per-sample IMU excitation, with downward hysteresis carried in last_n_cp_. Updates
-  // last_n_cp_ and returns the count in [1, n_cp_max].
-  int selectKnotDensity(const std::vector<ImuSample>& imu);
-
   // Knot-midpoint times of the segments spanning [t_begin, t_end], the evaluation
   // points for the under-excitation regularizer.
   std::vector<Timestamp> segmentMidpointTimes(Timestamp t_begin, Timestamp t_end) const;
@@ -276,6 +348,8 @@ private:
   // MERIDIAN_SYNC_KEYFRAME_COV env var as a live A/B diagnostic knob (same binary,
   // sync-vs-async covariance path).
   bool sync_cov_ = false;
+  // First stamp seen by the bootstrap path; drives the moving-start init fallback.
+  Timestamp bootstrap_first_t_ = 0;
   // Test seam: pins the window solve to one Ceres thread on the live path (see
   // set_force_single_thread_for_test). Always false in production.
   bool force_single_thread_ = false;
@@ -336,6 +410,13 @@ private:
   // the first slide.
   Timestamp window_floor_t_ = 0;
 
+  // The t_begin of the most recent sweep that actually REBUILT the prior (slides can
+  // advance window_floor_t_ without building one). Structured prior forgetting
+  // integrates its process noise over the span since this stamp, so skipped builds
+  // accumulate into the next one instead of being forgotten. Zero until the first
+  // build and after a window restart.
+  Timestamp last_prior_build_t_ = 0;
+
   // Real time of the spline's first knot at bootstrap, kept fixed for the whole mission
   // (front-trimming advances minTime() but not this). The marginalization warm-up gates
   // on it so the first knot is dropped only after the trajectory has grown longer than
@@ -369,19 +450,38 @@ private:
   ObservabilityReport last_obs_;
   FrontEndDiagnostics diag_;
 
-  // Adaptive-knot hysteresis state: the control-point count chosen for the previous
-  // outer segment. Seeds the next density decision so a band-down needs the deeper
-  // hysteresis drop. One until the first steady-state segment.
+  // Adaptive-density hysteresis state: the gear of the most recently FINALIZED outer
+  // segment (a segment whose IMU has arrived), updated in lay order inside ncpExtend.
+  // Seeds the next gear decision so a band-down needs the deeper hysteresis drop, and
+  // provisional (data-free) segments hold it. One until the first finalized segment,
+  // and always one with adaptive density disabled.
   int last_n_cp_ = 1;
+
+  // Max finalized gear laid this sweep (frontend/ct/n_cp telemetry). Equals
+  // last_n_cp_ when no segment finalized this sweep; one with ncp disabled.
+  int sweep_max_gear_ = 1;
+
+  // Deque index of the first unsupported tail knot the previous solve held constant
+  // (the pinning rule in solveWindow), adjusted by the slide's front-trim so it keeps
+  // addressing the same knots. ncpExtend reseeds from it and the warm-start
+  // mini-solve frees exactly the knots at/after it. -1 (invalid) until the first
+  // solve and after a window restart.
+  int last_first_pinned_ = -1;
 
   // LiDAR factor-cap accounting from the final outer step of the last solve (kept and
   // dropped residual counts), surfaced as telemetry.
   ct::LidarCapStats last_cap_stats_;
 
   // Sweep counter gating the per-family residual-stats probe: the extra per-family
-  // Problem::Evaluate sweep runs only every 5th sweep or on a keyframe sweep, so its
-  // cost stays bounded. Incremented once per solveWindow.
+  // Problem::Evaluate sweep runs only every 5th sweep or on a keyframe sweep (every
+  // sweep when the solver debug group is on), so its cost stays bounded. Incremented
+  // once per solveWindow.
   std::uint64_t resid_probe_counter_ = 0;
+
+  // Stamp of the last frontend/spline/path_sample pose emitted, so the path sampler
+  // walks forward at the configured cadence across sweeps without duplicates. Zero
+  // until the first sample.
+  Timestamp last_path_t_ = 0;
 
   // Pose-block marginal covariance (translation-first [rho; phi]) of the body pose
   // at the last solved sweep end, read from the window posterior in solveWindow
@@ -417,6 +517,10 @@ private:
   // Test-only parity probe state (see set_parity_probe_for_test).
   bool parity_probe_ = false;
   std::vector<ParityProbeResult> parity_probe_results_;
+
+  // Test-only slide-drop recording (see set_record_slide_drops_for_test).
+  bool record_slide_drops_ = false;
+  std::vector<SlideDropRecord> slide_drop_records_;
 
   // A hard window reseed carried the pose across a data hole on a constant-velocity
   // prediction whose error no covariance accounts for, so no relative keyframe edge
