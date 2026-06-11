@@ -17,6 +17,13 @@ find_package(meridian_debug REQUIRED)
 find_package(meridian_calib REQUIRED)
 find_package(meridian_preprocess REQUIRED)
 
+# OpenMP drives the per-point LiDAR association loop. It is optional: the loop
+# guards its pragma so a toolchain without OpenMP still compiles and runs serially.
+find_package(OpenMP QUIET)
+
+# The keyframe-cov worker runs on its own std::thread.
+find_package(Threads REQUIRED)
+
 # SHARED so the privately linked vendored kernels (basalt spline, ikd-Tree) are
 # resolved into this library and never appear in the exported link interface —
 # downstream packages need only the meridian targets.
@@ -30,8 +37,10 @@ add_library(meridian_frontend SHARED
   src/ct/residuals_visual.cpp
   src/ct/residuals_gnss.cpp
   src/ct/marginalization.cpp
+  src/ct/pose_marginal.cpp
+  src/ct/window_problem.cpp
+  src/ct/keyframe_finalizer.cpp
   src/ct/ct_frontend.cpp
-  src/iekf/iekf_frontend.cpp
 )
 target_include_directories(meridian_frontend PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -57,7 +66,11 @@ target_link_libraries(meridian_frontend PUBLIC
 target_link_libraries(meridian_frontend PRIVATE
   meridian::vendor_basalt
   meridian::vendor_ikdtree
+  Threads::Threads
 )
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(meridian_frontend PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 ament_export_targets(meridian_frontendTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(
@@ -109,14 +122,14 @@ if(BUILD_TESTING)
   meridian_add_gtest(test_residuals_lidar test/test_residuals_lidar.cpp)
   meridian_add_gtest(test_residuals_gnss test/test_residuals_gnss.cpp)
   meridian_add_gtest(test_marginalization test/test_marginalization.cpp)
-  meridian_add_gtest(test_iekf_frontend test/test_iekf_frontend.cpp)
   # The end-to-end suite runs whole synthetic streams per test; give it headroom
 # over ctest's 60 s default.
 meridian_add_gtest(test_ct_frontend test/test_ct_frontend.cpp TIMEOUT 180)
+  meridian_add_gtest(test_keyframe_finalizer test/test_keyframe_finalizer.cpp TIMEOUT 180)
   foreach(t test_residuals_imu test_residuals_lidar test_residuals_gnss test_marginalization
-            test_iekf_frontend test_ct_frontend)
+            test_ct_frontend test_keyframe_finalizer)
     # OpenCV is linked too: the CT front-end test renders synthetic camera images to
-    # exercise the visual stage, and the iEKF test sees the visual headers transitively.
+    # exercise the visual stage.
     target_link_libraries(${t} meridian_frontend meridian::vendor_basalt ${OpenCV_LIBS})
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   endforeach()
@@ -151,6 +164,47 @@ meridian_add_gtest(test_ct_frontend test/test_ct_frontend.cpp TIMEOUT 180)
     ${OpenCV_LIBS}
   )
   target_include_directories(test_visual_map PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+endif()
+
+# ThreadSanitizer probe for the parallel-association ikd-Tree data race. Off by default
+# (it instruments its own copy of residuals_lidar.cpp and the vendored ikd-Tree source
+# with -fsanitize=thread, which must not leak into the production library). Build with
+# -DMERIDIAN_TSAN_PROBE=ON to get two executables: tsan_lidar_map (the fixed path, with
+# the pre-flush) and tsan_lidar_map_noflush (the flush compiled out, which must report
+# the race -- proof the probe bites).
+option(MERIDIAN_TSAN_PROBE "Build the LidarLocalMap ThreadSanitizer probe" OFF)
+if(MERIDIAN_TSAN_PROBE)
+  find_package(Threads REQUIRED)
+  set(_tsan_ikd "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree/ikd_Tree.cpp")
+  foreach(variant tsan_lidar_map tsan_lidar_map_noflush)
+    add_executable(${variant}
+      test/test_lidar_map_tsan.cpp
+      src/ct/residuals_lidar.cpp
+      src/ct/spline_window.cpp
+      "${_tsan_ikd}"
+    )
+    target_include_directories(${variant} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_include_directories(${variant} SYSTEM PRIVATE
+      "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree"
+      ${PCL_INCLUDE_DIRS}
+    )
+    target_compile_features(${variant} PRIVATE cxx_std_20)
+    target_compile_options(${variant} PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(${variant} PRIVATE -fsanitize=thread)
+    target_link_libraries(${variant}
+      meridian_common::meridian_common
+      meridian_config::meridian_config
+      Eigen3::Eigen
+      Sophus::Sophus
+      Ceres::ceres
+      meridian::vendor_basalt
+      Threads::Threads
+    )
+  endforeach()
+  target_compile_definitions(tsan_lidar_map_noflush PRIVATE TSAN_PROBE_NO_FLUSH)
 endif()
 
 ament_package()

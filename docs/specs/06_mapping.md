@@ -124,7 +124,7 @@ nvblox's running-average TSDF is mathematically non-invertible (§4.4 below).
 > **Why no out-of-core archive tier.** An earlier design carried a third
 > "global NanoVDB archive" tier for evicted registration voxels. That is removed:
 > it is a defensive dual-path the simplicity mandate forbids (spec 00 §0, spec 11
-> §11). For the target sequences (FusionPortable / M2DGR, `DATASET.md`) Tier R's
+> §11). For the benchmark sequences (Newer College, `DATASET.md`) Tier R's
 > hot window plus the retained `KeyframeStore` are sufficient; long-mission RAM
 > growth is handled by the store's deferred mmap hook (§6.4), not by a second
 > voxel container with its own clear-region contract.
@@ -698,11 +698,11 @@ the *same* per-keyframe clouds:
   archival mesh utility (§10).
 
 A single retained store with `shared_ptr<const>` clouds gives all three the same
-bytes and one lifetime owner (spec 01 §2.4, R3, §7.5.1). It is also the durable
+bytes and one lifetime owner (spec 01 §2.4, R3, §7.5). It is also the durable
 geometry record that lets Tier R prune its hot window without an out-of-core
 voxel archive (§3.4).
 
-### 6.2 Declaration (mirrors spec 01 §7.5.1)
+### 6.2 Declaration (mirrors spec 01 §7.5)
 
 ```cpp
 class KeyframeStore : public IKeyframeStore {
@@ -743,7 +743,8 @@ private:
 First pass **retains all keyframe clouds in RAM**. Budget sanity: a keyframe at
 `keyframe.dist_m = 1.0` m spacing, deskewed+downsampled to ~10–20k points × 16 B
 (`LidarPoint` xyz+intensity+meta) ≈ 0.2–0.3 MB/keyframe; a 2 km trajectory ≈
-2000 keyframes ≈ 0.4–0.6 GB. Acceptable for the target sequences (`DATASET.md`).
+2000 keyframes ≈ 0.4–0.6 GB. The Newer College benchmark sequences (`DATASET.md`)
+are all shorter than that, so first-pass RAM retention is comfortably in budget.
 
 This is the one component of L4 that is **deliberately unbounded** — the store is
 the canonical source of truth, so it cannot evict clouds the way the derived tiers
@@ -988,11 +989,10 @@ The façade `LayeredMap::integrate(kf, T_map_body)` does, in order: (1)
 `surfaceMap.integrate` (nvblox). `apply_graph_update` runs the §7.2 algorithm
 across both tiers. `query_plane` delegates to Tier R; `extract_mesh` to nvblox.
 
-> **`makeMapLayer` does not select a backend.** Unlike the front-end factory
-> (which has a test-oracle entry), there is no map backend choice: `makeMapLayer`
-> always constructs `VoxelHashMap` + `NvbloxSurfaceMap`. The factory exists for
-> dependency injection and test mocking, not to offer a CPU/GPU menu (spec 00
-> §5, §8.3).
+> **`makeMapLayer` does not select a backend.** There is no map backend choice:
+> `makeMapLayer` always constructs `VoxelHashMap` + `NvbloxSurfaceMap`. The
+> factory exists for dependency injection and test mocking, not to offer a
+> CPU/GPU menu (spec 00 §5, §8.3).
 
 ### 8.2 Supporting value types declared here
 

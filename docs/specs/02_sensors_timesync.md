@@ -258,7 +258,7 @@ struct SensorInfo {
   std::uint8_t id          = 0;          // unique within the rig
   Modality     modality    = Modality::Imu;     // Imu|Lidar|Camera|Gnss
   Frame        sensor_frame = Frame::Unknown;   // os_sensor0 / cam_link / imu_link / gnss_link
-  std::string  model        = "";        // "ouster_os1_128", "vn100", ...
+  std::string  model        = "";        // "ouster_os0_128", "bmi085", ...
   double       nominal_rate_hz = 0.0;    // expected sample/scan rate (for dropout detection)
   StampSource  configured_stamp_source = StampSource::ArrivalOnly; // best mechanism this sensor is wired for
 };
@@ -523,22 +523,19 @@ mid-exposure once, at L0, so every downstream consumer (the front-end residual, 
 module re-derives it. The `CameraFrame::stamp` contract (spec 01 §4.3 and the §2
 obligation table) means mid-exposure everywhere the field is read.
 
-> **Known seam — uncompensated camera↔body-IMU time offset (FusionPortable).**
-> The mid-exposure convention corrects the *intra-frame* exposure bias, but it
-> does not correct a residual *inter-sensor* offset between the camera shutter
-> timeline and the body-IMU timeline. On the FusionPortable rig that L0 currently
-> replays, Kalibr's calibration reports a **`timeshift_sensor_bodyimu` of
-> +79 ms** for the event camera relative to the body IMU — i.e. the camera stamp
-> trails the IMU instant it should align to by that amount. The front-end at
-> present consumes the image stamp as-is (the visual residual queries `T(t)` at
-> `CameraFrame::stamp` with no per-sensor time correction applied), so this 79 ms
-> is **not compensated**. At any non-trivial platform speed that is a systematic
-> reprojection bias on every photometric constraint (79 ms at 1 m/s ≈ 8 cm of
-> phantom translation), so the photometric stage runs degraded on this dataset
-> until the offset is folded in. The right place for the fix is the §7 estimator
-> path (carry a per-sensor camera offset into the stamp, the same way the IMU↔
-> LiDAR offset is handled) rather than a hand-tuned constant; it is recorded here
-> as an open seam, not a committed behaviour.
+> **Residual camera↔body-IMU time offset.** The mid-exposure convention corrects
+> the *intra-frame* exposure bias; it does not correct a residual *inter-sensor*
+> offset between the camera shutter timeline and the body-IMU timeline. An
+> uncompensated offset is a systematic reprojection bias on every photometric
+> constraint (10 ms at 1 m/s ≈ 1 cm of phantom translation), so it must be
+> folded into the stamp, not absorbed by robust weighting. The committed
+> correction today is the constant `sensors.camera.time_offset_ms` shift applied
+> once at ingest (§5 note), loaded from calibration and trusted only after an
+> empirical A/B on the actual recording — a calibration-session timeshift is not
+> automatically valid for a recording (§5, spec 08 §7.2). The §7 estimator path
+> (estimate `ClockId::Cam` against the body-IMU reference and apply it through
+> `to_meridian`, the same way the IMU↔LiDAR offset is handled) is the intended
+> replacement for the constant; it is specified but not yet wired (§7.1).
 
 **Stamping paths (priority):**
 
@@ -569,8 +566,8 @@ is a JPEG/PNG `CompressedImage`; the transport wrapper decodes it straight to a
 tightly-packed `Mono8` frame at ingest (the photometric stage consumes intensity
 only, and the JPEG luma plane already exists at the decode). A payload that does
 not decode to an 8-bit image is dropped with a throttled warning, never forwarded
-malformed. This is how the high-resolution frame cameras (compressed-only in the
-FusionPortable bags) enter the same intake as a raw stream.
+malformed. This is how the Alphasense cameras (compressed-only mono8 JPEG in the
+Newer College bags) enter the same intake as a raw stream.
 
 ### 4.4 `GnssSource`
 
@@ -597,7 +594,7 @@ the back-end's job (spec 01 §4.4, GNC kernels spec 05 §8). L0 only reports `fi
 
 **Modality:** any (one `BagReplaySource<SampleT>` per recorded stream). This is
 the offline path that makes "the same core runs on a bag and on the robot" true
-(arch §1, §9.3; `DATASET.md`: FusionPortable primary, M2DGR co-primary).
+(arch §1, §9.3; `DATASET.md`: Newer College primary).
 
 * It reads recorded **typed samples** (or POD frames) and replays them through
   the *same* `Callback`, preserving their recorded stamps with
@@ -622,8 +619,8 @@ the offline path that makes "the same core runs on a bag and on the robot" true
 > in replay. LiDAR per-point offsets are relative to the sweep reference and ride
 > along unchanged. Default 0 = bit-identical to the uncorrected path. A
 > calibration-session timeshift is NOT evidence for a recording (hardware sync
-> paths differ per sensor and per session — see spec 08 §7.2 for the FusionPortable
-> double-verdict): set the key only after an empirical A/B on the actual data.
+> paths differ per sensor and per session — spec 08 §7.2): set the key only after
+> an empirical A/B on the actual data.
 
 ### 5.1 Three timelines and the one we estimate
 
@@ -842,13 +839,13 @@ arbitrary-but-consistent reference):
   should contribute weaker constraints than one timed to ±50 µs).
 
 > **Camera offset is the unwired case.** The estimator is specified for every
-> `ClockId`, but the **camera** offset path is not yet folded into the stamp the
-> front-end consumes: on the FusionPortable rig the camera carries a known
-> +79 ms `timeshift_sensor_bodyimu` (Kalibr) relative to the body IMU that is
-> currently **not compensated** (see §4.3, *Known seam*). The intended fix lives
-> here — estimate (or load) `ClockId::Cam`'s offset against the body-IMU
-> reference and apply it through `to_meridian`, exactly as the IMU↔LiDAR offset
-> is — rather than as a separate one-off correction at the camera source.
+> `ClockId`, but the **camera** offset is not yet estimated live: the stamp the
+> front-end consumes carries only the constant `sensors.camera.time_offset_ms`
+> shift loaded from calibration (§5 note; §4.3, *Residual camera↔body-IMU time
+> offset*). The intended end state lives here — estimate `ClockId::Cam`'s offset
+> against the body-IMU reference and apply it through `to_meridian`, exactly as
+> the IMU↔LiDAR offset is — rather than as a constant from a calibration
+> session that must be re-verified per recording.
 
 ### 7.2 The estimator: cross-correlation of motion signals + recursive filter
 
@@ -1187,13 +1184,13 @@ meridian:
       skew_warn_ppm: 200     # |ClockModel.skew_ppm| above this raises SkewOutOfRange
       nan_ratio_warn: 0.05   # LiDAR scan NaN/Inf fraction above this raises LidarHighNanRatio
   sensors:
-    lidar:   { id: 0, name: main, frame: os_sensor0, model: ouster_os1_128,
+    lidar:   { id: 0, name: main, frame: os_sensor0, model: ouster_os0_128,
                topic: /os/points, nominal_rate_hz: 10,
                ptp: true, timestamp_mode: TIME_FROM_PTP_1588 }
-    imu:     { id: 0, name: main, frame: imu_link, model: vn100,
+    imu:     { id: 0, name: main, frame: imu_link, model: bmi085,
                topic: /imu/data_raw, nominal_rate_hz: 200,
                has_device_clock: true, interval_end_shift_ns: 0 }
-    camera:  { id: 0, name: front, frame: cam_link, model: blackfly_s,
+    camera:  { id: 0, name: front, frame: cam_link, model: alphasense,
                topic: /cam/image_raw, nominal_rate_hz: 20,
                trigger: gpio, exposure_from_meta: true, shutter: global }
     gnss:    { id: 0, name: rover, frame: gnss_link, topic: /gnss/fix,
@@ -1365,7 +1362,7 @@ L0 is unusually testable because, per arch §1, it is pure C++ fed by POD frames
   with a known injected lag; assert recovered $\hat\tau$ within `grid_ms` and the
   KF converges; assert verify-mode residual flags when the injected offset
   exceeds threshold.
-* **Integration: bag replay.** Run `BagReplaySource` on a FusionPortable/M2DGR
+* **Integration: bag replay.** Run `BagReplaySource` on a Newer College
   sequence (`DATASET.md`); assert deterministic single-thread ordering, and run
   the estimator in verify mode to *report* the dataset's residual sync as a
   sanity check on the data itself.

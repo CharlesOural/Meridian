@@ -14,19 +14,6 @@ Visualization Manager:
       Enabled: true
       Name: TF
       Show Names: true
-    - Class: rviz_default_plugins/Odometry
-      Enabled: true
-      Name: Odometry
-      Topic:
-        Value: /meridian/odom
-        Depth: 100
-        Durability Policy: Volatile
-        Reliability Policy: Reliable
-      Keep: 100
-      Covariance:
-        Value: false
-      Position Tolerance: 0.05
-      Angle Tolerance: 0.05
     - Class: rviz_default_plugins/PointCloud2
       Enabled: true
       Name: CloudRegistered

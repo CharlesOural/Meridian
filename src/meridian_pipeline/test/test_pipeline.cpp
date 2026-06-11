@@ -1,9 +1,9 @@
+#include <gtest/gtest.h>
+
 #include <cstdint>
 #include <memory>
 #include <variant>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 #include "meridian/config/config.hpp"
 #include "meridian/debug/recording_sink.hpp"
@@ -35,17 +35,16 @@ struct Fixture {
     cfg.pipeline.mode = PipelineMode::Replay;
     cfg.preprocess.deskew.imu_init_count = 10;
     cfg.preprocess.lidar.point_filter_num = 1;
-    // Exercise the L0/L1 stage and its hand-off to the front-end with the stable iEKF
-    // estimator; the CT front-end's own behaviour is covered by its package tests.
-    cfg.frontend.kind = meridian::FrontEndKind::IekfOracle;
+    // Exercise the L0/L1 stage and its hand-off to the front-end; the CT front-end's
+    // own estimation behaviour is covered in depth by its package tests.
+    cfg.frontend.kind = meridian::FrontEndKind::CtLivo;
     // Each flushed group carries only its straddling IMU sample, so let the front-end
     // initialise from a single static sample and emit its first keyframe immediately.
     cfg.frontend.init_time_s = 0.0;
     auto sink = std::make_unique<RecordingSink>();
     rec = sink.get();
     pipeline = std::make_unique<MeridianPipeline>(cfg, std::move(sink));
-    pipeline->set_group_sink(
-        [this](PreprocessedGroup&& g) { groups.push_back(std::move(g)); });
+    pipeline->set_group_sink([this](PreprocessedGroup&& g) { groups.push_back(std::move(g)); });
   }
 
   // One stationary IMU sample: gravity along -z in the body frame, no rotation.
@@ -118,25 +117,36 @@ TEST(MeridianPipeline, BuffersSweepsUntilImuInitThenFlushesDeskewed) {
   EXPECT_TRUE(fx.groups.empty());
 
   // Four more IMU samples complete the init (10 total). The flush happens on the next
-  // group: a second sweep + its coverage sample must release BOTH groups, in order.
+  // group: a second sweep + its coverage sample must release BOTH held groups, in order.
   for (int i = 16; i < 20; ++i) fx.push_imu(t0 + i * 10 * kMs);
   EXPECT_TRUE(fx.groups.empty());
   fx.push_scan(t0 + 200 * kMs);
   fx.push_imu(t0 + 300 * kMs);
 
   ASSERT_EQ(fx.groups.size(), 2u);
+
+  // A third sweep + its coverage sample releases a third group. The front-end bootstraps
+  // on the first solved group and emits its first keyframe on the second, so the third
+  // group is the first to be flushed after the front-end owns the trajectory.
+  fx.push_scan(t0 + 350 * kMs);
+  fx.push_imu(t0 + 460 * kMs);
+
+  ASSERT_EQ(fx.groups.size(), 3u);
   EXPECT_LT(fx.groups[0].group.t_begin, fx.groups[1].group.t_begin);
+  EXPECT_LT(fx.groups[1].group.t_begin, fx.groups[2].group.t_begin);
   for (const auto& g : fx.groups) {
     ASSERT_TRUE(g.group.scan.points);
     EXPECT_EQ(g.group.scan.points->size(), 50u);
     ASSERT_TRUE(g.deskewed.has_value());
     EXPECT_EQ(g.deskewed->points->size(), 50u);
   }
-  // The first flushed group precedes any front-end keyframe, so it is cold-start; the
-  // front-end emits its first keyframe on that group, so the second group is no longer
-  // cold-start (the front-end now owns the trajectory).
+  // The first group bootstraps the spline window (no keyframe yet); the second is the
+  // first solve and emits the first keyframe. Both are flushed before any keyframe came
+  // back, so both are cold-start. The third group is flushed after the front-end owns
+  // the trajectory, so it is no longer cold-start.
   EXPECT_TRUE(fx.groups[0].cold_start);
-  EXPECT_FALSE(fx.groups[1].cold_start);
+  EXPECT_TRUE(fx.groups[1].cold_start);
+  EXPECT_FALSE(fx.groups[2].cold_start);
 
   // The init-converged event fired exactly once.
   int init_events = 0;
@@ -203,7 +213,7 @@ TEST(MeridianPipeline, BackendTapSeesKeyframesThenAnchoredGnss) {
 TEST(MeridianPipeline, DisabledBackendReportsEmptyTrajectory) {
   Config cfg;
   cfg.pipeline.mode = PipelineMode::Replay;
-  cfg.frontend.kind = meridian::FrontEndKind::IekfOracle;
+  cfg.frontend.kind = meridian::FrontEndKind::CtLivo;
   cfg.backend.enable = false;
   MeridianPipeline pipeline(cfg, nullptr);
   EXPECT_FALSE(pipeline.backend_enabled());

@@ -59,6 +59,16 @@ class LidarLocalMap {
   // A non-positive cube_m is a no-op (trimming disabled).
   void trimAround(const Eigen::Vector3d& center, double cube_m);
 
+  // Resolves every pending lazy push-down the tree carries, single-threaded, under the
+  // exclusive lock. insert()/trimAround() mark interior nodes with deferred delete/
+  // downsample flags that a later search would otherwise settle lazily by writing a
+  // child node's flags while a concurrent searcher reads them. Settling them all here,
+  // before the next parallel fitPlane round, means those searches only ever read
+  // already-resolved flags and never take the in-search push-down branch, so concurrent
+  // searches cannot race each other on those flags. Call once after the sweep's last
+  // tree modification (insert + trimAround) and before the next association round.
+  void flushPendingDeletes();
+
   // 5-NN plane fit at `p_world` with the distance and planarity gates from cfg:
   // rejects when fewer than cfg.num_match_points neighbours are found, when the
   // farthest neighbour's squared distance exceeds cfg.max_match_dist_sq, or when any

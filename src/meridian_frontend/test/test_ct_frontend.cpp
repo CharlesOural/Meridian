@@ -4,11 +4,13 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <opencv2/core.hpp>
 #include <random>
 #include <sophus/so3.hpp>
@@ -16,10 +18,10 @@
 
 #include "ct/ct_frontend.hpp"
 #include "ct/residuals_gnss.hpp"
-#include "iekf/iekf_frontend.hpp"
 #include "meridian/calib/calibration_set.hpp"
 #include "meridian/calib/intrinsics.hpp"
 #include "meridian/common/cloud.hpp"
+#include "meridian/common/cov_reorder.hpp"
 #include "meridian/common/keyframe_packet.hpp"
 #include "meridian/common/point.hpp"
 #include "meridian/common/pose.hpp"
@@ -35,7 +37,6 @@ using meridian::Duration;
 using meridian::Extrinsic;
 using meridian::Frame;
 using meridian::FrontendConfig;
-using meridian::IekfFrontEnd;
 using meridian::ImuSample;
 using meridian::IntrinsicsCamera;
 using meridian::KeyframePacket;
@@ -58,8 +59,8 @@ std::shared_ptr<const CalibrationSet> identityCalib() {
   auto c = std::make_shared<CalibrationSet>();
   c->estimation_frame = Frame::ImuLink;
   // Consumer-grade IMU noise densities: loose enough that the dense LiDAR drives the
-  // pose while the IMU regularizes smoothness, which is the regime both the CT and
-  // iEKF estimators target.
+  // pose while the IMU regularizes smoothness, which is the regime the CT estimator
+  // targets.
   c->imu_acc_noise = 5e-2;
   c->imu_gyr_noise = 5e-3;
   c->imu_acc_bias_rw = 1e-4;
@@ -88,13 +89,6 @@ FrontendConfig ctCfg() {
   cfg.keyframe.dist_m = 1.0;
   cfg.keyframe.rot_deg = 10.0;
   cfg.keyframe.time_s = 1.0;
-  return cfg;
-}
-
-FrontendConfig oracleCfg() {
-  FrontendConfig cfg = ctCfg();
-  cfg.kind = meridian::FrontEndKind::IekfOracle;
-  cfg.solver_max_iterations = 4;
   return cfg;
 }
 
@@ -528,20 +522,24 @@ TEST(CtFrontEnd, UnbridgeableGapReseedsAndRecovers) {
 
   const std::vector<Plane> walls = boxRoom(2.5);
   const GtFn gt = circleGt();
-  const int sweeps = 24;
+  const int sweeps = 30;
   auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
 
+  // Skip a run of consecutive sweeps long enough to exceed the IMU bridge horizon: a
+  // few-sweep hole is bridged by extrapolation, only a longer one reseeds. Each group
+  // carries only its own sweep's IMU, so skipping the run leaves a genuine IMU hole.
+  constexpr int kDropRun = 6;
   bool steady = false;
-  bool dropped = false;
+  int dropped = 0;
   bool checked_gap = false;
   bool saw_restart = false;
   for (int k = 0; k < sweeps; ++k) {
-    if (steady && !dropped) {
-      dropped = true;  // groups carry only their own sweep's IMU: the hole is real
+    if (steady && dropped < kDropRun) {
+      ++dropped;
       continue;
     }
     fe.ingest(stream[k]);
-    if (dropped && !checked_gap) {
+    if (dropped == kDropRun && !checked_gap) {
       checked_gap = true;
       saw_restart = fe.diagnostics().restarted;
     }
@@ -561,9 +559,10 @@ TEST(CtFrontEnd, UnbridgeableGapReseedsAndRecovers) {
   EXPECT_NEAR(st.g_world.norm(), kG, 1e-2);
 }
 
-// (b) DIFFERENTIAL: the CT front-end and the iEKF oracle, driven from the identical
-// group stream, agree on the final pose within a loose but meaningful bound.
-TEST(CtFrontEnd, DifferentialAgainstIekfOracle) {
+// (b) The CT front-end tracks ground truth on the yaw-crawl trajectory through the
+// box room: after 24 sweeps the final pose stays close to the ground-truth pose in
+// both position and orientation.
+TEST(CtFrontEnd, TracksYawCrawlGroundTruth) {
   const std::vector<Plane> walls = boxRoom(2.5);
   const GtFn gt = yawCrawlGt();
   const int sweeps = 24;
@@ -575,27 +574,11 @@ TEST(CtFrontEnd, DifferentialAgainstIekfOracle) {
     ct.ingest(g);
   }
 
-  std::mt19937 rng_iekf(19);
-  auto stream_iekf = buildStream(walls, sweeps, gt, rng_iekf, 0.01, 0.001);
-  IekfFrontEnd iekf(oracleCfg(), nullptr);
-  iekf.set_calibration(identityCalib());
-  for (auto& g : stream_iekf) {
-    iekf.ingest(g);
-  }
-
   const NavState a = ct.live_state();
-  const NavState b = iekf.live_state();
-  const double pos_diff = (a.T_world_body.t - b.T_world_body.t).norm();
-  const double rot_diff = rotErr(a.T_world_body.q, b.T_world_body.q);
-
-  // Both estimators also track the ground truth, which is what makes the agreement
-  // meaningful rather than two implementations sharing the same drift.
   const Pose gt_last = gtAtSweepEnd(gt, sweeps - 1);
   EXPECT_LT((a.T_world_body.t - gt_last.t).norm(), 0.20) << "CT off ground truth";
-
-  EXPECT_LT(pos_diff, 0.10) << "CT " << a.T_world_body.t.transpose() << " vs iEKF "
-                            << b.T_world_body.t.transpose();
-  EXPECT_LT(rot_diff, 3.0 * M_PI / 180.0) << "rotation disagreement " << rot_diff;
+  EXPECT_LT(rotErr(a.T_world_body.q, gt_last.q), 3.0 * M_PI / 180.0)
+      << "CT orientation off ground truth";
 }
 
 // (c) Keyframe stream: first packet AbsolutePrior then RelativeBetween, ids
@@ -609,7 +592,12 @@ TEST(CtFrontEnd, KeyframeStreamShapeAndChaining) {
   CtFrontEnd fe(cfg, identityCalib(), nullptr);
 
   std::vector<KeyframePacket> packets;
-  fe.set_keyframe_sink([&](KeyframePacket&& pkt) { packets.push_back(std::move(pkt)); });
+  std::mutex packets_mtx;
+  // The keyframe sink runs on the async worker thread in live mode, so guard the vector.
+  fe.set_keyframe_sink([&](KeyframePacket&& pkt) {
+    std::lock_guard<std::mutex> lock(packets_mtx);
+    packets.push_back(std::move(pkt));
+  });
 
   const std::vector<Plane> walls = boxRoom(2.5);
   // Straight x-crawl at 1.5 m/s, so ~0.15 m of motion per 100 ms sweep crosses the
@@ -625,6 +613,7 @@ TEST(CtFrontEnd, KeyframeStreamShapeAndChaining) {
   for (auto& g : stream) {
     fe.ingest(g);
   }
+  fe.drain_keyframes_for_test();  // flush the async worker before inspecting packets
 
   ASSERT_GE(packets.size(), 2u) << "expected at least an anchor plus one relative KF";
 
@@ -651,8 +640,85 @@ TEST(CtFrontEnd, KeyframeStreamShapeAndChaining) {
     EXPECT_GE(es.eigenvalues().minCoeff(), -1e-9) << "constraint_cov must be PSD";
     // Round-trip through the shared reorder helper returns the original block.
     const Eigen::Matrix<double, 6, 6> back =
-        IekfFrontEnd::reorderTransRotToRotTrans(IekfFrontEnd::reorderTransRotToRotTrans(M));
+        meridian::reorderTransRotToRotTrans(meridian::reorderTransRotToRotTrans(M));
     EXPECT_TRUE(back.isApprox(M, 1e-9));
+  }
+}
+
+// (c3) A hard reseed (IMU hole past the bridge horizon) breaks the relative keyframe
+// chain: the constant-velocity prediction across the hole carries error that no
+// covariance accounts for, so the next keyframe must arrive as an AbsolutePrior
+// anchor, and the chain then resumes with RelativeBetween edges off the new anchor.
+TEST(CtFrontEnd, ReseedBreaksKeyframeChainWithAbsolutePrior) {
+  std::mt19937 rng(7);
+  FrontendConfig cfg = ctCfg();
+  cfg.keyframe.dist_m = 0.4;
+  cfg.keyframe.rot_deg = 1000.0;
+  cfg.keyframe.time_s = 1000.0;
+  CtFrontEnd fe(cfg, identityCalib(), nullptr);
+
+  std::vector<KeyframePacket> packets;
+  std::mutex packets_mtx;
+  // The keyframe sink runs on the async worker thread in live mode, so guard the vector.
+  fe.set_keyframe_sink([&](KeyframePacket&& pkt) {
+    std::lock_guard<std::mutex> lock(packets_mtx);
+    packets.push_back(std::move(pkt));
+  });
+  auto packet_count = [&] {
+    std::lock_guard<std::mutex> lock(packets_mtx);
+    return packets.size();
+  };
+
+  const std::vector<Plane> walls = boxRoom(2.5);
+  const GtFn gt = [](Timestamp t) {
+    Pose p;
+    p.t = Eigen::Vector3d(1.5 * to_seconds(t), 0, 0);
+    return p;
+  };
+  const int sweeps = 30;
+  auto stream = buildStream(walls, sweeps, gt, rng, 0.01, 0.001);
+
+  // Skip a run long enough to exceed the IMU bridge horizon; each group carries only
+  // its own sweep's IMU, so the skipped run leaves a genuine data hole.
+  constexpr int kDropRun = 6;
+  bool steady = false;
+  int dropped = 0;
+  std::size_t kf_before_gap = 0;
+  bool saw_restart = false;
+  for (int k = 0; k < sweeps; ++k) {
+    if (steady && dropped < kDropRun) {
+      ++dropped;
+      // Flush the worker so the pre-gap keyframe count is settled before the boundary.
+      fe.drain_keyframes_for_test();
+      kf_before_gap = packet_count();
+      continue;
+    }
+    fe.ingest(stream[k]);
+    if (dropped == kDropRun && fe.diagnostics().restarted) {
+      saw_restart = true;
+    }
+    if (fe.live_state().stamp > 0) {
+      steady = true;
+    }
+  }
+  fe.drain_keyframes_for_test();  // flush before inspecting the full packet stream
+  ASSERT_TRUE(saw_restart) << "the IMU hole did not reseed the window";
+  ASSERT_GE(packets.size(), kf_before_gap + 2u) << "expected keyframes on both sides of the reseed";
+
+  // Before the gap: exactly the bootstrap anchor. After it: the chain-break anchor,
+  // then relative edges chained off the anchor's id.
+  for (std::size_t i = 1; i < kf_before_gap; ++i) {
+    EXPECT_EQ(packets[i].constraint_kind, KeyframePacket::ConstraintKind::RelativeBetween);
+  }
+  const KeyframePacket& anchor = packets[kf_before_gap];
+  EXPECT_EQ(anchor.constraint_kind, KeyframePacket::ConstraintKind::AbsolutePrior)
+      << "first post-reseed keyframe must break the relative chain";
+  std::uint64_t prev_id = anchor.id;
+  for (std::size_t i = kf_before_gap + 1; i < packets.size(); ++i) {
+    const KeyframePacket& p = packets[i];
+    EXPECT_EQ(p.constraint_kind, KeyframePacket::ConstraintKind::RelativeBetween);
+    EXPECT_EQ(p.rel_to_id, prev_id) << "post-reseed chain must resume off the anchor";
+    prev_id = p.id;
   }
 }
 
@@ -848,9 +914,8 @@ TEST(CtFrontEnd, DeadlineBoundedSolveHonoursBudget) {
   // strictly fewer total iterations than the generous run. A deadline that fails to cut
   // the inner schedule short would let the starved run match the generous count.
   EXPECT_EQ(s_outer, 1) << "starved schedule must collapse to a single outer pass";
-  EXPECT_LT(s_iters, g_iters)
-      << "deadline did not bound the schedule: starved iters " << s_iters
-      << " not below generous iters " << g_iters;
+  EXPECT_LT(s_iters, g_iters) << "deadline did not bound the schedule: starved iters " << s_iters
+                              << " not below generous iters " << g_iters;
   // The estimate must remain finite under the starved schedule (no NaN/explosion).
   EXPECT_TRUE(s_pose.t.allFinite());
 
@@ -929,8 +994,8 @@ TEST(CtFrontEnd, AdaptiveKnotDensityTracksThroughTransitions) {
   const GtFn gt = [&](Timestamp t) {
     const double ts = to_seconds(t);
     Pose p;
-    p.q = Eigen::Quaterniond(Eigen::AngleAxisd(yawAngle(ts), Eigen::Vector3d::UnitZ()))
-              .normalized();
+    p.q =
+        Eigen::Quaterniond(Eigen::AngleAxisd(yawAngle(ts), Eigen::Vector3d::UnitZ())).normalized();
     p.t = Eigen::Vector3d(0.25 * ts, 0.0, 0.0);
     return p;
   };
@@ -948,8 +1013,7 @@ TEST(CtFrontEnd, AdaptiveKnotDensityTracksThroughTransitions) {
   double max_err = 0.0;
   for (int k = 0; k < sweeps; ++k) {
     fe.ingest(stream[k]);
-    const double err =
-        (fe.live_state().T_world_body.t - gtAtSweepEnd(gt, k).t).norm();
+    const double err = (fe.live_state().T_world_body.t - gtAtSweepEnd(gt, k).t).norm();
     max_err = std::max(max_err, err);
   }
 
@@ -971,8 +1035,7 @@ TEST(CtFrontEnd, AdaptiveKnotDensityTracksThroughTransitions) {
   // Bound pinned just above the measured ~0.21 m (the fixed-cadence solve schedule
   // trades steady-state depth for robustness; see MarginalizationKeepsTrajectory-
   // Continuous for the same characteristic).
-  const double final_err =
-      (fe.live_state().T_world_body.t - gtAtSweepEnd(gt, sweeps - 1).t).norm();
+  const double final_err = (fe.live_state().T_world_body.t - gtAtSweepEnd(gt, sweeps - 1).t).norm();
   EXPECT_LT(final_err, 0.25) << "final error after the density ramp: " << final_err;
 }
 
@@ -1021,8 +1084,8 @@ TEST(CtFrontEnd, BiasBoxBoundsAndRecovery) {
   // (a) Cap invariant: an outlier-sized gyro offset (far past the box) cannot drive
   // the stored bias outside its bound, and the estimate stays finite.
   {
-    const NavState st = run(spin_gt, 10, Eigen::Vector3d(0.4, 0.0, 0.0),
-                            Eigen::Vector3d::Zero(), /*gyr_max=*/0.05);
+    const NavState st =
+        run(spin_gt, 10, Eigen::Vector3d(0.4, 0.0, 0.0), Eigen::Vector3d::Zero(), /*gyr_max=*/0.05);
     EXPECT_TRUE(st.T_world_body.t.allFinite());
     EXPECT_LE(st.b_g.cwiseAbs().maxCoeff(), 0.05 + 1e-6)
         << "gyro bias must stay inside its box: " << st.b_g.transpose();
@@ -1035,12 +1098,10 @@ TEST(CtFrontEnd, BiasBoxBoundsAndRecovery) {
   {
     const GtFn static_gt = [](Timestamp) { return Pose{}; };
     const Eigen::Vector3d accel_offset(0.15, 0.0, 0.0);
-    const NavState st =
-        run(static_gt, 20, Eigen::Vector3d::Zero(), accel_offset, /*gyr_max=*/0.5);
+    const NavState st = run(static_gt, 20, Eigen::Vector3d::Zero(), accel_offset, /*gyr_max=*/0.5);
     EXPECT_TRUE(st.T_world_body.t.allFinite());
     EXPECT_LT(st.T_world_body.t.norm(), 0.10)
-        << "static body crept under a constant accel offset: "
-        << st.T_world_body.t.transpose();
+        << "static body crept under a constant accel offset: " << st.T_world_body.t.transpose();
     EXPECT_GT(st.b_a.x(), 0.5 * accel_offset.x())
         << "free accel bias failed to absorb the offset: " << st.b_a.transpose();
   }
@@ -1050,7 +1111,7 @@ TEST(CtFrontEnd, ColdStartGatesMotionAndRecoversBias) {
   std::mt19937 rng(101);
   CtFrontEnd fe(ctCfg(), identityCalib(), nullptr);
 
-  int kf_count = 0;
+  std::atomic<int> kf_count{0};
   fe.set_keyframe_sink([&](KeyframePacket&&) { ++kf_count; });
 
   const std::vector<Plane> walls = boxRoom(2.5);
@@ -1068,7 +1129,8 @@ TEST(CtFrontEnd, ColdStartGatesMotionAndRecoversBias) {
                        /*gyr_sigma=*/2.0);
     fe.ingest(makeGroup(scan, std::move(imu)));
   }
-  EXPECT_EQ(kf_count, 0) << "shaky first group must not bootstrap or emit a keyframe";
+  fe.drain_keyframes_for_test();
+  EXPECT_EQ(kf_count.load(), 0) << "shaky first group must not bootstrap or emit a keyframe";
   EXPECT_LT(fe.live_state().T_world_body.t.norm(), 1e-9)
       << "no bootstrap means the live pose is still at its default";
 
@@ -1281,18 +1343,17 @@ TEST(CtFrontEnd, VisualDisabledMatchesLidarOnly) {
       << "disabled-visual rotation differs from LIO baseline";
 }
 
-// (visual-d) Differential CT-vs-oracle with the visual stage on: both estimators run
-// the photometric update over the identical LiDAR + IMU + image stream and still agree
-// on the final pose within a loose bound, and both track ground truth. This exercises
-// the visual term in both the CT solve and the iEKF oracle's sequential update.
-TEST(CtFrontEnd, DifferentialAgainstIekfOracleWithVisual) {
+// (visual-d) The CT front-end tracks ground truth with the visual stage on: it runs the
+// photometric update over the LiDAR + IMU + image stream, the visual stage genuinely
+// converges photometric residuals, and the final pose stays close to ground truth.
+TEST(CtFrontEnd, VisualEnabledTracksGroundTruth) {
   const std::vector<Plane> walls = boxRoom(2.5);
   const GtFn gt = yawCrawlGt();
   const int sweeps = 24;
 
-  // Both estimators get a RecordingSink so the test can confirm the visual stage actually
-  // engaged (converged photometric residuals) rather than silently degenerating into a
-  // LIO-only run that would pass a looser pose agreement for the wrong reason.
+  // A RecordingSink lets the test confirm the visual stage actually engaged (converged
+  // photometric residuals) rather than silently degenerating into a LIO-only run that
+  // would pass the looser pose bound for the wrong reason.
   std::mt19937 rng_ct(19);
   meridian::RecordingSink ct_sink;
   CtFrontEnd ct(ctCfg(), vis::cameraCalib(), &ct_sink);
@@ -1300,39 +1361,19 @@ TEST(CtFrontEnd, DifferentialAgainstIekfOracleWithVisual) {
                                           /*with_image=*/true, nullptr);
   for (auto& g : stream_ct) ct.ingest(g);
 
-  std::mt19937 rng_iekf(19);
-  meridian::RecordingSink iekf_sink;
-  IekfFrontEnd iekf(oracleCfg(), &iekf_sink);
-  iekf.set_calibration(vis::cameraCalib());
-  auto stream_iekf = vis::buildVisualStream(walls, sweeps, gt, rng_iekf, 0.01, 0.001,
-                                            /*with_image=*/true, nullptr);
-  for (auto& g : stream_iekf) iekf.ingest(g);
-
-  // The visual stage genuinely ran in BOTH estimators: a regression that gated the visual
-  // term off (bad intrinsics, broken promotion/gating) would leave n_converged at zero and
-  // fail here instead of hiding behind the pose-agreement slack.
+  // The visual stage genuinely ran: a regression that gated the visual term off (bad
+  // intrinsics, broken promotion/gating) would leave n_converged at zero and fail here
+  // instead of hiding behind the pose-tracking slack.
   EXPECT_GT(maxScalar(ct_sink, "frontend/visual/n_converged"), 0.0)
       << "CT visual stage never converged a photometric residual";
-  EXPECT_GT(maxScalar(iekf_sink, "frontend/visual/n_converged"), 0.0)
-      << "oracle visual stage never converged a photometric residual";
 
   const NavState a = ct.live_state();
-  const NavState b = iekf.live_state();
   EXPECT_TRUE(a.T_world_body.t.allFinite());
-  EXPECT_TRUE(b.T_world_body.t.allFinite());
 
   const Pose gt_last = gtAtSweepEnd(gt, sweeps - 1);
   EXPECT_LT((a.T_world_body.t - gt_last.t).norm(), 0.25) << "CT (visual) off ground truth";
-  EXPECT_LT((b.T_world_body.t - gt_last.t).norm(), 0.25) << "oracle (visual) off ground truth";
-
-  // Agreement bound no looser than the LIO-only differential (DifferentialAgainstIekfOracle
-  // uses 0.10 m / 3 deg on the same scene): with the visual term active and observable, the
-  // cross-estimator agreement must be at least as tight as without it, never weaker slack
-  // that would absorb a broken visual contribution.
-  const double pos_diff = (a.T_world_body.t - b.T_world_body.t).norm();
-  const double rot_diff = rotErr(a.T_world_body.q, b.T_world_body.q);
-  EXPECT_LT(pos_diff, 0.10) << "CT vs oracle (visual) position " << pos_diff;
-  EXPECT_LT(rot_diff, 3.0 * M_PI / 180.0) << "CT vs oracle (visual) rotation " << rot_diff;
+  EXPECT_LT(rotErr(a.T_world_body.q, gt_last.q), 3.0 * M_PI / 180.0)
+      << "CT (visual) orientation off ground truth";
 }
 
 // ---- GNSS-stage tests (conservative absolute position) ---------------------------
@@ -1705,8 +1746,8 @@ TEST(CtFrontEnd, BootstrapDeskewedSeedMatchesRawFallbackSeed) {
 
   // The raw-fallback seed is the geometry reference: a body at rest at identity localises
   // back at identity.
-  EXPECT_LT(p_raw.t.norm(), 0.05)
-      << "raw-fallback seed drifted from identity: " << p_raw.t.transpose();
+  EXPECT_LT(p_raw.t.norm(), 0.05) << "raw-fallback seed drifted from identity: "
+                                  << p_raw.t.transpose();
   EXPECT_LT(rotErr(p_raw.q, T_id.q), 0.05) << "raw-fallback seed orientation drifted from identity";
 
   // The two seed paths build identical map geometry, so with identical steady-state

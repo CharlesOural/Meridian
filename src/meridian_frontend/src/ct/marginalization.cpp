@@ -1,14 +1,14 @@
 #include "marginalization.hpp"
 
-#include <cmath>
-#include <cstring>
-#include <utility>
-
-#include <Eigen/Eigenvalues>
 #include <ceres/cost_function.h>
 #include <ceres/crs_matrix.h>
 #include <ceres/manifold.h>
 #include <ceres/problem.h>
+
+#include <Eigen/Eigenvalues>
+#include <cmath>
+#include <cstring>
+#include <utility>
 
 namespace meridian::ct {
 
@@ -42,10 +42,9 @@ Eigen::MatrixXd robustInverse(const Eigen::MatrixXd& A) {
 // reduced Jacobian stays fixed at J0 (the first-estimate linearization) while the
 // residual tracks the live boxminus.
 class PriorCost final : public ceres::CostFunction {
- public:
+public:
   PriorCost(std::vector<MarginalizationPrior::Block> blocks,
-            std::vector<std::vector<double>> lin_points, Eigen::MatrixXd j0,
-            Eigen::VectorXd r0)
+            std::vector<std::vector<double>> lin_points, Eigen::MatrixXd j0, Eigen::VectorXd r0)
       : blocks_(std::move(blocks)),
         lin_points_(std::move(lin_points)),
         j0_(std::move(j0)),
@@ -96,9 +95,8 @@ class PriorCost final : public ceres::CostFunction {
       const MarginalizationPrior::Block& blk = blocks_[i];
       const int off = col_offset_[i];
       // Row-major (num_residuals x global_size).
-      Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
-                               Eigen::RowMajor>>
-          jac(jacobians[i], n, blk.global_size);
+      Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> jac(
+          jacobians[i], n, blk.global_size);
       jac.setZero();
       const Eigen::MatrixXd local = j0_.middleCols(off, blk.local_size);
       if (blk.local_size == 3 && blk.global_size == 4) {
@@ -114,7 +112,7 @@ class PriorCost final : public ceres::CostFunction {
     return true;
   }
 
- private:
+private:
   std::vector<MarginalizationPrior::Block> blocks_;
   std::vector<std::vector<double>> lin_points_;
   std::vector<int> col_offset_;
@@ -126,8 +124,8 @@ class PriorCost final : public ceres::CostFunction {
 }  // namespace
 
 std::unique_ptr<MarginalizationPrior> MarginalizationPrior::fromSchur(
-    const Eigen::MatrixXd& H, const Eigen::VectorXd& b,
-    const std::vector<Block>& kept, int dropped_dim) {
+    const Eigen::MatrixXd& H, const Eigen::VectorXd& b, const std::vector<Block>& kept,
+    int dropped_dim, double scale) {
   int k = 0;
   for (const Block& blk : kept) {
     k += blk.local_size;
@@ -142,8 +140,7 @@ std::unique_ptr<MarginalizationPrior> MarginalizationPrior::fromSchur(
   for (const Block& blk : kept) {
     std::vector<double> v(static_cast<std::size_t>(blk.global_size));
     if (blk.ptr != nullptr) {
-      std::memcpy(v.data(), blk.ptr,
-                  sizeof(double) * static_cast<std::size_t>(blk.global_size));
+      std::memcpy(v.data(), blk.ptr, sizeof(double) * static_cast<std::size_t>(blk.global_size));
     }
     prior->lin_points_.push_back(std::move(v));
   }
@@ -183,6 +180,17 @@ std::unique_ptr<MarginalizationPrior> MarginalizationPrior::fromSchur(
   const Eigen::MatrixXd Vt = es.eigenvectors().transpose();
   prior->j0_ = s_sqrt.asDiagonal() * Vt;
   prior->r0_ = s_inv_sqrt.asDiagonal() * (Vt * b_marg);
+  // Information deflation: J0^T J0 becomes scale * H_marg while J0^T r0 becomes
+  // scale * b_marg, so the prior's Gauss-Newton step H_marg dx = -b_marg is
+  // unchanged in direction and magnitude -- only its weight against other factors
+  // shrinks. The scale==1.0 path must not touch the doubles at all (multiplying by
+  // sqrt(1.0) is not guaranteed bit-exact), so it is skipped, keeping the default
+  // build bit-identical to one without the parameter.
+  if (scale != 1.0) {
+    const double s = std::sqrt(scale);
+    prior->j0_ *= s;
+    prior->r0_ *= s;
+  }
   return prior;
 }
 
@@ -190,10 +198,24 @@ ceres::CostFunction* MarginalizationPrior::makeCost() const {
   return new PriorCost(blocks_, lin_points_, j0_, r0_);
 }
 
-void linearizeBlocks(ceres::Problem& problem,
-                     const std::vector<ceres::ResidualBlockId>& residuals,
-                     const std::vector<MarginalizationPrior::Block>& order,
-                     Eigen::MatrixXd* H, Eigen::VectorXd* b) {
+std::unique_ptr<MarginalizationPrior> MarginalizationPrior::cloneRemapped(
+    const std::function<double*(double*)>& remap) const {
+  auto copy = std::unique_ptr<MarginalizationPrior>(new MarginalizationPrior());
+  copy->blocks_ = blocks_;
+  for (Block& b : copy->blocks_) {
+    if (b.ptr != nullptr) {
+      b.ptr = remap(b.ptr);
+    }
+  }
+  copy->lin_points_ = lin_points_;
+  copy->j0_ = j0_;
+  copy->r0_ = r0_;
+  return copy;
+}
+
+void linearizeBlocks(ceres::Problem& problem, const std::vector<ceres::ResidualBlockId>& residuals,
+                     const std::vector<MarginalizationPrior::Block>& order, Eigen::MatrixXd* H,
+                     Eigen::VectorXd* b) {
   // Column offset and width (local size) of each ordered block in the tangent
   // layout the caller asked for.
   std::vector<int> col_offset(order.size());

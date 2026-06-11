@@ -24,7 +24,7 @@ enum class PopResult { Item, Timeout, Closed };
 // consumer.
 template <typename T>
 class BoundedQueue {
- public:
+public:
   explicit BoundedQueue(std::size_t capacity) : capacity_(capacity == 0 ? 1 : capacity) {}
 
   // Non-blocking push; false if the queue is full or closed.
@@ -105,6 +105,20 @@ class BoundedQueue {
     return depth;
   }
 
+  // Blocks the producer until the queue has room (or is closed), then enqueues. Unlike
+  // the lossy pushes this preserves FIFO order and never drops, at the cost of bounding
+  // the producer to the consumer's rate. Returns false only if the queue is closed.
+  bool push_blocking(T&& v) {
+    {
+      std::unique_lock<std::mutex> lock(m_);
+      space_cv_.wait(lock, [this] { return closed_ || q_.size() < capacity_; });
+      if (closed_) return false;
+      q_.push_back(std::move(v));
+    }
+    cv_.notify_one();
+    return true;
+  }
+
   // Blocks until an element is available or the queue is closed.
   // Returns false only when the queue is closed AND drained.
   bool pop(T& out) {
@@ -113,6 +127,7 @@ class BoundedQueue {
     if (q_.empty()) return false;
     out = std::move(q_.front());
     q_.pop_front();
+    space_cv_.notify_one();
     return true;
   }
 
@@ -135,16 +150,19 @@ class BoundedQueue {
     if (q_.empty()) return false;
     out = std::move(q_.front());
     q_.pop_front();
+    space_cv_.notify_one();
     return true;
   }
 
-  // Wakes all waiters; subsequent pops drain the remaining elements then return false.
+  // Wakes all waiters; subsequent pops drain the remaining elements then return false,
+  // and any producer blocked in push_blocking unblocks and returns false.
   void close() {
     {
       std::lock_guard<std::mutex> lock(m_);
       closed_ = true;
     }
     cv_.notify_all();
+    space_cv_.notify_all();
   }
 
   std::size_t size() const {
@@ -156,10 +174,11 @@ class BoundedQueue {
     return closed_;
   }
 
- private:
+private:
   const std::size_t capacity_;
   mutable std::mutex m_;
-  std::condition_variable cv_;
+  std::condition_variable cv_;        // signals a waiting consumer that data arrived
+  std::condition_variable space_cv_;  // signals a blocked producer that room freed
   std::deque<T> q_;
   bool closed_ = false;
 };

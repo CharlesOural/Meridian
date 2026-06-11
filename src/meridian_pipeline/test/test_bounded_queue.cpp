@@ -1,9 +1,9 @@
+#include <gtest/gtest.h>
+
 #include <thread>
 #include <vector>
 
-#include <gtest/gtest.h>
-
-#include "meridian/pipeline/bounded_queue.hpp"
+#include "meridian/common/bounded_queue.hpp"
 
 using meridian::BoundedQueue;
 
@@ -44,7 +44,9 @@ struct Tagged {
   int value = 0;
   bool protect = false;
 };
-bool isProtected(const Tagged& t) { return t.protect; }
+bool isProtected(const Tagged& t) {
+  return t.protect;
+}
 }  // namespace
 
 TEST(BoundedQueue, ProtectingEvictsUnprotectedNotProtected) {

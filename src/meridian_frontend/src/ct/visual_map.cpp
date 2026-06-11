@@ -16,6 +16,69 @@ Eigen::Vector3d worldToCam(const Pose& T_w_c, const Eigen::Vector3d& p_world) {
   return T_w_c.q.conjugate() * (p_world - T_w_c.t);
 }
 
+// A half-space in world coordinates: a point x is on the kept (inside) side when
+// n.x + d >= 0. The view frustum is the intersection of five such half-spaces.
+struct WorldPlane {
+  Eigen::Vector3d n;
+  double d;
+};
+
+// World-frame view-frustum planes for conservative voxel culling: the near plane
+// (camera z >= 0) and four side planes through the camera centre, built from the
+// image-corner rays so a voxel whose axis-aligned box lies wholly outside any one
+// plane cannot contain a point that projects on-image. The corner rays are pushed
+// out by a fixed angular margin so lens distortion (which bows the true frustum
+// boundary outward between the sampled corners) can never carry an in-frustum
+// point outside the cull volume -- the kept set stays a strict superset of the
+// points the exact per-point projection test admits.
+std::array<WorldPlane, 5> frustumPlanes(const CameraModel& cam, const Pose& T_w_c) {
+  const double w = static_cast<double>(cam.width());
+  const double h = static_cast<double>(cam.height());
+  // Image corners, unprojected to unit-depth camera rays (undistort handles the
+  // lens map), then widened from the optical axis by the distortion margin.
+  const std::array<Eigen::Vector2d, 4> corners_px = {
+      Eigen::Vector2d(0.0, 0.0), Eigen::Vector2d(w - 1.0, 0.0),
+      Eigen::Vector2d(w - 1.0, h - 1.0), Eigen::Vector2d(0.0, h - 1.0)};
+  constexpr double kMargin = 1.25;  // ray-spread inflation covering distortion bow
+  std::array<Eigen::Vector3d, 4> rays_c;
+  for (std::size_t i = 0; i < 4; ++i) {
+    const Eigen::Vector3d r = cam.unproject(corners_px[i]);
+    rays_c[i] = Eigen::Vector3d(r.x() * kMargin, r.y() * kMargin, 1.0);
+  }
+
+  const Eigen::Matrix3d R = T_w_c.q.toRotationMatrix();
+  const Eigen::Vector3d c = T_w_c.t;  // camera centre in world
+
+  std::array<WorldPlane, 5> planes;
+  // Near plane: camera z >= 0 (in front of the optical centre).
+  {
+    const Eigen::Vector3d n_w = R * Eigen::Vector3d::UnitZ();
+    planes[0] = {n_w, -n_w.dot(c)};
+  }
+  // Side planes: each contains the camera centre and two adjacent corner rays; the
+  // inward normal is their cross product, sign-fixed against the optical axis.
+  const Eigen::Vector3d axis_c(0.0, 0.0, 1.0);
+  for (std::size_t i = 0; i < 4; ++i) {
+    const Eigen::Vector3d& a = rays_c[i];
+    const Eigen::Vector3d& b = rays_c[(i + 1) % 4];
+    Eigen::Vector3d n_c = a.cross(b);
+    if (n_c.dot(axis_c) < 0.0) n_c = -n_c;  // orient inward (toward the view axis)
+    const Eigen::Vector3d n_w = R * n_c;
+    planes[i + 1] = {n_w, -n_w.dot(c)};
+  }
+  return planes;
+}
+
+// True when the axis-aligned box [lo, hi] lies entirely on the outside of `pl`,
+// i.e. its farthest-inward corner still has n.x + d < 0. Such a box holds no
+// in-frustum point and may be skipped.
+bool boxOutsidePlane(const Eigen::Vector3d& lo, const Eigen::Vector3d& hi,
+                     const WorldPlane& pl) {
+  Eigen::Vector3d far;
+  for (int k = 0; k < 3; ++k) far[k] = pl.n[k] >= 0.0 ? hi[k] : lo[k];
+  return pl.n.dot(far) + pl.d < 0.0;
+}
+
 }  // namespace
 
 VisualMapConfig::VisualMapConfig(const FrontendVisual& v) {
@@ -156,12 +219,35 @@ float VisualMap::patchNcc(const VisualObservation& a, const VisualObservation& b
 }
 
 void VisualMap::recomputeRefAndScore(VisualPoint* pt) const {
+  // The medoid, per-observation scores, and reference surface are a pure function of
+  // the observation set. While that set is unchanged the previous result is still
+  // exact, so the O(n^2) re-score is skipped entirely -- the steady-state case where a
+  // visible point adds no new view (and every converged point, which never adds one).
+  if (!pt->obs_dirty) {
+    return;
+  }
   const std::size_t n = pt->obs.size();
   if (n == 0) {
     pt->score = 0.f;
     pt->obs_count = 0;
+    pt->ncc_cache.clear();
+    pt->obs_dirty = false;
     return;
   }
+  // NCC of any fixed observation pair is constant (patches are immutable once stored),
+  // so the pairwise matrix is rebuilt only here, when the obs set has changed. The
+  // matrix is symmetric with a unit diagonal; storing it whole keeps the medoid loop a
+  // table lookup instead of an O(n^2) patch correlation every sweep.
+  pt->ncc_cache.assign(n * n, 0.f);
+  for (std::size_t i = 0; i < n; ++i) {
+    pt->ncc_cache[i * n + i] = 1.f;
+    for (std::size_t j = i + 1; j < n; ++j) {
+      const float c = patchNcc(pt->obs[i], pt->obs[j]);
+      pt->ncc_cache[i * n + j] = c;
+      pt->ncc_cache[j * n + i] = c;
+    }
+  }
+
   // Re-score each observation as w*NCC(to-others) + (1-w)*cos(view-change to set
   // centroid), then pick the medoid: the observation whose viewing direction is
   // most central (maximal summed cosine to the others), which is also the highest-
@@ -178,7 +264,7 @@ void VisualMap::recomputeRefAndScore(VisualPoint* pt) const {
     int cnt = 0;
     for (std::size_t j = 0; j < n; ++j) {
       if (i == j) continue;
-      ncc_sum += patchNcc(pt->obs[i], pt->obs[j]);
+      ncc_sum += static_cast<double>(pt->ncc_cache[i * n + j]);
       ++cnt;
     }
     const double ncc = cnt > 0 ? ncc_sum / cnt : 1.0;
@@ -199,6 +285,7 @@ void VisualMap::recomputeRefAndScore(VisualPoint* pt) const {
   pt->ref_patches = ref.patches;
   pt->T_w_c_ref = ref.T_w_c;
   pt->inv_expo_ref = ref.inv_expo;
+  pt->obs_dirty = false;
 }
 
 int VisualMap::promote(const ImagePyramidView& img, const CameraModel& cam, const Pose& T_w_c,
@@ -282,8 +369,41 @@ int VisualMap::promote(const ImagePyramidView& img, const CameraModel& cam, cons
   return added;
 }
 
+std::vector<std::int64_t> VisualMap::frustumCandidateIds(const CameraModel& cam,
+                                                         const Pose& T_w_c) const {
+  std::vector<std::int64_t> ids;
+  const std::array<WorldPlane, 5> planes = frustumPlanes(cam, T_w_c);
+  const double vm = cfg_.voxel_m;
+  for (const auto& [key, cell_ids] : index_) {
+    // World-space box of this voxel from its integer key and the index pitch.
+    const Eigen::Vector3d lo(static_cast<double>(key[0]) * vm, static_cast<double>(key[1]) * vm,
+                             static_cast<double>(key[2]) * vm);
+    const Eigen::Vector3d hi = lo + Eigen::Vector3d::Constant(vm);
+    bool outside = false;
+    for (const auto& pl : planes) {
+      if (boxOutsidePlane(lo, hi, pl)) {
+        outside = true;
+        break;
+      }
+    }
+    if (outside) continue;
+    ids.insert(ids.end(), cell_ids.begin(), cell_ids.end());
+  }
+  // Each cell's ids are already ascending and cells are visited key-ascending, but
+  // different voxels interleave id ranges, so a global sort restores the exact
+  // ascending-id order the whole-map scan relied on for its occlusion tie-break.
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
 std::vector<std::int64_t> VisualMap::selectVisibleIds(const CameraModel& cam,
                                                       const Pose& T_w_c) const {
+  return selectVisibleFromCandidates(cam, T_w_c, frustumCandidateIds(cam, T_w_c));
+}
+
+std::vector<std::int64_t> VisualMap::selectVisibleFromCandidates(
+    const CameraModel& cam, const Pose& T_w_c,
+    const std::vector<std::int64_t>& candidate_ids) const {
   std::vector<std::int64_t> out;
   if (!cam.valid()) return out;
   const int cw = cam.width();
@@ -314,11 +434,12 @@ std::vector<std::int64_t> VisualMap::selectVisibleIds(const CameraModel& cam,
 
   // Per-cell nearest-point pass: each in-frustum point claims its cell only if it is
   // closer than the current occupant, so the closest surface wins (occlusion order).
-  // The ordered map visits points by ascending id, so the winner is a deterministic
-  // function of the input, never of hash iteration order.
-  for (const auto& [id, uptr] : points_) {
-    const VisualPoint* pt = uptr.get();
-    if (!pt->normal_initialized) continue;
+  // Candidates are supplied ascending-id (the frustum subset in production), so the
+  // winner is a deterministic function of the input -- identical to a whole-map scan
+  // but bounded to what the camera can see rather than the full point count.
+  for (const std::int64_t id : candidate_ids) {
+    const VisualPoint* pt = pointById(id);
+    if (pt == nullptr || !pt->normal_initialized) continue;
     Eigen::Vector3d pc;
     Eigen::Vector2d uv;
     if (!projectWorld(cam, T_w_c, pt->p_world, &pc, &uv)) continue;
@@ -452,6 +573,8 @@ void VisualMap::updateAfterSolve(const ImagePyramidView& img, const CameraModel&
           pt->obs.erase(pt->obs.begin() + static_cast<std::ptrdiff_t>(worst));
         }
         pt->obs.push_back(cand);
+        // The obs set changed, so the cached NCC matrix and medoid are stale.
+        pt->obs_dirty = true;
       }
     }
 

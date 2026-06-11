@@ -4,6 +4,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <basalt/spline/ceres_spline_helper.h>
 #include <basalt/utils/sophus_utils.hpp>
 #include <sophus/so3.hpp>
 
@@ -78,6 +79,239 @@ inline Eigen::Matrix<double, 3, 4> tangentToQuatJac(const Eigen::Quaterniond& q)
   m.col(3) = -q.vec();
   m *= 2.0;
   return m;
+}
+
+// Body angular velocity of the cumulative SO(3) spline at one time, with its per-knot
+// right-tangent Jacobian. The velocity is omega = sum_{j=1..3} M_j (dcoeff[j] delta_j),
+// delta_j = Log(R_{j-1}^-1 R_j), A_j = exp(lambda_R[j] delta_j), and M_j the prefix
+// adjoint product Adj(A_3^-1) ... Adj(A_{j+1}^-1) (M_3 = I). dOmega_dR[j] is the
+// derivative w.r.t. a RIGHT perturbation knot_j <- knot_j exp(theta^). The first
+// contribution is through the dcoeff[j] delta_j terms (delta_j depends on knots j and
+// j-1); the second is through the A_k adjoints inside the prefix products.
+struct So3VelocityJac {
+  Eigen::Vector3d omega;
+  std::array<Eigen::Matrix3d, kSplineJacOrder> dOmega_dR;
+};
+
+inline So3VelocityJac evaluateSo3VelocityJac(
+    const std::array<Sophus::SO3d, kSplineJacOrder>& knot,
+    const Eigen::Vector4d& lambda_R, const Eigen::Vector4d& dcoeff) {
+  using SO3 = Sophus::SO3d;
+  std::array<Eigen::Vector3d, kSplineJacOrder> delta;
+  std::array<SO3, kSplineJacOrder> A;
+  for (int i = 1; i < kSplineJacOrder; ++i) {
+    const std::size_t si = static_cast<std::size_t>(i);
+    delta[si] = (knot[si - 1].inverse() * knot[si]).log();
+    A[si] = SO3::exp(lambda_R[i] * delta[si]);
+  }
+  // Prefix adjoints M_i = prod_{m=i+1..3} Adj(A_m^-1), M_3 = I.
+  std::array<Eigen::Matrix3d, kSplineJacOrder> M;
+  M[kSplineJacOrder - 1].setIdentity();
+  for (int i = kSplineJacOrder - 2; i >= 1; --i) {
+    const std::size_t si = static_cast<std::size_t>(i);
+    M[si] = M[si + 1] * A[si + 1].inverse().Adj();
+  }
+  So3VelocityJac out;
+  out.omega.setZero();
+  for (int i = 1; i < kSplineJacOrder; ++i) {
+    const std::size_t si = static_cast<std::size_t>(i);
+    out.omega += M[si] * (dcoeff[i] * delta[si]);
+  }
+  for (auto& m : out.dOmega_dR) m.setZero();
+  auto jr_inv = [](const Eigen::Vector3d& d) {
+    Eigen::Matrix3d J;
+    Sophus::rightJacobianInvSO3(d, J);
+    return J;
+  };
+  // Path A: through dcoeff_i * delta_i. delta_i depends on knot i (right, +Jr^-1) and
+  // knot i-1 (left and inverted, -Jr^-1^T).
+  for (int i = 1; i < kSplineJacOrder; ++i) {
+    const std::size_t si = static_cast<std::size_t>(i);
+    const Eigen::Matrix3d Ji = jr_inv(delta[si]);
+    out.dOmega_dR[si] += M[si] * (dcoeff[i] * Ji);
+    out.dOmega_dR[si - 1] += M[si] * (dcoeff[i] * (-Ji.transpose()));
+  }
+  // Path B: through the adjoints A_k inside the prefix products (k = 2..3).
+  for (int k = 2; k < kSplineJacOrder; ++k) {
+    const std::size_t sk = static_cast<std::size_t>(k);
+    Eigen::Vector3d S = Eigen::Vector3d::Zero();
+    for (int i = 1; i < k; ++i) {
+      const std::size_t si = static_cast<std::size_t>(i);
+      Eigen::Matrix3d inner = Eigen::Matrix3d::Identity();
+      for (int m = i + 1; m <= k - 1; ++m)
+        inner = inner * A[static_cast<std::size_t>(m)].inverse().Adj();
+      S += inner * (dcoeff[i] * delta[si]);
+    }
+    const Eigen::Vector3d phi = lambda_R[k] * delta[sk];
+    Eigen::Matrix3d Jr_neg;
+    Sophus::rightJacobianSO3(Eigen::Vector3d(-phi), Jr_neg);
+    const Eigen::Matrix3d dvec_dphi =
+        A[sk].inverse().Adj() * Sophus::SO3d::hat(S) * Jr_neg;
+    const Eigen::Matrix3d Jk = jr_inv(delta[sk]);
+    out.dOmega_dR[sk] += M[sk] * dvec_dphi * (lambda_R[k] * Jk);
+    out.dOmega_dR[sk - 1] += M[sk] * dvec_dphi * (lambda_R[k] * (-Jk.transpose()));
+  }
+  return out;
+}
+
+// Body angular velocity and acceleration of the cumulative SO(3) spline at one time,
+// each with per-knot right-tangent Jacobians. Forward recursion matches
+// evaluate_lie; the Jacobians are first derived w.r.t. a LEFT perturbation of each
+// knot (knot_k <- exp(theta^) knot_k) and converted to the RIGHT convention via
+// J_right = J_left * R_knot, since exp(theta_L^) R = R exp((R^-1 theta_L)^). The
+// velocity-only path zero-initializes dalpha_dR so the unused acceleration block is
+// never returned uninitialized.
+struct So3DerivJac {
+  Eigen::Vector3d omega;
+  Eigen::Vector3d alpha;
+  std::array<Eigen::Matrix3d, kSplineJacOrder> domega_dR;
+  std::array<Eigen::Matrix3d, kSplineJacOrder> dalpha_dR;
+};
+
+inline So3DerivJac evaluateSo3VelAccelJac(
+    const std::array<Sophus::SO3d, kSplineJacOrder>& knot, double u, double inv_dt,
+    bool want_accel) {
+  using SO3 = Sophus::SO3d;
+  using Mat3 = Eigen::Matrix3d;
+  using Vec3 = Eigen::Vector3d;
+  constexpr int N = kSplineJacOrder;
+  constexpr int DEG = N - 1;
+  using VecN = Eigen::Matrix<double, N, 1>;
+  using Helper = basalt::CeresSplineHelper<N>;
+
+  VecN p, coeff, dcoeff, ddcoeff;
+  Helper::template baseCoeffsWithTime<0>(p, u);
+  coeff = Helper::cumulative_blending_matrix_ * p;
+  Helper::template baseCoeffsWithTime<1>(p, u);
+  dcoeff = inv_dt * Helper::cumulative_blending_matrix_ * p;
+  if (want_accel) {
+    Helper::template baseCoeffsWithTime<2>(p, u);
+    ddcoeff = inv_dt * inv_dt * Helper::cumulative_blending_matrix_ * p;
+  }
+
+  So3DerivJac out;
+  for (int i = 0; i < N; ++i) {
+    out.domega_dR[static_cast<std::size_t>(i)].setZero();
+    out.dalpha_dR[static_cast<std::size_t>(i)].setZero();
+  }
+  out.omega.setZero();
+  out.alpha.setZero();
+
+  if (!want_accel) {
+    Vec3 delta_vec[DEG];
+    Mat3 R_tmp[DEG];
+    SO3 exp_k_delta[DEG];
+    Mat3 Jr_delta_inv[DEG];
+    Mat3 Jr_kdelta[DEG];
+    SO3 accum;
+    for (int i = DEG - 1; i >= 0; --i) {
+      const SO3 r01 = knot[static_cast<std::size_t>(i)].inverse() *
+                      knot[static_cast<std::size_t>(i + 1)];
+      delta_vec[i] = r01.log();
+      Sophus::rightJacobianInvSO3(delta_vec[i], Jr_delta_inv[i]);
+      Jr_delta_inv[i] *= knot[static_cast<std::size_t>(i + 1)].inverse().matrix();
+      const Vec3 k_delta = coeff[i + 1] * delta_vec[i];
+      Sophus::rightJacobianSO3(-k_delta, Jr_kdelta[i]);
+      R_tmp[i] = accum.matrix();
+      exp_k_delta[i] = SO3::exp(-k_delta);
+      accum *= exp_k_delta[i];
+    }
+    Mat3 d_vel_d_delta[DEG];
+    d_vel_d_delta[0] = dcoeff[1] * R_tmp[0] * Jr_delta_inv[0];
+    Vec3 rot_vel = delta_vec[0] * dcoeff[1];
+    for (int i = 1; i < DEG; ++i) {
+      d_vel_d_delta[i] = R_tmp[i - 1] * SO3::hat(rot_vel) * Jr_kdelta[i] * coeff[i + 1] +
+                         R_tmp[i] * dcoeff[i + 1];
+      d_vel_d_delta[i] *= Jr_delta_inv[i];
+      rot_vel = exp_k_delta[i] * rot_vel + delta_vec[i] * dcoeff[i + 1];
+    }
+    std::array<Mat3, N> d_left;
+    for (int i = 0; i < N; ++i) d_left[static_cast<std::size_t>(i)].setZero();
+    for (int i = 0; i < DEG; ++i) {
+      d_left[static_cast<std::size_t>(i)] -= d_vel_d_delta[i];
+      d_left[static_cast<std::size_t>(i + 1)] += d_vel_d_delta[i];
+    }
+    out.omega = rot_vel;
+    for (int k = 0; k < N; ++k)
+      out.domega_dR[static_cast<std::size_t>(k)] =
+          d_left[static_cast<std::size_t>(k)] * knot[static_cast<std::size_t>(k)].matrix();
+    return out;
+  }
+
+  // Acceleration path (also yields the velocity Jacobian).
+  Vec3 delta_vec[DEG];
+  Mat3 exp_k_delta[DEG];
+  Mat3 Jr_delta_inv[DEG];
+  Mat3 Jr_kdelta[DEG];
+  Vec3 rot_vel = Vec3::Zero();
+  Vec3 rot_accel = Vec3::Zero();
+  Vec3 rot_vel_arr[DEG];
+  Vec3 rot_accel_arr[DEG];
+  for (int i = 0; i < DEG; ++i) {
+    const SO3 r01 = knot[static_cast<std::size_t>(i)].inverse() *
+                    knot[static_cast<std::size_t>(i + 1)];
+    delta_vec[i] = r01.log();
+    Sophus::rightJacobianInvSO3(delta_vec[i], Jr_delta_inv[i]);
+    Jr_delta_inv[i] *= knot[static_cast<std::size_t>(i + 1)].inverse().matrix();
+    const Vec3 k_delta = coeff[i + 1] * delta_vec[i];
+    Sophus::rightJacobianSO3(-k_delta, Jr_kdelta[i]);
+    exp_k_delta[i] = SO3::exp(-k_delta).matrix();
+    rot_vel = exp_k_delta[i] * rot_vel;
+    const Vec3 vel_current = dcoeff[i + 1] * delta_vec[i];
+    rot_vel += vel_current;
+    rot_accel = exp_k_delta[i] * rot_accel;
+    rot_accel += ddcoeff[i + 1] * delta_vec[i] + rot_vel.cross(vel_current);
+    rot_vel_arr[i] = rot_vel;
+    rot_accel_arr[i] = rot_accel;
+  }
+  Mat3 d_accel_d_delta[DEG];
+  Mat3 d_vel_d_delta[DEG];
+  d_vel_d_delta[DEG - 1] =
+      coeff[DEG] * exp_k_delta[DEG - 1] * SO3::hat(rot_vel_arr[DEG - 2]) * Jr_kdelta[DEG - 1] +
+      Mat3::Identity() * dcoeff[DEG];
+  d_accel_d_delta[DEG - 1] =
+      coeff[DEG] * exp_k_delta[DEG - 1] * SO3::hat(rot_accel_arr[DEG - 2]) * Jr_kdelta[DEG - 1] +
+      Mat3::Identity() * ddcoeff[DEG] +
+      dcoeff[DEG] * (SO3::hat(rot_vel_arr[DEG - 1]) -
+                     SO3::hat(delta_vec[DEG - 1]) * d_vel_d_delta[DEG - 1]);
+  Mat3 pj = Mat3::Identity();
+  Vec3 sj = Vec3::Zero();
+  for (int i = DEG - 2; i >= 0; --i) {
+    sj += dcoeff[i + 2] * pj * delta_vec[i + 1];
+    pj *= exp_k_delta[i + 1];
+    d_vel_d_delta[i] = Mat3::Identity() * dcoeff[i + 1];
+    if (i >= 1)
+      d_vel_d_delta[i] += coeff[i + 1] * exp_k_delta[i] * SO3::hat(rot_vel_arr[i - 1]) * Jr_kdelta[i];
+    d_accel_d_delta[i] =
+        Mat3::Identity() * ddcoeff[i + 1] +
+        dcoeff[i + 1] * (SO3::hat(rot_vel_arr[i]) - SO3::hat(delta_vec[i]) * d_vel_d_delta[i]);
+    if (i >= 1)
+      d_accel_d_delta[i] += coeff[i + 1] * exp_k_delta[i] * SO3::hat(rot_accel_arr[i - 1]) * Jr_kdelta[i];
+    d_vel_d_delta[i] = pj * d_vel_d_delta[i];
+    d_accel_d_delta[i] = pj * d_accel_d_delta[i] - SO3::hat(sj) * d_vel_d_delta[i];
+  }
+  std::array<Mat3, N> dl_a, dl_v;
+  for (int i = 0; i < N; ++i) {
+    dl_a[static_cast<std::size_t>(i)].setZero();
+    dl_v[static_cast<std::size_t>(i)].setZero();
+  }
+  for (int i = 0; i < DEG; ++i) {
+    const Mat3 va = d_accel_d_delta[i] * Jr_delta_inv[i];
+    const Mat3 vv = d_vel_d_delta[i] * Jr_delta_inv[i];
+    dl_a[static_cast<std::size_t>(i)] -= va;
+    dl_a[static_cast<std::size_t>(i + 1)] += va;
+    dl_v[static_cast<std::size_t>(i)] -= vv;
+    dl_v[static_cast<std::size_t>(i + 1)] += vv;
+  }
+  out.omega = rot_vel;
+  out.alpha = rot_accel;
+  for (int k = 0; k < N; ++k) {
+    out.domega_dR[static_cast<std::size_t>(k)] =
+        dl_v[static_cast<std::size_t>(k)] * knot[static_cast<std::size_t>(k)].matrix();
+    out.dalpha_dR[static_cast<std::size_t>(k)] =
+        dl_a[static_cast<std::size_t>(k)] * knot[static_cast<std::size_t>(k)].matrix();
+  }
+  return out;
 }
 
 }  // namespace meridian::ct

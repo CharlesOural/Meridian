@@ -16,7 +16,7 @@ namespace meridian {
 // the YAML loader rejects any value outside the set.
 enum class PipelineMode { Live, Replay };
 enum class TimeSource { Ptp, Pps, Host };
-enum class FrontEndKind { CtLivo, IekfOracle };
+enum class FrontEndKind { CtLivo };
 enum class BackEndKind { Isam2 };
 enum class MapBackend { Nvblox };
 enum class MeshKind { MarchingCubes };
@@ -115,6 +115,12 @@ struct LidarSensorConfig {
   // automatically transfer to a recording (hardware sync paths differ); set this only
   // after an empirical check on the actual data.
   double time_offset_ms = 0.0;
+  // Subscribe RELIABLE instead of best-effort. Best-effort delivery of the large
+  // fragmented scan messages silently loses a double-digit percentage in flight when
+  // the host is under compute load, and a reliable reader pairs only with a reliable
+  // writer -- so this must match the publisher: true for bag replay (with the player's
+  // QoS override), false for a sensor driver publishing best-effort.
+  bool qos_reliable = false;
 };
 struct ImuSensorConfig {
   int id = 0;
@@ -377,6 +383,11 @@ struct FrontendConfig {
   int reassoc_steps = 2;
   double assoc_shift_thresh_m = 0.02;
   double assoc_shift_thresh_deg = 0.2;
+  // Multiplier in (0, 1] on the marginalization prior's information at build time
+  // (sqrt(scale) on its sqrt-information and residual, so the prior's Gauss-Newton
+  // step direction is preserved while its confidence is deflated). 1.0 leaves the
+  // prior untouched and is bit-identical to a build without the knob.
+  double marg_prior_scale = 1.0;
   FrontendSolver solver{};
   FrontendBias bias{};
   FrontendMotionReg motion_reg{};
@@ -384,7 +395,6 @@ struct FrontendConfig {
   FrontendLidar lidar{};
   FrontendVisual visual{};
   FrontendGnss gnss{};
-  bool extrinsic_refine = true;
   FrontendKeyframe keyframe{};
 };
 
@@ -550,6 +560,7 @@ struct DebugConfig {
   LogLevel level = LogLevel::Info;
   bool publish_clouds = true;
   bool publish_markers = true;
+  bool publish_odom = true;  // /meridian/odom (the rviz pose arrow); TF is published regardless
   bool timing = true;
   double telemetry_rate_hz = 10.0;
 };

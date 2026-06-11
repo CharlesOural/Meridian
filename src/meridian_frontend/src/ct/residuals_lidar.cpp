@@ -3,8 +3,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <Eigen/Eigenvalues>
 #include <array>
@@ -60,7 +67,9 @@ double pointWeight(const Eigen::Vector3d& p_lidar, const Eigen::Vector3d& n,
   }
   const double var = point_cov + kSigmaRange * kSigmaRange * range_sq +
                      kSigmaIncidence * kSigmaIncidence * incidence;
-  return 1.0 / std::sqrt(var > 0.0 ? var : point_cov);
+  // Floor the variance at a small positive epsilon so a non-positive configured
+  // point_cov can never produce a non-finite (NaN/inf) sqrt-information weight.
+  return 1.0 / std::sqrt(var > 0.0 ? var : 1e-6);
 }
 
 // One point-to-plane residual at a single point's true time. The 4 SO(3) and 4 R^3
@@ -158,9 +167,19 @@ struct LidarLocalMap::Impl {
 
   // Current world-frame cubic local-map bounds and whether they have been seeded. The
   // cube is recentred only when the body comes within move_margin of an edge, so the
-  // slide amount is bounded and the tree is not re-segmented on every sweep.
+  // slide amount is bounded and the structure is not re-segmented on every sweep.
   BoxPointType cube{};
   bool cube_init = false;
+
+  // Reader-writer gate over the backing structure. fitPlane (the parallelised search)
+  // holds it shared so many threads search at once; insert/trimAround hold it exclusive.
+  // The ikd-Tree's own search/rebuild coordination keeps concurrent searches safe only
+  // while no insert/delete/build runs alongside them, so this lock makes that ordering
+  // an enforced invariant rather than a timing assumption: a mutation can never overlap
+  // an in-flight search even if the call structure changes. The exclusive side is
+  // uncontended in the steady sweep (mutation runs after the solve, never during it),
+  // so the shared side adds no measurable cost on the hot path.
+  mutable std::shared_mutex search_mutex;
 };
 
 LidarLocalMap::LidarLocalMap(const FrontendLidar& cfg)
@@ -178,6 +197,7 @@ void LidarLocalMap::insert(const std::vector<Eigen::Vector3d>& pts_world) {
   if (pts_world.empty()) {
     return;
   }
+  const std::unique_lock<std::shared_mutex> lock(impl_->search_mutex);
   KD_TREE<ikdTree_PointType>::PointVector add;
   add.reserve(pts_world.size());
   for (const Eigen::Vector3d& p : pts_world) {
@@ -191,6 +211,7 @@ void LidarLocalMap::insert(const std::vector<Eigen::Vector3d>& pts_world) {
 }
 
 void LidarLocalMap::trimAround(const Eigen::Vector3d& center, double cube_m) {
+  const std::unique_lock<std::shared_mutex> lock(impl_->search_mutex);
   if (cube_m <= 0.0 || impl_->tree->size() == 0) {
     return;
   }
@@ -242,18 +263,48 @@ void LidarLocalMap::trimAround(const Eigen::Vector3d& center, double cube_m) {
   }
 }
 
+void LidarLocalMap::flushPendingDeletes() {
+  const std::unique_lock<std::shared_mutex> lock(impl_->search_mutex);
+  if (impl_->tree->size() == 0) {
+    return;
+  }
+  // A box that contains the entire tree forces the read-only range search to visit and
+  // Push_Down every node (the full-cover branch flattens the whole subtree, and flatten
+  // pushes down each node it descends through), resolving all deferred flags. The search
+  // honours the rebuild handoff exactly as the nearest-neighbour search does, so this is
+  // safe to run while the async rebuild thread is active. The returned points are
+  // discarded; only the side effect of settling the flags matters.
+  BoxPointType full;
+  for (int i = 0; i < 3; ++i) {
+    full.vertex_min[i] = -1e18f;
+    full.vertex_max[i] = 1e18f;
+  }
+  KD_TREE<ikdTree_PointType>::PointVector sink;
+  impl_->tree->Box_Search(full, sink);
+}
+
 bool LidarLocalMap::fitPlane(const Eigen::Vector3d& p_world, PlaneFit* out) const {
   if (out != nullptr) {
     *out = PlaneFit{};
   }
+  const std::shared_lock<std::shared_mutex> lock(impl_->search_mutex);
   const int k = impl_->num_match_points;
-  KD_TREE<ikdTree_PointType>::PointVector nbrs;
+
+  // k nearest stored points, ascending by squared distance; the farthest-neighbour
+  // gate below owns the radius decision.
+  KD_TREE<ikdTree_PointType>::PointVector ik;
   std::vector<float> dists;
-  impl_->tree->Nearest_Search(toIkd(p_world), k, nbrs, dists);
+  impl_->tree->Nearest_Search(toIkd(p_world), k, ik, dists);
+  std::vector<Eigen::Vector3d> nbrs;
+  nbrs.reserve(ik.size());
+  for (const auto& p : ik) {
+    nbrs.emplace_back(p.x, p.y, p.z);
+  }
+
   if (static_cast<int>(nbrs.size()) < k) {
     return false;
   }
-  // Distances come back squared and sorted ascending, so the last is the farthest.
+  // Distances are squared and sorted ascending, so the last is the farthest.
   if (dists.back() > impl_->max_match_dist_sq) {
     return false;
   }
@@ -264,9 +315,7 @@ bool LidarLocalMap::fitPlane(const Eigen::Vector3d& p_world, PlaneFit* out) cons
   Eigen::MatrixXd A(m, 3);
   const Eigen::VectorXd b = -Eigen::VectorXd::Ones(m);
   for (int i = 0; i < m; ++i) {
-    A(i, 0) = nbrs[i].x;
-    A(i, 1) = nbrs[i].y;
-    A(i, 2) = nbrs[i].z;
+    A.row(i) = nbrs[i].transpose();
   }
   const Eigen::Vector3d u = A.colPivHouseholderQr().solve(b);
   const double norm = u.norm();
@@ -278,8 +327,7 @@ bool LidarLocalMap::fitPlane(const Eigen::Vector3d& p_world, PlaneFit* out) cons
   const double d = inv;
 
   for (int i = 0; i < m; ++i) {
-    const Eigen::Vector3d q(nbrs[i].x, nbrs[i].y, nbrs[i].z);
-    if (std::abs(n.dot(q) + d) > impl_->plane_thresh) {
+    if (std::abs(n.dot(nbrs[i]) + d) > impl_->plane_thresh) {
       return false;
     }
   }
@@ -295,6 +343,90 @@ std::size_t LidarLocalMap::size() const {
   return static_cast<std::size_t>(impl_->tree->size());
 }
 
+namespace {
+
+// One point's association attempt: deskew through the spline, plane-fit against the
+// map, apply the range-aware acceptance gate. On acceptance fills *hit and returns the
+// matched/accepted bumps via the bool pair. The math is identical to the serial loop
+// and depends only on this point, so running it on disjoint points in parallel is
+// independent: no cross-point reduction, no shared mutable state beyond the (read-only,
+// internally reader-locked) map search.
+struct AssocOutcome {
+  bool attempted = false;
+  bool matched = false;
+  bool accepted = false;
+};
+
+AssocOutcome associateOne(const SplineWindow& spline, const Eigen::Quaterniond& q_fe_l,
+                          const Eigen::Vector3d& t_fe_l, const LidarPoint& lp, Timestamp t0_scan,
+                          const LidarLocalMap& map, const FrontendLidar& cfg, LidarHit* hit) {
+  AssocOutcome out;
+  const Timestamp t = t0_scan + static_cast<Timestamp>(lp.t_offset_ns);
+  if (!spline.covers(t)) {
+    return out;
+  }
+  out.attempted = true;
+
+  const Eigen::Vector3d p_lidar = lp.xyz.cast<double>();
+  const Pose T_w_fe = spline.pose(t);
+  const Eigen::Vector3d p_world = T_w_fe * (q_fe_l * p_lidar + t_fe_l);
+
+  PlaneFit plane;
+  if (!map.fitPlane(p_world, &plane)) {
+    return out;
+  }
+  out.matched = true;
+
+  const double r = plane.n.dot(p_world) + plane.d;
+  const double range = p_lidar.norm();
+  // A point at the sensor origin has no usable bearing and is rejected.
+  if (range <= 0.0) {
+    return out;
+  }
+  // Range-aware acceptance: the tolerance grows with sqrt(range), so distant
+  // returns are gated more leniently than near ones.
+  const double s = 1.0 - 0.9 * std::abs(r) / std::sqrt(range);
+  if (!(s > 0.9)) {
+    return out;
+  }
+  out.accepted = true;
+
+  hit->p_lidar = p_lidar;
+  hit->p_world = p_world;
+  hit->t = t;
+  hit->plane = plane;
+  hit->t_offset_ns = lp.t_offset_ns;
+  hit->ring = lp.ring;
+  const Eigen::Matrix3d R_w_l = (T_w_fe.q * q_fe_l).toRotationMatrix();
+  hit->weight = pointWeight(p_lidar, plane.n, R_w_l, cfg.point_cov);
+  return out;
+}
+
+int assocThreadCount(std::size_t n_points) {
+#ifdef _OPENMP
+  const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+  unsigned want = std::min(8u, hw);
+  // No point spinning up more threads than points to process.
+  if (n_points < want) {
+    want = static_cast<unsigned>(std::max<std::size_t>(1, n_points));
+  }
+  return static_cast<int>(want);
+#else
+  (void)n_points;
+  return 1;
+#endif
+}
+
+}  // namespace
+
+// The per-point work is independent, so the loop is split into contiguous static
+// chunks (one per thread) with per-thread output buffers and stat counters, then the
+// buffers are concatenated in thread-index order. With schedule(static) thread t owns
+// a contiguous, ascending point range, so concatenating buffers 0,1,2,... reassembles
+// the exact order the serial scan would have produced -- the hit set and its order are
+// therefore bit-identical to the single-threaded result, which is what keeps replay
+// bit-exact regardless of thread count. The map search is internally reader-locked, so
+// concurrent fitPlane calls cannot race a map mutation.
 LidarAssocStats associate(const SplineWindow& spline, const Pose& T_fe_lidar,
                           const std::vector<LidarPoint>& pts, Timestamp t0_scan,
                           const LidarLocalMap& map, const FrontendLidar& cfg,
@@ -303,48 +435,45 @@ LidarAssocStats associate(const SplineWindow& spline, const Pose& T_fe_lidar,
   const Eigen::Quaterniond q_fe_l = T_fe_lidar.q;
   const Eigen::Vector3d t_fe_l = T_fe_lidar.t;
 
-  for (const LidarPoint& lp : pts) {
-    const Timestamp t = t0_scan + static_cast<Timestamp>(lp.t_offset_ns);
-    if (!spline.covers(t)) {
-      continue;
-    }
-    ++stats.attempted;
+  const int n_threads = assocThreadCount(pts.size());
+  const auto n = static_cast<std::ptrdiff_t>(pts.size());
 
-    const Eigen::Vector3d p_lidar = lp.xyz.cast<double>();
-    const Pose T_w_fe = spline.pose(t);
-    const Eigen::Vector3d p_world = T_w_fe * (q_fe_l * p_lidar + t_fe_l);
+  std::vector<std::vector<LidarHit>> thread_hits(static_cast<std::size_t>(n_threads));
+  std::vector<LidarAssocStats> thread_stats(static_cast<std::size_t>(n_threads));
 
-    PlaneFit plane;
-    if (!map.fitPlane(p_world, &plane)) {
-      continue;
-    }
-    ++stats.matched;
-
-    const double r = plane.n.dot(p_world) + plane.d;
-    const double range = p_lidar.norm();
-    // A point at the sensor origin has no usable bearing and is rejected.
-    if (range <= 0.0) {
-      continue;
-    }
-    // Range-aware acceptance: the tolerance grows with sqrt(range), so distant
-    // returns are gated more leniently than near ones.
-    const double s = 1.0 - 0.9 * std::abs(r) / std::sqrt(range);
-    if (!(s > 0.9)) {
-      continue;
-    }
-    ++stats.accepted;
-
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(n_threads)
+#endif
+  for (std::ptrdiff_t i = 0; i < n; ++i) {
+#ifdef _OPENMP
+    const auto tid = static_cast<std::size_t>(omp_get_thread_num());
+#else
+    const std::size_t tid = 0;
+#endif
     LidarHit hit;
-    hit.p_lidar = p_lidar;
-    hit.p_world = p_world;
-    hit.t = t;
-    hit.plane = plane;
-    hit.t_offset_ns = lp.t_offset_ns;
-    hit.ring = lp.ring;
-    const Eigen::Matrix3d R_w_l = (T_w_fe.q * q_fe_l).toRotationMatrix();
-    hit.weight = pointWeight(p_lidar, plane.n, R_w_l, cfg.point_cov);
+    const AssocOutcome o = associateOne(spline, q_fe_l, t_fe_l, pts[static_cast<std::size_t>(i)],
+                                        t0_scan, map, cfg, &hit);
+    LidarAssocStats& ts = thread_stats[tid];
+    if (o.attempted) {
+      ++ts.attempted;
+    }
+    if (o.matched) {
+      ++ts.matched;
+    }
+    if (o.accepted) {
+      ++ts.accepted;
+      thread_hits[tid].push_back(hit);
+    }
+  }
+
+  for (int tid = 0; tid < n_threads; ++tid) {
+    const LidarAssocStats& ts = thread_stats[static_cast<std::size_t>(tid)];
+    stats.attempted += ts.attempted;
+    stats.matched += ts.matched;
+    stats.accepted += ts.accepted;
     if (hits != nullptr) {
-      hits->push_back(hit);
+      const std::vector<LidarHit>& tb = thread_hits[static_cast<std::size_t>(tid)];
+      hits->insert(hits->end(), tb.begin(), tb.end());
     }
   }
   return stats;

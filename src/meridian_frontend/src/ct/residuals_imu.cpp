@@ -1,11 +1,5 @@
 #include "residuals_imu.hpp"
 
-#include <algorithm>
-#include <cmath>
-#include <cstddef>
-#include <limits>
-#include <vector>
-
 #include <basalt/spline/ceres_spline_helper.h>
 #include <ceres/autodiff_cost_function.h>
 #include <ceres/cost_function.h>
@@ -13,7 +7,15 @@
 #include <ceres/manifold.h>
 #include <ceres/problem.h>
 #include <ceres/sphere_manifold.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <limits>
 #include <sophus/so3.hpp>
+#include <vector>
+
+#include "spline_analytic.hpp"
 
 namespace meridian::ct {
 
@@ -36,9 +38,8 @@ constexpr int kSplineOrder = 4;
 // block is never registered twice in one residual. kSharedBias selects the layout.
 template <bool kSharedBias>
 struct ImuResidual {
-  ImuResidual(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel, double u,
-              double inv_dt, double alpha, double gravity_mag, double w_gyro,
-              double w_accel)
+  ImuResidual(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel, double u, double inv_dt,
+              double alpha, double gravity_mag, double w_gyro, double w_accel)
       : gyro_(gyro),
         accel_(accel),
         u_(u),
@@ -60,8 +61,8 @@ struct ImuResidual {
         params, u_, inv_dt_, &R_w_fe, &omega_body, nullptr);
 
     Vec3T accel_world;
-    basalt::CeresSplineHelper<kSplineOrder>::template evaluate<T, 3, 2>(
-        params + kSplineOrder, u_, inv_dt_, &accel_world);
+    basalt::CeresSplineHelper<kSplineOrder>::template evaluate<T, 3, 2>(params + kSplineOrder, u_,
+                                                                        inv_dt_, &accel_world);
 
     Vec3T b_g;
     Vec3T b_a;
@@ -88,11 +89,9 @@ struct ImuResidual {
     const Vec3T g_world = g_dir * T(gravity_mag_);
 
     Eigen::Map<Eigen::Matrix<T, 6, 1>> residual(residual_ptr);
-    residual.template head<3>() =
-        T(w_gyro_) * (omega_body + b_g - gyro_.cast<T>());
+    residual.template head<3>() = T(w_gyro_) * (omega_body + b_g - gyro_.cast<T>());
     residual.template tail<3>() =
-        T(w_accel_) *
-        (R_w_fe.inverse() * (accel_world - g_world) + b_a - accel_.cast<T>());
+        T(w_accel_) * (R_w_fe.inverse() * (accel_world - g_world) + b_a - accel_.cast<T>());
     return true;
   }
 
@@ -112,8 +111,7 @@ struct ImuResidual {
 // pulls the segment toward constant acceleration (zero jerk), removing the position
 // spline's highest unconstrained derivative without biasing toward any pose.
 struct JerkResidual {
-  JerkResidual(double u, double inv_dt, double weight)
-      : u_(u), inv_dt_(inv_dt), weight_(weight) {}
+  JerkResidual(double u, double inv_dt, double weight) : u_(u), inv_dt_(inv_dt), weight_(weight) {}
 
   template <class T>
   bool operator()(T const* const* params, T* residual_ptr) const {
@@ -165,16 +163,14 @@ struct AngularAccelResidual {
 // constant-velocity extrapolation uncertainty, weak enough for real measurements to
 // override it as soon as they arrive.
 struct VelocityAnchorResidual {
-  VelocityAnchorResidual(const Eigen::Vector3d& v_pred, double u, double inv_dt,
-                         double weight)
+  VelocityAnchorResidual(const Eigen::Vector3d& v_pred, double u, double inv_dt, double weight)
       : v_pred_(v_pred), u_(u), inv_dt_(inv_dt), weight_(weight) {}
 
   template <class T>
   bool operator()(T const* const* params, T* residual_ptr) const {
     using Vec3T = Eigen::Matrix<T, 3, 1>;
     Vec3T vel;
-    basalt::CeresSplineHelper<kSplineOrder>::template evaluate<T, 3, 1>(params, u_, inv_dt_,
-                                                                        &vel);
+    basalt::CeresSplineHelper<kSplineOrder>::template evaluate<T, 3, 1>(params, u_, inv_dt_, &vel);
     Eigen::Map<Vec3T> residual(residual_ptr);
     residual = T(weight_) * (vel - v_pred_.cast<T>());
     return true;
@@ -217,12 +213,11 @@ struct RateAnchorResidual {
 // sqrt-information weight is 1 / (sigma * sqrt(dt)), shared by the gyro and accel
 // halves through their own sigmas. Larger gaps are tied more weakly.
 struct BiasTieResidual {
-  BiasTieResidual(double w_gyro, double w_accel)
-      : w_gyro_(w_gyro), w_accel_(w_accel) {}
+  BiasTieResidual(double w_gyro, double w_accel) : w_gyro_(w_gyro), w_accel_(w_accel) {}
 
   template <class T>
-  bool operator()(const T* bg_prev, const T* bg_next, const T* ba_prev,
-                  const T* ba_next, T* residual_ptr) const {
+  bool operator()(const T* bg_prev, const T* bg_next, const T* ba_prev, const T* ba_next,
+                  T* residual_ptr) const {
     using Vec3T = Eigen::Matrix<T, 3, 1>;
     Eigen::Map<const Vec3T> bgp(bg_prev);
     Eigen::Map<const Vec3T> bgn(bg_next);
@@ -238,7 +233,440 @@ struct BiasTieResidual {
   double w_accel_;
 };
 
+// Non-cumulative R^3 blending row scaled to the real-time Deriv-th derivative:
+// c[j] = inv_dt^Deriv * (blending_matrix_ * baseCoeffsWithTime<Deriv>(u))[j]. A pure
+// R^3 spline derivative is sum_j c[j] * P_j with these scalar weights.
+template <int Deriv>
+Eigen::Matrix<double, kSplineOrder, 1> r3DerivBlend(double u, double inv_dt) {
+  Eigen::Matrix<double, kSplineOrder, 1> p;
+  basalt::CeresSplineHelper<kSplineOrder>::template baseCoeffsWithTime<Deriv>(p, u);
+  double scale = 1.0;
+  for (int i = 0; i < Deriv; ++i) scale *= inv_dt;
+  return scale * (basalt::CeresSplineHelper<kSplineOrder>::blending_matrix_ * p);
+}
+
+// Combined gyro + accel residual at one IMU sample, analytic Jacobians. Math is
+// identical to the autodiff ImuResidual<kSharedBias>:
+//   r_gyro = w_g * ( omega_body(u) + b_g - omega_measured )
+//   r_acc  = w_a * ( R_W_Fe(u)^-1 (a_world(u) - g_W) + b_a - a_measured )
+// where g_W = magnitude * direction. SO(3) knot Jacobians are RIGHT-tangent then
+// mapped to ambient quaternion (x,y,z,w); R^3/bias/gravity blocks are native ambient.
+// No manifold is installed here: the EigenQuaternionManifold on the SO(3) knots and
+// the SphereManifold<3> on the gravity direction are attached by the caller, and Ceres
+// applies their PlusJacobian to these ambient blocks. The accel residual SUBTRACTS
+// gravity, so the gravity-direction block carries the NEGATIVE sign.
+template <bool kSharedBias>
+class AnalyticImuCost final : public ceres::CostFunction {
+public:
+  AnalyticImuCost(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel, double u,
+                  double inv_dt, double alpha, double gravity_mag, double w_gyro, double w_accel)
+      : gyro_(gyro),
+        accel_(accel),
+        alpha_(alpha),
+        gravity_mag_(gravity_mag),
+        w_gyro_(w_gyro),
+        w_accel_(w_accel) {
+    set_num_residuals(6);
+    for (int j = 0; j < kSplineOrder; ++j) mutable_parameter_block_sizes()->push_back(4);
+    for (int j = 0; j < kSplineOrder; ++j) mutable_parameter_block_sizes()->push_back(3);
+    if constexpr (kSharedBias) {
+      mutable_parameter_block_sizes()->push_back(3);  // b_g
+      mutable_parameter_block_sizes()->push_back(3);  // b_a
+    } else {
+      mutable_parameter_block_sizes()->push_back(3);  // bg_left
+      mutable_parameter_block_sizes()->push_back(3);  // bg_right
+      mutable_parameter_block_sizes()->push_back(3);  // ba_left
+      mutable_parameter_block_sizes()->push_back(3);  // ba_right
+    }
+    mutable_parameter_block_sizes()->push_back(3);  // gravity direction
+
+    using Helper = basalt::CeresSplineHelper<kSplineOrder>;
+    const Eigen::Vector4d p0(1.0, u, u * u, u * u * u);
+    const Eigen::Vector4d p1(0.0, 1.0, 2.0 * u, 3.0 * u * u);
+    const Eigen::Vector4d p2(0.0, 0.0, 2.0, 6.0 * u);
+    lambda_r_ = Helper::cumulative_blending_matrix_ * p0;
+    dcoeff_ = inv_dt * (Helper::cumulative_blending_matrix_ * p1);
+    lambda_acc_ = (inv_dt * inv_dt) * (Helper::blending_matrix_ * p2);  // NON-cumulative
+  }
+
+  bool Evaluate(double const* const* parameters, double* residuals,
+                double** jacobians) const override {
+    using SO3 = Sophus::SO3d;
+    std::array<SO3, kSplineOrder> R;
+    for (int j = 0; j < kSplineOrder; ++j)
+      R[static_cast<std::size_t>(j)] = SO3(Eigen::Map<const Eigen::Quaterniond>(parameters[j]));
+
+    const So3SplineJac sj = evaluateSo3CumulativeJac(R, lambda_r_);
+    const So3VelocityJac vj = evaluateSo3VelocityJac(R, lambda_r_, dcoeff_);
+    const SO3& R_w_fe = sj.R;
+    const Eigen::Matrix3d R_fe_w = R_w_fe.inverse().matrix();
+
+    Eigen::Vector3d a_world = Eigen::Vector3d::Zero();
+    for (int j = 0; j < kSplineOrder; ++j)
+      a_world += lambda_acc_[j] * Eigen::Map<const Eigen::Vector3d>(parameters[kSplineOrder + j]);
+
+    Eigen::Vector3d b_g, b_a;
+    int g_index = 0;
+    double wl = 0.0, wr = 0.0;
+    if constexpr (kSharedBias) {
+      b_g = Eigen::Map<const Eigen::Vector3d>(parameters[2 * kSplineOrder]);
+      b_a = Eigen::Map<const Eigen::Vector3d>(parameters[2 * kSplineOrder + 1]);
+      g_index = 2 * kSplineOrder + 2;
+    } else {
+      wl = 1.0 - alpha_;
+      wr = alpha_;
+      const Eigen::Map<const Eigen::Vector3d> bg_l(parameters[2 * kSplineOrder]);
+      const Eigen::Map<const Eigen::Vector3d> bg_r(parameters[2 * kSplineOrder + 1]);
+      const Eigen::Map<const Eigen::Vector3d> ba_l(parameters[2 * kSplineOrder + 2]);
+      const Eigen::Map<const Eigen::Vector3d> ba_r(parameters[2 * kSplineOrder + 3]);
+      b_g = wl * bg_l + wr * bg_r;
+      b_a = wl * ba_l + wr * ba_r;
+      g_index = 2 * kSplineOrder + 4;
+    }
+
+    const Eigen::Vector3d g_world =
+        Eigen::Map<const Eigen::Vector3d>(parameters[g_index]) * gravity_mag_;
+    const Eigen::Vector3d v = a_world - g_world;  // specific force, world frame
+    const Eigen::Vector3d v_b = R_fe_w * v;       // rotated into the body frame
+
+    Eigen::Map<Eigen::Matrix<double, 6, 1>> r(residuals);
+    r.head<3>() = w_gyro_ * (vj.omega + b_g - gyro_);
+    r.tail<3>() = w_accel_ * (v_b + b_a - accel_);
+
+    if (jacobians == nullptr) return true;
+
+    // SO(3) knots. A right perturbation R_w_fe <- R_w_fe exp(dRt theta) moves the
+    // body-frame specific force by R^-1 v <- v_b + [v_b]_x (dRt theta) to first order.
+    for (int j = 0; j < kSplineOrder; ++j) {
+      if (jacobians[j] == nullptr) continue;
+      const std::size_t k = static_cast<std::size_t>(j);
+      Eigen::Matrix<double, 6, 3> jt;
+      jt.topRows<3>() = w_gyro_ * vj.dOmega_dR[k];
+      jt.bottomRows<3>() = w_accel_ * SO3::hat(v_b) * sj.dRt_dR[k];
+      Eigen::Map<Eigen::Matrix<double, 6, 4, Eigen::RowMajor>> J(jacobians[j]);
+      J = jt * tangentToQuatJac(R[k].unit_quaternion());
+    }
+    // R^3 knots: accel rows only, second-derivative non-cumulative blend.
+    for (int j = 0; j < kSplineOrder; ++j) {
+      if (jacobians[kSplineOrder + j] == nullptr) continue;
+      Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(jacobians[kSplineOrder + j]);
+      J.setZero();
+      J.bottomRows<3>() = (w_accel_ * lambda_acc_[j]) * R_fe_w;
+    }
+    // Bias blocks.
+    if constexpr (kSharedBias) {
+      if (jacobians[2 * kSplineOrder] != nullptr) {  // b_g
+        Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(jacobians[2 * kSplineOrder]);
+        J.setZero();
+        J.topRows<3>() = w_gyro_ * Eigen::Matrix3d::Identity();
+      }
+      if (jacobians[2 * kSplineOrder + 1] != nullptr) {  // b_a
+        Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(jacobians[2 * kSplineOrder + 1]);
+        J.setZero();
+        J.bottomRows<3>() = w_accel_ * Eigen::Matrix3d::Identity();
+      }
+    } else {
+      const double bg_w[2] = {w_gyro_ * wl, w_gyro_ * wr};
+      const double ba_w[2] = {w_accel_ * wl, w_accel_ * wr};
+      for (int s = 0; s < 2; ++s) {  // bg_left, bg_right
+        if (jacobians[2 * kSplineOrder + s] == nullptr) continue;
+        Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(jacobians[2 * kSplineOrder + s]);
+        J.setZero();
+        J.topRows<3>() = bg_w[s] * Eigen::Matrix3d::Identity();
+      }
+      for (int s = 0; s < 2; ++s) {  // ba_left, ba_right
+        if (jacobians[2 * kSplineOrder + 2 + s] == nullptr) continue;
+        Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(
+            jacobians[2 * kSplineOrder + 2 + s]);
+        J.setZero();
+        J.bottomRows<3>() = ba_w[s] * Eigen::Matrix3d::Identity();
+      }
+    }
+    // Gravity direction: the residual subtracts g_W = mag * dir, so d r_acc / d dir =
+    // -w_accel * mag * R^-1 (ambient; the SphereManifold PlusJacobian is applied by
+    // Ceres).
+    if (jacobians[g_index] != nullptr) {
+      Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(jacobians[g_index]);
+      J.setZero();
+      J.bottomRows<3>() = (-w_accel_ * gravity_mag_) * R_fe_w;
+    }
+    return true;
+  }
+
+private:
+  Eigen::Vector3d gyro_, accel_;
+  double alpha_, gravity_mag_, w_gyro_, w_accel_;
+  Eigen::Vector4d lambda_r_, dcoeff_, lambda_acc_;
+};
+
+// Jerk regularizer, analytic. r = w * sum_j c3[j] * P_j over the four R^3 knots, with
+// c3 the third-derivative non-cumulative blend; J_j = w * c3[j] * I3.
+class AnalyticJerkCost final : public ceres::CostFunction {
+public:
+  AnalyticJerkCost(double u, double inv_dt, double weight) : weight_(weight) {
+    set_num_residuals(3);
+    for (int j = 0; j < kSplineOrder; ++j) mutable_parameter_block_sizes()->push_back(3);
+    c3_ = r3DerivBlend<3>(u, inv_dt);
+  }
+  bool Evaluate(double const* const* parameters, double* residuals,
+                double** jacobians) const override {
+    Eigen::Map<Eigen::Vector3d> r(residuals);
+    r.setZero();
+    for (int j = 0; j < kSplineOrder; ++j)
+      r += (weight_ * c3_[j]) * Eigen::Map<const Eigen::Vector3d>(parameters[j]);
+    if (jacobians == nullptr) return true;
+    for (int j = 0; j < kSplineOrder; ++j) {
+      if (jacobians[j] == nullptr) continue;
+      Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::RowMajor>> J(jacobians[j]);
+      J = (weight_ * c3_[j]) * Eigen::Matrix3d::Identity();
+    }
+    return true;
+  }
+
+private:
+  double weight_;
+  Eigen::Matrix<double, kSplineOrder, 1> c3_;
+};
+
+// Tail velocity anchor, analytic. r = w * (sum_j c1[j] * P_j - v_pred); the constant
+// v_pred offset drops from the Jacobian, leaving J_j = w * c1[j] * I3.
+class AnalyticVelocityAnchorCost final : public ceres::CostFunction {
+public:
+  AnalyticVelocityAnchorCost(const Eigen::Vector3d& v_pred, double u, double inv_dt, double weight)
+      : v_pred_(v_pred), weight_(weight) {
+    set_num_residuals(3);
+    for (int j = 0; j < kSplineOrder; ++j) mutable_parameter_block_sizes()->push_back(3);
+    c1_ = r3DerivBlend<1>(u, inv_dt);
+  }
+  bool Evaluate(double const* const* parameters, double* residuals,
+                double** jacobians) const override {
+    Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+    for (int j = 0; j < kSplineOrder; ++j)
+      vel += c1_[j] * Eigen::Map<const Eigen::Vector3d>(parameters[j]);
+    Eigen::Map<Eigen::Vector3d> r(residuals);
+    r = weight_ * (vel - v_pred_);
+    if (jacobians == nullptr) return true;
+    for (int j = 0; j < kSplineOrder; ++j) {
+      if (jacobians[j] == nullptr) continue;
+      Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::RowMajor>> J(jacobians[j]);
+      J = (weight_ * c1_[j]) * Eigen::Matrix3d::Identity();
+    }
+    return true;
+  }
+
+private:
+  Eigen::Vector3d v_pred_;
+  double weight_;
+  Eigen::Matrix<double, kSplineOrder, 1> c1_;
+};
+
+// Angular-acceleration regularizer, analytic. r = w * alpha(u); SO(3) knot Jacobians
+// are right-tangent (dalpha_dR) mapped to ambient quaternion.
+class AnalyticAngularAccelCost final : public ceres::CostFunction {
+public:
+  AnalyticAngularAccelCost(double u, double inv_dt, double weight)
+      : u_(u), inv_dt_(inv_dt), weight_(weight) {
+    set_num_residuals(3);
+    for (int j = 0; j < kSplineOrder; ++j) mutable_parameter_block_sizes()->push_back(4);
+  }
+  bool Evaluate(double const* const* parameters, double* residuals,
+                double** jacobians) const override {
+    using SO3 = Sophus::SO3d;
+    std::array<SO3, kSplineOrder> R;
+    for (int j = 0; j < kSplineOrder; ++j)
+      R[static_cast<std::size_t>(j)] = SO3(Eigen::Map<const Eigen::Quaterniond>(parameters[j]));
+    const So3DerivJac dj = evaluateSo3VelAccelJac(R, u_, inv_dt_, /*want_accel=*/true);
+    Eigen::Map<Eigen::Vector3d> r(residuals);
+    r = weight_ * dj.alpha;
+    if (jacobians == nullptr) return true;
+    for (int j = 0; j < kSplineOrder; ++j) {
+      if (jacobians[j] == nullptr) continue;
+      const std::size_t k = static_cast<std::size_t>(j);
+      const Eigen::Matrix3d jt = weight_ * dj.dalpha_dR[k];
+      Eigen::Map<Eigen::Matrix<double, 3, 4, Eigen::RowMajor>> J(jacobians[j]);
+      J = jt * tangentToQuatJac(R[k].unit_quaternion());
+    }
+    return true;
+  }
+
+private:
+  double u_, inv_dt_, weight_;
+};
+
+// Tail angular-rate anchor, analytic. r = w * (omega(u) - w_pred); SO(3) knot
+// Jacobians are right-tangent (domega_dR) mapped to ambient quaternion.
+class AnalyticRateAnchorCost final : public ceres::CostFunction {
+public:
+  AnalyticRateAnchorCost(const Eigen::Vector3d& w_pred, double u, double inv_dt, double weight)
+      : w_pred_(w_pred), u_(u), inv_dt_(inv_dt), weight_(weight) {
+    set_num_residuals(3);
+    for (int j = 0; j < kSplineOrder; ++j) mutable_parameter_block_sizes()->push_back(4);
+  }
+  bool Evaluate(double const* const* parameters, double* residuals,
+                double** jacobians) const override {
+    using SO3 = Sophus::SO3d;
+    std::array<SO3, kSplineOrder> R;
+    for (int j = 0; j < kSplineOrder; ++j)
+      R[static_cast<std::size_t>(j)] = SO3(Eigen::Map<const Eigen::Quaterniond>(parameters[j]));
+    const So3DerivJac dj = evaluateSo3VelAccelJac(R, u_, inv_dt_, /*want_accel=*/false);
+    Eigen::Map<Eigen::Vector3d> r(residuals);
+    r = weight_ * (dj.omega - w_pred_);
+    if (jacobians == nullptr) return true;
+    for (int j = 0; j < kSplineOrder; ++j) {
+      if (jacobians[j] == nullptr) continue;
+      const std::size_t k = static_cast<std::size_t>(j);
+      const Eigen::Matrix3d jt = weight_ * dj.domega_dR[k];
+      Eigen::Map<Eigen::Matrix<double, 3, 4, Eigen::RowMajor>> J(jacobians[j]);
+      J = jt * tangentToQuatJac(R[k].unit_quaternion());
+    }
+    return true;
+  }
+
+private:
+  Eigen::Vector3d w_pred_;
+  double u_, inv_dt_, weight_;
+};
+
+// Random-walk tie between two consecutive bias knots, analytic. Block order is
+// bg_prev, bg_next, ba_prev, ba_next. r_head = w_g (bg_next - bg_prev), r_tail =
+// w_a (ba_next - ba_prev); constant Jacobians +-w_g I3 / +-w_a I3.
+class AnalyticBiasTieCost final : public ceres::CostFunction {
+public:
+  AnalyticBiasTieCost(double w_gyro, double w_accel) : w_gyro_(w_gyro), w_accel_(w_accel) {
+    set_num_residuals(6);
+    for (int b = 0; b < 4; ++b) mutable_parameter_block_sizes()->push_back(3);
+  }
+  bool Evaluate(double const* const* parameters, double* residuals,
+                double** jacobians) const override {
+    const Eigen::Map<const Eigen::Vector3d> bgp(parameters[0]);
+    const Eigen::Map<const Eigen::Vector3d> bgn(parameters[1]);
+    const Eigen::Map<const Eigen::Vector3d> bap(parameters[2]);
+    const Eigen::Map<const Eigen::Vector3d> ban(parameters[3]);
+    Eigen::Map<Eigen::Matrix<double, 6, 1>> r(residuals);
+    r.head<3>() = w_gyro_ * (bgn - bgp);
+    r.tail<3>() = w_accel_ * (ban - bap);
+    if (jacobians == nullptr) return true;
+    const Eigen::Matrix3d I = Eigen::Matrix3d::Identity();
+    if (jacobians[0] != nullptr) {  // bg_prev
+      Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(jacobians[0]);
+      J.setZero();
+      J.topRows<3>() = -w_gyro_ * I;
+    }
+    if (jacobians[1] != nullptr) {  // bg_next
+      Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(jacobians[1]);
+      J.setZero();
+      J.topRows<3>() = w_gyro_ * I;
+    }
+    if (jacobians[2] != nullptr) {  // ba_prev
+      Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(jacobians[2]);
+      J.setZero();
+      J.bottomRows<3>() = -w_accel_ * I;
+    }
+    if (jacobians[3] != nullptr) {  // ba_next
+      Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J(jacobians[3]);
+      J.setZero();
+      J.bottomRows<3>() = w_accel_ * I;
+    }
+    return true;
+  }
+
+private:
+  double w_gyro_, w_accel_;
+};
+
 }  // namespace
+
+template <bool kSharedBias>
+ceres::CostFunction* makeImuCost(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel,
+                                 double u, double inv_dt, double alpha, double gravity_mag,
+                                 double w_gyro, double w_accel) {
+  return new AnalyticImuCost<kSharedBias>(gyro, accel, u, inv_dt, alpha, gravity_mag, w_gyro,
+                                          w_accel);
+}
+
+template <bool kSharedBias>
+ceres::CostFunction* makeImuCostAutodiff(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel,
+                                         double u, double inv_dt, double alpha, double gravity_mag,
+                                         double w_gyro, double w_accel) {
+  auto* c = new ceres::DynamicAutoDiffCostFunction<ImuResidual<kSharedBias>, 4>(
+      new ImuResidual<kSharedBias>(gyro, accel, u, inv_dt, alpha, gravity_mag, w_gyro, w_accel));
+  const int n_blocks = 2 * kSplineOrder + (kSharedBias ? 3 : 5);
+  for (int i = 0; i < n_blocks; ++i) c->AddParameterBlock(i < kSplineOrder ? 4 : 3);
+  c->SetNumResiduals(6);
+  return c;
+}
+
+template ceres::CostFunction* makeImuCost<true>(const Eigen::Vector3d&, const Eigen::Vector3d&,
+                                                double, double, double, double, double, double);
+template ceres::CostFunction* makeImuCost<false>(const Eigen::Vector3d&, const Eigen::Vector3d&,
+                                                 double, double, double, double, double, double);
+template ceres::CostFunction* makeImuCostAutodiff<true>(const Eigen::Vector3d&,
+                                                        const Eigen::Vector3d&, double, double,
+                                                        double, double, double, double);
+template ceres::CostFunction* makeImuCostAutodiff<false>(const Eigen::Vector3d&,
+                                                         const Eigen::Vector3d&, double, double,
+                                                         double, double, double, double);
+
+ceres::CostFunction* makeJerkCost(double u, double inv_dt, double weight) {
+  return new AnalyticJerkCost(u, inv_dt, weight);
+}
+
+ceres::CostFunction* makeJerkCostAutodiff(double u, double inv_dt, double weight) {
+  auto* cost =
+      new ceres::DynamicAutoDiffCostFunction<JerkResidual, 4>(new JerkResidual(u, inv_dt, weight));
+  for (int i = 0; i < kSplineOrder; ++i) cost->AddParameterBlock(3);
+  cost->SetNumResiduals(3);
+  return cost;
+}
+
+ceres::CostFunction* makeVelocityAnchorCost(const Eigen::Vector3d& v_pred, double u, double inv_dt,
+                                            double weight) {
+  return new AnalyticVelocityAnchorCost(v_pred, u, inv_dt, weight);
+}
+
+ceres::CostFunction* makeVelocityAnchorCostAutodiff(const Eigen::Vector3d& v_pred, double u,
+                                                    double inv_dt, double weight) {
+  auto* cost = new ceres::DynamicAutoDiffCostFunction<VelocityAnchorResidual, 4>(
+      new VelocityAnchorResidual(v_pred, u, inv_dt, weight));
+  for (int i = 0; i < kSplineOrder; ++i) cost->AddParameterBlock(3);
+  cost->SetNumResiduals(3);
+  return cost;
+}
+
+ceres::CostFunction* makeAngularAccelCost(double u, double inv_dt, double weight) {
+  return new AnalyticAngularAccelCost(u, inv_dt, weight);
+}
+
+ceres::CostFunction* makeAngularAccelCostAutodiff(double u, double inv_dt, double weight) {
+  auto* cost = new ceres::DynamicAutoDiffCostFunction<AngularAccelResidual, 4>(
+      new AngularAccelResidual(u, inv_dt, weight));
+  for (int i = 0; i < kSplineOrder; ++i) cost->AddParameterBlock(4);
+  cost->SetNumResiduals(3);
+  return cost;
+}
+
+ceres::CostFunction* makeRateAnchorCost(const Eigen::Vector3d& w_pred, double u, double inv_dt,
+                                        double weight) {
+  return new AnalyticRateAnchorCost(w_pred, u, inv_dt, weight);
+}
+
+ceres::CostFunction* makeRateAnchorCostAutodiff(const Eigen::Vector3d& w_pred, double u,
+                                                double inv_dt, double weight) {
+  auto* cost = new ceres::DynamicAutoDiffCostFunction<RateAnchorResidual, 4>(
+      new RateAnchorResidual(w_pred, u, inv_dt, weight));
+  for (int i = 0; i < kSplineOrder; ++i) cost->AddParameterBlock(4);
+  cost->SetNumResiduals(3);
+  return cost;
+}
+
+ceres::CostFunction* makeBiasTieCost(double w_gyro, double w_accel) {
+  return new AnalyticBiasTieCost(w_gyro, w_accel);
+}
+
+ceres::CostFunction* makeBiasTieCostAutodiff(double w_gyro, double w_accel) {
+  return new ceres::AutoDiffCostFunction<BiasTieResidual, 6, 3, 3, 3, 3>(
+      new BiasTieResidual(w_gyro, w_accel));
+}
 
 GravityBlock::GravityBlock(const Eigen::Vector3d& g_world, double magnitude)
     : magnitude_(magnitude) {
@@ -251,11 +679,17 @@ Eigen::Vector3d GravityBlock::gravityWorld() const {
   return magnitude_ * direction_;
 }
 
-BiasKnots::BiasKnots(Timestamp t0, Duration dt_ns, int n_knots)
-    : t0_(t0), dt_ns_(dt_ns) {
+BiasKnots::BiasKnots(Timestamp t0, Duration dt_ns, int n_knots) : t0_(t0), dt_ns_(dt_ns) {
   const int n = n_knots < 1 ? 1 : n_knots;
   gyro_.assign(static_cast<std::size_t>(n), Eigen::Vector3d::Zero());
   accel_.assign(static_cast<std::size_t>(n), Eigen::Vector3d::Zero());
+}
+
+BiasKnots BiasKnots::clone() const {
+  BiasKnots copy(t0_, dt_ns_, numKnots());
+  copy.gyro_ = gyro_;
+  copy.accel_ = accel_;
+  return copy;
 }
 
 void BiasKnots::extendTo(Timestamp t) {
@@ -346,11 +780,12 @@ Eigen::Vector3d BiasKnots::accelBiasAt(Timestamp t) const {
   return (1.0 - a) * accel_[k] + a * accel_[k + 1];
 }
 
-ceres::Manifold* makeGravityManifold() { return new ceres::SphereManifold<3>(); }
+ceres::Manifold* makeGravityManifold() {
+  return new ceres::SphereManifold<3>();
+}
 
-ImuExcitation imuExcitation(const std::vector<ImuSample>& samples,
-                            const Eigen::Vector3d& b_g, const Eigen::Vector3d& b_a,
-                            double gravity_mag) {
+ImuExcitation imuExcitation(const std::vector<ImuSample>& samples, const Eigen::Vector3d& b_g,
+                            const Eigen::Vector3d& b_a, double gravity_mag) {
   ImuExcitation exc;
   for (const ImuSample& s : samples) {
     const double w = (s.gyro - b_g).norm();
@@ -396,8 +831,7 @@ int bandsCrossed(double value, const std::vector<double>& thresh, double hystere
 
 }  // namespace
 
-int knotDensityFromExcitation(const ImuExcitation& exc,
-                              const std::vector<double>& omega_thresh,
+int knotDensityFromExcitation(const ImuExcitation& exc, const std::vector<double>& omega_thresh,
                               const std::vector<double>& accel_thresh, double hysteresis,
                               int n_cp_max, int prev_n_cp) {
   const int cap = std::max(1, n_cp_max);
@@ -413,8 +847,8 @@ int knotDensityFromExcitation(const ImuExcitation& exc,
 }
 
 int addImuResiduals(ceres::Problem& problem, SplineWindow& spline, BiasKnots& bias,
-                    GravityBlock& gravity, const std::vector<ImuSample>& samples,
-                    Timestamp t_begin, Timestamp t_end, const ImuWeights& weights) {
+                    GravityBlock& gravity, const std::vector<ImuSample>& samples, Timestamp t_begin,
+                    Timestamp t_end, const ImuWeights& weights) {
   // White-noise residuals use sqrt-information = 1 / sigma.
   const double w_gyro = 1.0 / weights.sigma_gyro;
   const double w_accel = 1.0 / weights.sigma_accel;
@@ -445,27 +879,13 @@ int addImuResiduals(ceres::Problem& problem, SplineWindow& spline, BiasKnots& bi
     }
 
     if (shared) {
-      auto* c = new ceres::DynamicAutoDiffCostFunction<ImuResidual<true>, 4>(
-          new ImuResidual<true>(s.gyro, s.acc, seg.u, 1.0 / seg.dt_s, alpha,
-                                gravity.magnitude(), w_gyro, w_accel));
-      // 4 SO(3) + 4 R^3 + b_g + b_a + gravity.
-      for (int i = 0; i < 2 * kSplineOrder + 3; ++i) {
-        c->AddParameterBlock(i < kSplineOrder ? 4 : 3);
-      }
-      c->SetNumResiduals(6);
-      cost = c;
+      cost = makeImuCost<true>(s.gyro, s.acc, seg.u, 1.0 / seg.dt_s, alpha, gravity.magnitude(),
+                               w_gyro, w_accel);
       blocks.push_back(bias.gyroBlock(bk));
       blocks.push_back(bias.accelBlock(bk));
     } else {
-      auto* c = new ceres::DynamicAutoDiffCostFunction<ImuResidual<false>, 4>(
-          new ImuResidual<false>(s.gyro, s.acc, seg.u, 1.0 / seg.dt_s, alpha,
-                                 gravity.magnitude(), w_gyro, w_accel));
-      // 4 SO(3) + 4 R^3 + bg_left + bg_right + ba_left + ba_right + gravity.
-      for (int i = 0; i < 2 * kSplineOrder + 5; ++i) {
-        c->AddParameterBlock(i < kSplineOrder ? 4 : 3);
-      }
-      c->SetNumResiduals(6);
-      cost = c;
+      cost = makeImuCost<false>(s.gyro, s.acc, seg.u, 1.0 / seg.dt_s, alpha, gravity.magnitude(),
+                                w_gyro, w_accel);
       blocks.push_back(bias.gyroBlock(bk));
       blocks.push_back(bias.gyroBlock(bk + 1));
       blocks.push_back(bias.accelBlock(bk));
@@ -500,22 +920,12 @@ int addTailAnchors(ceres::Problem& problem, SplineWindow& spline,
     const double inv_dt = 1.0 / seg.dt_s;
 
     {
-      auto* cost = new ceres::DynamicAutoDiffCostFunction<VelocityAnchorResidual, 4>(
-          new VelocityAnchorResidual(v_pred, seg.u, inv_dt, w_vel));
-      for (int i = 0; i < kSplineOrder; ++i) {
-        cost->AddParameterBlock(3);
-      }
-      cost->SetNumResiduals(3);
+      ceres::CostFunction* cost = makeVelocityAnchorCost(v_pred, seg.u, inv_dt, w_vel);
       std::vector<double*> blocks(seg.r3_knots.begin(), seg.r3_knots.end());
       problem.AddResidualBlock(cost, nullptr, blocks);
     }
     {
-      auto* cost = new ceres::DynamicAutoDiffCostFunction<RateAnchorResidual, 4>(
-          new RateAnchorResidual(w_pred, seg.u, inv_dt, w_rate));
-      for (int i = 0; i < kSplineOrder; ++i) {
-        cost->AddParameterBlock(4);
-      }
-      cost->SetNumResiduals(3);
+      ceres::CostFunction* cost = makeRateAnchorCost(w_pred, seg.u, inv_dt, w_rate);
       std::vector<double*> blocks(seg.so3_knots.begin(), seg.so3_knots.end());
       problem.AddResidualBlock(cost, nullptr, blocks);
     }
@@ -524,8 +934,7 @@ int addTailAnchors(ceres::Problem& problem, SplineWindow& spline,
   return added;
 }
 
-int addBiasRandomWalk(ceres::Problem& problem, BiasKnots& bias,
-                      const ImuWeights& weights) {
+int addBiasRandomWalk(ceres::Problem& problem, BiasKnots& bias, const ImuWeights& weights) {
   const int n = bias.numKnots();
   if (n <= 1) {
     return 0;
@@ -544,20 +953,17 @@ int addBiasRandomWalk(ceres::Problem& problem, BiasKnots& bias,
 
   int added = 0;
   for (int k = 1; k < n; ++k) {
-    auto* cost =
-        new ceres::AutoDiffCostFunction<BiasTieResidual, 6, 3, 3, 3, 3>(
-            new BiasTieResidual(w_bg, w_ba));
-    problem.AddResidualBlock(cost, nullptr, bias.gyroBlock(k - 1),
-                             bias.gyroBlock(k), bias.accelBlock(k - 1),
-                             bias.accelBlock(k));
+    ceres::CostFunction* cost = makeBiasTieCost(w_bg, w_ba);
+    problem.AddResidualBlock(cost, nullptr, bias.gyroBlock(k - 1), bias.gyroBlock(k),
+                             bias.accelBlock(k - 1), bias.accelBlock(k));
     ++added;
   }
   return added;
 }
 
 int addMotionRegularizer(ceres::Problem& problem, SplineWindow& spline,
-                         const std::vector<Timestamp>& times, double weight,
-                         double accel_weight, double gyro_weight) {
+                         const std::vector<Timestamp>& times, double weight, double accel_weight,
+                         double gyro_weight) {
   if (weight <= 0.0) {
     return 0;
   }
@@ -576,24 +982,14 @@ int addMotionRegularizer(ceres::Problem& problem, SplineWindow& spline,
 
     // Jerk on the R^3 knots.
     {
-      auto* cost = new ceres::DynamicAutoDiffCostFunction<JerkResidual, 4>(
-          new JerkResidual(seg.u, inv_dt, w_jerk));
-      for (int i = 0; i < kSplineOrder; ++i) {
-        cost->AddParameterBlock(3);
-      }
-      cost->SetNumResiduals(3);
+      ceres::CostFunction* cost = makeJerkCost(seg.u, inv_dt, w_jerk);
       std::vector<double*> blocks(seg.r3_knots.begin(), seg.r3_knots.end());
       problem.AddResidualBlock(cost, nullptr, blocks);
     }
 
     // Angular acceleration on the SO(3) knots.
     {
-      auto* cost = new ceres::DynamicAutoDiffCostFunction<AngularAccelResidual, 4>(
-          new AngularAccelResidual(seg.u, inv_dt, w_accel));
-      for (int i = 0; i < kSplineOrder; ++i) {
-        cost->AddParameterBlock(4);
-      }
-      cost->SetNumResiduals(3);
+      ceres::CostFunction* cost = makeAngularAccelCost(seg.u, inv_dt, w_accel);
       std::vector<double*> blocks(seg.so3_knots.begin(), seg.so3_knots.end());
       problem.AddResidualBlock(cost, nullptr, blocks);
     }

@@ -57,6 +57,15 @@ struct VisualPoint {
   bool normal_initialized = false;
   bool converged = false;  // latched: obs list frozen, re-scoring still runs
   std::int64_t id = 0;     // stable creation order, deterministic tie-break
+
+  // Cached pairwise NCC of the stored observations: ncc_cache[i*obs_count + j] is
+  // NCC(obs[i], obs[j]). Patches are immutable once an observation is stored, so the
+  // NCC of any fixed pair never changes; the cache is rebuilt only when the obs set
+  // changes (add/evict), which obs_dirty marks. obs_dirty also gates whether the
+  // medoid/score recompute runs at all: with an unchanged obs set the recompute is a
+  // pure idempotent function of obs, so reusing the previous result is exact.
+  std::vector<float> ncc_cache;
+  bool obs_dirty = true;
 };
 
 // Tunables for the visual-point map. Built from FrontendVisual where those fields
@@ -94,6 +103,12 @@ struct VisualMapConfig {
 class VisualMap {
 public:
   explicit VisualMap(const VisualMapConfig& cfg);
+
+  // Equivalence harness: the frustum-cull test drives the private candidate
+  // pipeline against an uncull-ed full-map scan to prove the cull is a strict
+  // superset. It needs the candidate seams and the live id set, none of which are
+  // production surface.
+  friend class VisualMapFrustumEquivalenceAccess;
 
   // Promote accepted LiDAR hits visible in the current frame to visual points.
   // Per grid cell the single highest-gradient-score candidate (with an initialized
@@ -160,6 +175,21 @@ private:
   // visibleCandidates() and updateAfterSolve() so both bound their work to the
   // visible set (<= grid cells) instead of scanning the whole map.
   std::vector<std::int64_t> selectVisibleIds(const CameraModel& cam, const Pose& T_w_c) const;
+  // The per-candidate visibility pipeline (project + on-image gate + per-cell nearest
+  // occlusion + depth-continuity), run over an arbitrary candidate-id list. Both the
+  // frustum-culled production path and any reference that scans a different candidate
+  // set share this body, so the cull is a pure restriction of the iteration: feeding
+  // the whole map yields the same visible set as feeding the frustum subset whenever
+  // the cull is a true superset of what this admits.
+  std::vector<std::int64_t> selectVisibleFromCandidates(
+      const CameraModel& cam, const Pose& T_w_c,
+      const std::vector<std::int64_t>& candidate_ids) const;
+  // Ids of points in voxels intersecting the view frustum, in ascending-id order.
+  // A conservative superset of the in-frustum points (voxels wholly outside the
+  // frustum are culled via the spatial index), so the per-point projection test in
+  // selectVisibleIds still admits exactly the same set -- only the iteration is
+  // bounded to what the camera can see instead of the whole map.
+  std::vector<std::int64_t> frustumCandidateIds(const CameraModel& cam, const Pose& T_w_c) const;
   // Shi-Tomasi-like corner score from the local gradient structure tensor at `uv`.
   float gradientScore(const ImagePyramidView& img, const Eigen::Vector2d& uv) const;
   // Extract the kLevels reference patches centred at level-0 pixel `uv`.

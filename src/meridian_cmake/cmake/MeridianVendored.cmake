@@ -31,7 +31,10 @@ endfunction()
 if(NOT TARGET meridian::vendor_basalt)
   if(EXISTS "${MERIDIAN_VENDOR_DIR}/basalt-headers/include")
     add_library(meridian_vendor_basalt INTERFACE)
-    target_include_directories(meridian_vendor_basalt INTERFACE
+    # SYSTEM so the vendored spline kernel is exempt from the house -Werror set (matches the
+    # ikd-Tree treatment below): newer GCCs emit a false-positive maybe-uninitialized in
+    # ceres_spline_helper.h that would otherwise fail the build.
+    target_include_directories(meridian_vendor_basalt SYSTEM INTERFACE
       "${MERIDIAN_VENDOR_DIR}/basalt-headers/include")
     target_link_libraries(meridian_vendor_basalt INTERFACE Eigen3::Eigen Sophus::Sophus)
     add_library(meridian::vendor_basalt ALIAS meridian_vendor_basalt)

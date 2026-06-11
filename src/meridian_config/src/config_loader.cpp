@@ -117,6 +117,7 @@ void load_sensors(const YAML::Node& root, SensorsConfig& c) {
     get(l, "time_offset_ms", c.lidar.time_offset_ms);
     get(l, "model", c.lidar.model);
     get(l, "nominal_rate_hz", c.lidar.nominal_rate_hz);
+    get(l, "qos_reliable", c.lidar.qos_reliable);
     get(l, "ptp", c.lidar.ptp);
     get(l, "timestamp_mode", c.lidar.timestamp_mode);
     if (l["extrinsic_T"])
@@ -237,9 +238,8 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   const YAML::Node n = root["frontend"];
   if (!n) return;
   if (n["kind"]) {
-    c.kind = parse_enum<FrontEndKind>(
-        n["kind"], "frontend.kind",
-        {{"ct_livo", FrontEndKind::CtLivo}, {"iekf_oracle", FrontEndKind::IekfOracle}});
+    c.kind =
+        parse_enum<FrontEndKind>(n["kind"], "frontend.kind", {{"ct_livo", FrontEndKind::CtLivo}});
   }
   get(n, "init_time_s", c.init_time_s);
   get(n, "solver_max_iterations", c.solver_max_iterations);
@@ -249,6 +249,7 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   get(n, "reassoc_steps", c.reassoc_steps);
   get(n, "assoc_shift_thresh_m", c.assoc_shift_thresh_m);
   get(n, "assoc_shift_thresh_deg", c.assoc_shift_thresh_deg);
+  get(n, "marg_prior_scale", c.marg_prior_scale);
   const YAML::Node solver = n["solver"];
   // max_iterations / epsi keep their legacy flat keys; the solver block carries the
   // deadline bracket. Accept max_iterations under the block too for spec-name parity.
@@ -315,7 +316,6 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   get(g, "floor_spp_v", c.gnss.floor_spp_v);
   get(g, "innovation_k", c.gnss.innovation_k);
   get(g, "reacquire_count", c.gnss.reacquire_count);
-  get(n, "extrinsic_refine", c.extrinsic_refine);
   const YAML::Node kf = n["keyframe"];
   get(kf, "dist_m", c.keyframe.dist_m);
   get(kf, "rot_deg", c.keyframe.rot_deg);
@@ -437,6 +437,7 @@ void load_debug(const YAML::Node& root, DebugConfig& c) {
   }
   get(n, "publish_clouds", c.publish_clouds);
   get(n, "publish_markers", c.publish_markers);
+  get(n, "publish_odom", c.publish_odom);
   get(n, "timing", c.timing);
   get(n, "telemetry_rate_hz", c.telemetry_rate_hz);
 }
@@ -515,6 +516,9 @@ bool Config::validate(std::string* error_out) const {
   }
   if (frontend.assoc_shift_thresh_m < 0.0 || frontend.assoc_shift_thresh_deg < 0.0) {
     return fail("frontend.assoc_shift_thresh_{m,deg} must be >= 0");
+  }
+  if (frontend.marg_prior_scale <= 0.0 || frontend.marg_prior_scale > 1.0) {
+    return fail("frontend.marg_prior_scale must be in (0, 1]");
   }
   if (frontend.bias.gyr_max <= 0.0 || frontend.bias.acc_max <= 0.0) {
     return fail("frontend.bias.{gyr_max,acc_max} must be > 0");

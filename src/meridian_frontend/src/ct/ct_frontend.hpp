@@ -9,6 +9,7 @@
 #include <optional>
 #include <vector>
 
+#include "ct/keyframe_finalizer.hpp"
 #include "ct/marginalization.hpp"
 #include "ct/residuals_gnss.hpp"
 #include "ct/residuals_imu.hpp"
@@ -16,6 +17,7 @@
 #include "ct/residuals_visual.hpp"
 #include "ct/spline_window.hpp"
 #include "ct/visual_map.hpp"
+#include "ct/window_problem.hpp"
 #include "meridian/calib/calibration_set.hpp"
 #include "meridian/calib/camera_model.hpp"
 #include "meridian/common/frontend_diagnostics.hpp"
@@ -59,6 +61,36 @@ public:
   NavState live_state() const override;
   void set_keyframe_sink(KeyframeSink sink) override;
   FrontEndDiagnostics diagnostics() const override;
+
+  // Test-only: force the window solve to a single Ceres thread even on the live
+  // (deterministic_==false) path. Lets a test drive the async keyframe worker while
+  // keeping the solved trajectory bit-reproducible against a synchronous reference, so
+  // the only variable under comparison is the covariance code path. No effect in
+  // production (never called there).
+  void set_force_single_thread_for_test(bool on) { force_single_thread_ = on; }
+
+  // Test-only bit-exact parity probe. When enabled, every live keyframe sweep records
+  // the pose marginal computed TWO ways on the identical solved state: (a) the
+  // synchronous routine on the live ceres::Problem, and (b) the worker routine on the
+  // rebuilt snapshot clone. The test asserts the two 6x6 blocks are bit-identical.
+  struct ParityProbeResult {
+    Eigen::Matrix<double, 6, 6> sync_cov;    // path (a): live problem
+    Eigen::Matrix<double, 6, 6> worker_cov;  // path (b): rebuilt snapshot
+    bool absolute_prior = false;
+    bool sync_ok = false;
+    bool worker_ok = false;
+  };
+  void set_parity_probe_for_test(bool on) { parity_probe_ = on; }
+  const std::vector<ParityProbeResult>& parity_probe_results_for_test() const {
+    return parity_probe_results_;
+  }
+
+  // Test-only: block until the async keyframe worker has emitted every keyframe
+  // submitted so far, so a test can assert on the emitted packets without racing the
+  // worker. No-op on the deterministic (synchronous) path.
+  void drain_keyframes_for_test() {
+    if (finalizer_) finalizer_->drain_for_test();
+  }
 
 private:
   // Integrate the group's IMU forward from the spline's last solved pose/velocity
@@ -132,6 +164,10 @@ private:
   // Bias knot cadence from config, floored at one millisecond.
   Duration biasKnotDt() const;
 
+  // Configured per-segment control-point cap, floored at 1 (a non-positive config
+  // value disables adaptive density and yields the uniform single-knot spline).
+  int maxControlPoints() const;
+
   // Warp the downsampled scan to world at each point's solved spline time and
   // insert it into the local map. `t0_scan` is the scan-start time the per-point
   // offsets are relative to.
@@ -161,6 +197,24 @@ private:
   // information is rank-deficient so the caller can fall back to poseMarginal.
   bool poseMarginalFromProblem(ceres::Problem& problem, Timestamp stamp,
                                Eigen::Matrix<double, 6, 6>* cov);
+
+  // Capture the final outer round's window-problem build inputs (value copies, so the
+  // record is self-contained once the live problem and spline have moved on). Filled on
+  // the live path's keyframe sweeps so emitKeyframe can package an async finalize job;
+  // unused on the deterministic path. `capped_hits`/`imu`/`patches` are the final round's
+  // data; the decisions (motion-reg engagement, tail/gauge/pin indices) mirror that round.
+  void captureFinalRound(Timestamp t_begin, Timestamp t_end, const std::vector<ImuSample>& imu,
+                         const ct::ImuWeights& weights,
+                         const std::vector<ct::LidarHit>& capped_hits,
+                         const std::vector<ct::VisualPatchParams>& patches,
+                         const VisualContext* vis, const GnssContext* gnss, bool motion_reg_engaged,
+                         const std::vector<Timestamp>& motion_reg_times,
+                         const std::vector<Timestamp>& tail_times, int first_pinned_knot);
+
+  // Package the captured final round + partial packet into a KeyframeJob and submit it to
+  // the finalizer; the worker fills constraint_cov. Live path only.
+  void submitKeyframeJob(KeyframePacket&& pkt, const Pose& T_world_body, Timestamp stamp,
+                         const std::vector<ct::LidarHit>& hits, bool absolute_prior);
 
   bool keyframeDue(const Pose& T_world_body, Timestamp stamp) const;
   void emitKeyframe(const Pose& T_world_body, Timestamp stamp,
@@ -208,7 +262,6 @@ private:
   // last_n_cp_ and returns the count in [1, n_cp_max].
   int selectKnotDensity(const std::vector<ImuSample>& imu);
 
-
   // Knot-midpoint times of the segments spanning [t_begin, t_end], the evaluation
   // points for the under-excitation regularizer.
   std::vector<Timestamp> segmentMidpointTimes(Timestamp t_begin, Timestamp t_end) const;
@@ -218,6 +271,14 @@ private:
   // Replay/sync determinism signal: when set, solveWindow ignores the wall-clock
   // deadline and runs the fixed iteration schedule so a recorded run is reproducible.
   bool deterministic_ = false;
+  // Compute the keyframe covariance inline on the sweep thread instead of on the
+  // async finalizer. Always true under deterministic_; additionally settable via the
+  // MERIDIAN_SYNC_KEYFRAME_COV env var as a live A/B diagnostic knob (same binary,
+  // sync-vs-async covariance path).
+  bool sync_cov_ = false;
+  // Test seam: pins the window solve to one Ceres thread on the live path (see
+  // set_force_single_thread_for_test). Always false in production.
+  bool force_single_thread_ = false;
 
   std::shared_ptr<const CalibrationSet> calib_;
   std::uint32_t calib_version_ = 0;
@@ -317,12 +378,50 @@ private:
   // dropped residual counts), surfaced as telemetry.
   ct::LidarCapStats last_cap_stats_;
 
+  // Sweep counter gating the per-family residual-stats probe: the extra per-family
+  // Problem::Evaluate sweep runs only every 5th sweep or on a keyframe sweep, so its
+  // cost stays bounded. Incremented once per solveWindow.
+  std::uint64_t resid_probe_counter_ = 0;
+
   // Pose-block marginal covariance (translation-first [rho; phi]) of the body pose
   // at the last solved sweep end, read from the window posterior in solveWindow
   // while the Ceres problem is alive. false until the first successful extraction;
   // emitKeyframe prefers it and falls back to the LiDAR-only poseMarginal otherwise.
   Eigen::Matrix<double, 6, 6> last_pose_cov_ = Eigen::Matrix<double, 6, 6>::Identity();
   bool have_pose_cov_ = false;
+
+  // ---- async keyframe-cov worker (live path only) ----
+  // On the live path the per-keyframe constraint covariance is computed off T2 by this
+  // worker: solveWindow captures the final round's build inputs into capture_, emitKeyframe
+  // packages them into a KeyframeJob, and the worker rebuilds the (bit-identical) problem
+  // and recovers the marginal a full keyframe interval before L3 needs it. The
+  // deterministic path leaves finalizer_ null and computes the marginal inline, preserving
+  // replay==live bit-exactness.
+  std::unique_ptr<KeyframeFinalizer> finalizer_;
+
+  // The final outer round's window-problem build inputs, captured by value on a live
+  // keyframe sweep. Held as a member so emitKeyframe can move it into the job; the
+  // contained pointers are rewired to the job's clones inside submitKeyframeJob.
+  struct WindowBuildCapture {
+    bool valid = false;
+    ct::WindowProblemInputs inputs;
+    std::unique_ptr<SplineWindow> spline_clone;
+    std::unique_ptr<ct::BiasKnots> bias_clone;
+    ct::GravityBlock gravity_clone{Eigen::Vector3d(0, 0, -1), 9.81};
+    std::unique_ptr<ct::MarginalizationPrior> prior_clone;
+    std::vector<ct::LidarHit> capped_hits;
+    std::vector<ImuSample> imu;
+  };
+  WindowBuildCapture capture_;
+
+  // Test-only parity probe state (see set_parity_probe_for_test).
+  bool parity_probe_ = false;
+  std::vector<ParityProbeResult> parity_probe_results_;
+
+  // A hard window reseed carried the pose across a data hole on a constant-velocity
+  // prediction whose error no covariance accounts for, so no relative keyframe edge
+  // may span it: the next keyframe is emitted as an AbsolutePrior chain break instead.
+  bool kf_chain_broken_ = false;
 };
 
 }  // namespace meridian

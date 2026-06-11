@@ -1,4 +1,6 @@
 #include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -65,15 +67,65 @@ class OdometryNode : public rclcpp::Node {
   Timestamp now_ns() { return static_cast<Timestamp>(get_clock()->now().nanoseconds()); }
 
   void create_subscriptions() {
-    const auto qos_cloud = rclcpp::SensorDataQoS().keep_last(5);
+    // Queue depths absorb bursty delivery (a stalled-then-catching-up bag player, or a
+    // driver hiccup on the robot) while the single executor thread drains the per-message
+    // convert/decode serially. A depth that the executor can drain before it refills adds
+    // no steady-state latency; too shallow silently overwrites whole scans at the rmw
+    // layer, invisible to every counter downstream. 20 clouds = 2 s of LiDAR; 40 frames
+    // = 2 s of camera.
+    //
+    // Reliability must MATCH the publisher: best-effort delivery of the fragmented
+    // multi-MB scans silently loses a double-digit fraction in flight when the host is
+    // under compute load (no retransmission), while a reliable reader pairs only with a
+    // reliable writer. cfg selects per deployment: reliable against the replay player's
+    // QoS override, best-effort against a sensor driver publishing best-effort.
+    auto qos_cloud = rclcpp::SensorDataQoS().keep_last(20);
+    if (cfg_.sensors.lidar.qos_reliable) {
+      qos_cloud.reliable();
+    }
     const auto qos_imu = rclcpp::SensorDataQoS().keep_last(400);
-    const auto qos_small = rclcpp::SensorDataQoS().keep_last(10);
+    const auto qos_small = rclcpp::SensorDataQoS().keep_last(40);
 
     sub_cloud_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         cfg_.sensors.lidar.topic, qos_cloud,
         [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+          // Intake audit + transport-loss gate: count every delivery, and infer scans
+          // lost UPSTREAM of this callback (rmw/transport) from the sensor-stamp
+          // discontinuity -- the stream ticks at the nominal period, so a hole of k
+          // periods means k-1 scans died before reaching us. Loss here is invisible to
+          // every downstream counter (the estimator only bridges the holes), so this is
+          // the one place it can be detected; a sustained ratio means the subscription
+          // reliability does not match the publisher or the transport is saturated.
+          ++lidar_cb_n_;
+          const Timestamp stamp = Timestamp(msg->header.stamp.sec) * 1000000000ll +
+                                  msg->header.stamp.nanosec;
+          if (last_lidar_stamp_ > 0 && cfg_.sensors.lidar.nominal_rate_hz > 0) {
+            const double period_ns = 1e9 / cfg_.sensors.lidar.nominal_rate_hz;
+            const double gap = static_cast<double>(stamp - last_lidar_stamp_);
+            const long missed = std::lround(gap / period_ns) - 1;
+            if (missed > 0) {
+              lidar_lost_upstream_ += missed;
+              const double frac = static_cast<double>(lidar_lost_upstream_) /
+                                  static_cast<double>(lidar_lost_upstream_ + lidar_cb_n_);
+              if (frac > 0.01) {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 10000,
+                    "TRANSPORT LOSS: %lu scans (%.1f%%) never reached this node -- "
+                    "lost upstream of the subscription (QoS reliability mismatch or "
+                    "saturated transport; see docs/REALTIME_DEBUGGING.md intake audit)",
+                    static_cast<unsigned long>(lidar_lost_upstream_), 100.0 * frac);
+              }
+            }
+          }
+          last_lidar_stamp_ = stamp;
+          sink_->scalar("wrapper/lidar/cb_n", static_cast<double>(lidar_cb_n_), stamp);
+          sink_->scalar("wrapper/lidar/lost_upstream_n",
+                        static_cast<double>(lidar_lost_upstream_), stamp);
           RawLidarFrame f;
           if (!to_raw_lidar(*msg, now_ns(), &lidar_scratch_, &f)) {
+            ++lidar_convert_rejected_;
+            sink_->scalar("wrapper/lidar/convert_rejected_n",
+                          static_cast<double>(lidar_convert_rejected_), stamp);
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
                                  "dropping scan: missing x/y/z or per-point time field");
             return;
@@ -205,6 +257,11 @@ class OdometryNode : public rclcpp::Node {
   // Reused conversion buffer for incoming scans; only ever touched by the single executor
   // thread that runs the subscription callbacks.
   std::vector<RawPoint> lidar_scratch_;
+  // Intake audit (lidar callback only; executor-serialized so plain members suffice).
+  std::uint64_t lidar_cb_n_ = 0;
+  std::uint64_t lidar_lost_upstream_ = 0;
+  std::uint64_t lidar_convert_rejected_ = 0;
+  Timestamp last_lidar_stamp_ = 0;
   std::atomic<std::uint64_t> group_count_{0};
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_cloud_;

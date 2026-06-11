@@ -117,16 +117,16 @@ struct VisualUsedPoint {
 // arrays and exposures are fixed at build time (the image model is linearized at the
 // projected centre, so every pixel shares the same du).
 struct VisualPatchParams {
-  Eigen::Quaterniond q_fe_c;          // T_fe_cam rotation
-  Eigen::Vector3d t_fe_c;             // T_fe_cam translation
-  Eigen::Vector3d p_world;            // tracked 3-D point (world frame)
-  Eigen::Matrix<double, 2, 3> Jpi;    // projection Jacobian at p_c0
-  Eigen::Vector3d p_c0;               // linearization point in the current camera frame
-  double u = 0.0;                     // normalized segment position
-  double tau_ref = 1.0;               // reference-frame inverse exposure (fixed)
-  double weight = 1.0;                // photometric whitening weight
-  std::vector<double> ref_patch;      // exposure-folded warped reference patch
-  std::vector<double> cur_I0;         // current patch intensities at the centre tap
+  Eigen::Quaterniond q_fe_c;              // T_fe_cam rotation
+  Eigen::Vector3d t_fe_c;                 // T_fe_cam translation
+  Eigen::Vector3d p_world;                // tracked 3-D point (world frame)
+  Eigen::Matrix<double, 2, 3> Jpi;        // projection Jacobian at p_c0
+  Eigen::Vector3d p_c0;                   // linearization point in the current camera frame
+  double u = 0.0;                         // normalized segment position
+  double tau_ref = 1.0;                   // reference-frame inverse exposure (fixed)
+  double weight = 1.0;                    // photometric whitening weight
+  std::vector<double> ref_patch;          // exposure-folded warped reference patch
+  std::vector<double> cur_I0;             // current patch intensities at the centre tap
   std::vector<Eigen::Vector2d> cur_grad;  // current patch image gradients
 };
 
@@ -142,12 +142,26 @@ ceres::CostFunction* makeVisualPatchCost(const VisualPatchParams& p);
 // derivative-correctness tests as the parity reference.
 ceres::CostFunction* makeVisualPatchCostAutodiff(const VisualPatchParams& p);
 
+// `out_patches`, when non-null, receives the VisualPatchParams of every accepted patch
+// in build order -- the self-contained inputs makeVisualPatchCost consumed. Replaying
+// makeVisualPatchCost on these against the same knot segment / exposure block rebuilds
+// a bit-identical residual set without re-running association or touching the image.
 VisualAssocStats addVisualResiduals(ceres::Problem& problem, SplineWindow& spline,
                                     const CameraModel& cam, const Pose& T_fe_cam,
                                     const ImagePyramidView& img, Timestamp t_mid_expo,
                                     ExposureChain& expo, std::size_t expo_index,
                                     const VisualMap& vmap, const FrontendVisual& cfg,
-                                    std::vector<VisualUsedPoint>* used);
+                                    std::vector<VisualUsedPoint>* used,
+                                    std::vector<VisualPatchParams>* out_patches = nullptr);
+
+// Replays the photometric residuals from captured VisualPatchParams against `spline`'s
+// segment at `t_mid_expo` and the `expo_index` exposure block, in the given order, using
+// the same cost factory and Huber loss as addVisualResiduals. Bit-identical to the live
+// build provided the spline knot values, t_mid_expo, and exposure block match. Returns
+// the number of residuals added.
+int replayVisualResiduals(ceres::Problem& problem, SplineWindow& spline, Timestamp t_mid_expo,
+                          ExposureChain& expo, std::size_t expo_index,
+                          const std::vector<VisualPatchParams>& patches);
 
 // --- exposed for unit testing the smooth (autodiff) part in isolation ---
 

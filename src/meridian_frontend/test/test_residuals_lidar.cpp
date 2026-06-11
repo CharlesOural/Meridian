@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -470,6 +471,83 @@ TEST(ResidualsLidar, RecoversTrajectoryFromPerturbedKnots) {
     EXPECT_LT((fit.t - truth.t).norm(), 8e-2) << "t=" << t;
     const double ang = fit.q.angularDistance(truth.q);
     EXPECT_LT(ang, 5e-2) << "t=" << t;
+  }
+}
+
+// Parallel association is deterministic and order-stable: the schedule(static) split
+// gives each thread a contiguous ascending point range, and the per-thread hit buffers
+// are merged in thread-index order, so the produced hit set and its order are identical
+// across repeated runs. The downstream cap selects survivors by a stride over the
+// (t_offset_ns, ring) key, which is only replay-stable if associate()'s output order is
+// itself stable -- this asserts that property. A large scan is used so >1 thread engages.
+TEST(ResidualsLidar, ParallelAssociateIsDeterministicAndOrderStable) {
+  const GroundTruth gt;
+  const FrontendLidar cfg = makeCfg();
+  const Duration knot_dt = 25'000'000;
+  const Timestamp t0 = 0;
+  const Timestamp t_end = 200'000'000;
+
+  const Pose T_fe_lidar(Sophus::SO3d::exp(Eigen::Vector3d(0.02, -0.03, 0.05)).unit_quaternion(),
+                        Eigen::Vector3d(0.1, 0.0, -0.05));
+
+  BoxRoom room;
+  LidarLocalMap map(cfg);
+  map.insert(room.wallPoints(0.1));
+  ASSERT_TRUE(map.initialized());
+
+  SplineWindow spline = makeSpline(gt, t0, t_end, knot_dt);
+  const auto kts = knotTimes(t0, t_end, knot_dt, 1);
+  reseedToGroundTruth(spline, gt, kts);
+
+  // A dense scan (finer wall grid) so the point count is well above the thread count and
+  // the static chunking actually distributes work across threads.
+  std::vector<LidarPoint> scan;
+  {
+    const std::vector<Eigen::Vector3d> walls = room.interiorWallPoints(0.5, 0.15);
+    const int n = static_cast<int>(walls.size());
+    scan.reserve(walls.size());
+    for (int i = 0; i < n; ++i) {
+      const auto frac = static_cast<double>(i) / static_cast<double>(n);
+      const Timestamp t = t0 + static_cast<Timestamp>(frac * t_end);
+      const Pose T_w_l = gt.pose(tSec(t)) * T_fe_lidar;
+      const Eigen::Vector3d p_l = T_w_l.inverse() * walls[i];
+      LidarPoint lp;
+      lp.xyz = p_l.cast<float>();
+      lp.t_offset_ns = static_cast<std::int32_t>(t - t0);
+      lp.ring = static_cast<std::uint16_t>(i % 64);
+      scan.push_back(lp);
+    }
+  }
+  ASSERT_GT(scan.size(), 200u);
+
+  std::vector<LidarHit> a;
+  std::vector<LidarHit> b;
+  const LidarAssocStats sa = associate(spline, T_fe_lidar, scan, t0, map, cfg, &a);
+  const LidarAssocStats sb = associate(spline, T_fe_lidar, scan, t0, map, cfg, &b);
+
+  ASSERT_GT(sa.accepted, 0);
+  EXPECT_EQ(sa.attempted, sb.attempted);
+  EXPECT_EQ(sa.matched, sb.matched);
+  EXPECT_EQ(sa.accepted, sb.accepted);
+  ASSERT_EQ(a.size(), b.size());
+  ASSERT_EQ(static_cast<int>(a.size()), sa.accepted);
+
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    EXPECT_EQ(a[i].t_offset_ns, b[i].t_offset_ns) << "hit " << i;
+    EXPECT_EQ(a[i].ring, b[i].ring) << "hit " << i;
+    EXPECT_EQ(a[i].t, b[i].t) << "hit " << i;
+    EXPECT_EQ(a[i].p_world, b[i].p_world) << "hit " << i;  // bit-exact, not near
+    EXPECT_EQ(a[i].p_lidar, b[i].p_lidar) << "hit " << i;
+    EXPECT_EQ(a[i].plane.n, b[i].plane.n) << "hit " << i;
+    EXPECT_EQ(a[i].plane.d, b[i].plane.d) << "hit " << i;
+    EXPECT_EQ(a[i].weight, b[i].weight) << "hit " << i;
+  }
+
+  // Output order is ascending in the per-point time key the cap relies on, since each
+  // thread keeps its contiguous range in scan order and the merge preserves thread order
+  // (the scan's t_offset_ns is monotonic in index here).
+  for (std::size_t i = 1; i < a.size(); ++i) {
+    EXPECT_LE(a[i - 1].t_offset_ns, a[i].t_offset_ns) << "order break at " << i;
   }
 }
 
@@ -1002,3 +1080,13 @@ TEST(AnalyticLidarCost, ResidualMatchesAutodiffFunctor) {
     EXPECT_NEAR(r_analytic, r_ref, 1e-12) << "trial " << trial;
   }
 }
+
+// ---------------------------------------------------------------------------
+// iVox / ikd-Tree backend equivalence: the same stored point set must yield the
+// same plane fit through both backends.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+}  // namespace
+

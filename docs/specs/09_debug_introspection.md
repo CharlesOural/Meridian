@@ -742,8 +742,7 @@ time around the GPU launch + sync.
 
 ### 6.2 Worked example — reading a timing stream
 
-A healthy 10 Hz LiDAR + 20 Hz camera run on the FusionPortable rig should show
-roughly (Jetson Orin):
+A healthy 10 Hz LiDAR + 20 Hz camera run should show roughly (Jetson Orin):
 
 ```
 preprocess              ~3 ms      frontend.lidar_assoc   ~6 ms
@@ -1225,9 +1224,10 @@ vs `BagReplaySource`, spec 01 §7.1) and the bound sink. Therefore:
 
 ### 13.3 The regression use
 
-A CI replay test binds a `RecordingSink`, runs a short FusionPortable/M2DGR
-segment (`DATASET.md`), and asserts on telemetry: e.g. `frontend/lidar/inlier_ratio`
-median > 0.6, `frontend/visual/n_tracked` median > 30, no `frontend/window_restart`
+A CI replay test binds a `RecordingSink`, runs a short Newer College segment
+(`DATASET.md`), and asserts on telemetry: e.g. `frontend/lidar/inlier_ratio`
+median > 0.6, `frontend/visual/n_tracked` median > 30 (once the visual stage
+runs on these bags), no `frontend/window_restart`
 event, final `backend/chi2` within tolerance of golden, ATE from
 `corrected_trajectory()` under threshold. **This is debugging-as-testing** — the
 same signals an operator watches are the signals CI gates on. FAST-LIO cannot do

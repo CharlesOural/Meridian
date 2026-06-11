@@ -14,8 +14,8 @@ Usage (inside the dev container, after sourcing the workspace):
     python3 tools/record_tum.py OUT.tum [--topic /meridian/odom]
 
 Then play the bag as usual; Ctrl-C this script when the bag finishes. Compare
-against the FusionPortable ground truth with evo (optional, see docs/TESTING.md):
-    evo_ape tum GT.tum OUT.tum -a
+against the sequence's ground truth (see docs/TESTING.md):
+    python3 tools/eval_ate.py GT.txt OUT.tum
 """
 import argparse
 import sys
