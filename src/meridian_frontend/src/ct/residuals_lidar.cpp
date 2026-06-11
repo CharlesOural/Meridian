@@ -153,14 +153,15 @@ std::vector<LidarPoint> voxelDownsample(const std::vector<LidarPoint>& pts,
 struct LidarLocalMap::Impl {
   explicit Impl(const FrontendLidar& cfg)
       : tree(std::make_unique<KD_TREE<ikdTree_PointType>>(0.3f, 0.6f, 0.2f)) {
-    const double v = cfg.voxel_map_m > 1e-3 ? cfg.voxel_map_m : 1e-3;
-    tree->set_downsample_param(static_cast<float>(v));
+    voxel_m = cfg.voxel_map_m > 1e-3 ? static_cast<float>(cfg.voxel_map_m) : 1e-3f;
+    tree->set_downsample_param(voxel_m);
     num_match_points = cfg.num_match_points > 0 ? cfg.num_match_points : 5;
     max_match_dist_sq = cfg.max_match_dist_sq;
     plane_thresh = cfg.plane_thresh;
   }
 
   std::unique_ptr<KD_TREE<ikdTree_PointType>> tree;
+  float voxel_m = 1e-3f;  // downsample pitch, retained so a rebuild matches the live tree
   int num_match_points = 5;
   double max_match_dist_sq = 5.0;
   double plane_thresh = 0.1;
@@ -208,6 +209,37 @@ void LidarLocalMap::insert(const std::vector<Eigen::Vector3d>& pts_world) {
   } else {
     impl_->tree->Add_Points(add, true);
   }
+}
+
+void LidarLocalMap::transform(const Pose& delta) {
+  const std::unique_lock<std::shared_mutex> lock(impl_->search_mutex);
+  if (impl_->tree->size() == 0) {
+    return;
+  }
+  // Pull every live point out via a box search over the tree's own bounding box; the tree
+  // has no in-place rigid transform.
+  KD_TREE<ikdTree_PointType>::PointVector pts;
+  impl_->tree->Box_Search(impl_->tree->tree_range(), pts);
+
+  const Eigen::Matrix3d dR = delta.q.toRotationMatrix();
+  for (ikdTree_PointType& pt : pts) {
+    const Eigen::Vector3d p(pt.x, pt.y, pt.z);
+    const Eigen::Vector3d q = dR * p + delta.t;
+    pt.x = static_cast<float>(q.x());
+    pt.y = static_cast<float>(q.y());
+    pt.z = static_cast<float>(q.z());
+  }
+
+  // Rebuild from the shifted points. The points are already at the map's voxel resolution,
+  // so Build (no further downsample) reproduces it; the downsample pitch is reapplied so
+  // later inserts stay consistent. The old tree (and its rebuild thread) is torn down here.
+  impl_->tree = std::make_unique<KD_TREE<ikdTree_PointType>>(0.3f, 0.6f, 0.2f);
+  impl_->tree->set_downsample_param(impl_->voxel_m);
+  impl_->tree->Build(pts);
+
+  // The trim cube was seeded in the old frame; drop it so the next trimAround re-centres
+  // around the shifted body rather than sliding the whole map out in one step.
+  impl_->cube_init = false;
 }
 
 void LidarLocalMap::trimAround(const Eigen::Vector3d& center, double cube_m) {

@@ -2335,9 +2335,8 @@ void CtFrontEnd::apply_correction(const GraphUpdate& update) {
     return;
   }
   // Re-anchor odom: shift every spline control pose by the rigid correction implied
-  // by the most recent moved keyframe. The local map is left in the old odom frame;
-  // no map rebuild is performed (the map is re-anchored implicitly at the next
-  // insert from the shifted trajectory).
+  // by the most recent moved keyframe, and re-anchor the local map by the same delta so
+  // the next scan-to-map association sees a consistent frame.
   const GraphUpdate::Moved& m = update.moved.back();
   if (m.id != prev_kf_id_) {
     return;
@@ -2360,14 +2359,20 @@ void CtFrontEnd::apply_correction(const GraphUpdate& update) {
   }
 
   // Re-anchor odom: the integration anchor, the previous-keyframe pose, and the live
-  // state all shift by the same delta. The local map is left in the old odom frame
-  // (no rebuild); subsequent inserts re-anchor it implicitly from the shifted curve.
+  // state all shift by the same delta.
   anchor_pose_ = delta * anchor_pose_;
   anchor_vel_ = delta.q * anchor_vel_;
   prev_kf_pose_ = m.new_T_map_body;
 
   live_state_.T_world_body = delta * live_state_.T_world_body;
   live_state_.v_world = delta.q * live_state_.v_world;
+
+  // Re-anchor the LiDAR local map by the same rigid delta. Without this the freshly
+  // shifted trajectory would register the next scan against a map still in the old frame,
+  // and the resulting point-to-plane mismatch compounds sweep over sweep into divergence.
+  if (map_ && cfg_.lidar.rebase_local_map) {
+    map_->transform(delta);
+  }
 }
 
 }  // namespace meridian

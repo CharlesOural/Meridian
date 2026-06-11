@@ -291,6 +291,11 @@ struct FrontendLidar {
   // bounding map RAM and nearest-neighbour search depth. Non-positive disables trimming
   // (the map grows for the whole trajectory).
   double local_map_cube_m = 500.0;
+  // On a back-end correction, rigidly re-anchor the ikd-Tree local map by the same delta as
+  // the trajectory (flatten + transform + rebuild) so scan-to-map stays in one frame. Off
+  // leaves the map in the pre-correction frame (the next insert re-anchors implicitly); kept
+  // as an escape hatch since the rebuild is the one heavy step on the correction path.
+  bool rebase_local_map = true;
 };
 struct FrontendVisual {
   // Master gate for the sparse-direct photometric stage. When off (or when the
@@ -427,6 +432,10 @@ struct BackendConfig {
   double obs_inflation_gamma = 2.0;
   double degenerate_thresh = 0.05;  // score below = degenerate
   bool degenerate_lock = true;      // hard-lock worst axis if degenerate
+  // Feed an admitted loop/GNSS correction back into the front-end (re-anchor its spline and
+  // local map onto the corrected estimate). Off decouples the front-end as pure odometry and
+  // lets the back-end own the global map -- a useful A/B and a safe fallback.
+  bool correct_frontend = true;
   // loops + PCM
   double loop_min_fitness = 0.5;  // reject low GICP fitness
   double pcm_chi2_alpha = 0.99;

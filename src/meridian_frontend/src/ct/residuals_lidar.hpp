@@ -59,6 +59,13 @@ class LidarLocalMap {
   // A non-positive cube_m is a no-op (trimming disabled).
   void trimAround(const Eigen::Vector3d& center, double cube_m);
 
+  // Rigidly re-anchors the whole map by `delta` (left action: p -> delta.q*p + delta.t)
+  // so it stays consistent with a trajectory that was just shifted by the same delta (a
+  // loop-closure re-anchor). The tree has no in-place transform, so every point is pulled
+  // out, transformed, and the tree rebuilt; the trim cube is invalidated so the next
+  // trimAround re-seeds it around the shifted body. A no-op on an empty map.
+  void transform(const Pose& delta);
+
   // Resolves every pending lazy push-down the tree carries, single-threaded, under the
   // exclusive lock. insert()/trimAround() mark interior nodes with deferred delete/
   // downsample flags that a later search would otherwise settle lazily by writing a

@@ -289,6 +289,7 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   get(lid, "min_factors_per_normal", c.lidar.min_factors_per_normal);
   get(lid, "normal_strata", c.lidar.normal_strata);
   get(lid, "local_map_cube_m", c.lidar.local_map_cube_m);
+  get(lid, "rebase_local_map", c.lidar.rebase_local_map);
   const YAML::Node vis = n["visual"];
   get(vis, "enable", c.visual.enable);
   get(vis, "patch", c.visual.patch);
@@ -343,6 +344,7 @@ void load_backend(const YAML::Node& root, BackendConfig& c) {
   get(n, "obs_inflation_gamma", c.obs_inflation_gamma);
   get(n, "degenerate_thresh", c.degenerate_thresh);
   get(n, "degenerate_lock", c.degenerate_lock);
+  get(n, "correct_frontend", c.correct_frontend);
   get(n, "loop_min_fitness", c.loop_min_fitness);
   get(n, "pcm_chi2_alpha", c.pcm_chi2_alpha);
   get(n, "pcm_max_nodes", c.pcm_max_nodes);

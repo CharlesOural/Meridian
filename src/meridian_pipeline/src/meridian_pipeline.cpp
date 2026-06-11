@@ -493,7 +493,7 @@ void MeridianPipeline::publish_graph_update(const GraphUpdate& gu) {
   // against a marginalization prior that stays at its old linearization point, which the
   // front-end then has to fight on every sweep. L4 still sees every moved keyframe through
   // the unconditional graph-update sink below.
-  if (gu.loop_closed) {
+  if (gu.loop_closed && cfg_.backend.correct_frontend) {
     std::lock_guard<std::mutex> lock(correction_mu_);
     pending_correction_ = gu;
   }
