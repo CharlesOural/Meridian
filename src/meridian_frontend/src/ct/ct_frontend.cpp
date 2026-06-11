@@ -7,6 +7,7 @@
 #include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -765,6 +766,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     // the cap never collapses the very axis observability protects. The outer-step
     // index rotates the per-stratum stride phase so the visited subset moves across
     // rounds while staying replay-identical.
+    const auto t_assemble = Clock::now();
     const std::vector<Eigen::Vector3d> weak_axes = weakTranslationAxes(*hits);
     last_cap_stats_ =
         ct::capHitsByNormalStrata(*hits, cfg_.lidar, round, weak_axes, kWeakAxisCos, &capped_hits);
@@ -780,6 +782,9 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     fam_mark = problem.NumResidualBlocks();
     ct::addBiasRandomWalk(problem, *bias_, weights);
     fam_range[kFamBias] = {fam_mark, problem.NumResidualBlocks()};
+    if (telemetry_) {
+      telemetry_->timing("frontend.ct.assemble", ms_since(t_assemble), t_end);
+    }
 
     // Tail anchors over the span past the newest measurement: tie the spline's
     // velocity and body rate there to the seed's constant extrapolation. The pinning
@@ -1008,6 +1013,14 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
       ceres::Solver::Summary summary;
       ceres::Solve(sopts, &problem, &summary);
       total_iters += static_cast<int>(summary.iterations.size());
+      if (telemetry_) {
+        telemetry_->timing("frontend.ct.solve.residual_eval",
+                           summary.residual_evaluation_time_in_seconds * 1e3, t_end);
+        telemetry_->timing("frontend.ct.solve.jacobian_eval",
+                           summary.jacobian_evaluation_time_in_seconds * 1e3, t_end);
+        telemetry_->timing("frontend.ct.solve.linear_solver",
+                           summary.linear_solver_time_in_seconds * 1e3, t_end);
+      }
       if (total_budget_s > 0.0 && total_iters >= min_iters_floor &&
           ms_since(solve_start) * 1e-3 >= total_budget_s) {
         deadline_hit = true;
@@ -1417,6 +1430,7 @@ void CtFrontEnd::updateMap(const std::vector<LidarPoint>& scan_ds, Timestamp t0_
   // trajectory warp. Keeping it out of the map stops one bad solve from poisoning
   // every later association.
   constexpr double kMaxInsertRangeM = 200.0;
+  const auto t_warp = Clock::now();
   std::vector<Eigen::Vector3d> world;
   world.reserve(scan_ds.size());
   int rejected = 0;
@@ -1433,19 +1447,30 @@ void CtFrontEnd::updateMap(const std::vector<LidarPoint>& scan_ds, Timestamp t0_
     }
     world.push_back(p_w);
   }
+  if (telemetry_) {
+    telemetry_->timing("frontend.ct.map.warp", ms_since(t_warp), last_solved_t_);
+  }
   if (rejected > 0 && telemetry_) {
     telemetry_->scalar("frontend/map/insert_rejected", static_cast<double>(rejected),
                        last_solved_t_);
   }
   if (!world.empty()) {
+    const auto t_insert = Clock::now();
     map_->insert(world);
+    if (telemetry_) {
+      telemetry_->timing("frontend.ct.map.insert", ms_since(t_insert), last_solved_t_);
+    }
   }
   // Segment the ikd-Tree to a cube around the current body so map RAM and the per-point
   // nearest-neighbour search depth stay bounded over a long mission.
+  const auto t_trim = Clock::now();
   map_->trimAround(anchor_pose_.t, cfg_.lidar.local_map_cube_m);
   // Resolve every deferred push-down the insert/trim left behind so the next sweep's
   // parallel association only ever reads settled node flags and cannot race on them.
   map_->flushPendingDeletes();
+  if (telemetry_) {
+    telemetry_->timing("frontend.ct.map.trim", ms_since(t_trim), last_solved_t_);
+  }
 }
 
 void CtFrontEnd::publishPatchOverlay(const cv::Mat& intensity, Timestamp t_image,
@@ -2016,6 +2041,18 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
     last_obs_ = computeObservability(T_world_end, hits);
   }
   diag_.observability = last_obs_;
+
+  // Per-axis observability score (lambda/(lambda+kappa) in [0,1], translation-first
+  // [tx,ty,tz,rx,ry,rz]); a value near 0 is an unconstrained DOF. Published every
+  // solve so a degenerate axis is visible over time, not only inside a keyframe.
+  // One atomic vector (not six scalars): a burst of per-axis messages is dropped
+  // front-first by a best-effort subscriber, which silently loses the tx/ty axes.
+  if (telemetry_) {
+    const auto& s = last_obs_.score;
+    Eigen::Matrix<double, 6, 1> ov(s[0], s[1], s[2], s[3], s[4], s[5]);
+    telemetry_->vec("frontend/obs", ov, t_end, "tx,ty,tz,rx,ry,rz");
+    telemetry_->scalar("frontend/obs_min", *std::min_element(s.begin(), s.end()), t_end);
+  }
 
   {
     const auto t_map = Clock::now();

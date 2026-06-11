@@ -1,7 +1,39 @@
 # Real-time debugging (front-end, on target)
 
 Field guide for "the trajectory looks wrong on the Jetson." Specs own the design;
-this is triage. Tools: `tools/run_bag_headless.sh`, `tools/eval_ate.py`.
+this is triage.
+
+## Tooling (run this before interpreting anything)
+
+```bash
+# Deterministic offline replay — THE way to evaluate accuracy / run A/Bs.
+# Reads the bag directly (no ROS transport), pipeline in Replay mode: lossless,
+# solver deadline off, byte-identical output across runs, parallel-safe.
+install/meridian_ros/lib/meridian_ros/replay_runner \
+    <cfg.yaml> <bag_dir> out.tum [max_content_secs]
+
+# Live-path run (nondeterministic: lossy transport + wall-clock budget; use for
+# integration/viz, NOT for accuracy conclusions) -> full report + figure:
+tools/run_eval.sh --config <cfg.yaml> --rate 0.25 --secs 485 --name myrun \
+    --gt <GT.tum> --diagnose
+
+# Re-diagnose existing artifacts without re-running:
+tools/diagnose_run.py --est myrun.tum --gt GT.tum --events myrun_events.txt \
+    --stage-timing myrun_stage.txt --name myrun
+
+# A/B several runs at a glance (ATE / onset / phantom table + overlay plot):
+tools/compare_runs.py --gt GT.tum a=a.tum b=b.tum c=c.tum
+```
+
+Always look at `diagnose_run`'s sections **in order**: a wrong trajectory is
+useless to interpret until [1] confirms the GT is trustworthy (it flags an
+identity-quaternion GT and disables heading metrics) and [2] says what the
+platform physically did (stationary / in-place-turn / forward). The
+**phantom-motion** metric (estimate translating while the platform is still)
+catches rotation-as-translation failures that ATE alone hides. Plot first.
+
+Other tools: `tools/run_bag_headless.sh` (legacy distrobox runner),
+`tools/eval_ate.py`.
 
 ## The failure mode you'll hit: overload, not divergence
 
@@ -134,3 +166,6 @@ marginalization blankets, so sustained loss inflates the `marg` tail.
 - **Background load mis-attributed a "regression"** (294→752 drops; a streaming encoder
   at ~65% CPU). The matched A/B showed the async cov worker *reduces* restarts 25→0-1;
   hence the preflight load check.
+- **Never `colcon build` while a replay is running** — with `--symlink-install` the
+  rebuild swaps the shared libraries under the live process, which then wedges or
+  silently runs mixed-version code. Finish or kill replays first.

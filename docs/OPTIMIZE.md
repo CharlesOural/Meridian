@@ -95,18 +95,19 @@ rows below.
 
 | knob | now | trades |
 |---|---|---|
-| `visual.enable` | true | false → drop the whole photometric stage (~20 ms), clean LIO ~7.5 cm. Biggest cut. |
+| `visual.enable` | true (garden_day); **false (legged_underground)** | false → drop the whole photometric stage (~20 ms), clean LIO ~7.5 cm. Biggest cut. On the legged bag the stage is also an accuracy hazard: in the dark corridor it diverges the estimate (full-bag replay 340–2834 m vs 4.5 m off; the well-lit first 120 s are fine at 1.3 m). Low-light gating needed before re-enabling there. |
 | camera (`sensors.camera`) | FLIR 1024×768 | DAVIS `event_cam00` 346×260 ≈ 8× fewer pixels in the visual stage |
 | `lidar.num_match_points` | 5 | ↓ = fewer NN neighbours per assoc query |
 | (settled) iVox map backend — REMOVED | n/a | A/B benchmarked then removed (don't re-attempt). Exact stencil diverged (1331 voxels at radius 2.236 m / voxel 0.6 m); approx stencil=1 (27 vox) *tied* ikd-Tree (~22 vs ~21 ms, ATE 0.108 vs 0.103). iVox only wins at radius≈voxel (Faster-LIO regime), not our ratio 3.7. The map structure was never the lever — parallel association was. |
 | `solver.time_limit_ms` | 90 | hard per-sweep solve cap (safety, not tuning); ↓ bounds latency but shallows the solve |
-| `max_outer_iters` / `reassoc_steps` | 2 / 2 (yaml; code default 4 / 2) | ↓ = fewer re-association passes → less assoc+solve, less refinement |
+| `max_outer_iters` / `reassoc_steps` | 2 / 2 (newer-college yamls; code default 4 / 2); **6 / 2 + `solver_max_iterations` 12 (legged_underground)** | ↓ = fewer re-association passes → less assoc+solve, less refinement. On the legged bag the 5/4 caps under-converge the corridor walk and diverge at t≈188 s even with the deadline off (replay ATE 340 m vs 4.5 m at 12/6); live, `time_limit_ms` gates the schedule either way. |
 | ceres `num_threads` — marginalization (marginalization.cpp) | 1 | the window solve is threaded (above); the marginalization solve could follow the same determinism-gated pattern if it shows up in profiling |
 
 ## Accuracy / robustness constants (change only with GT in hand)
 
 | knob | now | role |
 |---|---|---|
+| `sensors.imu.cov_*` (legged_underground) | ≈×40 the calib Allan densities | IMU-vs-LiDAR trust. Static-calib Allan floors over-trust the IMU under locomotion vibration: calib values diverge (448 m ATE / 120 s), ×10 still diverges (116 m), ×20 holds (0.5 m), ×40 holds (0.6 m; shipped values 0.2 m, full bag 4.5 m / 161 m). Set per platform from a GT replay sweep, not from the calib file. |
 | `spline.n_cp_max` | 1 | adaptive knot density; >1 DIVERGES until the warm-start redesign lands (task #62) — see tested-and-rejected above |
 | `marg_prior_scale` | **0.5** (all deployed configs, `newer-college-*.yaml`; code default 1.0) | multiplier in (0,1] on the marginalization-prior information at build time (sqrt(scale) on J0/r0: GN step direction preserved, confidence deflated = exponential forgetting per slide; 1.0 skips the multiply, bit-identical to pre-knob builds). **THE complete-stream fix.** Attribution matrix (complete 10 Hz, 0 bridges): 1.0 = 0.894 m rmse, prior RMS growing 3.7→7.4, accel bias locked ~0.16 m/s² (unbroken prior chain bakes in early bias/tilt error); **0.5 = 0.083 rmse / 0.064 mean**, prior RMS flat ~1.3-2.5, accel bias relaxes to 0.01-0.09; 0.1 = 0.087 (plateau). Cross-checks: `max_lidar_factors` 1500 = nil (0.951); LIO-only = partial (0.498); **`voxel_map_m` 0.5's apparent win (0.089) is CONFOUNDED — its load re-thinned the stream (313 bridges); do not re-tune voxel from that run.** Newer College full-bag A/B (quad-easy, LIO-only, corrected IMU noise): 0.5 = consistent {0.193, 0.159} rmse; 1.0 = **bimodal lottery {0.078, 1.172}** across identical runs — the overconfident chain makes accuracy depend on nondeterministic live-replay timing. Keep 0.5: forgetting buys run-to-run consistency, the property a benchmark baseline needs. Short-clip A/Bs of this knob are invalid (effects are cumulative; a 90 s A/B inverted the verdict twice). |
 | `spline.window_knots` / `knot_dt_ms` | 8 / 100 | window length (knots) / one knot per 10 Hz sweep |
