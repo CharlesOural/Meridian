@@ -167,17 +167,23 @@ TEST(MeridianPipeline, BackendTapSeesKeyframesThenAnchoredGnss) {
   fx.pipeline->set_backend_tap(
       [&](const MeridianPipeline::BackendItem& item) { items.push_back(item); });
   std::vector<std::uint64_t> sink_ids;
-  fx.pipeline->set_keyframe_sink(
-      [&](KeyframePacket&& kf) { sink_ids.push_back(kf.id); });
+  fx.pipeline->set_keyframe_sink([&](KeyframePacket&& kf) { sink_ids.push_back(kf.id); });
 
-  // Converge the IMU init, then one covered sweep carrying one accepted GNSS fix.
+  // The front-end bootstraps on the first solved sweep and emits its first keyframe on the
+  // second, so drive several sweeps; one window carries an accepted GNSS fix.
   const Timestamp t0 = 1'000 * kMs;
-  for (int i = 0; i < 12; ++i) fx.push_imu(t0 + i * 10 * kMs);
-  fx.push_scan(t0 + 130 * kMs);
-  fx.push_gnss(t0 + 170 * kMs);
-  fx.push_imu(t0 + 240 * kMs);
-  fx.push_imu(t0 + 250 * kMs);
-  ASSERT_EQ(fx.groups.size(), 1u);
+  for (int i = 0; i < 5; ++i) fx.push_imu(t0 + i * 10 * kMs);
+  fx.push_scan(t0 + 50 * kMs);
+  fx.push_imu(t0 + 150 * kMs);
+  for (int i = 16; i < 20; ++i) fx.push_imu(t0 + i * 10 * kMs);
+  fx.push_scan(t0 + 200 * kMs);
+  fx.push_imu(t0 + 300 * kMs);
+  fx.push_scan(t0 + 350 * kMs);
+  fx.push_imu(t0 + 460 * kMs);
+  fx.push_scan(t0 + 500 * kMs);
+  fx.push_gnss(t0 + 550 * kMs);  // inside scan-500's sweep window, after a keyframe has emitted
+  fx.push_imu(t0 + 610 * kMs);
+  ASSERT_GE(fx.groups.size(), 3u);
 
   // The tap saw the same keyframes the wrapper sink did, in the same order, and each
   // keyframe item was fed before the sink's move consumed it.
