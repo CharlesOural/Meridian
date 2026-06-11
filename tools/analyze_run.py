@@ -89,7 +89,9 @@ def parse_scalars(path, keys):
                     val = None
                 inv = False
             elif line.startswith("---"):
-                if key in data and sec is not None and val is not None:
+                # Some scalars are emitted with stamp 0 (e.g. backend/queue_depth on the
+                # cadence path); drop them so they don't land at t=0 and wreck the axis.
+                if key in data and sec is not None and sec > 0 and val is not None:
                     data[key][0].append(sec + ns * 1e-9)
                     data[key][1].append(val)
                 sec = ns = key = val = None
@@ -190,6 +192,7 @@ def main():
         if onset is not None:
             ax.axvline(onset - t0, color="blue", ls="--", lw=1)
     axes[-1].set_xlabel("time since start [s]  (red=drop, green=loop, blue=onset)")
+    axes[0].set_xlim(tr.min() - 2, tr.max() + 2)  # guard against stray-stamp outliers
     axes[0].set_title(os.path.basename(args.run_dir))
     fig.tight_layout()
     fig.savefig(out + "_timeline.png", dpi=110)
