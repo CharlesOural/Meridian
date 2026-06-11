@@ -13,6 +13,7 @@
 using meridian::Config;
 using meridian::GnssFix;
 using meridian::KeyframePacket;
+using meridian::Marker;
 using meridian::MeridianPipeline;
 using meridian::PipelineMode;
 using meridian::PreprocessedGroup;
@@ -246,6 +247,32 @@ TEST(MeridianPipeline, LoopDetectorWiringRunsAndStaysDeterministic) {
     EXPECT_DOUBLE_EQ(a[i].T_map_body.t.y(), b[i].T_map_body.t.y());
     EXPECT_DOUBLE_EQ(a[i].T_map_body.t.z(), b[i].T_map_body.t.z());
   }
+}
+
+TEST(MeridianPipeline, FrontendEmitsVizMarkers) {
+  Fixture fx;
+  const Timestamp t0 = 1'000 * kMs;
+  // Drive several sweeps so the front-end solves a window and emits the §7 viz markers.
+  for (int i = 0; i < 5; ++i) fx.push_imu(t0 + i * 10 * kMs);
+  fx.push_scan(t0 + 50 * kMs);
+  fx.push_imu(t0 + 150 * kMs);
+  for (int i = 16; i < 20; ++i) fx.push_imu(t0 + i * 10 * kMs);
+  fx.push_scan(t0 + 200 * kMs);
+  fx.push_imu(t0 + 300 * kMs);
+  fx.push_scan(t0 + 350 * kMs);
+  fx.push_imu(t0 + 460 * kMs);
+
+  bool hex = false, knot_pts = false, knot_line = false, box = false;
+  for (const auto& m : fx.rec->markers) {
+    if (m.ns == "frontend/observability" && m.type == Marker::Type::Hexagon) hex = true;
+    if (m.ns == "frontend/spline_knots" && m.type == Marker::Type::Points) knot_pts = true;
+    if (m.ns == "frontend/spline_knots" && m.type == Marker::Type::LineStrip) knot_line = true;
+    if (m.ns == "frontend/window_box" && m.type == Marker::Type::LineList) box = true;
+  }
+  EXPECT_TRUE(hex);
+  EXPECT_TRUE(knot_pts);
+  EXPECT_TRUE(knot_line);
+  EXPECT_TRUE(box);
 }
 
 TEST(MeridianPipeline, DisabledBackendReportsEmptyTrajectory) {

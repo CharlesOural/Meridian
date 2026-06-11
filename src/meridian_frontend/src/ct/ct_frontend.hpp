@@ -183,6 +183,8 @@ private:
   // point-to-plane Jacobian rows, kept translation-first [tx,ty,tz,rx,ry,rz].
   ObservabilityReport computeObservability(const Pose& T_world_body,
                                            const std::vector<ct::LidarHit>& hits) const;
+  // Emits the observability hexagon, spline-knot polyline, and sliding-window AABB markers.
+  void emitFrontendMarkers(const Pose& T_world_body, Timestamp t_end);
 
   // Pose marginal (translation-first [rho; phi]) of the body pose at `stamp` from
   // the LiDAR hit information block; the fallback when the full window posterior is

@@ -1643,6 +1643,94 @@ bool CtFrontEnd::poseMarginalFromProblem(ceres::Problem& problem, Timestamp stam
   return ct::poseMarginalFromProblem(problem, *spline_, stamp, cov);
 }
 
+void CtFrontEnd::emitFrontendMarkers(const Pose& T_world_body, Timestamp t_end) {
+  // Observability hexagon (spec-09 §7.1): six spokes from the body origin, length proportional
+  // to the per-axis score, coloured green (observable) -> red (degenerate).
+  if (telemetry_->enabled("frontend/observability")) {
+    Marker hex;
+    hex.type = Marker::Type::Hexagon;
+    hex.frame = Frame::Odom;
+    hex.ns = "frontend/observability";
+    hex.id = 0;
+    hex.scale = 0.04f;
+    const Eigen::Vector3f o = T_world_body.t.cast<float>();
+    for (int k = 0; k < 6; ++k) {
+      const double ang = static_cast<double>(k) * (M_PI / 3.0);
+      const double score = std::clamp(last_obs_.score[static_cast<std::size_t>(k)], 0.0, 1.0);
+      const Eigen::Vector3f dir(static_cast<float>(std::cos(ang)),
+                                static_cast<float>(std::sin(ang)), 0.f);
+      const float len = static_cast<float>(0.2 + 1.8 * score);
+      const std::array<float, 4> col{static_cast<float>(1.0 - score),
+                                     static_cast<float>(score), 0.f, 1.f};
+      hex.points.push_back(o);
+      hex.points.push_back(o + dir * len);
+      hex.colors.push_back(col);
+      hex.colors.push_back(col);
+    }
+    telemetry_->marker(hex, t_end);
+  }
+
+  // Spline knots + sliding-window box (spec-09 §5.1/§7.2): the trajectory the window currently
+  // owns, sampled along its covered span; the box is its AABB.
+  const bool want_knots = telemetry_->enabled("frontend/spline_knots");
+  const bool want_box = telemetry_->enabled("frontend/window_box");
+  if (!spline_ || (!want_knots && !want_box)) return;
+  std::vector<Eigen::Vector3f> samples;
+  const Timestamp lo = spline_->minTime();
+  const Timestamp hi = spline_->maxTime();
+  constexpr int kSamples = 16;
+  for (int i = 0; i <= kSamples; ++i) {
+    const Timestamp t = lo + (hi - lo) * i / kSamples;
+    if (spline_->covers(t)) samples.push_back(spline_->pose(t).t.cast<float>());
+  }
+  if (samples.size() < 2) return;
+
+  if (want_knots) {
+    Marker pts;
+    pts.type = Marker::Type::Points;
+    pts.frame = Frame::Odom;
+    pts.ns = "frontend/spline_knots";
+    pts.id = 0;
+    pts.color = {1.f, 1.f, 0.f, 1.f};
+    pts.scale = 0.12f;
+    pts.points = samples;
+    telemetry_->marker(pts, t_end);
+    Marker strip = pts;
+    strip.type = Marker::Type::LineStrip;
+    strip.id = 1;
+    strip.scale = 0.04f;
+    telemetry_->marker(strip, t_end);
+  }
+  if (want_box) {
+    Eigen::Vector3f mn = samples.front();
+    Eigen::Vector3f mx = samples.front();
+    for (const Eigen::Vector3f& p : samples) {
+      mn = mn.cwiseMin(p);
+      mx = mx.cwiseMax(p);
+    }
+    // The eight corners and twelve edges of the AABB (Marker.scale is one scalar, so a Cube
+    // cannot represent a non-cubic box — a LineList of edges is faithful).
+    const Eigen::Vector3f c[8] = {{mn.x(), mn.y(), mn.z()}, {mx.x(), mn.y(), mn.z()},
+                                  {mx.x(), mx.y(), mn.z()}, {mn.x(), mx.y(), mn.z()},
+                                  {mn.x(), mn.y(), mx.z()}, {mx.x(), mn.y(), mx.z()},
+                                  {mx.x(), mx.y(), mx.z()}, {mn.x(), mx.y(), mx.z()}};
+    const int e[12][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6},
+                          {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+    Marker box;
+    box.type = Marker::Type::LineList;
+    box.frame = Frame::Odom;
+    box.ns = "frontend/window_box";
+    box.id = 0;
+    box.color = {0.3f, 0.5f, 1.f, 0.6f};
+    box.scale = 0.03f;
+    for (const auto& edge : e) {
+      box.points.push_back(c[edge[0]]);
+      box.points.push_back(c[edge[1]]);
+    }
+    telemetry_->marker(box, t_end);
+  }
+}
+
 ObservabilityReport CtFrontEnd::computeObservability(const Pose& T_world_body,
                                                      const std::vector<ct::LidarHit>& hits) const {
   // Eigen-decompose the pose information block, assign each eigenvalue's
@@ -2051,7 +2139,9 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
     const auto& s = last_obs_.score;
     Eigen::Matrix<double, 6, 1> ov(s[0], s[1], s[2], s[3], s[4], s[5]);
     telemetry_->vec("frontend/obs", ov, t_end, "tx,ty,tz,rx,ry,rz");
+    telemetry_->vec("frontend/observability", ov, t_end, "tx,ty,tz,rx,ry,rz");  // spec-09 §7.1 key
     telemetry_->scalar("frontend/obs_min", *std::min_element(s.begin(), s.end()), t_end);
+    emitFrontendMarkers(T_world_end, t_end);
   }
 
   {
