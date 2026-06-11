@@ -25,6 +25,7 @@
 #include "gauge_damping_factor.hpp"
 #include "gnc_consolidation.hpp"
 #include "gnss_factor.hpp"
+#include "gnss_factor_refined.hpp"
 #include "gtsam_adapter.hpp"
 #include "keys.hpp"
 #include "meridian/calib/calibration_set.hpp"
@@ -60,7 +61,22 @@ Isam2BackEnd::Isam2BackEnd(const BackendConfig& cfg, std::shared_ptr<const Calib
       sink_(telemetry ? telemetry : fallback_sink()),
       deterministic_(deterministic),
       isam2_(make_isam2(cfg_.isam2_use_qr)),
-      pcm_(chi2inv(cfg.pcm_chi2_alpha, 6), cfg.pcm_max_nodes) {}
+      pcm_(chi2inv(cfg.pcm_chi2_alpha, 6), cfg.pcm_max_nodes) {
+  // Online lever refinement engages only when the master switch is on AND the GNSS extrinsic
+  // is present and individually flagged for refinement; otherwise the constant-lever path runs.
+  if (cfg_.extrinsic_refine) {
+    try {
+      const Extrinsic& e = calib_->extrinsic(Frame::GnssLink);
+      if (e.refine_online) {
+        extrinsic_refine_gnss_ = true;
+        extrinsic_offline_lever_ = e.T_parent_child.t;
+        extrinsic_lever_ = e.T_parent_child.t;
+      }
+    } catch (const std::exception&) {
+      // No GNSS extrinsic to refine; stay on the constant-lever path.
+    }
+  }
+}
 
 std::unique_ptr<gtsam::ISAM2> Isam2BackEnd::make_isam2(bool use_qr) const {
   gtsam::ISAM2Params params;
@@ -158,6 +174,19 @@ void Isam2BackEnd::add_keyframe(KeyframePacket&& kf) {
           gtsam::noiseModel::Gaussian::Covariance(cov));
       new_values_.insert(keyX(kf.id), to_gtsam(T_map_odom_ * kf.T_ref_body));
       chain_cov_.extend(kf.rel_to_id, kf.id, kf.T_relto_this, reorder_gtsam_to_meridian(cov));
+      // Accumulate platform excitation since the lever variable was added; refinement engages
+      // only once both rotation and translation pass the gate (a free extrinsic without
+      // excitation is a canonical indeterminate-system cause).
+      if (extrinsic_added_ && !extrinsic_excited_) {
+        extrinsic_rot_accum_ += 2.0 * std::acos(std::min(1.0, std::abs(kf.T_relto_this.q.w())));
+        extrinsic_trans_accum_ += kf.T_relto_this.t.norm();
+        if (extrinsic_rot_accum_ >= cfg_.extrinsic_excite_rot &&
+            extrinsic_trans_accum_ >= cfg_.extrinsic_excite_trans) {
+          extrinsic_excited_ = true;
+          sink_->event(Level::Info, "backend/extrinsic_excited",
+                       "gnss lever refinement engaged (excitation reached)", tele_stamp());
+        }
+      }
       record_keyframe(std::move(kf));
       return;
     }
@@ -655,6 +684,11 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
   } catch (const std::exception&) {
     return;
   }
+  // While refining online, the antenna geometry uses the current best lever (offline until the
+  // estimate freezes); the refined-lever factor itself reads the live E(GnssLink) estimate.
+  if (extrinsic_refine_gnss_) {
+    lever = extrinsic_lever_;
+  }
 
   // beta / endpoint select the factor form; the antenna position itself comes from the shared
   // interpolation helper so it matches the datum-buffering geometry exactly.
@@ -722,10 +756,31 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
     sink_->vec(kTeleGnssResidual, r, tele_stamp(), "e,n,u");
   }
 
+  // First post-lock fix under refinement seeds the E(GnssLink) variable at the offline lever with
+  // a loose prior; it stays pinned by that prior (and the constant-lever factors) until the
+  // excitation gate opens, then the refined-lever factors below make it observable.
+  if (extrinsic_refine_gnss_ && !extrinsic_added_) {
+    const gtsam::Pose3 e_seed(gtsam::Rot3::Identity(), gtsam::Point3(extrinsic_offline_lever_));
+    new_values_.insert(keyE(Frame::GnssLink), e_seed);
+    new_graph_.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+        keyE(Frame::GnssLink), e_seed,
+        gtsam::noiseModel::Isotropic::Sigma(6, cfg_.extrinsic_refine_sigma));
+    extrinsic_added_ = true;
+  }
+
   const gtsam::SharedNoiseModel noise = make_gnss_noise(fix.cov_enu, cfg_.gnss_huber_k);
   const gtsam::Point3 lever_pt(lever);
   const gtsam::Point3 meas(p_enu);
-  if (endpoint) {
+  const bool use_refined = extrinsic_refine_gnss_ && extrinsic_excited_ && !extrinsic_frozen_;
+  if (use_refined) {
+    if (endpoint) {
+      new_graph_.emplace_shared<GnssFactorRefinedEndpoint>(keyX(end_id), kKeyG,
+                                                           keyE(Frame::GnssLink), meas, noise);
+    } else {
+      new_graph_.emplace_shared<GnssFactorRefined>(keyX(br.i), keyX(br.j), kKeyG,
+                                                   keyE(Frame::GnssLink), beta, meas, noise);
+    }
+  } else if (endpoint) {
     new_graph_.emplace_shared<GnssFactorEndpoint>(keyX(end_id), kKeyG, lever_pt, meas, noise);
   } else {
     new_graph_.emplace_shared<GnssFactor>(keyX(br.i), keyX(br.j), kKeyG, beta, lever_pt, meas,
@@ -791,6 +846,10 @@ GraphUpdate Isam2BackEnd::optimize() {
     finalize_pending_loops(result, ts);
   } else {
     abandon_pending_loops();
+  }
+
+  if (committed) {
+    update_extrinsic(ts);
   }
 
   GraphUpdate update = build_graph_update();
@@ -918,7 +977,66 @@ std::vector<StampedPose> Isam2BackEnd::corrected_trajectory() const {
 }
 
 std::shared_ptr<const CalibrationSet> Isam2BackEnd::refined_calibration() const {
-  return calib_;
+  // Once the online lever has frozen, publish the snapshot carrying the refined value; otherwise
+  // the offline calibration is the better estimate.
+  return refined_calib_ ? refined_calib_ : calib_;
+}
+
+void Isam2BackEnd::publish_refined_lever() {
+  auto snap = std::make_shared<CalibrationSet>(*calib_);
+  for (Extrinsic& e : snap->extrinsics) {
+    if (e.child == Frame::GnssLink) {
+      e.T_parent_child.t = extrinsic_lever_;
+      ++e.version;
+    }
+  }
+  ++snap->version;
+  refined_calib_ = snap;
+}
+
+void Isam2BackEnd::update_extrinsic(Timestamp ts) {
+  if (!extrinsic_refine_gnss_ || !extrinsic_added_ || extrinsic_frozen_) {
+    return;
+  }
+  if (!estimate_cache_.exists(keyE(Frame::GnssLink))) {
+    return;
+  }
+  const Eigen::Vector3d lever =
+      from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyE(Frame::GnssLink))).t;
+
+  // FM-5 sanity clamp: a refined lever leaving the offline box is untrustworthy. Revert to the
+  // offline value, publish that safe value, and stop refining rather than bias the trajectory.
+  if ((lever - extrinsic_offline_lever_).norm() > cfg_.extrinsic_max_dev) {
+    extrinsic_lever_ = extrinsic_offline_lever_;
+    extrinsic_frozen_ = true;
+    publish_refined_lever();
+    sink_->event(Level::Warn, "backend/extrinsic_clamped",
+                 "gnss lever left the offline box; reverted and frozen", ts);
+    return;
+  }
+  extrinsic_lever_ = lever;
+
+  // The lever is only observable, and so only published, once the excitation gate has opened.
+  if (!extrinsic_excited_) {
+    return;
+  }
+  publish_refined_lever();
+
+  // Convergence freeze: once the lever's marginal is tight, stop treating it as free.
+  try {
+    const gtsam::Matrix m = isam2_->marginalCovariance(keyE(Frame::GnssLink));
+    // GTSAM Pose3 tangent is rotation-first; the translation block is the bottom-right 3x3.
+    if (m.bottomRightCorner<3, 3>().trace() < cfg_.extrinsic_freeze_cov) {
+      extrinsic_frozen_ = true;
+      sink_->event(Level::Info, "backend/extrinsic_frozen",
+                   "gnss lever refined and frozen: [" + std::to_string(extrinsic_lever_.x()) +
+                       ", " + std::to_string(extrinsic_lever_.y()) + ", " +
+                       std::to_string(extrinsic_lever_.z()) + "]",
+                   ts);
+    }
+  } catch (const std::exception&) {
+    // Marginal not yet available (E just entered the estimate); retry next fold.
+  }
 }
 
 BackEndDiagnostics Isam2BackEnd::diagnostics() const {

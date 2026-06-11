@@ -127,6 +127,12 @@ private:
   // Folds one accepted GNSS fix into the staged batch after the datum is locked: gates it,
   // builds the interpolated or endpoint factor, and runs the sustained-rejection auto-disable.
   void admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_enu, const Bracket& br);
+  // Post-optimize maintenance of the online GNSS-lever extrinsic (§10.2): tracks the current
+  // estimate, freezes + publishes it once its marginal converges, and rejects a lever that
+  // strays past the offline box (FM-5).
+  void update_extrinsic(Timestamp ts);
+  // Builds and stores the versioned CalibrationSet snapshot carrying the current refined lever.
+  void publish_refined_lever();
   // Drops bookkeeping for keyframes whose variables are not in the estimate after an
   // abandoned batch, restoring chain consistency.
   void rollback_uncommitted_keyframes();
@@ -182,6 +188,22 @@ private:
   std::optional<Eigen::Vector3d> gnss_last_antenna_;
   // Sustained rejection counter: consecutive post-lock fixes whose chi2 exceeds the gate.
   int gnss_consecutive_chi2_reject_ = 0;
+
+  // Online GNSS-lever extrinsic refinement (§10, off by default). When active the antenna lever
+  // becomes an E(GnssLink) Pose3 variable: pinned by a loose prior and constant-lever factors
+  // until the platform delivers enough rotational + translational excitation, then made observable
+  // by refined-lever factors; once its marginal converges the value is frozen and published, and a
+  // lever that leaves the offline box is rejected (FM-5).
+  bool extrinsic_refine_gnss_ = false;
+  bool extrinsic_added_ = false;
+  bool extrinsic_excited_ = false;
+  bool extrinsic_frozen_ = false;
+  double extrinsic_rot_accum_ = 0.0;    // cumulative |rotation| since the variable was added [rad]
+  double extrinsic_trans_accum_ = 0.0;  // cumulative |translation| since added [m]
+  Eigen::Vector3d extrinsic_offline_lever_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d extrinsic_lever_ =
+      Eigen::Vector3d::Zero();  // current best (offline, then frozen)
+  std::shared_ptr<const CalibrationSet> refined_calib_;
 
   // Loop closures. pcm_ buffers every accepted LoopConstraint and decides admit/evict/reject via
   // pairwise-consistency max-clique. loop_factor_index_ maps an in-graph loop's PCM handle to its

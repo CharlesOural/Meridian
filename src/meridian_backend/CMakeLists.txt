@@ -28,6 +28,7 @@ add_library(meridian_backend SHARED
   src/geodetic.cpp
   src/robust_kernels.cpp
   src/gnss_factor.cpp
+  src/gnss_factor_refined.cpp
   src/datum.cpp
   src/gnss_gate.cpp
   src/isam2_backend.cpp
@@ -84,7 +85,8 @@ if(BUILD_TESTING)
             test_determinism test_backend_recovery test_pim_from_summary
             test_restart_bridge test_geodetic test_robust_kernels test_gnss_factor
             test_datum test_gnss_gate test_backend_gnss test_max_clique test_pcm
-            test_gnc_consolidation test_backend_loops)
+            test_gnc_consolidation test_backend_loops test_gnss_factor_refined
+            test_backend_extrinsic)
     meridian_add_gtest(${t} test/${t}.cpp)
     target_link_libraries(${t} meridian_backend gtsam)
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
