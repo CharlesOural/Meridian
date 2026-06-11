@@ -28,13 +28,13 @@ class NullLoopDetector final : public ILoopDetector {
 
 std::unique_ptr<ILoopDetector> makeLoopDetector(const PlaceConfig& cfg,
                                                 std::shared_ptr<const KeyframeStore> store,
-                                                KeyframePoseSource pose_source,
-                                                bool deterministic) {
+                                                KeyframePoseSource pose_source, bool deterministic,
+                                                TelemetrySink* telemetry) {
   if (!cfg.enable) return std::make_unique<NullLoopDetector>();
   switch (cfg.kind) {
     case PlaceKind::ScanContextPp:
-      return std::make_unique<HierarchicalLoopDetector>(cfg, std::move(store),
-                                                        std::move(pose_source), deterministic);
+      return std::make_unique<HierarchicalLoopDetector>(
+          cfg, std::move(store), std::move(pose_source), deterministic, telemetry);
   }
   return std::make_unique<NullLoopDetector>();
 }

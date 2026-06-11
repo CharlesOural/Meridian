@@ -159,8 +159,8 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
         if (it == kf_stamps_.end()) return std::nullopt;
         return it->second;
       };
-      loop_detector_ =
-          makeLoopDetector(cfg_.place, store_, pose_source_, /*deterministic=*/sync_mode_);
+      loop_detector_ = makeLoopDetector(cfg_.place, store_, pose_source_,
+                                        /*deterministic=*/sync_mode_, sink_.get());
     }
   }
 }

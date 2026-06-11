@@ -9,6 +9,7 @@ include(MeridianDeps)            # Eigen3::Eigen, Sophus::Sophus, small_gicp::sm
 
 find_package(meridian_common REQUIRED)
 find_package(meridian_config REQUIRED)
+find_package(meridian_debug REQUIRED)
 
 add_library(meridian_place
   src/keyframe_store.cpp
@@ -30,6 +31,7 @@ meridian_apply_warnings(meridian_place)
 target_link_libraries(meridian_place PUBLIC
   meridian_common::meridian_common
   meridian_config::meridian_config
+  meridian_debug::meridian_debug
   Eigen3::Eigen Sophus::Sophus)
 # small_gicp is an implementation detail of the Stage-C verifier (private src/ header), so
 # it is not exported on the public interface.
@@ -42,7 +44,7 @@ install(TARGETS meridian_place EXPORT meridian_placeTargets
 ament_export_targets(meridian_placeTargets HAS_LIBRARY_TARGET)
 # small_gicp is a private link dependency, but a static library propagates it as a link
 # requirement, so downstream packages must be able to resolve the imported target.
-ament_export_dependencies(meridian_common meridian_config Eigen3 Sophus small_gicp)
+ament_export_dependencies(meridian_common meridian_config meridian_debug Eigen3 Sophus small_gicp)
 
 if(BUILD_TESTING)
   include(MeridianTesting)

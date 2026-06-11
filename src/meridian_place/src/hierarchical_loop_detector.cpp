@@ -1,7 +1,9 @@
 #include "hierarchical_loop_detector.hpp"
 
+#include <algorithm>
 #include <utility>
 
+#include "meridian/debug/telemetry.hpp"
 #include "loop_cov.hpp"
 #include "pcm_self_test.hpp"
 
@@ -10,7 +12,7 @@ namespace meridian {
 HierarchicalLoopDetector::HierarchicalLoopDetector(const PlaceConfig& cfg,
                                                    std::shared_ptr<const KeyframeStore> store,
                                                    KeyframePoseSource pose_source,
-                                                   bool deterministic)
+                                                   bool deterministic, TelemetrySink* telemetry)
     : cfg_(cfg),
       store_(std::move(store)),
       pose_source_(std::move(pose_source)),
@@ -22,7 +24,8 @@ HierarchicalLoopDetector::HierarchicalLoopDetector(const PlaceConfig& cfg,
           },
           cfg.submap_window, cfg.submap_voxel, cfg.submap_cache),
       gicp_(cfg, deterministic),
-      chi2_threshold_(chi2InvDof6(cfg.pcm_chi2_conf)) {}
+      chi2_threshold_(chi2InvDof6(cfg.pcm_chi2_conf)),
+      sink_(telemetry) {}
 
 void HierarchicalLoopDetector::add_keyframe(std::uint64_t id, PointCloudPtr cloud,
                                             const Pose& /*T_map_body*/) {
@@ -78,58 +81,73 @@ std::vector<LoopConstraint> HierarchicalLoopDetector::detect() {
   }
 
   const std::vector<std::uint64_t> eligible = eligible_for(query);
-  if (eligible.empty()) return loops;
-  const std::vector<ScCandidate> cands = sc_db_.retrieve(query, eligible, cfg_.sc_topK);
+  const std::vector<ScCandidate> cands =
+      eligible.empty() ? std::vector<ScCandidate>{}
+                       : sc_db_.retrieve(query, eligible, cfg_.sc_topK);
   diag_.candidates += cands.size();
-  if (cands.empty()) return loops;
 
   const std::optional<Pose> q_pose =
       pose_source_.pose ? pose_source_.pose(query) : std::optional<Pose>{};
-  if (!q_pose) return loops;
   const std::shared_ptr<const PointCloud> q_source =
       cfg_.gicp_source_submap ? submaps_.submap(query) : store_->cloud(query);
-  if (!q_source || q_source->empty()) return loops;
   const std::optional<ObservabilityReport> q_obs =
       pose_source_.obs ? pose_source_.obs(query) : std::optional<ObservabilityReport>{};
 
-  for (const ScCandidate& c : cands) {
-    const std::optional<Pose> c_pose =
-        pose_source_.pose ? pose_source_.pose(c.id) : std::optional<Pose>{};
-    if (!c_pose) continue;
-    const std::shared_ptr<const PointCloud> target = submaps_.submap(c.id);
-    if (!target || target->empty()) continue;
+  double best_fitness = 0.0;
+  if (q_pose && q_source && !q_source->empty()) {
+    for (const ScCandidate& c : cands) {
+      const std::optional<Pose> c_pose =
+          pose_source_.pose ? pose_source_.pose(c.id) : std::optional<Pose>{};
+      if (!c_pose) continue;
+      const std::shared_ptr<const PointCloud> target = submaps_.submap(c.id);
+      if (!target || target->empty()) continue;
 
-    // GICP init: the corrected-odometry relative pose between the endpoints.
-    const Pose init_from_to = c_pose->inverse() * (*q_pose);
-    const VerifiedLoop v = gicp_.verify(*target, *q_source, init_from_to);
-    if (!v.accepted) continue;
-    ++diag_.verified;
+      // GICP init: the corrected-odometry relative pose between the endpoints.
+      const Pose init_from_to = c_pose->inverse() * (*q_pose);
+      const VerifiedLoop v = gicp_.verify(*target, *q_source, init_from_to);
+      best_fitness = std::max(best_fitness, v.fitness);
+      if (!v.accepted) continue;
+      ++diag_.verified;
 
-    const std::optional<ObservabilityReport> c_obs =
-        pose_source_.obs ? pose_source_.obs(c.id) : std::optional<ObservabilityReport>{};
-    const PoseCov6 cov = shapeLoopCov(v.info_rot_first, v.fitness, cfg_, c_obs, q_obs);
+      const std::optional<ObservabilityReport> c_obs =
+          pose_source_.obs ? pose_source_.obs(c.id) : std::optional<ObservabilityReport>{};
+      const PoseCov6 cov = shapeLoopCov(v.info_rot_first, v.fitness, cfg_, c_obs, q_obs);
 
-    // Stage D: single-loop odometry self-test, judged on the combined loop + chain covariance.
-    Eigen::Matrix<double, 6, 6> combined = cov.M;
-    if (pose_source_.chain_cov) {
-      const std::optional<Eigen::Matrix<double, 6, 6>> chain = pose_source_.chain_cov(c.id, query);
-      if (chain) combined += *chain;
+      // Stage D: single-loop odometry self-test on the combined loop + chain covariance.
+      Eigen::Matrix<double, 6, 6> combined = cov.M;
+      if (pose_source_.chain_cov) {
+        const std::optional<Eigen::Matrix<double, 6, 6>> chain =
+            pose_source_.chain_cov(c.id, query);
+        if (chain) combined += *chain;
+      }
+      if (!loopAgreesWithOdometry(init_from_to, v.T_from_to, combined, chi2_threshold_)) {
+        ++diag_.self_test_rejected;
+        continue;
+      }
+
+      LoopConstraint lc;
+      lc.from_id = c.id;
+      lc.to_id = query;
+      lc.T_from_to = v.T_from_to;
+      lc.cov = cov;
+      lc.fitness = v.fitness;
+      loops.push_back(lc);
+      ++diag_.emitted;
+      last_emitted_to_ = query;
+      has_emitted_ = true;
     }
-    if (!loopAgreesWithOdometry(init_from_to, v.T_from_to, combined, chi2_threshold_)) {
-      ++diag_.self_test_rejected;
-      continue;
-    }
+  }
 
-    LoopConstraint lc;
-    lc.from_id = c.id;
-    lc.to_id = query;
-    lc.T_from_to = v.T_from_to;
-    lc.cov = cov;
-    lc.fitness = v.fitness;
-    loops.push_back(lc);
-    ++diag_.emitted;
-    last_emitted_to_ = query;
-    has_emitted_ = true;
+  if (sink_ && sink_->enabled("place/best_sc_dist")) {
+    const Timestamp ts =
+        pose_source_.stamp ? pose_source_.stamp(query).value_or(0) : static_cast<Timestamp>(0);
+    sink_->scalar("place/n_eligible", static_cast<double>(eligible.size()), ts);
+    sink_->scalar("place/n_candidates", static_cast<double>(cands.size()), ts);
+    sink_->scalar("place/best_sc_dist", cands.empty() ? 1.0 : cands.front().sc_dist, ts);
+    sink_->scalar("place/best_fitness", best_fitness, ts);
+    sink_->scalar("place/verified", static_cast<double>(diag_.verified), ts);
+    sink_->scalar("place/self_test_rejected", static_cast<double>(diag_.self_test_rejected), ts);
+    sink_->scalar("place/emitted", static_cast<double>(diag_.emitted), ts);
   }
   return loops;
 }

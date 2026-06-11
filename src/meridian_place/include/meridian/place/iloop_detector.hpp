@@ -19,6 +19,8 @@
 
 namespace meridian {
 
+class TelemetrySink;
+
 // Read-only views into the back-end's current estimate, supplied by the pipeline so L5
 // never links L3. All queries are by keyframe id and return nullopt for an unknown id.
 struct KeyframePoseSource {
@@ -62,7 +64,7 @@ class ILoopDetector {
 // reproducible behaviour (replay/harness); false permits non-determinism-tolerant speedups.
 std::unique_ptr<ILoopDetector> makeLoopDetector(const PlaceConfig& cfg,
                                                 std::shared_ptr<const KeyframeStore> store,
-                                                KeyframePoseSource pose_source,
-                                                bool deterministic);
+                                                KeyframePoseSource pose_source, bool deterministic,
+                                                TelemetrySink* telemetry = nullptr);
 
 }  // namespace meridian

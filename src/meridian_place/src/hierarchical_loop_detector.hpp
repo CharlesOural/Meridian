@@ -11,6 +11,8 @@
 
 namespace meridian {
 
+class TelemetrySink;
+
 // The staged hierarchical detector: Stage A (Scan Context retrieval) -> Stage C (GICP
 // verification) -> Stage D (single-loop odometry self-test). Stage B (STD/BTC re-rank) is
 // skipped this pass behind the ScanContextDb retrieval seam. Runs synchronously on the
@@ -18,7 +20,8 @@ namespace meridian {
 class HierarchicalLoopDetector final : public ILoopDetector {
  public:
   HierarchicalLoopDetector(const PlaceConfig& cfg, std::shared_ptr<const KeyframeStore> store,
-                           KeyframePoseSource pose_source, bool deterministic);
+                           KeyframePoseSource pose_source, bool deterministic,
+                           TelemetrySink* telemetry);
 
   void add_keyframe(std::uint64_t id, PointCloudPtr cloud, const Pose& T_map_body) override;
   std::vector<LoopConstraint> detect() override;
@@ -37,6 +40,7 @@ class HierarchicalLoopDetector final : public ILoopDetector {
   SubmapAccumulator submaps_;
   GicpVerifier gicp_;
   double chi2_threshold_;
+  TelemetrySink* sink_ = nullptr;  // borrowed; place/* diagnostics, null = no telemetry
 
   std::vector<std::uint64_t> added_ids_;  // ascending; the retrieval candidate pool
   std::uint64_t newest_id_ = 0;
