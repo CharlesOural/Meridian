@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 #include "loop_cov.hpp"
 #include "pcm_self_test.hpp"
 
@@ -138,16 +139,16 @@ std::vector<LoopConstraint> HierarchicalLoopDetector::detect() {
     }
   }
 
-  if (sink_ && sink_->enabled("place/best_sc_dist")) {
+  if (sink_ && sink_->enabled(keys::place::BestScDist)) {
     const Timestamp ts =
         pose_source_.stamp ? pose_source_.stamp(query).value_or(0) : static_cast<Timestamp>(0);
-    sink_->scalar("place/n_eligible", static_cast<double>(eligible.size()), ts);
-    sink_->scalar("place/n_candidates", static_cast<double>(cands.size()), ts);
-    sink_->scalar("place/best_sc_dist", cands.empty() ? 1.0 : cands.front().sc_dist, ts);
-    sink_->scalar("place/best_fitness", best_fitness, ts);
-    sink_->scalar("place/verified", static_cast<double>(diag_.verified), ts);
-    sink_->scalar("place/self_test_rejected", static_cast<double>(diag_.self_test_rejected), ts);
-    sink_->scalar("place/emitted", static_cast<double>(diag_.emitted), ts);
+    sink_->scalar(keys::place::NEligible, static_cast<double>(eligible.size()), ts);
+    sink_->scalar(keys::place::NCandidates, static_cast<double>(cands.size()), ts);
+    sink_->scalar(keys::place::BestScDist, cands.empty() ? 1.0 : cands.front().sc_dist, ts);
+    sink_->scalar(keys::place::BestFitness, best_fitness, ts);
+    sink_->scalar(keys::place::Verified, static_cast<double>(diag_.verified), ts);
+    sink_->scalar(keys::place::SelfTestRejected, static_cast<double>(diag_.self_test_rejected), ts);
+    sink_->scalar(keys::place::Emitted, static_cast<double>(diag_.emitted), ts);
   }
   return loops;
 }

@@ -7,6 +7,7 @@
 
 #include "meridian/debug/log.hpp"
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian {
 
@@ -145,7 +146,7 @@ std::vector<cv::Mat> CameraPreprocessor::buildPyramid(const cv::Mat& intensity) 
 }
 
 ProcessedCamera CameraPreprocessor::process(const CameraFrame& frame) const {
-  MERIDIAN_SCOPED_TIME(telemetry_, "preprocess.camera", frame.stamp);
+  MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::PreprocessCamera, frame.stamp);
 
   ProcessedCamera out;
   out.frame = frame;

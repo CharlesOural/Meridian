@@ -1021,7 +1021,7 @@ TEST(CtFrontEnd, AdaptiveKnotDensityTracksThroughTransitions) {
   // returned to 1 once calm (downward hysteresis included).
   std::vector<double> ncp;
   for (const auto& r : sink.scalars) {
-    if (r.key == "frontend/spline/n_cp") ncp.push_back(r.v);
+    if (r.key == "frontend/ct/n_cp") ncp.push_back(r.v);
   }
   ASSERT_FALSE(ncp.empty()) << "n_cp telemetry never emitted";
   const double peak = *std::max_element(ncp.begin(), ncp.end());

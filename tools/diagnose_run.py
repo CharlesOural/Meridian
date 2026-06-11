@@ -110,7 +110,7 @@ def parse_observability(path):
             if "values:" in b else []
         if k.group(1) == "frontend/obs_min" and vals:
             tmin.append((t, vals[0]))
-        elif k.group(1) == "frontend/obs" and len(vals) >= 6:
+        elif k.group(1) == "frontend/observability" and len(vals) >= 6:
             for i, a in enumerate(order):
                 axes[a].append((t, vals[i]))
     axes = {a: v for a, v in axes.items() if v}

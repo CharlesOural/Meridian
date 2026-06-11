@@ -198,6 +198,10 @@ private:
   // voxel-downsampled, published in the map frame. Throttled, and forced on a loop closure (when
   // the map de-warps). No-op without the keyframe store / back-end / an enabled sink key.
   void publish_map_cloud(Timestamp ts, bool force);
+  // Measurement-time anchor for back-end-path telemetry sampled outside a measurement
+  // callback (queue depth, post-optimize diagnostics): the last keyframe's stamp, or 0
+  // before the first keyframe. Data-driven, not wall-clock, so replay stays deterministic.
+  Timestamp tele_stamp() const;
 
   Config cfg_;
   bool sync_mode_ = false;  // Replay: process inline, no thread/queue

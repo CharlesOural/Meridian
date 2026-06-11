@@ -12,6 +12,7 @@
 #include "meridian/common/point.hpp"
 #include "meridian/debug/log.hpp"
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian {
 
@@ -87,7 +88,7 @@ class LidarValidityFilter final : public ILidarPreprocessor {
         telemetry_(telemetry) {}
 
   LidarScan process(const LidarScan& raw) const override {
-    MERIDIAN_SCOPED_TIME(telemetry_, "preprocess.lidar.validity", raw.stamp_start);
+    MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::PreprocessLidarValidity, raw.stamp_start);
 
     LidarScan out = raw;  // copies metadata; points pointer shared until we rebuild it
     const PointCloud* in = raw.points.get();
@@ -301,17 +302,17 @@ class LidarValidityFilter final : public ILidarPreprocessor {
     if (telemetry_ == nullptr) {
       return;
     }
-    telemetry_->scalar("lidar/n_in", static_cast<double>(s.n_in), t);
-    telemetry_->scalar("lidar/n_out", static_cast<double>(s.n_out), t);
-    telemetry_->scalar("lidar/n_voxel_out", static_cast<double>(s.n_voxel_out), t);
-    telemetry_->scalar("lidar/n_nan", static_cast<double>(s.n_nan), t);
-    telemetry_->scalar("lidar/n_blind", static_cast<double>(s.n_blind), t);
-    telemetry_->scalar("lidar/n_far", static_cast<double>(s.n_far), t);
-    telemetry_->scalar("lidar/n_selfhit", static_cast<double>(s.n_selfhit), t);
-    telemetry_->scalar("lidar/n_intensity", static_cast<double>(s.n_intensity), t);
+    telemetry_->scalar(keys::lidar::NIn, static_cast<double>(s.n_in), t);
+    telemetry_->scalar(keys::lidar::NOut, static_cast<double>(s.n_out), t);
+    telemetry_->scalar(keys::lidar::NVoxelOut, static_cast<double>(s.n_voxel_out), t);
+    telemetry_->scalar(keys::lidar::NNan, static_cast<double>(s.n_nan), t);
+    telemetry_->scalar(keys::lidar::NBlind, static_cast<double>(s.n_blind), t);
+    telemetry_->scalar(keys::lidar::NFar, static_cast<double>(s.n_far), t);
+    telemetry_->scalar(keys::lidar::NSelfhit, static_cast<double>(s.n_selfhit), t);
+    telemetry_->scalar(keys::lidar::NIntensity, static_cast<double>(s.n_intensity), t);
     const double sfrac =
         s.n_in > 0 ? static_cast<double>(s.n_selfhit) / static_cast<double>(s.n_in) : 0.0;
-    telemetry_->scalar("lidar/selfhit_frac", sfrac, t);
+    telemetry_->scalar(keys::lidar::SelfhitFrac, sfrac, t);
   }
 
   PreprocLidar cfg_;

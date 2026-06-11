@@ -29,6 +29,7 @@
 #include "meridian/common/point.hpp"
 #include "meridian/debug/log.hpp"
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian {
 
@@ -502,9 +503,9 @@ void CtFrontEnd::gateGnss(const PreprocessedGroup& group, Timestamp t_end, GnssC
   // anchor is created, no telemetry advances beyond the one informational inactive
   // state — the trajectory is bit-identical to a build without this stage.
   if (!cfg_.gnss.use || group.group.gnss.empty()) {
-    if (telemetry_ && telemetry_->enabled("frontend/gnss/accept_rate") && !gnss_inactive_logged_) {
+    if (telemetry_ && telemetry_->enabled(keys::frontend::GnssAcceptRate) && !gnss_inactive_logged_) {
       gnss_inactive_logged_ = true;
-      telemetry_->event(Level::Info, "frontend/gnss/inactive",
+      telemetry_->event(Level::Info, keys::frontend::GnssInactive,
                         cfg_.gnss.use ? "gnss enabled, no fixes yet" : "gnss disabled in config",
                         t_end);
     }
@@ -569,15 +570,15 @@ void CtFrontEnd::gateGnss(const PreprocessedGroup& group, Timestamp t_end, GnssC
     const ct::GnssGateResult res = gnss_gate_->gate(r, cov_floored, pose_marg);
 
     if (telemetry_) {
-      if (telemetry_->enabled("frontend/gnss/innovation_m")) {
-        telemetry_->scalar("frontend/gnss/innovation_m", res.innovation_m, t_fix);
+      if (telemetry_->enabled(keys::frontend::GnssInnovationM)) {
+        telemetry_->scalar(keys::frontend::GnssInnovationM, res.innovation_m, t_fix);
       }
-      if (!res.accepted && telemetry_->enabled("frontend/gnss/reject")) {
+      if (!res.accepted && telemetry_->enabled(keys::frontend::GnssReject)) {
         const char* reason = res.reason == ct::GnssGateResult::Reason::Gate ? "gate"
                              : res.reason == ct::GnssGateResult::Reason::ReacquirePersist
                                  ? "reacq_persist"
                                  : "quality";
-        telemetry_->event(Level::Warn, "frontend/gnss/reject", reason, t_fix);
+        telemetry_->event(Level::Warn, keys::frontend::GnssReject, reason, t_fix);
       }
     }
 
@@ -603,11 +604,11 @@ void CtFrontEnd::gateGnss(const PreprocessedGroup& group, Timestamp t_end, GnssC
     ctx->fixes.push_back(m);
   }
 
-  if (telemetry_ && telemetry_->enabled("frontend/gnss/accept_rate")) {
+  if (telemetry_ && telemetry_->enabled(keys::frontend::GnssAcceptRate)) {
     const int total = gnss_gate_->accepted() + gnss_gate_->rejected();
     const double rate =
         total > 0 ? static_cast<double>(gnss_gate_->accepted()) / static_cast<double>(total) : 0.0;
-    telemetry_->scalar("frontend/gnss/accept_rate", rate, t_end);
+    telemetry_->scalar(keys::frontend::GnssAcceptRate, rate, t_end);
   }
 }
 
@@ -702,7 +703,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
   // across cm-level pose refinement. Every outer round's residual build and the
   // post-solve map update then reuse this cache instead of re-scanning the map.
   if (vis != nullptr && vis->img != nullptr && vmap_ && spline_->covers(vis->t_image)) {
-    MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.vmap.select", t_end);
+    MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtVmapSelect, t_end);
     const Pose T_w_c_seed = spline_->pose(vis->t_image) * T_fe_cam_;
     vmap_->refreshVisibleCache(cam_model_, T_w_c_seed);
   }
@@ -751,7 +752,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     // the current (seeded, then solved) spline.
     hits->clear();
     {
-      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.assoc", t_end);
+      MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtAssoc, t_end);
       ct::LidarAssocStats stats =
           ct::associate(*spline_, T_fe_lidar_, *scan_ds, t0_scan, *map_, cfg_.lidar, hits);
       accepted = stats.accepted;
@@ -783,7 +784,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     ct::addBiasRandomWalk(problem, *bias_, weights);
     fam_range[kFamBias] = {fam_mark, problem.NumResidualBlocks()};
     if (telemetry_) {
-      telemetry_->timing("frontend.ct.assemble", ms_since(t_assemble), t_end);
+      telemetry_->timing(keys::stage::CtAssemble, ms_since(t_assemble), t_end);
     }
 
     // Tail anchors over the span past the newest measurement: tie the spline's
@@ -845,7 +846,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     // gate selection is linearisation-point dependent like the LiDAR planes). The
     // map is empty on the first sweep, so this is a no-op until promote() has run.
     if (vis != nullptr && vis->img != nullptr && vis->expo != nullptr && vmap_) {
-      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.visual", t_end);
+      MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtVisual, t_end);
       fam_mark = problem.NumResidualBlocks();
       std::vector<ct::VisualUsedPoint> round_used;
       std::vector<ct::VisualPatchParams> round_patches;
@@ -995,7 +996,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
     }
 
     {
-      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.solve", t_end);
+      MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtSolve, t_end);
       // The deadline is suspended until the minimum-iterations floor is met: while
       // total_iters < min_iters_floor the inner solve runs deadline-free so the floor
       // is always honoured even under a very tight budget.
@@ -1014,11 +1015,11 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
       ceres::Solve(sopts, &problem, &summary);
       total_iters += static_cast<int>(summary.iterations.size());
       if (telemetry_) {
-        telemetry_->timing("frontend.ct.solve.residual_eval",
+        telemetry_->timing(keys::stage::CtSolveResidualEval,
                            summary.residual_evaluation_time_in_seconds * 1e3, t_end);
-        telemetry_->timing("frontend.ct.solve.jacobian_eval",
+        telemetry_->timing(keys::stage::CtSolveJacobianEval,
                            summary.jacobian_evaluation_time_in_seconds * 1e3, t_end);
-        telemetry_->timing("frontend.ct.solve.linear_solver",
+        telemetry_->timing(keys::stage::CtSolveLinearSolver,
                            summary.linear_solver_time_in_seconds * 1e3, t_end);
       }
       if (total_budget_s > 0.0 && total_iters >= min_iters_floor &&
@@ -1076,13 +1077,13 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
   // fighting the inertial prediction. Cheap, emitted every sweep.
   if (telemetry_ && have_innov_seed && spline_->covers(t_end)) {
     const Pose T_solved_end = spline_->pose(t_end);
-    if (telemetry_->enabled("frontend/innov/trans_m")) {
-      telemetry_->scalar("frontend/innov/trans_m", (T_solved_end.t - T_seed_end.t).norm(), t_end);
+    if (telemetry_->enabled(keys::frontend::InnovTransM)) {
+      telemetry_->scalar(keys::frontend::InnovTransM, (T_solved_end.t - T_seed_end.t).norm(), t_end);
     }
-    if (telemetry_->enabled("frontend/innov/rot_deg")) {
+    if (telemetry_->enabled(keys::frontend::InnovRotDeg)) {
       // angle(R_seed^T R_solved): the geodesic rotation between seed and solution.
       const Eigen::Quaterniond dq = (T_seed_end.q.conjugate() * T_solved_end.q).normalized();
-      telemetry_->scalar("frontend/innov/rot_deg", Sophus::SO3d(dq).log().norm() * 180.0 / M_PI,
+      telemetry_->scalar(keys::frontend::InnovRotDeg, Sophus::SO3d(dq).log().norm() * 180.0 / M_PI,
                          t_end);
     }
   }
@@ -1147,14 +1148,14 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
   capture_.valid = false;
   if (keyframeDue(spline_->pose(t_end), t_end)) {
     if (sync_cov_) {
-      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.posecov", t_end);
+      MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtPosecov, t_end);
       Eigen::Matrix<double, 6, 6> pose_cov;
       have_pose_cov_ = poseMarginalFromProblem(problem, t_end, &pose_cov);
       if (have_pose_cov_) {
         last_pose_cov_ = pose_cov;
       }
     } else {
-      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.covsnapshot", t_end);
+      MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtCovsnapshot, t_end);
       captureFinalRound(t_begin, t_end, imu, weights, capped_hits, cap_patches,
                         vis != nullptr && vis->img != nullptr ? vis : nullptr, gnss,
                         cap_motion_engaged, cap_motion_times, cap_tail_times, cap_first_pinned);
@@ -1222,7 +1223,7 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
 
   // Slide the window on the final, solved problem.
   {
-    MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.marg", t_end);
+    MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtMarg, t_end);
     slideWindow(problem, t_begin, t_end);
   }
 
@@ -1232,27 +1233,27 @@ int CtFrontEnd::solveWindow(const PreprocessedGroup& group, Timestamp t_begin, T
   diag_.deadline_hit = deadline_hit;
 
   if (telemetry_) {
-    if (telemetry_->enabled("frontend/deadline_hit")) {
-      telemetry_->scalar("frontend/deadline_hit", deadline_hit ? 1.0 : 0.0, t_end);
+    if (telemetry_->enabled(keys::frontend::DeadlineHit)) {
+      telemetry_->scalar(keys::frontend::DeadlineHit, deadline_hit ? 1.0 : 0.0, t_end);
     }
-    if (telemetry_->enabled("frontend/bias_bounded")) {
-      telemetry_->scalar("frontend/bias_bounded", bound_engaged ? 1.0 : 0.0, t_end);
+    if (telemetry_->enabled(keys::frontend::BiasBounded)) {
+      telemetry_->scalar(keys::frontend::BiasBounded, bound_engaged ? 1.0 : 0.0, t_end);
     }
     // Solved-state evolution at the sweep end (bias spline and velocity read-outs).
-    if (telemetry_->enabled("frontend/state/bias_gyr_norm")) {
-      telemetry_->scalar("frontend/state/bias_gyr_norm", bias_->gyroBiasAt(t_end).norm(), t_end);
+    if (telemetry_->enabled(keys::frontend::BiasGyrNorm)) {
+      telemetry_->scalar(keys::frontend::BiasGyrNorm, bias_->gyroBiasAt(t_end).norm(), t_end);
     }
-    if (telemetry_->enabled("frontend/state/bias_acc_norm")) {
-      telemetry_->scalar("frontend/state/bias_acc_norm", bias_->accelBiasAt(t_end).norm(), t_end);
+    if (telemetry_->enabled(keys::frontend::BiasAccNorm)) {
+      telemetry_->scalar(keys::frontend::BiasAccNorm, bias_->accelBiasAt(t_end).norm(), t_end);
     }
-    if (telemetry_->enabled("frontend/state/vel_norm") && spline_->covers(t_end)) {
-      telemetry_->scalar("frontend/state/vel_norm", spline_->linearVelocityWorld(t_end).norm(),
+    if (telemetry_->enabled(keys::frontend::VelNorm) && spline_->covers(t_end)) {
+      telemetry_->scalar(keys::frontend::VelNorm, spline_->linearVelocityWorld(t_end).norm(),
                          t_end);
     }
     // Prior health after the slide: the residual dimension of the prior the NEXT
     // sweep will solve under (0 = chain broken / not yet started).
-    if (telemetry_->enabled("frontend/prior/dim")) {
-      telemetry_->scalar("frontend/prior/dim",
+    if (telemetry_->enabled(keys::frontend::PriorDim)) {
+      telemetry_->scalar(keys::frontend::PriorDim,
                          prior_ ? static_cast<double>(prior_->residualDim()) : 0.0, t_end);
     }
   }
@@ -1424,7 +1425,7 @@ void CtFrontEnd::slideWindow(ceres::Problem& problem, Timestamp t_begin, Timesta
 }
 
 void CtFrontEnd::updateMap(const std::vector<LidarPoint>& scan_ds, Timestamp t0_scan) {
-  MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.map", last_solved_t_);
+  MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtMap, last_solved_t_);
   // The validity filter caps point range well below this, so a world point farther
   // than the bound from the sweep-end body position can only come from a pathological
   // trajectory warp. Keeping it out of the map stops one bad solve from poisoning
@@ -1448,17 +1449,17 @@ void CtFrontEnd::updateMap(const std::vector<LidarPoint>& scan_ds, Timestamp t0_
     world.push_back(p_w);
   }
   if (telemetry_) {
-    telemetry_->timing("frontend.ct.map.warp", ms_since(t_warp), last_solved_t_);
+    telemetry_->timing(keys::stage::CtMapWarp, ms_since(t_warp), last_solved_t_);
   }
   if (rejected > 0 && telemetry_) {
-    telemetry_->scalar("frontend/map/insert_rejected", static_cast<double>(rejected),
+    telemetry_->scalar(keys::frontend::MapInsertRejected, static_cast<double>(rejected),
                        last_solved_t_);
   }
   if (!world.empty()) {
     const auto t_insert = Clock::now();
     map_->insert(world);
     if (telemetry_) {
-      telemetry_->timing("frontend.ct.map.insert", ms_since(t_insert), last_solved_t_);
+      telemetry_->timing(keys::stage::CtMapInsert, ms_since(t_insert), last_solved_t_);
     }
   }
   // Segment the ikd-Tree to a cube around the current body so map RAM and the per-point
@@ -1469,7 +1470,7 @@ void CtFrontEnd::updateMap(const std::vector<LidarPoint>& scan_ds, Timestamp t0_
   // parallel association only ever reads settled node flags and cannot race on them.
   map_->flushPendingDeletes();
   if (telemetry_) {
-    telemetry_->timing("frontend.ct.map.trim", ms_since(t_trim), last_solved_t_);
+    telemetry_->timing(keys::stage::CtMapTrim, ms_since(t_trim), last_solved_t_);
   }
 }
 
@@ -1495,7 +1496,7 @@ void CtFrontEnd::publishPatchOverlay(const cv::Mat& intensity, Timestamp t_image
     patch.level = u.level;
     ov.patches.push_back(patch);
   }
-  telemetry_->image("frontend/visual/patches", ov, t_image);
+  telemetry_->image(keys::frontend::VisualPatches, ov, t_image);
 }
 
 void CtFrontEnd::captureFinalRound(Timestamp t_begin, Timestamp t_end,
@@ -1610,7 +1611,7 @@ void CtFrontEnd::submitKeyframeJob(KeyframePacket&& pkt, const Pose& T_world_bod
   // The push blocks only when the finalizer queue is full (worker behind by a full
   // queue depth of keyframes); the timer makes such a stall visible in the telemetry
   // instead of appearing as an anonymous sweep overrun.
-  MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.covsubmit", stamp);
+  MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtCovsubmit, stamp);
   finalizer_->submit(std::move(job));
 }
 
@@ -1646,11 +1647,11 @@ bool CtFrontEnd::poseMarginalFromProblem(ceres::Problem& problem, Timestamp stam
 void CtFrontEnd::emitFrontendMarkers(const Pose& T_world_body, Timestamp t_end) {
   // Observability hexagon (spec-09 §7.1): six spokes from the body origin, length proportional
   // to the per-axis score, coloured green (observable) -> red (degenerate).
-  if (telemetry_->enabled("frontend/observability")) {
+  if (telemetry_->enabled(keys::frontend::Observability)) {
     Marker hex;
     hex.type = Marker::Type::Hexagon;
     hex.frame = Frame::Odom;
-    hex.ns = "frontend/observability";
+    hex.ns = keys::frontend::Observability;
     hex.id = 0;
     hex.scale = 0.04f;
     const Eigen::Vector3f o = T_world_body.t.cast<float>();
@@ -1672,8 +1673,8 @@ void CtFrontEnd::emitFrontendMarkers(const Pose& T_world_body, Timestamp t_end) 
 
   // Spline knots + sliding-window box (spec-09 §5.1/§7.2): the trajectory the window currently
   // owns, sampled along its covered span; the box is its AABB.
-  const bool want_knots = telemetry_->enabled("frontend/spline_knots");
-  const bool want_box = telemetry_->enabled("frontend/window_box");
+  const bool want_knots = telemetry_->enabled(keys::frontend::SplineKnots);
+  const bool want_box = telemetry_->enabled(keys::frontend::WindowBox);
   if (!spline_ || (!want_knots && !want_box)) return;
   std::vector<Eigen::Vector3f> samples;
   const Timestamp lo = spline_->minTime();
@@ -1689,7 +1690,7 @@ void CtFrontEnd::emitFrontendMarkers(const Pose& T_world_body, Timestamp t_end) 
     Marker pts;
     pts.type = Marker::Type::Points;
     pts.frame = Frame::Odom;
-    pts.ns = "frontend/spline_knots";
+    pts.ns = keys::frontend::SplineKnots;
     pts.id = 0;
     pts.color = {1.f, 1.f, 0.f, 1.f};
     pts.scale = 0.12f;
@@ -1719,7 +1720,7 @@ void CtFrontEnd::emitFrontendMarkers(const Pose& T_world_body, Timestamp t_end) 
     Marker box;
     box.type = Marker::Type::LineList;
     box.frame = Frame::Odom;
-    box.ns = "frontend/window_box";
+    box.ns = keys::frontend::WindowBox;
     box.id = 0;
     box.color = {0.3f, 0.5f, 1.f, 0.6f};
     box.scale = 0.03f;
@@ -2020,7 +2021,7 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
       if (telemetry_) {
         char msg[96];
         std::snprintf(msg, sizeof(msg), "sweep gap %.0f ms bridged by IMU", gap_ms);
-        telemetry_->event(Level::Info, "frontend/sweep_gap_bridged", msg, t_begin);
+        telemetry_->event(Level::Info, keys::frontend::SweepGapBridged, msg, t_begin);
       }
       // Fall through: buildSeed integrates from last_solved_t_ across the hole and
       // extendTo appends the missing segments from the integrated trail.
@@ -2029,7 +2030,7 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
         char msg[96];
         std::snprintf(msg, sizeof(msg), "sweep gap %.0f ms exceeds IMU horizon; window reseeded",
                       gap_ms);
-        telemetry_->event(Level::Warn, "frontend/window_restart", msg, t_begin);
+        telemetry_->event(Level::Warn, keys::frontend::WindowRestart, msg, t_begin);
       }
       reseedAfterGap(group, t_begin, t_end);
       diag_.restarted = true;
@@ -2043,9 +2044,6 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   // excitation (with hysteresis) so aggressive motion gets denser knots and smooth
   // motion stays cheap; the constant-1 case is recovered when n_cp_max <= 1.
   const int n_cp = selectKnotDensity(mg.imu);
-  if (telemetry_ && telemetry_->enabled("frontend/spline/n_cp")) {
-    telemetry_->scalar("frontend/spline/n_cp", static_cast<double>(n_cp), t_end);
-  }
   auto seed = buildSeed(mg.imu, last_solved_t_, t_end);
   spline_->extendTo(t_end, seed, n_cp);
   bias_->extendTo(t_end);
@@ -2079,7 +2077,7 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   if (want_visual && !visualEnabled(group) && !visual_disabled_logged_) {
     visual_disabled_logged_ = true;
     if (telemetry_) {
-      telemetry_->event(Level::Warn, "frontend/visual/disabled",
+      telemetry_->event(Level::Warn, keys::frontend::VisualDisabled,
                         "camera intrinsics invalid or extrinsic missing; running LIO only", t_end);
     }
     MERIDIAN_WARN(kLogModule, "event", "frontend/visual/disabled", "cam_valid",
@@ -2126,7 +2124,7 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   anchor_ba_ = bias_->accelBiasAt(t_end);
 
   {
-    MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.obs", t_end);
+    MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtObs, t_end);
     last_obs_ = computeObservability(T_world_end, hits);
   }
   diag_.observability = last_obs_;
@@ -2139,9 +2137,8 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   if (telemetry_) {
     const auto& s = last_obs_.score;
     Eigen::Matrix<double, 6, 1> ov(s[0], s[1], s[2], s[3], s[4], s[5]);
-    telemetry_->vec("frontend/obs", ov, t_end, "tx,ty,tz,rx,ry,rz");
-    telemetry_->vec("frontend/observability", ov, t_end, "tx,ty,tz,rx,ry,rz");  // spec-09 §7.1 key
-    telemetry_->scalar("frontend/obs_min", *std::min_element(s.begin(), s.end()), t_end);
+    telemetry_->vec(keys::frontend::Observability, ov, t_end, "tx,ty,tz,rx,ry,rz");
+    telemetry_->scalar(keys::frontend::ObsMin, *std::min_element(s.begin(), s.end()), t_end);
     emitFrontendMarkers(T_world_end, t_end);
   }
 
@@ -2166,7 +2163,7 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   // Promotion uses the accepted LiDAR hits (which carry world point + fitted plane
   // normal) so a freshly promoted point already has the normal the warp needs.
   if (vctx.img != nullptr && vmap_) {
-    MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.visual_map", t_end);
+    MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtVisualMap, t_end);
     if (cfg_.visual.exposure_estimate_en && inv_expo_std_ > 0.0) {
       const double solved = expo.value(0);
       if (std::isfinite(solved) && solved > 0.0) {
@@ -2179,20 +2176,20 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
     // Tracked-patch overlay (gated): draw the patches captured from this sweep's kept
     // solve round before the map is mutated below, so the overlay shows exactly the
     // points that constrained the solve (not the post-promote/post-evict selection).
-    if (telemetry_ && telemetry_->enabled("frontend/visual/patches") && !pyramid.empty()) {
+    if (telemetry_ && telemetry_->enabled(keys::frontend::VisualPatches) && !pyramid.empty()) {
       publishPatchOverlay(pyramid.front(), t_img, vctx.used);
     }
 
     {
-      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.vmap.update", t_end);
+      MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtVmapUpdate, t_end);
       vmap_->updateAfterSolve(*vctx.img, cam_model_, T_w_c, inv_expo_);
     }
     {
-      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.vmap.promote", t_end);
+      MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtVmapPromote, t_end);
       vmap_->promote(*vctx.img, cam_model_, T_w_c, inv_expo_, hits);
     }
     {
-      MERIDIAN_SCOPED_TIME(telemetry_, "frontend.ct.vmap.evict", t_end);
+      MERIDIAN_SCOPED_TIME(telemetry_, keys::stage::CtVmapEvict, t_end);
       vmap_->evict(T_w_c.t);
     }
   }
@@ -2200,34 +2197,34 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   if (telemetry_) {
     // n_tracked: patches that passed the warp/level gate into this frame; n_converged:
     // those that also passed NCC/SSD and contributed a photometric residual to the solve.
-    if (telemetry_->enabled("frontend/visual/n_tracked")) {
-      telemetry_->scalar("frontend/visual/n_tracked", static_cast<double>(vctx.stats.warped),
+    if (telemetry_->enabled(keys::frontend::VisualNTracked)) {
+      telemetry_->scalar(keys::frontend::VisualNTracked, static_cast<double>(vctx.stats.warped),
                          t_end);
     }
     // Funnel observability: map population and per-frame candidate count localize a
     // tracking dropout to promotion, candidacy gating, or the warp/NCC stages.
-    if (vmap_ && telemetry_->enabled("frontend/visual/map_points")) {
-      telemetry_->scalar("frontend/visual/map_points", static_cast<double>(vmap_->size()), t_end);
+    if (vmap_ && telemetry_->enabled(keys::frontend::VisualMapPoints)) {
+      telemetry_->scalar(keys::frontend::VisualMapPoints, static_cast<double>(vmap_->size()), t_end);
     }
-    if (telemetry_->enabled("frontend/visual/n_candidates")) {
-      telemetry_->scalar("frontend/visual/n_candidates", static_cast<double>(vctx.stats.candidates),
+    if (telemetry_->enabled(keys::frontend::VisualNCandidates)) {
+      telemetry_->scalar(keys::frontend::VisualNCandidates, static_cast<double>(vctx.stats.candidates),
                          t_end);
     }
-    if (telemetry_->enabled("frontend/visual/n_converged")) {
-      telemetry_->scalar("frontend/visual/n_converged", static_cast<double>(vctx.stats.accepted),
+    if (telemetry_->enabled(keys::frontend::VisualNConverged)) {
+      telemetry_->scalar(keys::frontend::VisualNConverged, static_cast<double>(vctx.stats.accepted),
                          t_end);
     }
-    if (telemetry_->enabled("frontend/visual/res_mean")) {
+    if (telemetry_->enabled(keys::frontend::VisualResMean)) {
       const double res_mean = vctx.stats.accepted > 0
                                   ? vctx.stats.res_sum / static_cast<double>(vctx.stats.accepted)
                                   : 0.0;
-      telemetry_->scalar("frontend/visual/res_mean", res_mean, t_end);
+      telemetry_->scalar(keys::frontend::VisualResMean, res_mean, t_end);
     }
     // The photometric model estimates a multiplicative inverse-exposure gain only; the
     // affine brightness pair is [a, b] = [inv_expo, 0] (no additive offset estimated).
-    if (telemetry_->enabled("frontend/visual/exposure_gain")) {
+    if (telemetry_->enabled(keys::frontend::VisualExposureGain)) {
       Eigen::Vector2d gain(inv_expo_, 0.0);
-      telemetry_->vec("frontend/visual/exposure_gain", gain, t_end);
+      telemetry_->vec(keys::frontend::VisualExposureGain, gain, t_end);
     }
   }
 
@@ -2238,41 +2235,41 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
   diag_.scan_time_ms = ms_since(t_start);
 
   if (telemetry_) {
-    if (telemetry_->enabled("frontend/lidar/n_inlier")) {
-      telemetry_->scalar("frontend/lidar/n_inlier", static_cast<double>(accepted), t_end);
+    if (telemetry_->enabled(keys::frontend::LidarNInlier)) {
+      telemetry_->scalar(keys::frontend::LidarNInlier, static_cast<double>(accepted), t_end);
     }
-    if (telemetry_->enabled("frontend/map/size")) {
-      telemetry_->scalar("frontend/map/size", static_cast<double>(map_->size()), t_end);
+    if (telemetry_->enabled(keys::frontend::MapSize)) {
+      telemetry_->scalar(keys::frontend::MapSize, static_cast<double>(map_->size()), t_end);
     }
     // The weakest pose axis of this sweep's LiDAR observability report.
-    if (telemetry_->enabled("frontend/obs/min_score")) {
-      telemetry_->scalar("frontend/obs/min_score",
+    if (telemetry_->enabled(keys::frontend::ObsMinScore)) {
+      telemetry_->scalar(keys::frontend::ObsMinScore,
                          *std::min_element(last_obs_.score.begin(), last_obs_.score.end()), t_end);
     }
-    if (telemetry_->enabled("frontend/iter_count")) {
-      telemetry_->scalar("frontend/iter_count", static_cast<double>(diag_.iterations), t_end);
+    if (telemetry_->enabled(keys::frontend::IterCount)) {
+      telemetry_->scalar(keys::frontend::IterCount, static_cast<double>(diag_.iterations), t_end);
     }
-    if (telemetry_->enabled("frontend/solve_ms")) {
-      telemetry_->scalar("frontend/solve_ms", diag_.solve_time_ms, t_end);
+    if (telemetry_->enabled(keys::frontend::SolveMs)) {
+      telemetry_->scalar(keys::frontend::SolveMs, diag_.solve_time_ms, t_end);
     }
-    if (telemetry_->enabled("frontend/outer_iters")) {
-      telemetry_->scalar("frontend/outer_iters", static_cast<double>(diag_.outer_iters), t_end);
+    if (telemetry_->enabled(keys::frontend::OuterIters)) {
+      telemetry_->scalar(keys::frontend::OuterIters, static_cast<double>(diag_.outer_iters), t_end);
     }
-    if (telemetry_->enabled("frontend/lidar/n_factors_kept")) {
-      telemetry_->scalar("frontend/lidar/n_factors_kept", static_cast<double>(last_cap_stats_.kept),
+    if (telemetry_->enabled(keys::frontend::LidarNFactorsKept)) {
+      telemetry_->scalar(keys::frontend::LidarNFactorsKept, static_cast<double>(last_cap_stats_.kept),
                          t_end);
     }
-    if (telemetry_->enabled("frontend/lidar/n_factors_dropped")) {
-      telemetry_->scalar("frontend/lidar/n_factors_dropped",
+    if (telemetry_->enabled(keys::frontend::LidarNFactorsDropped)) {
+      telemetry_->scalar(keys::frontend::LidarNFactorsDropped,
                          static_cast<double>(last_cap_stats_.dropped), t_end);
     }
-    if (telemetry_->enabled("frontend/ct/n_cp")) {
-      telemetry_->scalar("frontend/ct/n_cp", static_cast<double>(last_n_cp_), t_end);
+    if (telemetry_->enabled(keys::frontend::CtNCp)) {
+      telemetry_->scalar(keys::frontend::CtNCp, static_cast<double>(last_n_cp_), t_end);
     }
-    if (telemetry_->enabled("odom/body")) {
-      telemetry_->pose("odom/body", T_world_end, Frame::Body, t_end);
+    if (telemetry_->enabled(keys::odom::Body)) {
+      telemetry_->pose(keys::odom::Body, T_world_end, Frame::Body, t_end);
     }
-    if (telemetry_->enabled("frontend/lidar/inliers") && !hits.empty()) {
+    if (telemetry_->enabled(keys::frontend::LidarInliers) && !hits.empty()) {
       PointCloud inliers;
       inliers.reserve(hits.size());
       for (const ct::LidarHit& h : hits) {
@@ -2285,9 +2282,9 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
         inliers.push_back(lp);
       }
       PointCloudView view{std::span<const LidarPoint>(inliers.data(), inliers.size())};
-      telemetry_->cloud("frontend/lidar/inliers", view, Frame::Odom, t_end);
+      telemetry_->cloud(keys::frontend::LidarInliers, view, Frame::Odom, t_end);
     }
-    if (telemetry_->enabled("map/registered") && !scan_ds.empty()) {
+    if (telemetry_->enabled(keys::map::Registered) && !scan_ds.empty()) {
       PointCloud reg;
       reg.reserve(scan_ds.size());
       for (const LidarPoint& p : scan_ds) {
@@ -2301,7 +2298,7 @@ void CtFrontEnd::ingest(const PreprocessedGroup& group) {
         reg.push_back(lp);
       }
       PointCloudView view{std::span<const LidarPoint>(reg.data(), reg.size())};
-      telemetry_->cloud("map/registered", view, Frame::Odom, t_end);
+      telemetry_->cloud(keys::map::Registered, view, Frame::Odom, t_end);
     }
   }
 }

@@ -3,6 +3,7 @@
 #include <unordered_map>
 
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian {
 
@@ -11,8 +12,8 @@ void emitGraphMarkers(TelemetrySink* sink,
                       const std::vector<std::pair<std::uint64_t, std::uint64_t>>& edges,
                       Timestamp ts) {
   if (sink == nullptr) return;
-  const bool want_nodes = sink->enabled("backend/graph_nodes");
-  const bool want_edges = sink->enabled("backend/graph_edges");
+  const bool want_nodes = sink->enabled(keys::backend::GraphNodes);
+  const bool want_edges = sink->enabled(keys::backend::GraphEdges);
   if (!want_nodes && !want_edges) return;
 
   std::unordered_map<std::uint64_t, Eigen::Vector3f> pos;
@@ -21,7 +22,7 @@ void emitGraphMarkers(TelemetrySink* sink,
   Marker nm;
   nm.type = Marker::Type::Points;
   nm.frame = Frame::Map;
-  nm.ns = "backend/graph_nodes";
+  nm.ns = keys::backend::GraphNodes;
   nm.id = 0;
   nm.color = {0.2f, 0.9f, 1.0f, 1.0f};  // cyan
   nm.scale = 0.15f;
@@ -37,7 +38,7 @@ void emitGraphMarkers(TelemetrySink* sink,
     Marker em;
     em.type = Marker::Type::LineList;
     em.frame = Frame::Map;
-    em.ns = "backend/graph_edges";
+    em.ns = keys::backend::GraphEdges;
     em.id = 0;
     em.color = {0.6f, 0.6f, 0.6f, 0.8f};  // dim gray
     em.scale = 0.04f;

@@ -76,7 +76,6 @@ class RosTelemetrySink final : public TelemetrySink {
   double default_hz(bool heavy) const;
 
   static std::string sanitize(const std::string& key);  // '/' -> '_' for topic suffixes
-  static const char* unit_of(const std::string& key);
   std::string cloud_topic(const std::string& key) const;
   std::string pose_topic(const std::string& key) const;
   std::string image_topic(const std::string& key) const;

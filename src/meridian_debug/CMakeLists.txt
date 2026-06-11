@@ -10,6 +10,7 @@ find_package(meridian_common REQUIRED)
 
 add_library(meridian_debug
   src/telemetry.cpp
+  src/telemetry_keys.cpp
   src/log.cpp
   src/file_sink.cpp
   src/packet_log.cpp)
@@ -42,6 +43,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_file_sink meridian_debug)
   meridian_add_gtest(test_packet_log test/test_packet_log.cpp)
   target_link_libraries(test_packet_log meridian_debug)
+  meridian_add_gtest(test_telemetry_keys test/test_telemetry_keys.cpp)
+  target_link_libraries(test_telemetry_keys meridian_debug)
 endif()
 
 ament_package()

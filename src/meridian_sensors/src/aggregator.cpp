@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian {
 
@@ -75,7 +76,7 @@ void Aggregator::flag(std::uint8_t sensor_id, Modality modality, HealthCode code
   const std::uint64_t count =
       ++flag_counts_[{sensor_id, static_cast<std::uint16_t>(code)}];
   if (telemetry_) {
-    std::string key = "sensors/validator/";
+    std::string key = std::string(keys::sensors::ValidatorPrefix);
     key += modality_name(modality);
     key += std::to_string(static_cast<unsigned>(sensor_id));
     key += '/';
@@ -283,8 +284,8 @@ void Aggregator::emit_group(PendingSweep&& sweep, bool imu_late) {
     flag(group.scan.sensor_id, Modality::Imu, HealthCode::ImuLate, sweep.t_end);
   }
 
-  if (telemetry_ && telemetry_->enabled("sensors/imu_in_group")) {
-    telemetry_->scalar("sensors/imu_in_group",
+  if (telemetry_ && telemetry_->enabled(keys::sensors::ImuInGroup)) {
+    telemetry_->scalar(keys::sensors::ImuInGroup,
                        static_cast<double>(group.imu.size()), sweep.t_end);
   }
 

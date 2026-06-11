@@ -18,6 +18,7 @@
 #include "meridian/calib/extrinsic.hpp"
 #include "meridian/calib/intrinsics.hpp"
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 #include "meridian/frontend/ifrontend.hpp"
 #include "meridian/preprocess/camera_preprocess.hpp"
 #include "meridian/preprocess/gnss_gate.hpp"
@@ -107,7 +108,7 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
   // A defaulted (identity) LiDAR extrinsic is a valid-looking value the estimator
   // will silently consume as a real calibration; surface it loudly once at startup.
   if (!s.lidar.extrinsic_set) {
-    sink_->event(Level::Warn, "sensors/lidar/extrinsic_default",
+    sink_->event(Level::Warn, keys::sensors::LidarExtrinsicDefault,
                  "lidar extrinsic not configured; using identity T_imu_lidar", 0);
   }
 
@@ -273,7 +274,7 @@ void MeridianPipeline::enqueue(SensorSample&& s) {
   // After close() the queue accepts nothing: samples still arriving on an ingest thread
   // during shutdown are dropped silently and are not counted as an overload drop.
   const std::size_t dropped = q_sensors_.push_or_drop_oldest(std::move(s));
-  if (dropped > 0) sink_->scalar("pipeline/q_sensors_dropped", 1.0, t);
+  if (dropped > 0) sink_->scalar(keys::pipeline::QSensorsDropped, 1.0, t);
 }
 
 void MeridianPipeline::stage_loop() {
@@ -299,14 +300,14 @@ void MeridianPipeline::dispatch_to_frontend(MeasSample&& m) {
   if (outcome.evicted) {
     if (std::holds_alternative<PreprocessedGroup>(*outcome.evicted)) {
       const Timestamp te = std::get<PreprocessedGroup>(*outcome.evicted).group.t_end;
-      sink_->scalar("pipeline/q_meas_dropped", 1.0, te);
-      sink_->scalar("pipeline/q_meas_dropped_sweep", 1.0, te);
-      sink_->event(Level::Error, "pipeline/q_meas_dropped_sweep",
+      sink_->scalar(keys::pipeline::QMeasDropped, 1.0, te);
+      sink_->scalar(keys::pipeline::QMeasDroppedSweep, 1.0, te);
+      sink_->event(Level::Error, keys::pipeline::QMeasDroppedSweep,
                    "front-end overloaded: dropped a whole sweep from Q_meas", te);
     } else {
       const Timestamp ts = std::get<ImuSample>(*outcome.evicted).stamp;
-      sink_->scalar("pipeline/q_meas_dropped", 1.0, ts);
-      sink_->scalar("pipeline/q_meas_dropped_imu", 1.0, ts);
+      sink_->scalar(keys::pipeline::QMeasDropped, 1.0, ts);
+      sink_->scalar(keys::pipeline::QMeasDroppedImu, 1.0, ts);
     }
   }
 }
@@ -348,8 +349,8 @@ void MeridianPipeline::on_keyframe(KeyframePacket&& kf) {
   // The first keyframe means the front-end's window now spans the sweep, so it deskews
   // with its own trajectory; later groups are no longer cold_start.
   if (!spline_active_) spline_active_ = true;
-  sink_->event(Level::Info, "frontend/keyframe", "front-end emitted a keyframe", kf.stamp);
-  sink_->scalar("frontend/keyframe_count", static_cast<double>(n), kf.stamp);
+  sink_->event(Level::Info, keys::frontend::Keyframe, "front-end emitted a keyframe", kf.stamp);
+  sink_->scalar(keys::frontend::KeyframeCount, static_cast<double>(n), kf.stamp);
   last_kf_id_ = kf.id;
   // The back-end stream sees the keyframe before the wrapper sink consumes the move;
   // the copy is cheap because the heavy payloads are shared-immutable handles.
@@ -402,10 +403,10 @@ void MeridianPipeline::feed_backend(BackendItem&& item) {
   // Lossless edge: the graph must see every item, so the queue grows instead of
   // dropping and the resulting depth is the overload signal.
   const std::size_t depth = q_backend_.push_always(std::move(item));
-  sink_->scalar("backend/queue_depth", static_cast<double>(depth), t);
+  sink_->scalar(keys::backend::QueueDepth, static_cast<double>(depth), t);
   const bool over = static_cast<int>(depth) > cfg_.backend.queue_warn_depth;
   if (over && !backend_queue_over_) {
-    sink_->event(Level::Warn, "backend/queue_overload",
+    sink_->event(Level::Warn, keys::backend::QueueOverload,
                  "back-end input queue depth crossed the warn threshold", t);
   }
   backend_queue_over_ = over;
@@ -454,7 +455,7 @@ void MeridianPipeline::backend_loop() {
         ++staged;
       }
     }
-    sink_->scalar("backend/queue_depth", static_cast<double>(q_backend_.size()), 0);
+    sink_->scalar(keys::backend::QueueDepth, static_cast<double>(q_backend_.size()), tele_stamp());
     if (staged == 0) continue;
     // The cadence timer batches inserts; an immediate request (an admitted loop, a
     // just-locked datum) bypasses it.
@@ -486,8 +487,9 @@ void MeridianPipeline::backend_loop() {
 
 void MeridianPipeline::publish_graph_update(const GraphUpdate& gu) {
   const BackEndDiagnostics diag = backend_->diagnostics();
-  sink_->scalar("backend/optimize_lag", static_cast<double>(diag.optimize_lag), 0);
-  sink_->scalar("backend/n_keyframes", static_cast<double>(diag.num_keyframes), 0);
+  const Timestamp ts = tele_stamp();
+  sink_->scalar(keys::backend::OptimizeLag, static_cast<double>(diag.optimize_lag), ts);
+  sink_->scalar(keys::backend::NKeyframes, static_cast<double>(diag.num_keyframes), ts);
   // The front-end is re-anchored only when the back-end performs a real rigid correction
   // (a loop closure or GNSS realignment). Routine per-keyframe moves and the floating-gauge
   // drift are not corrections to fold back: feeding them would repeatedly perturb the spline
@@ -504,8 +506,6 @@ void MeridianPipeline::publish_graph_update(const GraphUpdate& gu) {
   // Assembled map cloud, stamped at the latest keyframe. Forced on a loop fold so the
   // de-warp is visible the instant the graph snaps; throttled otherwise.
   if (store_ && last_kf_id_) {
-    const auto it = kf_stamps_.find(*last_kf_id_);
-    const Timestamp ts = it != kf_stamps_.end() ? it->second : 0;
     publish_map_cloud(ts, /*force=*/gu.loop_closed);
   }
   if (graph_update_sink_) graph_update_sink_(gu);
@@ -528,10 +528,16 @@ std::vector<LoopConstraint> MeridianPipeline::detect_loops() {
   return loops;
 }
 
+Timestamp MeridianPipeline::tele_stamp() const {
+  if (!last_kf_id_) return 0;
+  const auto it = kf_stamps_.find(*last_kf_id_);
+  return it != kf_stamps_.end() ? it->second : 0;
+}
+
 void MeridianPipeline::publish_map_cloud(Timestamp ts, bool force) {
   // Skip the O(all-points) rebuild entirely when no sink renders clouds (file/null): the
   // assembled map cloud is viz-only, so building it just to drop it wastes the whole cost.
-  if (!store_ || !backend_ || !sink_->wants_clouds() || !sink_->enabled("map/cloud")) return;
+  if (!store_ || !backend_ || !sink_->wants_clouds() || !sink_->enabled(keys::map::Cloud)) return;
   // Throttle: rebuilding the whole map cloud from every stored keyframe is O(points), so
   // only do it every few folds — unless a loop just folded, where the whole point is to
   // show the de-warp the instant it happens.
@@ -564,7 +570,7 @@ void MeridianPipeline::publish_map_cloud(Timestamp ts, bool force) {
   std::vector<LidarPoint> out;
   out.reserve(grid.size());
   for (auto& [key, pt] : grid) out.push_back(pt);
-  sink_->cloud("map/cloud", PointCloudView{out}, Frame::Map, ts);
+  sink_->cloud(keys::map::Cloud, PointCloudView{out}, Frame::Map, ts);
 }
 
 void MeridianPipeline::drain_pending_correction() {
@@ -584,10 +590,10 @@ void MeridianPipeline::process(SensorSample&& s) {
           if (!imu_init_->done()) {
             const bool became_done = imu_init_->add(sample);
             if (became_done) {
-              sink_->event(Level::Info, "preprocess/imu_init_done", "static init converged",
+              sink_->event(Level::Info, keys::preprocess::ImuInitDone, "static init converged",
                            sample.stamp);
             } else if (imu_init_->failed()) {
-              sink_->event(Level::Warn, "preprocess/imu_init_retry",
+              sink_->event(Level::Warn, keys::preprocess::ImuInitRetry,
                            "motion gate rejected the static window", sample.stamp);
               imu_init_->clear();
             }
@@ -599,12 +605,12 @@ void MeridianPipeline::process(SensorSample&& s) {
         } else if constexpr (std::is_same_v<T, LidarScan>) {
           LidarScan filtered;
           {
-            MERIDIAN_SCOPED_TIME(sink_.get(), "preprocess", sample.stamp_start);
+            MERIDIAN_SCOPED_TIME(sink_.get(), keys::stage::Preprocess, sample.stamp_start);
             filtered = lidar_preprocessor_->process(sample);
           }
           // Measured on the filtered scan: start-vs-end spacing is the tripwire for a
           // driver stamping the end of the sweep instead of the first column.
-          sink_->scalar("sensors/lidar/sweep_duration_ms",
+          sink_->scalar(keys::sensors::LidarSweepDurationMs,
                         static_cast<double>(filtered.sweep_duration) / 1e6,
                         filtered.stamp_start);
           aggregator_->on(std::move(filtered));
@@ -619,19 +625,19 @@ void MeridianPipeline::process(SensorSample&& s) {
 }
 
 void MeridianPipeline::on_group(MeasureGroup&& g) {
-  sink_->scalar("pipeline/q_sensors_depth", static_cast<double>(q_sensors_.size()),
+  sink_->scalar(keys::pipeline::QSensorsDepth, static_cast<double>(q_sensors_.size()),
                 g.t_end);
 
   if (!imu_init_->done()) {
     // Surface bootstrap progress so the operator can see why nothing is published yet.
     const double target = static_cast<double>(cfg_.preprocess.deskew.imu_init_count);
-    sink_->scalar("preprocess/imu_init_progress",
+    sink_->scalar(keys::preprocess::ImuInitProgress,
                   static_cast<double>(imu_init_->state().count) / target, g.t_end);
     // Hold sweeps until the static init converges; the freshest scans win.
     const auto cap = static_cast<std::size_t>(cfg_.preprocess.deskew.bootstrap_max_scans);
     if (bootstrap_groups_.size() >= cap) {
       bootstrap_groups_.pop_front();
-      sink_->event(Level::Warn, "preprocess/bootstrap_drop",
+      sink_->event(Level::Warn, keys::preprocess::BootstrapDrop,
                    "bootstrap buffer full, dropped oldest sweep", g.t_end);
     }
     bootstrap_groups_.push_back(std::move(g));
@@ -650,20 +656,20 @@ void MeridianPipeline::on_group(MeasureGroup&& g) {
 void MeridianPipeline::emit_group(MeasureGroup&& g) {
   std::optional<LidarScan> deskewed;
   {
-    MERIDIAN_SCOPED_TIME(sink_.get(), "preprocess.deskew", g.t_end);
+    MERIDIAN_SCOPED_TIME(sink_.get(), keys::stage::PreprocessDeskew, g.t_end);
     deskewed = deskew_group(g);
   }
 
-  if (deskewed && sink_->enabled("body/scan")) {
-    sink_->cloud("body/scan", PointCloudView{*deskewed->points}, Frame::Body, g.t_end);
+  if (deskewed && sink_->enabled(keys::body::Scan)) {
+    sink_->cloud(keys::body::Scan, PointCloudView{*deskewed->points}, Frame::Body, g.t_end);
   }
-  sink_->scalar("pipeline/group_imu_count", static_cast<double>(g.imu.size()), g.t_end);
-  sink_->scalar("pipeline/group_points",
+  sink_->scalar(keys::pipeline::GroupImuCount, static_cast<double>(g.imu.size()), g.t_end);
+  sink_->scalar(keys::pipeline::GroupPoints,
                 static_cast<double>(g.scan.points ? g.scan.points->size() : 0), g.t_end);
 
-  if (g.image && sink_->enabled("preprocess/camera_pyramid")) {
+  if (g.image && sink_->enabled(keys::preprocess::CameraPyramid)) {
     const ProcessedCamera cam = camera_preprocessor_->process(*g.image);
-    sink_->scalar("preprocess/camera_pyramid_levels",
+    sink_->scalar(keys::preprocess::CameraPyramidLevels,
                   static_cast<double>(cam.pyramid.size()), g.image->stamp);
     // Surface both the decoded original and its undistorted form so the rectification can
     // be watched side by side. This is an inspection path; the front-end is fed the raw
@@ -681,8 +687,8 @@ void MeridianPipeline::emit_group(MeasureGroup&& g) {
       ov.base = std::span<const std::uint8_t>(img.data, img.total());
       sink_->image(key, ov, g.image->stamp);
     };
-    publish_mono("preprocess/camera_raw", cam.intensity_raw);
-    publish_mono("preprocess/camera_intensity", cam.intensity);
+    publish_mono(keys::preprocess::CameraRaw, cam.intensity_raw);
+    publish_mono(keys::preprocess::CameraIntensity, cam.intensity);
   }
 
   PreprocessedGroup pg{std::move(g), std::move(deskewed),
@@ -711,7 +717,7 @@ std::optional<LidarScan> MeridianPipeline::deskew_group(const MeasureGroup& g) {
                   "imu horizon misses the sweep: head %+.0f us, tail %+.0f us",
                   static_cast<double>(g.imu.front().stamp - g.t_begin) / 1e3,
                   static_cast<double>(g.t_end - g.imu.back().stamp) / 1e3);
-    sink_->event(Level::Warn, "preprocess/deskew_horizon", msg, g.t_end);
+    sink_->event(Level::Warn, keys::preprocess::DeskewHorizon, msg, g.t_end);
     return std::nullopt;
   }
   return out;

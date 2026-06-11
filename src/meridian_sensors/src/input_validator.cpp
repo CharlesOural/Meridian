@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian {
 
@@ -367,7 +368,7 @@ const char* code_name(HealthCode code) {
 void InputValidator::emit_count(HealthCode code, Timestamp t) {
   if (!telemetry_) return;
   // Build the per-code key once and gate on it so an idle key skips the format step.
-  std::string key = "sensors/validator/";
+  std::string key = std::string(keys::sensors::ValidatorPrefix);
   key += sensor_tag(info_);
   key += '/';
   key += code_name(code);
@@ -381,7 +382,7 @@ void InputValidator::emit_count(HealthCode code, Timestamp t) {
 
 void InputValidator::emit_rate(double rate_hz, Timestamp t) {
   if (!telemetry_) return;
-  std::string key = "sensors/rate/";
+  std::string key = std::string(keys::sensors::RatePrefix);
   key += sensor_tag(info_);
   if (telemetry_->enabled(key.c_str())) {
     telemetry_->scalar(key.c_str(), rate_hz, t);

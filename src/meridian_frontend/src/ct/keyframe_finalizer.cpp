@@ -14,6 +14,7 @@
 #include "ct/window_problem.hpp"
 #include "meridian/common/cov_reorder.hpp"
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian {
 
@@ -125,8 +126,8 @@ void KeyframeFinalizer::finalize(KeyframeJob&& job) {
     have_pose_cov_ = true;
   }
 
-  if (telemetry_ != nullptr && telemetry_->enabled("frontend.ct.posecov.worker")) {
-    telemetry_->scalar("frontend.ct.posecov.worker", ms_since(t_start), job.stamp);
+  if (telemetry_ != nullptr && telemetry_->enabled(keys::stage::CtPosecovWorker)) {
+    telemetry_->scalar(keys::stage::CtPosecovWorker, ms_since(t_start), job.stamp);
   }
 
   if (sink_) {

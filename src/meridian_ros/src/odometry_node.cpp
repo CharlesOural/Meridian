@@ -24,6 +24,7 @@
 #include "conversions/ros2core.hpp"
 #include "debug/ros_telemetry_sink.hpp"
 #include "meridian/config/config_loader.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 #include "meridian/pipeline/meridian_pipeline.hpp"
 
 namespace meridian {
@@ -118,13 +119,13 @@ class OdometryNode : public rclcpp::Node {
             }
           }
           last_lidar_stamp_ = stamp;
-          sink_->scalar("wrapper/lidar/cb_n", static_cast<double>(lidar_cb_n_), stamp);
-          sink_->scalar("wrapper/lidar/lost_upstream_n",
+          sink_->scalar(keys::wrapper::LidarCbN, static_cast<double>(lidar_cb_n_), stamp);
+          sink_->scalar(keys::wrapper::LidarLostUpstreamN,
                         static_cast<double>(lidar_lost_upstream_), stamp);
           RawLidarFrame f;
           if (!to_raw_lidar(*msg, now_ns(), &lidar_scratch_, &f)) {
             ++lidar_convert_rejected_;
-            sink_->scalar("wrapper/lidar/convert_rejected_n",
+            sink_->scalar(keys::wrapper::LidarConvertRejectedN,
                           static_cast<double>(lidar_convert_rejected_), stamp);
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
                                  "dropping scan: missing x/y/z or per-point time field");

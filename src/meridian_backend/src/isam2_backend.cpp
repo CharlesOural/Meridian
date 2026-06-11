@@ -35,7 +35,7 @@
 #include "observability_inflation.hpp"
 #include "pim_from_summary.hpp"
 #include "robust_kernels.hpp"
-#include "telemetry_keys.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian::backend {
 
@@ -105,7 +105,7 @@ void Isam2BackEnd::add_keyframe(KeyframePacket&& kf) {
     case KeyframePacket::ConstraintKind::AbsolutePrior: {
       if (last_kf_id_) {
         sink_->event(
-            Level::Warn, "backend/absolute_ignored",
+            Level::Warn, keys::backend::AbsoluteIgnored,
             "absolute keyframe " + std::to_string(kf.id) + " after the first; packet dropped",
             tele_stamp());
         return;
@@ -127,7 +127,7 @@ void Isam2BackEnd::add_keyframe(KeyframePacket&& kf) {
       // chain is dropped whole rather than bridged with a fabricated constraint.
       if (!last_kf_id_ || kf.rel_to_id != *last_kf_id_) {
         const std::string expected = last_kf_id_ ? std::to_string(*last_kf_id_) : "none";
-        sink_->event(Level::Error, kTeleContiguity,
+        sink_->event(Level::Error, keys::backend::Contiguity,
                      "kf " + std::to_string(kf.id) + " chains to " + std::to_string(kf.rel_to_id) +
                          " but last accepted is " + expected + "; packet dropped",
                      tele_stamp());
@@ -138,7 +138,7 @@ void Isam2BackEnd::add_keyframe(KeyframePacket&& kf) {
       // an information-form block fed to a covariance noise model inverts every axis.
       GaussianBlock<6> cov_block = kf.constraint_cov;
       if (cov_block.form == GaussianBlock<6>::Form::Information) {
-        sink_->event(Level::Warn, kTeleInfoForm,
+        sink_->event(Level::Warn, keys::backend::InfoForm,
                      "kf " + std::to_string(kf.id) + " shipped information-form cov; inverting",
                      tele_stamp());
         Eigen::Matrix<double, 6, 6> info = cov_block.M;
@@ -151,7 +151,7 @@ void Isam2BackEnd::add_keyframe(KeyframePacket&& kf) {
       // inflate the wrong axes. Skip inflation rather than misapply it.
       InflationResult inf;
       if (kf.observability.frame != Frame::Body && !kf.observability.eigvecs) {
-        sink_->event(Level::Warn, kTeleObsFrame,
+        sink_->event(Level::Warn, keys::backend::ObsFrame,
                      "kf " + std::to_string(kf.id) +
                          " observability not in body frame; "
                          "inflation skipped",
@@ -166,7 +166,7 @@ void Isam2BackEnd::add_keyframe(KeyframePacket&& kf) {
       publish_observability(kf.id, kf.observability, inf);
       Eigen::Matrix<double, 6, 6> cov = inf.cov;  // rotation-first
       if (ensure_psd(cov)) {
-        sink_->event(Level::Warn, kTelePsdClamp,
+        sink_->event(Level::Warn, keys::backend::PsdClamp,
                      "constraint covariance of kf " + std::to_string(kf.id) + " clamped to PSD",
                      tele_stamp());
       }
@@ -184,7 +184,7 @@ void Isam2BackEnd::add_keyframe(KeyframePacket&& kf) {
         if (extrinsic_rot_accum_ >= cfg_.extrinsic_excite_rot &&
             extrinsic_trans_accum_ >= cfg_.extrinsic_excite_trans) {
           extrinsic_excited_ = true;
-          sink_->event(Level::Info, "backend/extrinsic_excited",
+          sink_->event(Level::Info, keys::backend::ExtrinsicExcited,
                        "gnss lever refinement engaged (excitation reached)", tele_stamp());
         }
       }
@@ -204,7 +204,7 @@ void Isam2BackEnd::add_restart_imu_edge(KeyframePacket&& kf) {
   if (!kf.kinematics_included || !kf.imu_summary.has_value() || !last_kf_id_ ||
       kf.rel_to_id != *last_kf_id_) {
     const std::string expected = last_kf_id_ ? std::to_string(*last_kf_id_) : "none";
-    sink_->event(Level::Error, kTeleContiguity,
+    sink_->event(Level::Error, keys::backend::Contiguity,
                  "restart kf " + std::to_string(kf.id) + " chains to " +
                      std::to_string(kf.rel_to_id) + " but last accepted is " + expected +
                      " (or missing kinematics); packet dropped",
@@ -278,7 +278,7 @@ void Isam2BackEnd::add_restart_imu_edge(KeyframePacket&& kf) {
   chain_cov_.extend(i, j, T_i_j, pose_cov);
 
   pending_bridges_.push_back(BridgeRecord{i, j});
-  sink_->event(Level::Info, kTeleRestartBridge,
+  sink_->event(Level::Info, keys::backend::RestartBridge,
                "restart bridge " + std::to_string(i) + "->" + std::to_string(j), tele_stamp());
 
   record_keyframe(std::move(kf));
@@ -289,7 +289,7 @@ void Isam2BackEnd::add_loop_constraint(const LoopConstraint& lc) {
   // geometric match is unlikely to be consistent and only inflates the consistency graph.
   if (lc.fitness < cfg_.loop_min_fitness) {
     ++diag_.num_loops_rejected;
-    sink_->event(Level::Info, kTeleLoopRejectedPcm,
+    sink_->event(Level::Info, keys::backend::LoopRejectedPcm,
                  "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) +
                      " fitness " + std::to_string(lc.fitness) + " below floor; dropped",
                  tele_stamp());
@@ -326,7 +326,7 @@ void Isam2BackEnd::process_pending_loops(Timestamp ts) {
     publish_loop_marker(lc, /*accepted=*/false, ts);
     pcm_.mark_rejected(h);
     ++diag_.num_loops_rejected;
-    sink_->event(Level::Info, kTeleLoopRejectedPcm,
+    sink_->event(Level::Info, keys::backend::LoopRejectedPcm,
                  "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) +
                      " PCM-inconsistent; dropped",
                  ts);
@@ -373,7 +373,7 @@ void Isam2BackEnd::finalize_pending_loops(const gtsam::ISAM2Result& result, Time
     const LoopConstraint& lc = pcm_.at(handle);
     publish_loop_marker(lc, /*accepted=*/true, ts);
     sink_->event(
-        Level::Info, kTeleLoopAccepted,
+        Level::Info, keys::backend::LoopAccepted,
         "loop " + std::to_string(lc.from_id) + "->" + std::to_string(lc.to_id) + " admitted", ts);
   }
   for (const std::size_t handle : staged_evict_handles_) {
@@ -481,7 +481,7 @@ void Isam2BackEnd::run_gnc_consolidation(Timestamp ts) {
     staged_gnc_reject_handles_.push_back(handle);
   }
   if (!staged_gnc_reject_handles_.empty()) {
-    sink_->event(Level::Info, kTeleLoopRejectedGnc,
+    sink_->event(Level::Info, keys::backend::LoopRejectedGnc,
                  "batch GNC flagged " + std::to_string(staged_gnc_reject_handles_.size()) +
                      " loop(s) for removal",
                  ts);
@@ -489,7 +489,7 @@ void Isam2BackEnd::run_gnc_consolidation(Timestamp ts) {
 }
 
 void Isam2BackEnd::publish_loop_marker(const LoopConstraint& lc, bool accepted, Timestamp ts) {
-  if (!sink_->enabled(kTeleLoopEdge)) {
+  if (!sink_->enabled(keys::backend::LoopEdge)) {
     return;
   }
   if (!estimate_cache_.exists(keyX(lc.from_id)) || !estimate_cache_.exists(keyX(lc.to_id))) {
@@ -500,7 +500,7 @@ void Isam2BackEnd::publish_loop_marker(const LoopConstraint& lc, bool accepted, 
   Marker m;
   m.type = Marker::Type::LineList;
   m.frame = Frame::Map;
-  m.ns = kTeleLoopEdge;
+  m.ns = keys::backend::LoopEdge;
   m.id = static_cast<std::int32_t>((lc.to_id << 20) ^ lc.from_id);
   m.points = {a.t.cast<float>(), b.t.cast<float>()};
   m.color = accepted ? std::array<float, 4>{0.0F, 1.0F, 0.0F, 1.0F}
@@ -545,7 +545,7 @@ std::optional<Isam2BackEnd::Bracket> Isam2BackEnd::find_bracket(Timestamp stamp,
 
 void Isam2BackEnd::add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id) {
   if (!cfg_.gnss_enabled || gnss_auto_disabled_) {
-    sink_->event(Level::Debug, kTeleGnssSkip,
+    sink_->event(Level::Debug, keys::backend::GnssSkip,
                  "gnss disabled; fix near kf " + std::to_string(nearest_kf_id) + " dropped",
                  tele_stamp());
     return;
@@ -557,7 +557,7 @@ void Isam2BackEnd::add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id)
   try {
     lever = calib_->extrinsic(Frame::GnssLink).T_parent_child.t;
   } catch (const std::exception&) {
-    sink_->event(Level::Warn, kTeleGnssSkip, "no GnssLink extrinsic; fix dropped", tele_stamp());
+    sink_->event(Level::Warn, keys::backend::GnssSkip, "no GnssLink extrinsic; fix dropped", tele_stamp());
     return;
   }
 
@@ -565,7 +565,7 @@ void Isam2BackEnd::add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id)
   // neither seed the permanent ENU origin nor poison the datum fit. This guards the pre-lock path
   // (the post-lock path gates again through gnss_gate_).
   if (fix.fix == GnssFix::FixType::None || fix.cov_enu.trace() > cfg_.gnss_max_cov) {
-    sink_->event(Level::Debug, kTeleGnssSkip, "gnss fix below quality floor; dropped",
+    sink_->event(Level::Debug, keys::backend::GnssSkip, "gnss fix below quality floor; dropped",
                  tele_stamp());
     return;
   }
@@ -583,7 +583,7 @@ void Isam2BackEnd::add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id)
   const std::optional<Bracket> br = find_bracket(fix.stamp, nearest_kf_id);
   if (!br) {
     // No estimated keyframe to anchor against yet (before the first optimize()).
-    sink_->event(Level::Debug, kTeleGnssSkip, "no estimated keyframe to anchor gnss fix",
+    sink_->event(Level::Debug, keys::backend::GnssSkip, "no estimated keyframe to anchor gnss fix",
                  tele_stamp());
     return;
   }
@@ -646,7 +646,7 @@ void Isam2BackEnd::add_absolute(const GnssFix& fix, std::uint64_t nearest_kf_id)
                                          lock.T_map_enu.q.x() * lock.T_map_enu.q.y()),
                                   1.0 - 2.0 * (lock.T_map_enu.q.y() * lock.T_map_enu.q.y() +
                                                lock.T_map_enu.q.z() * lock.T_map_enu.q.z()));
-    sink_->event(Level::Info, kTeleDatumLocked,
+    sink_->event(Level::Info, keys::backend::DatumLocked,
                  "datum locked: yaw=" + std::to_string(yaw) +
                      " rad, yaw_sigma=" + std::to_string(lock.yaw_sigma_rad) +
                      " rad, fixes=" + std::to_string(datum_.size()),
@@ -726,7 +726,7 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
     const char* reason = decision == GnssGate::Decision::RejectQuality   ? "quality"
                          : decision == GnssGate::Decision::SkipConfident ? "confident"
                                                                          : "spacing";
-    sink_->event(Level::Debug, kTeleGnssSkip, std::string("gnss fix dropped: ") + reason,
+    sink_->event(Level::Debug, keys::backend::GnssSkip, std::string("gnss fix dropped: ") + reason,
                  tele_stamp());
     return;
   }
@@ -743,18 +743,18 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
       ++gnss_consecutive_chi2_reject_;
       if (gnss_consecutive_chi2_reject_ >= cfg_.gnss_reacq_persist) {
         gnss_auto_disabled_ = true;
-        sink_->event(Level::Error, kTeleGnssDisabled,
+        sink_->event(Level::Error, keys::backend::GnssDisabled,
                      "gnss auto-disabled after " + std::to_string(gnss_consecutive_chi2_reject_) +
                          " consecutive chi2-failing fixes",
                      tele_stamp());
       } else {
-        sink_->event(Level::Debug, kTeleGnssSkip, "gnss fix failed chi2 health; dropped",
+        sink_->event(Level::Debug, keys::backend::GnssSkip, "gnss fix failed chi2 health; dropped",
                      tele_stamp());
       }
       return;
     }
     gnss_consecutive_chi2_reject_ = 0;
-    sink_->vec(kTeleGnssResidual, r, tele_stamp(), "e,n,u");
+    sink_->vec(keys::backend::GnssResidual, r, tele_stamp(), "e,n,u");
   }
 
   // First post-lock fix under refinement seeds the E(GnssLink) variable at the offline lever with
@@ -831,7 +831,7 @@ GraphUpdate Isam2BackEnd::optimize() {
       isam2_->update();
     } catch (const gtsam::IndeterminantLinearSystemException& e) {
       // The state is left at the last completed pass; stop refining instead of crashing.
-      sink_->event(Level::Error, kTeleIndeterminate,
+      sink_->event(Level::Error, keys::backend::Indeterminate,
                    "extra pass failed near " + key_name(e.nearbyVariable()), ts);
       break;
     }
@@ -867,7 +867,7 @@ GraphUpdate Isam2BackEnd::optimize() {
   if (last_kf_id_ && estimate_cache_.exists(keyX(*last_kf_id_))) {
     const Pose X_last = from_gtsam(estimate_cache_.at<gtsam::Pose3>(keyX(*last_kf_id_)));
     T_map_odom_ = X_last * kf_records_.at(*last_kf_id_).T_ref_body.inverse();
-    sink_->pose(kTeleMapKeyframe, X_last, Frame::Map, ts);
+    sink_->pose(keys::map::Keyframe, X_last, Frame::Map, ts);
   }
 
   publish_graph_markers(ts);
@@ -877,18 +877,18 @@ GraphUpdate Isam2BackEnd::optimize() {
   diag_.variables_relinearized = static_cast<int>(result.variablesRelinearized);
   diag_.optimize_lag = folded;
 
-  sink_->scalar(kTeleChi2, diag_.chi2, ts);
-  sink_->scalar(kTeleNFactors, static_cast<double>(isam2_->getFactorsUnsafe().size()), ts);
-  sink_->scalar(kTeleNLoops, static_cast<double>(diag_.num_loops), ts);
-  sink_->scalar(kTeleNGnss, static_cast<double>(diag_.num_gnss_factors), ts);
-  sink_->scalar(kTeleUpdateMs, diag_.isam_update_ms, ts);
-  sink_->scalar(kTeleRelinCount, static_cast<double>(diag_.variables_relinearized), ts);
-  sink_->scalar(kTeleOptimizeLag, static_cast<double>(folded), ts);
-  sink_->timing("backend.optimize", diag_.isam_update_ms, ts);
+  sink_->scalar(keys::backend::Chi2, diag_.chi2, ts);
+  sink_->scalar(keys::backend::NFactors, static_cast<double>(isam2_->getFactorsUnsafe().size()), ts);
+  sink_->scalar(keys::backend::NLoops, static_cast<double>(diag_.num_loops), ts);
+  sink_->scalar(keys::backend::NGnss, static_cast<double>(diag_.num_gnss_factors), ts);
+  sink_->scalar(keys::backend::UpdateMs, diag_.isam_update_ms, ts);
+  sink_->scalar(keys::backend::RelinCount, static_cast<double>(diag_.variables_relinearized), ts);
+  sink_->scalar(keys::backend::OptimizeLag, static_cast<double>(folded), ts);
+  sink_->timing(keys::stage::BackendOptimize, diag_.isam_update_ms, ts);
   // A fold that relinearizes a large fraction of the trajectory is the loop-thrash / bad-fold
   // signature worth flagging for the operator, with the Bayes-tree size for context.
   if (diag_.variables_relinearized > kRelinEventThresh) {
-    sink_->event(Level::Debug, kTeleRelinearize,
+    sink_->event(Level::Debug, keys::backend::Relinearize,
                  "relinearized " + std::to_string(diag_.variables_relinearized) + " of " +
                      std::to_string(isam2_->getFactorsUnsafe().size()) + " factors",
                  ts);
@@ -914,7 +914,7 @@ bool Isam2BackEnd::run_update_with_recovery(
     result = isam2_->update(new_graph_, new_values_, remove_indices_, constrained);
     return true;
   } catch (const gtsam::IndeterminantLinearSystemException& e) {
-    sink_->event(Level::Error, kTeleIndeterminate,
+    sink_->event(Level::Error, keys::backend::Indeterminate,
                  "indeterminate system near " + key_name(e.nearbyVariable()) + "; retrying on QR",
                  ts);
   }
@@ -928,7 +928,7 @@ bool Isam2BackEnd::run_update_with_recovery(
     result = isam2_->update(new_graph_, new_values_, remove_indices_, constrained);
     return true;
   } catch (const gtsam::IndeterminantLinearSystemException& e) {
-    sink_->event(Level::Error, kTeleIndeterminate,
+    sink_->event(Level::Error, keys::backend::Indeterminate,
                  "QR retry failed near " + key_name(e.nearbyVariable()) + "; dropping the batch",
                  ts);
   }
@@ -939,13 +939,13 @@ bool Isam2BackEnd::run_update_with_recovery(
     try {
       result = isam2_->update(last_good, estimate_cache_);
     } catch (const gtsam::IndeterminantLinearSystemException& e) {
-      sink_->event(Level::Error, kTeleIndeterminate,
+      sink_->event(Level::Error, keys::backend::Indeterminate,
                    "last-good restore failed near " + key_name(e.nearbyVariable()), ts);
     }
   }
   diag_.last_optimize_diverged = true;
   ++diag_.fallback_count;
-  sink_->scalar(kTeleFallbackCount, static_cast<double>(diag_.fallback_count), ts);
+  sink_->scalar(keys::backend::FallbackCount, static_cast<double>(diag_.fallback_count), ts);
   return false;
 }
 
@@ -1023,7 +1023,7 @@ void Isam2BackEnd::update_extrinsic(Timestamp ts) {
     extrinsic_frozen_ = true;
     extrinsic_repin_value_ = extrinsic_offline_lever_;  // re-pin E to offline next fold (FM-5)
     publish_refined_lever();
-    sink_->event(Level::Warn, "backend/extrinsic_clamped",
+    sink_->event(Level::Warn, keys::backend::ExtrinsicClamped,
                  "gnss lever left the offline box; reverted and frozen", ts);
     return;
   }
@@ -1042,7 +1042,7 @@ void Isam2BackEnd::update_extrinsic(Timestamp ts) {
     if (m.bottomRightCorner<3, 3>().trace() < cfg_.extrinsic_freeze_cov) {
       extrinsic_frozen_ = true;
       extrinsic_repin_value_ = extrinsic_lever_;  // re-pin E to the converged value next fold
-      sink_->event(Level::Info, "backend/extrinsic_frozen",
+      sink_->event(Level::Info, keys::backend::ExtrinsicFrozen,
                    "gnss lever refined and frozen: [" + std::to_string(extrinsic_lever_.x()) +
                        ", " + std::to_string(extrinsic_lever_.y()) + ", " +
                        std::to_string(extrinsic_lever_.z()) + "]",
@@ -1093,7 +1093,7 @@ std::optional<Eigen::Matrix<double, 6, 6>> Isam2BackEnd::chain_cov_between(
 }
 
 void Isam2BackEnd::publish_graph_markers(Timestamp ts) const {
-  if (!sink_->enabled("backend/graph_nodes") && !sink_->enabled("backend/graph_edges")) return;
+  if (!sink_->enabled(keys::backend::GraphNodes) && !sink_->enabled(keys::backend::GraphEdges)) return;
   // Same traversal as write_g2o: keyframe pose vertices + the relative (between/loop) edges.
   std::vector<std::pair<std::uint64_t, Pose>> nodes;
   nodes.reserve(kf_order_.size());
@@ -1134,7 +1134,7 @@ void Isam2BackEnd::write_g2o(const std::string& path) const {
   try {
     gtsam::writeG2o(edges, poses, path);
   } catch (const std::exception& e) {
-    sink_->event(Level::Warn, "backend/g2o_snapshot",
+    sink_->event(Level::Warn, keys::backend::G2oSnapshot,
                  std::string("g2o snapshot failed: ") + e.what(), tele_stamp());
   }
 }
@@ -1222,30 +1222,30 @@ void Isam2BackEnd::perform_bridge_marginalization(Timestamp ts) {
   } catch (const std::exception&) {
     // gtsam throws when a scheduled key is not actually a leaf; keep all of them and retry
     // next fold rather than dropping the inertial states inconsistently.
-    sink_->event(Level::Warn, kTeleMarginalizeSkip,
+    sink_->event(Level::Warn, keys::backend::MarginalizeSkip,
                  "bridge V/B not leaf-eligible; marginalization deferred", ts);
   }
 }
 
 void Isam2BackEnd::publish_observability(std::uint64_t id, const ObservabilityReport& obs,
                                          const InflationResult& inf) {
-  if (sink_->enabled(kTeleObsMin)) {
+  if (sink_->enabled(keys::backend::ObsMin)) {
     double obs_min = obs.score[0];
     for (const double s : obs.score) {
       obs_min = std::min(obs_min, s);
     }
-    sink_->scalar(kTeleObsMin, obs_min, tele_stamp());
+    sink_->scalar(keys::backend::ObsMin, obs_min, tele_stamp());
     // Per-axis inflation multipliers in factor (rotation-first) order, so a degenerate axis
     // is visible over the whole run, not only inside one keyframe.
     Eigen::Matrix<double, 6, 1> lam;
     for (int k = 0; k < 6; ++k) {
       lam(k) = inf.lambda[static_cast<std::size_t>(k)];
     }
-    const std::string key = kTeleObservabilityPrefix + std::to_string(id);
+    const std::string key = std::string(keys::backend::ObservabilityPrefix) + std::to_string(id);
     sink_->vec(key.c_str(), lam, tele_stamp(), "rx,ry,rz,tx,ty,tz");
   }
   if (inf.any_locked) {
-    sink_->event(Level::Warn, kTeleDegenerate,
+    sink_->event(Level::Warn, keys::backend::Degenerate,
                  "kf " + std::to_string(id) + " has a degenerate axis locked to max inflation",
                  tele_stamp());
   }

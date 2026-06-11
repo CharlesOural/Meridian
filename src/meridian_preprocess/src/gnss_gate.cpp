@@ -4,6 +4,7 @@
 
 #include "meridian/debug/log.hpp"
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian {
 
@@ -158,7 +159,7 @@ GnssVerdict GnssGate::evaluate(const GnssFix& fix) {
     v.accepted = false;
     v.reason = q;
     if (telemetry_ != nullptr) {
-      telemetry_->scalar("gnss/rejected", 1.0, fix.stamp);
+      telemetry_->scalar(keys::gnss::Rejected, 1.0, fix.stamp);
     }
     MERIDIAN_WARN(kLogModule, "event", "gnss/quality_reject", "reason",
                   static_cast<int>(q), "sats", static_cast<int>(fix.num_sats));
@@ -178,7 +179,7 @@ GnssVerdict GnssGate::evaluate(const GnssFix& fix) {
     v.accepted = false;
     v.reason = GnssVerdict::Reason::SpoofVelocity;
     if (telemetry_ != nullptr) {
-      telemetry_->scalar("gnss/spoof", 1.0, fix.stamp);
+      telemetry_->scalar(keys::gnss::Spoof, 1.0, fix.stamp);
     }
     MERIDIAN_WARN(kLogModule, "event", "gnss/spoof_suspected", "run", spoof_run_);
     return v;
@@ -188,7 +189,7 @@ GnssVerdict GnssGate::evaluate(const GnssFix& fix) {
   v.reason = GnssVerdict::Reason::Accepted;
   accepted_.push(StampedEnu{fix.stamp, enu});
   if (telemetry_ != nullptr) {
-    telemetry_->scalar("gnss/accepted", 1.0, fix.stamp);
+    telemetry_->scalar(keys::gnss::Accepted, 1.0, fix.stamp);
   }
   return v;
 }

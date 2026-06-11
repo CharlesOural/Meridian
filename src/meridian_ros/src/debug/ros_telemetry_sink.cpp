@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "conversions/core2ros.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 
 namespace meridian {
 
@@ -96,7 +97,7 @@ void RosTelemetrySink::scalar(const char* key, double v, Timestamp t) {
   m.key = key;
   m.values = {v};
   m.axis_order = "";
-  m.unit = unit_of(key);
+  m.unit = keys::unit_string(key);
   pub_telemetry_->publish(m);
 }
 
@@ -108,7 +109,7 @@ void RosTelemetrySink::vec(const char* key, const Eigen::Ref<const Eigen::Vector
   m.key = key;
   m.values.assign(v.data(), v.data() + v.size());
   m.axis_order = axis_order ? axis_order : "";
-  m.unit = unit_of(key);
+  m.unit = keys::unit_string(key);
   pub_telemetry_->publish(m);
 }
 
@@ -256,16 +257,6 @@ std::string RosTelemetrySink::sanitize(const std::string& key) {
   std::string out = key;
   std::replace(out.begin(), out.end(), '/', '_');
   return out;
-}
-
-const char* RosTelemetrySink::unit_of(const std::string& key) {
-  if (key.find("rate_hz") != std::string::npos) return "hz";
-  if (key.find("_ms") != std::string::npos) return "ms";
-  if (key.find("n_") != std::string::npos || key.find("count") != std::string::npos ||
-      key.find("depth") != std::string::npos || key.find("dropped") != std::string::npos ||
-      key.find("points") != std::string::npos || key.find("levels") != std::string::npos)
-    return "count";
-  return "";
 }
 
 std::string RosTelemetrySink::cloud_topic(const std::string& key) const {

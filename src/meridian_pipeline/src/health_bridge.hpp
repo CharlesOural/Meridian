@@ -7,6 +7,7 @@
 #include <optional>
 
 #include "meridian/debug/telemetry.hpp"
+#include "meridian/debug/telemetry_keys.hpp"
 #include "meridian/sensors/health.hpp"
 
 namespace meridian {
@@ -44,27 +45,27 @@ class TelemetryHealthBridge final : public HealthSink {
       if (last && now - *last < kDegradeRepeatWindow) return;
       last = now;
     }
-    sink_->event(Level::Warn, "health/degrade", code_name(code), 0);
+    sink_->event(Level::Warn, keys::health::Degrade, code_name(code), 0);
   }
 
  private:
   static const char* rate_key(Modality m) {
     switch (m) {
-      case Modality::Imu: return "health/imu/rate_hz";
-      case Modality::Lidar: return "health/lidar/rate_hz";
-      case Modality::Camera: return "health/camera/rate_hz";
-      case Modality::Gnss: return "health/gnss/rate_hz";
+      case Modality::Imu: return keys::health::ImuRateHz;
+      case Modality::Lidar: return keys::health::LidarRateHz;
+      case Modality::Camera: return keys::health::CameraRateHz;
+      case Modality::Gnss: return keys::health::GnssRateHz;
     }
-    return "health/rate_hz";
+    return keys::health::RateHz;
   }
   static const char* level_tag(Modality m) {
     switch (m) {
-      case Modality::Imu: return "health/imu";
-      case Modality::Lidar: return "health/lidar";
-      case Modality::Camera: return "health/camera";
-      case Modality::Gnss: return "health/gnss";
+      case Modality::Imu: return keys::health::Imu;
+      case Modality::Lidar: return keys::health::Lidar;
+      case Modality::Camera: return keys::health::Camera;
+      case Modality::Gnss: return keys::health::Gnss;
     }
-    return "health";
+    return keys::health::Root;
   }
   static const char* level_name(HealthLevel level) {
     switch (level) {
