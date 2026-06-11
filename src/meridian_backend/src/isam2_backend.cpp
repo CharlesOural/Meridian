@@ -793,6 +793,15 @@ void Isam2BackEnd::admit_gnss_fix(const GnssFix& fix, const Eigen::Vector3d& p_e
 
 GraphUpdate Isam2BackEnd::optimize() {
   const Timestamp ts = tele_stamp();
+  // A clamp/freeze on the previous fold left a re-pin pending: pin E tight here so the stale
+  // refined-lever factors evaluate at the safe lever and stop biasing the trajectory.
+  if (extrinsic_repin_value_) {
+    const gtsam::Pose3 pin(gtsam::Rot3::Identity(), gtsam::Point3(*extrinsic_repin_value_));
+    new_graph_.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+        keyE(Frame::GnssLink), pin,
+        gtsam::noiseModel::Isotropic::Sigma(6, cfg_.extrinsic_prior_sigma));
+    extrinsic_repin_value_.reset();
+  }
   // Run PCM before measuring the staged batch: admitted loops add factors and evictions add
   // removals, both of which the fold below must see.
   if (pcm_.pending_count() > 0 || !loop_factor_index_.empty()) {
@@ -1009,6 +1018,7 @@ void Isam2BackEnd::update_extrinsic(Timestamp ts) {
   if ((lever - extrinsic_offline_lever_).norm() > cfg_.extrinsic_max_dev) {
     extrinsic_lever_ = extrinsic_offline_lever_;
     extrinsic_frozen_ = true;
+    extrinsic_repin_value_ = extrinsic_offline_lever_;  // re-pin E to offline next fold (FM-5)
     publish_refined_lever();
     sink_->event(Level::Warn, "backend/extrinsic_clamped",
                  "gnss lever left the offline box; reverted and frozen", ts);
@@ -1028,6 +1038,7 @@ void Isam2BackEnd::update_extrinsic(Timestamp ts) {
     // GTSAM Pose3 tangent is rotation-first; the translation block is the bottom-right 3x3.
     if (m.bottomRightCorner<3, 3>().trace() < cfg_.extrinsic_freeze_cov) {
       extrinsic_frozen_ = true;
+      extrinsic_repin_value_ = extrinsic_lever_;  // re-pin E to the converged value next fold
       sink_->event(Level::Info, "backend/extrinsic_frozen",
                    "gnss lever refined and frozen: [" + std::to_string(extrinsic_lever_.x()) +
                        ", " + std::to_string(extrinsic_lever_.y()) + ", " +

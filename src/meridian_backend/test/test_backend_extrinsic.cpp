@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -86,7 +87,7 @@ Eigen::Vector3d refinedLever(const IBackEnd& be) {
 // axes, so the datum yaw is observable and the extrinsic excitation gate opens.
 std::unique_ptr<IBackEnd> drive(const Eigen::Vector3d& offline_lever,
                                 const Eigen::Vector3d& true_lever, CountingSink* sink, int n = 90,
-                                double max_dev = -1.0) {
+                                double max_dev = -1.0, bool refine = true) {
   const Pose T_map_enu{Eigen::Quaterniond(Eigen::AngleAxisd(0.12, Eigen::Vector3d::UnitZ())),
                        Eigen::Vector3d(3.0, -2.0, 0.5)};
   const GeodeticDatum origin = hkOrigin();
@@ -98,6 +99,7 @@ std::unique_ptr<IBackEnd> drive(const Eigen::Vector3d& offline_lever,
   const SynthChain chain = make_chain(opt);
 
   BackendConfig cfg = refineConfig();
+  cfg.extrinsic_refine = refine;
   if (max_dev > 0.0) {
     cfg.extrinsic_max_dev = max_dev;
   }
@@ -186,4 +188,19 @@ TEST(BackendExtrinsic, ClampRejectsRunawayLever) {
   EXPECT_GE(sink.count("backend/extrinsic_clamped"), 1) << "runaway lever was not clamped";
   // Reverted to the offline value; it never adopts the out-of-box estimate.
   EXPECT_EQ(refinedLever(*be), offline_lever);
+
+  // The clamp must also re-pin E so the stale refined factors stop biasing the trajectory: the
+  // corrected path must match a never-refined run on the same data, not drift off it.
+  CountingSink sink_off;
+  auto be_off = drive(offline_lever, true_lever, &sink_off, /*n=*/90, /*max_dev=*/0.003,
+                      /*refine=*/false);
+  const auto traj = be->corrected_trajectory();
+  const auto traj_off = be_off->corrected_trajectory();
+  ASSERT_EQ(traj.size(), traj_off.size());
+  double max_diff = 0.0;
+  for (std::size_t i = 0; i < traj.size(); ++i) {
+    max_diff = std::max(max_diff, (traj[i].T_map_body.t - traj_off[i].T_map_body.t).norm());
+  }
+  EXPECT_LT(max_diff, 0.05) << "clamp did not neutralize the refined factors (trajectory diverged "
+                            << max_diff << " m from the un-refined run)";
 }

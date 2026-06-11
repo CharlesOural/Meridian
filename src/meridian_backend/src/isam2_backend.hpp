@@ -203,6 +203,9 @@ private:
   Eigen::Vector3d extrinsic_offline_lever_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d extrinsic_lever_ =
       Eigen::Vector3d::Zero();  // current best (offline, then frozen)
+  // When a clamp or freeze fires, the lever to re-pin E to with a tight prior on the next fold;
+  // this neutralizes the refined-lever factors so they can no longer bias the trajectory.
+  std::optional<Eigen::Vector3d> extrinsic_repin_value_;
   std::shared_ptr<const CalibrationSet> refined_calib_;
 
   // Loop closures. pcm_ buffers every accepted LoopConstraint and decides admit/evict/reject via

@@ -1235,6 +1235,17 @@ boundaries via `IFrontEnd::set_calibration`. The version counter lets L2 detect
 "calibration changed, reset linearization" (`01 §5.3`). The snapshot crosses L3→L2
 as Shared-immutable, never as live shared mutable — no data race.
 
+> **Implementation note (GNSS lever).** L3 realises the tight-then-loose prior as a
+> *constant* prior at `extrinsic_refine_sigma` combined with **factor gating**: before
+> the excitation gate opens the GNSS factors carry the constant offline lever, so `E` is
+> held by its prior alone and cannot drift; once the gate opens they switch to the
+> refined-lever form (`GnssFactorRefined`, lever = `E.translation()`), which makes the
+> lever observable. The convergence freeze stops issuing refined-lever factors and
+> publishes the frozen value rather than mutating the prior in place. Because the datum
+> `G` is fit and pinned while still using the offline lever, refinement is bounded by that
+> lock's bias — which is why this path targets the trusted-but-drifting (mm–cm) regime, not
+> a gross offline error.
+
 ### 10.2 Observability & safeguards
 
 Extrinsics are weakly observable without excitation (the platform must rotate
