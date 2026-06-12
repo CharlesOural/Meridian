@@ -44,6 +44,12 @@ public:
   // solved estimate instead of the dead-reckoned one.
   void rebase(const NavState& solved);
 
+  // Observe the gyro bias from one registered scan: the body-frame orientation
+  // discrepancy between the propagated (IMU-predicted) attitude and `measured_q` over
+  // `dt` seconds is the rate error the integration carried; a low-gain step folds its
+  // consistent part into b_g. Call before rebase(); a no-op unless enabled in config.
+  void correct_gyro_bias(const Eigen::Quaterniond& measured_q, double dt);
+
   // The IMU-rate state; runs ahead of the registered pose between scans.
   NavState propagated_state() const;
 

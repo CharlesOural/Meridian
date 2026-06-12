@@ -156,6 +156,23 @@ void ImuTracker::rebase(const NavState& solved) {
   state_.v_world = solved.v_world;
 }
 
+void ImuTracker::correct_gyro_bias(const Eigen::Quaterniond& measured_q, double dt) {
+  if (!cfg_.estimate_gyro_bias || dt <= 0.0) {
+    return;
+  }
+  // The propagated and measured attitudes share the previous solved orientation, so
+  // their relative rotation is exactly this interval's attitude error. Integrating with
+  // (gyro - b_g), a bias that is too small over-rotates: e_body = log(meas^-1 * pred) is
+  // the excess body rotation, equal to -(b_g - b_g_true) * dt to first order. Hence b_g
+  // moves by +gain * e_body / dt toward the value that would have cancelled the excess.
+  const Eigen::Vector3d e_body =
+      Sophus::SO3d(measured_q.normalized().conjugate() * state_.T_world_body.q.normalized()).log();
+  Eigen::Vector3d b_g = state_.b_g + cfg_.gyro_bias_gain * (e_body / dt);
+  const double m = cfg_.gyro_bias_max;
+  b_g = b_g.cwiseMax(-m).cwiseMin(m);
+  state_.b_g = b_g;
+}
+
 NavState ImuTracker::propagated_state() const {
   return state_;
 }

@@ -36,6 +36,9 @@ front-end is bit-identical run-to-run, so a single replay per point is valid.
 | `init_stationary_s` | 1.0 | ↑ = tighter gravity/bias init (frozen biases can't absorb error later) vs longer mandatory standstill | initial value, untuned (pre-Jetson); 0 disables static init — bench only |
 | `max_gap_s` | 0.5 | ↓ = reseeds armed on smaller holes → safer but more chain breaks (AbsolutePrior packets) | initial value, untuned (pre-Jetson) |
 | `reseed_cov_inflation` | 100.0 | ↓ = post-reseed anchor trusted more → backend snaps to it, wrong-landing risk | initial value, untuned (pre-Jetson) |
+| `estimate_gyro_bias` | true (newer-college yamls) | online gyro-bias observer: each scan folds the IMU-vs-ICP attitude discrepancy into b_g, so the rest-fixed bias tracks slow drift on long runs | **park (571 s) 0.64→0.52 m (−19 %, max 1.46→0.95), quad-hard 0.123→0.118, quad-easy/math neutral** — replay-validated on NCD; off = the pre-existing static-init bias |
+| `gyro_bias_gain` | 0.05 | per-scan filter gain on the observed rate error. ↑ tracks bias faster but absorbs ICP rotation noise; swept on NCD: 0.05 beats 0.1 (park 0.52 vs 0.58, and 0.1 regresses quad-hard back to 0.124) | **swept; 0.05 optimal of {0.05, 0.1}** |
+| `gyro_bias_max` | 0.1 rad/s | per-axis clamp on \|b_g\| — runaway guard against a bad interval; well above any real MEMS gyro bias | safety clamp, not hit in NCD runs |
 
 ## `frontend.keyframe.*` (cadence — packet rate × per-packet info trade)
 

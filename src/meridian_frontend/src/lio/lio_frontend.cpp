@@ -268,6 +268,9 @@ void LioFrontEnd::processGroup(const MeasureGroup& g) {
     const Eigen::Matrix<double, 6, 1> xi = res.pose.boxminus(last_state_.T_world_body);
     solved.v_world = res.pose.q * (xi.head<3>() / dt);
   }
+  // Fold this scan's attitude discrepancy into the gyro bias before reading it back, so
+  // the dead-reckoning between the next scans integrates the updated bias.
+  tracker_.correct_gyro_bias(res.pose.q, dt);
   solved.b_g = tracker_.bias_gyro();
   solved.b_a = tracker_.bias_accel();
   tracker_.rebase(solved);

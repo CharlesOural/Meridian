@@ -265,6 +265,13 @@ struct FrontendLio {
   double init_stationary_s = 1.0;       // standstill window for static init; 0 = start immediately
   double max_gap_s = 0.5;               // sensor gap beyond this triggers a reseed
   double reseed_cov_inflation = 100.0;  // constraint-cov inflation on the reseeded keyframe
+  // Online gyro-bias estimation: each registered scan observes the orientation
+  // discrepancy between the IMU prediction and the solved pose; the consistent part is
+  // the gyro-bias error, tracked by a low-gain filter (static init alone leaves the bias
+  // fixed, so it drifts over long runs). Off by default keeps the bias at its rest value.
+  bool estimate_gyro_bias = false;
+  double gyro_bias_gain = 0.05;     // per-scan filter gain on the observed rate error
+  double gyro_bias_max = 0.1;       // clamp on |bias| per axis [rad/s]
 };
 struct FrontendKeyframe {
   double dist_m = 1.0;

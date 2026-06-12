@@ -251,6 +251,9 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   get(lio, "init_stationary_s", c.lio.init_stationary_s);
   get(lio, "max_gap_s", c.lio.max_gap_s);
   get(lio, "reseed_cov_inflation", c.lio.reseed_cov_inflation);
+  get(lio, "estimate_gyro_bias", c.lio.estimate_gyro_bias);
+  get(lio, "gyro_bias_gain", c.lio.gyro_bias_gain);
+  get(lio, "gyro_bias_max", c.lio.gyro_bias_max);
   const YAML::Node kf = n["keyframe"];
   get(kf, "dist_m", c.keyframe.dist_m);
   get(kf, "rot_deg", c.keyframe.rot_deg);
@@ -505,6 +508,12 @@ bool Config::validate(std::string* error_out) const {
   }
   if (frontend.lio.reseed_cov_inflation < 1.0) {
     return fail("frontend.lio.reseed_cov_inflation must be >= 1");
+  }
+  if (frontend.lio.gyro_bias_gain < 0.0 || frontend.lio.gyro_bias_gain > 1.0) {
+    return fail("frontend.lio.gyro_bias_gain must be in [0, 1]");
+  }
+  if (frontend.lio.gyro_bias_max <= 0.0) {
+    return fail("frontend.lio.gyro_bias_max must be > 0");
   }
 
   // --- back-end ---
