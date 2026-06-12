@@ -1,0 +1,112 @@
+# Meridian configuration for the Barracuda 4x4 (Shark Robotics) Jetson Orin AGX rig.
+# Live LiDAR-Inertial odometry: Ouster OS1-128 (PTP grandmaster on the Jetson's end0)
+# + SBG IMU on /imu/data (400 Hz, ROS-stamped, REP-103 ENU). ZED camera and GNSS are
+# wired later; this config is LIO-only.
+#
+# CALIBRATION STATUS (fill before trusting odometry):
+#   - sensors.lidar.extrinsic_T / extrinsic_R : CAD seed below is a PLACEHOLDER
+#     (identity). Replace with the measured LiDAR-in-IMU transform, then refine with a
+#     targetless LiDAR-IMU run (LI-Init) and update again.
+#   - sensors.imu.cov_* : seeded at MEMS order-of-magnitude. Replace with SBG datasheet
+#     densities, then with an Allan-variance fit on a long static log; inflate for the
+#     4x4's drivetrain/terrain vibration once a GT A/B is available.
+#   - preprocess.blind : set to just beyond the chassis so the rig's own returns are cut.
+meridian:
+  pipeline:
+    mode: live              # the node ingests live from the driver topics
+    queue:
+      meas_capacity: 8      # Q_meas (lossy under overload); ~0.8 s at 10 Hz
+      kf_capacity: 64       # Q_kf (lossless back-pressure)
+      map_capacity: 64      # Q_map (lossless back-pressure)
+  time:
+    source: ptp             # live: the Ouster is PTP-disciplined off the host grandmaster
+    max_skew_ms: 5.0
+    ptp:
+      iface: end0           # the grandmaster NIC that serves the Ouster
+      domain: 0
+      require_lock: true    # fail fast if PTP is not locked; set false to bring up before sync is verified
+    validator:              # standing live stamp-integrity gate, always on
+      gap_periods: 2.5      # dropout when a raw gap exceeds 2.5 nominal periods
+      skew_warn_ppm: 200
+      nan_ratio_warn: 0.05  # reject only an all-NaN scan; drop offending points below this
+  sensors:
+    lidar:
+      topic: /os_cloud_node/points
+      model: ouster_os1_128
+      nominal_rate_hz: 10.0
+      ptp: true                       # device stamps from the PTP-disciplined clock
+      timestamp_mode: TIME_FROM_PTP_1588
+      qos_reliable: false             # the live Ouster driver publishes best-effort; match it
+      # Constant correction onto the IMU/estimation timeline. The host-stamped SBG vs the
+      # PTP LiDAR clock has a residual constant lag that the software-offset KF estimates
+      # online; leave 0 and only set a constant here after a gyro-cross-correlation check.
+      time_offset_ms: 0.0
+      # T_imu_lidar: LiDAR (os_sensor) frame expressed in the IMU (ENU body) frame.
+      # p_imu = R * p_lidar + T. Both frames are X-fwd / Y-left / Z-up. Translation is
+      # CAD-measured (SBG base-plate reference point -> os_sensor origin): LiDAR sits
+      # 0.4474 m behind, 0.0082 m right, 0.2396 m above the IMU. Rotation is identity
+      # (co-aligned mounting); the small mounting misalignment is refined from a motion bag.
+      extrinsic_T: [-0.4474, -0.0082, 0.2396]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+    imu:
+      topic: /imu/data                # SBG sensor_msgs/Imu, 400 Hz
+      rate_hz: 400.0
+      has_device_clock: false         # ROS-stamped on host arrival; no PTP device clock
+      # Variances = squared continuous-time densities, from a 25 h Allan-variance fit on
+      # this unit (noise_density^2 -> cov_*, random_walk^2 -> b_*_cov). On the 4x4 consider
+      # inflating cov_acc/cov_gyr if a GT sweep shows the Ellipse FIR vibration rejection is
+      # exceeded, or b_gyr_cov if the gyro bias pegs and heading drifts under thermal/vibration.
+      cov_acc: 3.733e-7   # (m/s^2)^2/Hz   (density 6.110e-4)
+      cov_gyr: 5.120e-9   # (rad/s)^2/Hz   (density 7.156e-5)
+      b_acc_cov: 1.183e-10
+      b_gyr_cov: 7.423e-12
+    gnss:
+      topic: /gnss/fix
+      enable: false                   # not wired yet
+  preprocess:
+    blind: 1.5                # PLACEHOLDER: raise to just beyond the chassis extent so the
+                              # Barracuda's own body does not feed self-returns to registration
+    det_range: 120.0          # OS1-128 usable range
+    point_filter_num: 2
+    voxel_surf_m: 0.5         # surf-voxel downsample edge
+    sweep_floor_frac: 0.5     # min sweep_duration = half a 10 Hz period
+    surf_max_pts: 1           # one representative per voxel (nearest centre)
+    surf_seed: 0              # only used when surf_max_pts > 1
+  frontend:
+    kind: lio
+    lio:
+      voxel_size_m: 1.0           # map voxel edge [m]
+      max_points_per_voxel: 20
+      max_range_m: 120.0          # matches preprocess.det_range
+      keypoint_voxel_factor: 1.5  # keypoint downsample voxel = factor * voxel_size_m
+      min_keypoints: 30           # below this the sweep is rejected for registration
+      icp_max_iterations: 100
+      convergence_eps: 1.0e-5
+      max_corr_dist_m: 0.5
+      min_beta: 200.0             # floor on the gravity-regularizer weight
+      max_expected_jerk: 3.0      # [m/s^3]
+      init_stationary_s: 2.0      # standstill window for static init; start each run still
+      max_gap_s: 0.5              # sensor gap beyond this triggers a reseed
+      reseed_cov_inflation: 100.0 # constraint-cov inflation on the reseeded keyframe
+    keyframe:
+      dist_m: 1.0
+      rot_deg: 10.0
+      time_s: 1.0
+  place:
+    enable: false             # loop closure off for first odometry bring-up; enable and
+                              # tune ranges (sc_rmax/sc_max_xy) for the vehicle scale later
+  backend:
+    enable: true
+  debug:
+    level: info
+    publish_clouds: true
+    publish_markers: true
+    publish_odom: true        # /meridian/odom for live inspection and ATE recording
+    timing: true
+    telemetry_rate_hz: 50.0
+    publish_path: true
+    path_sample_hz: 30.0
+    path_publish_hz: 1.0
+    path_max_poses: 40000
