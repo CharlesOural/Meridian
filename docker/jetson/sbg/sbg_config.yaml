@@ -16,10 +16,10 @@ sbg_device:
       use_enu: true
       frame_id: "sbg_imu"
       log_status: 200
-      log_imu_data: 8
-      log_ekf_euler: 8
+      log_imu_data: 1
+      log_ekf_euler: 0
       log_ekf_quat: 8
-      log_ekf_nav: 8
+      log_ekf_nav: 0
       log_ekf_vel_body: 0
       log_ekf_rot_accel_body: 0
       log_ekf_rot_accel_ned: 0
