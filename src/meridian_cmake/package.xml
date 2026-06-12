@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>meridian_cmake</name>
+  <version>0.0.0</version>
+  <description>Shared CMake toolchain, dependency finders, vendored-target helpers and
+    test macros for the Meridian workspace. Every other package find_package()es this
+    and include()s its modules, so the C++20/CUDA flags, warning policy and
+    find_package invocations are written exactly once.</description>
+  <maintainer email="charles@cfglobal.fr">Charles Farhat</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

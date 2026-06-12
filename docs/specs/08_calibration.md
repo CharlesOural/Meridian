@@ -26,9 +26,8 @@
 > consumes the time model of [`02_sensors_timesync.md`](02_sensors_timesync.md)
 > (the `ClockModel`, `StampSource`, and the **time-offset estimation** of §7 —
 > *temporal* calibration lives partly there and is referenced, not duplicated,
-> here). It is consumed by **L2** (the CT LIVO+GNSS front-end, which transforms
-> every sensor into the estimation frame $F_e$ and refines the photometric
-> intrinsic internally), **L3** (back-end, the *authority* for online-refined
+> here). It is consumed by **L2** (the LIO front-end, which transforms
+> every sensor into the estimation frame $F_e$), **L3** (back-end, the *authority* for online-refined
 > extrinsics held as graph variables), and **L4** (nvblox colourisation needs
 > `T_body_cam` and camera intrinsics). Where this spec needs a type not yet in
 > spec 01, it says so explicitly and the change is **amended into spec 01**, never
@@ -49,11 +48,11 @@
 > **observability gate** on whether a parameter is currently estimable, and the
 > offline-calibrate → online-refine handoff is undocumented. The offline-tooling
 > convention is **Kalibr** (target-board intrinsics + camera–IMU spatiotemporal
-> extrinsics + IMU Allan-variance noise), the de-facto standard the evaluation
-> datasets ship in ([`DATASET.md`](../DATASET.md): the datasets ship Kalibr-format
-> intrinsics + extrinsics + IMU noise — these *seed the priors*, §8).
+> extrinsics + IMU Allan-variance noise), the de-facto standard the benchmark
+> dataset ships in ([`DATASET.md`](../DATASET.md): per-collection Kalibr
+> camchain-imucam files plus the rig-transform YAML — these *seed the priors*, §8).
 >
-> **Notation** follows spec 01 §0 / course §02: $T_{A\_B}\in SE(3)$ maps a point
+> **Notation** follows spec 01 §0: $T_{A\_B}\in SE(3)$ maps a point
 > from frame $B$ to frame $A$ ($p_A = T_{A\_B}\,p_B$); the estimation frame is
 > $F_e$ (normally `imu_link`, spec 01 §2.3); tangent ordering is **translation
 > first, rotation second** $\xi=[\rho;\phi]\in\mathbb{R}^6$ with the **right**
@@ -86,12 +85,11 @@
 Calibration is not a layer; it is a *substrate* every layer reads and one layer
 (L3) writes. A tightly-coupled multi-sensor estimator is, at root, the assertion
 that several sensors observe **the same rigid body** through **known relative
-transforms**. Every fused residual in Meridian's CT LIVO+GNSS front-end is
+transforms**. Every fused residual in Meridian's front-end is
 conditioned on a calibration parameter:
 
-* The direct LiDAR point-to-plane residual
-  $r = n^\top(R_e\,(T_{F_e\_L}\,p_L) + p_e) + d$ (spec 04), evaluated for each
-  point at its true sample time on the CT trajectory, brings a point $p_L$ from
+* The LiDAR registration residual (spec 04) deskews and
+  registers each point at its true sample time, bringing a point $p_L$ from
   the LiDAR frame into $F_e$ through the **extrinsic** $T_{F_e\_L}$. A 1° error in
   $T_{F_e\_L}$ rotation at 30 m range is a ~0.5 m phantom shift — orders of
   magnitude above the few-cm map resolution.
@@ -103,8 +101,8 @@ conditioned on a calibration parameter:
   antenna phase centre, or the absolute factor is biased by the lever arm times
   the orientation.
 * Every cross-sensor fuse needs a **temporal** calibration — the per-sensor time
-  offset that places measurements on one timeline (spec 02 §5, §7) so the CT
-  spline samples each at the right instant.
+  offset that places measurements on one timeline (spec 02 §5, §7) so the
+  estimator integrates and warps each at the right instant.
 
 Because *all* of these condition the estimate, the architecture (arch §1.1, R1)
 forbids scattering them through the layers the way FAST-LIO inlines a single
@@ -246,7 +244,7 @@ struct IntrinsicsCamera {            // (geometric fields from spec 01 §5.1)
   // --- NEW (this spec): photometric intrinsic for direct visual (FAST-LIVO2) ---
   // Brightness constancy is broken by auto-exposure; FAST-LIVO2 estimates the
   // inverse exposure time online. We carry it as an intrinsic with a prior so a
-  // calibrated camera seeds it and the CT front-end refines it per frame (§6.5).
+  // calibrated camera seeds it and the future visual stage refines it per frame (§6.5).
   double inv_expo_prior   = 1.0;   // 1/exposure scale prior (1.0 = none)
   double inv_expo_std     = 0.0;   // prior 1σ; 0 ⇒ fixed
   bool   refine_photometric_online = true;   // FAST-LIVO2 path: on (§6.5)
@@ -280,20 +278,23 @@ default, held **fixed** for the mission.
 
 Pinhole $K_{cam} = \begin{psmallmatrix} f_x & 0 & c_x \\ 0 & f_y & c_y \\ 0 & 0 &
 1\end{psmallmatrix}$ plus a distortion model (`RadTan` $k_1,k_2,p_1,p_2,k_3$ or
-`Equidistant`/fisheye $k_1..k_4$ — the M2DGR fish-eye case,
-[`DATASET.md`](../DATASET.md) caveat). Source: a **Kalibr** target-board
+`Equidistant`/fisheye $k_1..k_4$ — the Newer College Alphasense case: Kalibr
+`pinhole-equi`). Source: a **Kalibr** target-board
 intrinsics calibration (`pinhole-radtan` / `pinhole-equi` model), or the vendor
 factory file. The front-end's direct photometric residual projects through
 $\pi(K_{cam},\cdot)$; an error here is a systematic per-pixel reprojection bias,
 so intrinsics are tightened first and refined last.
 
-> **Fisheye handling.** M2DGR ships fish-eye cameras awkward for direct visual
-> ([`DATASET.md`](../DATASET.md)). Meridian's stance (spec 02 §4.3 note: rectify in
-> L1, not L0) is that `meridian_calib` stores the **native** intrinsics (`Equidistant`)
+> **Equidistant handling.** Equidistant/fisheye distortion is awkward for direct
+> visual methods, so Meridian supports it as a first-class intrinsic model.
+> The stance (spec 02 §4.3 note: rectify in L1, not L0) is that `meridian_calib`
+> stores the **native** intrinsics (`Equidistant`)
 > and L1 builds a rectified pinhole virtual camera; the *rectified* $K$ is a
 > derived intrinsic `meridian_calib` computes and caches, keyed by the source
-> intrinsic version, so L2 always sees a pinhole. This is the "rectify-then-use"
-> stress test the dataset doc calls for.
+> intrinsic version, so L2 always sees a pinhole. The benchmark rig's Alphasense
+> cameras are exactly this case ([`DATASET.md`](../DATASET.md)): until the rectify
+> map (or native equidistant projection) is wired into L1, the visual stage
+> auto-disables on them and the system runs LIO-only.
 
 ### 4.2 IMU intrinsics (noise model)
 
@@ -303,9 +304,28 @@ densities) and `imu_acc_bias_rw`, `imu_gyr_bias_rw` (bias random-walk) — *are*
 the IMU's factory intrinsics. They feed the CT IMU-derivative residual noise and
 the restart-fallback preintegration noise (the analogue of FAST-LIO
 `set_gyr_cov` / `set_acc_cov` / `process_noise_cov`, `use-ikfom.hpp:35–43`).
-Source: an **Allan-variance** run (Kalibr's `imu_utils` / `kalibr_allan`),
-shipped by the evaluation datasets ([`DATASET.md`](../DATASET.md):
-"Kalibr-format … + IMU noise"). These are held **fixed** (online IMU-intrinsic
+
+> **Units convention — the `CalibrationSet` fields carry standard deviations, the
+> config carries variances.** The `imu_acc_noise` / `imu_gyr_noise` /
+> `imu_acc_bias_rw` / `imu_gyr_bias_rw` fields on `CalibrationSet` are the
+> **continuous-time noise densities as standard deviations** (e.g.
+> $\mathrm{(m/s^2)}/\sqrt{\mathrm{Hz}}$, $\mathrm{(rad/s)}/\sqrt{\mathrm{Hz}}$),
+> because the residual assemblers weight by $1/\sigma$ and $1/(\sigma\sqrt{dt})$
+> directly. The runtime config (spec 02 §10) instead carries the **squared**
+> densities — `sensors.imu.cov_acc` / `cov_gyr` (and `b_acc_cov` / `b_gyr_cov`) are
+> **variances** ($\mathrm{(m/s^2)^2}$, $\mathrm{(rad/s)^2}$). The bootstrap importer
+> `calibrationFromConfig` therefore takes the **square root** of each configured
+> value when it populates the `CalibrationSet`. A config author writes variances; a
+> reader of `CalibrationSet` gets std-devs. Crossing the two (feeding a variance
+> where a std-dev is expected, or vice versa) silently mis-weights every IMU
+> residual — keep the convention straight by field, not by intuition.
+Source: an **Allan-variance** run (Kalibr's `imu_utils` / `kalibr_allan`) or the
+dataset's published IMU model. **Sanity-check imported densities against the
+sensor datasheet before trusting them** — a mis-shipped density silently
+mis-weights every IMU residual until the estimate diverges (the benchmark
+dataset shipped a gyro density duplicated from the accel field; the deployed
+configs carry the corrected value, [`DATASET.md`](../DATASET.md)).
+These are held **fixed** (online IMU-intrinsic
 estimation — scale/misalignment — is a deferred seam, §11). Meridian additionally
 lets L0/L2 **inflate** these by the timing uncertainty $\sigma_{o_s}$ from spec 02
 §7 (a poorly-timed IMU is a noisier IMU); that inflation is a runtime fold, not a
@@ -319,12 +339,15 @@ off). Meridian allows an **optional** weak-prior online refinement of $f_x,f_y$ 
 unless explicitly enabled in config. The **photometric** intrinsic
 (`inv_expo_prior`, §3.2) is different: it *is* refined live, because brightness
 constancy without it is hopeless under auto-exposure (FAST-LIVO2 estimates it per
-frame). It is refined in the **CT front-end** (it is a per-frame nuisance, not a
-slowly-varying rig parameter), not in L3 — see §6.5.
+frame). It belongs to the **front-end's visual stage** (a per-frame nuisance, not a
+slowly-varying rig parameter), not to L3 — see §6.5; dormant until that stage
+exists.
 
 ### 4.4 LiDAR intrinsics
 
-Range bias / intensity-calibration curves are vendor-supplied for the Ouster
+Range bias / intensity-calibration curves and the per-beam angle table (e.g.
+`calib/beam_intrinsics_os0-128.json`, consumed only when decoding raw LiDAR
+packets rather than driver point clouds) are vendor-supplied for the Ouster
 LiDAR and held **fixed**; Meridian does not estimate them (out of scope, and
 Ouster's factory calibration is good). The only "intrinsic" Meridian acts on is the
 per-point time field, which is a *temporal* property handled in L0 (spec 02 §4.1)
@@ -358,8 +381,8 @@ values with no uncertainty.
    └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**(a) Kalibr import** — the default path, because the datasets ship it and
-Kalibr is the field standard. Kalibr's `camchain-imucam` YAML gives
+**(a) Kalibr import** — the default path, because the benchmark dataset ships it
+and Kalibr is the field standard. Kalibr's `camchain-imucam` YAML gives
 $T_{\text{cam}\_\text{imu}}$ plus the time offset $t_d$; the importer
 inverts/composes into Meridian's $T_{F_e\_\text{cam}} = T_{\text{imu}\_\text{cam}} =
 (T_{\text{cam}\_\text{imu}})^{-1}$ (with $F_e =$ `imu_link`), and copies Kalibr's
@@ -528,11 +551,12 @@ prior is **rejected**, the variable reset to the prior, and
 (soft prior) + braces (hard box) + observability signal — because a silently bad
 extrinsic poisons the entire map and every loop closure.
 
-### 6.5 Photometric intrinsic refinement (CT front-end, not L3)
+### 6.5 Photometric intrinsic refinement (front-end visual stage, not L3)
 
 The inverse-exposure intrinsic (`inv_expo_prior`, §3.2) is a **per-frame
 nuisance**, not a rig constant, so it is estimated **inside L2** (the FAST-LIVO2
-sparse-direct path), appended to the CT front-end's sliding-window solve, and
+sparse-direct path) when the visual stage exists — today the front-end is
+LiDAR-inertial only and this refinement is **dormant** — and is
 **not** crossed to L3 as a graph variable (R1: implementation-internal). It is
 reported on the telemetry bus (§12) and its prior is re-seeded from a slow running
 mean so a clean exposure recovers the prior. This keeps L3's graph minimal (the
@@ -545,16 +569,23 @@ To preserve the clean information budget (spec 01 §6.4, MUST-FIX #3): a refined
 extrinsic crosses **L3→L2** only as a *versioned snapshot* (spec 01 §5.3), never
 as a live shared mutable. Each geometric extrinsic (LiDAR, camera, GNSS lever-arm)
 that is refine-flagged is refined in **exactly one** place — **L3**, the
-authoritative multi-sensor owner. The CT front-end consumes the published
+authoritative multi-sensor owner. The front-end consumes the published
 snapshot and resets its linearisation; it does not separately ship the same
-extrinsic back as an L3 variable, so no information is double-counted. (The
-optional iEKF reference oracle, arch §5.4, MAY refine the LiDAR extrinsic inside
-its own private state for differential-testing parity with FAST-LIO; that path is
-test-only and never feeds L3, so it cannot double-count.) **Rule:** any single
+extrinsic back as an L3 variable, so no information is double-counted.
+**Rule:** any single
 extrinsic is refined in exactly one place; in the production CT system that place
 is L3.
 
 ---
+
+> **Identity-default guard on configured extrinsics.** A defaulted (identity)
+> extrinsic is a syntactically valid value, so absence is only knowable at parse
+> time: the loader records `extrinsic_set` per sensor. A missing camera extrinsic
+> withholds the CamLink entry from the `CalibrationSet`, which makes the front-end
+> disable the visual stage loudly (`frontend/visual/disabled`) instead of running
+> with a sideways frustum; a missing LiDAR extrinsic warns once at startup
+> (`sensors/lidar/extrinsic_default`) since LIO can legitimately run at identity on
+> a bench rig but must never mistake it for a calibration.
 
 ## 7. Temporal calibration (time offsets)
 
@@ -585,16 +616,38 @@ property), while `meridian_calib`'s $t_d$ captures the *fixed sensor-to-$F_e$ ph
 relative to the IMU). They compose:
 $t_{F_e} = \text{ClockModel}.to\_meridian(t_{\text{dev}}) - t_d$. L0 makes all
 sensors agree on *when now is*; `meridian_calib` makes the **fused geometry** agree
-on *which $F_e$ instant a sensor's measurement corresponds to* — which the CT
-spline needs to sample each sensor at the correct knot phase.
+on *which $F_e$ instant a sensor's measurement corresponds to* — which the
+estimator needs to place each sensor's measurement on the trajectory correctly.
 
 ### 7.2 The temporal-offset prior
 
 `time_offset_ns` / `time_offset_std_ns` (§3.1) are seeded from the Kalibr
 camera–IMU time offset (§8). For a hardware-synced rig
-([`DATASET.md`](../DATASET.md): FusionPortable is hardware-time-synced) the prior
+([`DATASET.md`](../DATASET.md): the Newer College rig is FPGA-synchronized — the
+Ouster and the Alphasense share the FPGA clock) the prior
 is $t_d \approx 0$ with small $\sigma$; for a software-synced rig the prior is
 whatever L0's §7 estimator converged to, with its $\sigma_{o_s}$.
+
+> **Resolved — constant per-sensor stamp correction is wired through the intake.**
+> `sensors.camera.time_offset_ms` and `sensors.lidar.time_offset_ms` apply a
+> constant correction onto the body-IMU timeline ($t_{corr} = t_{sensor} +
+> \text{offset}$) once, in the pipeline's `ingest()` overloads — *before*
+> validation and aggregation, so every stamp-driven decision (monotonicity, group
+> assembly, image–sweep matching) sees corrected time, identically live and in
+> replay. Online $t_d$ refinement remains off by default (§7.3).
+>
+> **Calibration-session timeshifts do NOT automatically transfer to a recording**
+> — this is a hard rule, established twice on an earlier benchmark set whose
+> Kalibr sessions reported >100 ms shifts while the bag A/B verdict was **0 ms**
+> (the recorded streams were already stamp-disciplined; applying the session
+> value degraded patch convergence and ATE, the opposite sign pushed every image
+> outside its sweep's matching window). Hardware sync paths differ per
+> sensor and per recording: set a `time_offset_ms` only after an empirical A/B on
+> the actual data (visual-funnel telemetry + ATE), never from the session value
+> alone. The importer therefore reports the session timeshift but does not
+> own the config key. (The Newer College camchains report +1.8…+2.0 ms cam→imu
+> over the same FPGA path as the recordings, so the value is expected to transfer
+> — it still gets the A/B before sub-centimetre ATE deltas are trusted.)
 
 ### 7.3 Online temporal refinement (optional)
 
@@ -620,31 +673,47 @@ config-switchable seam.
 
 ## 8. Seeding the priors from dataset calibration files
 
-This is the concrete bridge from [`DATASET.md`](../DATASET.md) ("the datasets
-ship Kalibr-format intrinsics + extrinsics + IMU noise … these seed the offline
-calibration stage; Meridian's back-end then refines extrinsics online — so the
-dataset calibration is a *prior*, not a hard constant — itself a useful test of
-the online-refinement path") to a populated `CalibrationSet v0`.
+This is the concrete bridge from [`DATASET.md`](../DATASET.md) — the benchmark
+ships per-collection Kalibr `camchain-imucam` files (the rig was recalibrated
+between collections, so park must not run with the quad calibration), the shared
+rig-transform YAML, and the OS0-128 beam table — to a populated
+`CalibrationSet v0`. The dataset calibration seeds the offline stage; Meridian's
+back-end then refines extrinsics online, so it is a *prior*, not a hard constant.
 
 ### 8.1 The Kalibr importer (`meridian_calib::load_kalibr`)
 
 `meridian_calib` ships a loader that parses the two Kalibr YAML families and produces
-a `CalibrationSet`:
+a `CalibrationSet` (until it lands, `tools/import_ncd.py` performs the same
+seeding offline, writing the calibration blocks of the deployed
+`newer-college-*.yaml` configs from the same files):
 
 * **`*-camchain-imucam.yaml`** → the camera: `IntrinsicsCamera`
   (`intrinsics: [fx, fy, cx, cy]`, `distortion_model`, `distortion_coeffs`,
-  `resolution`), and `T_cam_imu` → inverted to `Extrinsic{parent=ImuLink,
+  `resolution` — the Newer College Alphasense cam0 imports as pinhole +
+  `Equidistant` $k_1..k_4$, 720×540), and `T_cam_imu` → inverted to
+  `Extrinsic{parent=ImuLink,
   child=CamLink, T_parent_child = inv(T_cam_imu)}`; plus `timeshift_cam_imu` →
-  `time_offset_ns` (Kalibr reports seconds; convert to int64 ns).
+  `time_offset_ns` (Kalibr reports seconds; convert to int64 ns). The imported
+  `time_offset_ns` populates the **prior**; the constant intake correction is the
+  config's `sensors.*.time_offset_ms` (§7.2), which is set only after the bag A/B
+  — the importer reports the session value, it does not write the config key.
 * **`*-imu.yaml`** → `imu_acc_noise = accelerometer_noise_density`,
   `imu_gyr_noise = gyroscope_noise_density`,
   `imu_acc_bias_rw = accelerometer_random_walk`,
-  `imu_gyr_bias_rw = gyroscope_random_walk` (spec 01 §5.3 fields).
-* **LiDAR↔IMU**: Kalibr does not natively calibrate LiDAR; the datasets ship the
-  LiDAR extrinsic in their own format (FusionPortable / M2DGR provide it). The
-  importer has a per-dataset adapter (`load_fusionportable_extrinsics`,
-  `load_m2dgr_extrinsics`) that fills `Extrinsic{child=OsSensor0}` from the
-  dataset's calibration file, tagging `source = Vendor`/`Kalibr` as appropriate.
+  `imu_gyr_bias_rw = gyroscope_random_walk` (spec 01 §5.3 fields). When the
+  dataset ships no Kalibr IMU file (Newer College does not), the IMU noise rides
+  the config `cov_*` (variance) path of §4.2 instead — subject to the same
+  datasheet sanity check.
+* **LiDAR↔IMU**: Kalibr does not natively calibrate LiDAR; the dataset ships the
+  rig chain in its own format. The
+  importer has a per-dataset adapter (`load_newer_college_extrinsics`) that fills
+  `Extrinsic{child=OsSensor0}` from
+  `calib/os_imu_lidar_transforms.yaml` — the `os_sensor_to_as_imu` entry, since
+  the bags' clouds are stamped in the `os_sensor` frame — tagging
+  `source = Vendor`/`Manual` as appropriate (the chain mixes Ouster factory
+  numbers with CAD-derived links). Two caveats the adapter owns: the file's
+  quaternions are **(qx, qy, qz, qw)**, qx first; and the os→Alphasense rotation
+  is a 180° flip about X, not identity.
 
 ### 8.2 Field mapping table (Kalibr → Meridian)
 
@@ -656,10 +725,18 @@ a `CalibrationSet`:
 | `cam0.resolution` | `IntrinsicsCamera{width,height}` | direct |
 | `cam0.T_cam_imu` (4×4) | `Extrinsic::T_parent_child = inv(·)` | Meridian parent=$F_e$=imu; Kalibr gives cam←imu |
 | `cam0.timeshift_cam_imu` (s) | `Extrinsic::time_offset_ns` | ×1e9, round to int64; `time_offset_std_ns` from config or Kalibr report |
-| `imu.accelerometer_noise_density` | `CalibrationSet::imu_acc_noise` | continuous-time |
-| `imu.gyroscope_noise_density` | `CalibrationSet::imu_gyr_noise` | continuous-time |
-| `imu.accelerometer_random_walk` | `CalibrationSet::imu_acc_bias_rw` | bias RW |
-| `imu.gyroscope_random_walk` | `CalibrationSet::imu_gyr_bias_rw` | bias RW |
+| `imu.accelerometer_noise_density` | `CalibrationSet::imu_acc_noise` | continuous-time **std-dev**; copied directly (Kalibr already reports a density) |
+| `imu.gyroscope_noise_density` | `CalibrationSet::imu_gyr_noise` | continuous-time **std-dev**; copied directly |
+| `imu.accelerometer_random_walk` | `CalibrationSet::imu_acc_bias_rw` | bias RW **std-dev**; copied directly |
+| `imu.gyroscope_random_walk` | `CalibrationSet::imu_gyr_bias_rw` | bias RW **std-dev**; copied directly |
+
+> **Kalibr vs. config-YAML path differ on the IMU-noise convention.** Kalibr's
+> `*-imu.yaml` reports the densities as **standard deviations**, so `load_kalibr`
+> copies them straight into the (std-dev) `CalibrationSet` fields — no square root.
+> The runtime config path is different: `sensors.imu.cov_acc` / `cov_gyr` (and the
+> bias-RW twins) are **variances**, and `calibrationFromConfig` takes their square
+> root before populating the same fields (§4.2). Same destination field, two source
+> conventions — Kalibr already-std, config-YAML squared.
 
 ### 8.3 Prior covariance and refine flags on import
 
@@ -673,7 +750,7 @@ dataset's recording epoch (provenance), `version = 0`, `source = Kalibr`. The
 resulting `CalibrationSet v0` is the seed handed to the pipeline at construction
 (spec 01 §5.3: "owned by the system bootstrap, shared read-only with the
 front-end"), and it is precisely the prior that L3 then refines — exercising the
-online path on every dataset run, as the dataset doc intends.
+online path on every dataset run.
 
 ---
 
@@ -741,7 +818,7 @@ and the L3→L2 boundary row in spec 01 §9.
 
 | Consumer | Reads | When | Reaction to a version bump |
 |---|---|---|---|
-| L1 preprocess | (none directly; deskew is implicit in L2's CT trajectory) | — | — |
+| L1 preprocess | (none directly; deskew is internal to L2) | — | — |
 | L2 front-end | extrinsics (transform sensors → $F_e$), cam intrinsics, IMU noise | every scan; re-cache at keyframe boundary | reset linearisation (§9.2) |
 | L3 back-end | the refine-flagged extrinsics it *owns*; priors | each `optimize()` | it is the writer |
 | L4 map | `T_body_cam` + cam intrinsics for **colourisation** | per integrated keyframe | use the snapshot pinned in `KeyframePacket::T_body_cam` (spec 01 §6.1) for reproducibility, *not* live |
@@ -757,16 +834,19 @@ and the L3→L2 boundary row in spec 01 §9.
 
 ## 10. Configuration schema
 
-Calibration config lives under the `meridian:` tree (arch §8.2). The file path to a
-Kalibr/dataset calibration is itself a config field, so "run on FusionPortable" is
-a one-line change.
+Calibration config lives under the `meridian:` tree (arch §8.2). The file paths to
+the Kalibr/dataset calibration are themselves config fields, so retargeting a
+dataset (or a Newer College collection — the rig was recalibrated between them)
+is a per-config path change, not code.
 
 ```yaml
 calib:
   # --- where the stage-1/2 priors come from (§8) ---
-  source_file: /data/fusionportable/calib/camchain-imucam.yaml   # Kalibr or dataset
-  source_kind: kalibr            # kalibr | fusionportable | m2dgr | meridian_native
-  imu_noise_file: /data/fusionportable/calib/imu.yaml            # Allan-variance (§4.2)
+  source_file: bags/newer-college/calib/collection1/cam0-1/_2021-07-01-13-36-53-cam0-1-camchain-imucam.yaml
+  source_kind: kalibr            # kalibr | newer_college | meridian_native
+  rig_file: bags/newer-college/calib/os_imu_lidar_transforms.yaml  # LiDAR<->IMU chain (§8.1)
+  # imu_noise_file: <Kalibr *-imu.yaml>  # Allan-variance (§4.2); Newer College ships
+  #                                      # none — IMU noise rides sensors.imu.cov_*
   estimation_frame: imu_link     # F_e (spec 01 §2.3)
 
   # --- global default; per-sensor override below (§6) ---
@@ -782,6 +862,10 @@ calib:
       max_drift_trans_m: 0.05
       max_drift_rot_deg: 1.0
     - child: cam0                # the camera
+      # T_imu_cam, as [tx,ty,tz,qx,qy,qz,qw]. REQUIRED for the visual stage: with it
+      # absent the importer leaves an identity transform, which silently breaks
+      # promotion of map points into the camera frame and the visual map stays empty.
+      # validate() fails fast on a missing camera extrinsic rather than defaulting it.
       refine_online: true        # thermal/mounting drift is real
       prior_trans_std_m: 0.01
       prior_rot_std_deg: 0.3
@@ -798,7 +882,7 @@ calib:
 
   # --- photometric intrinsic (§4.3, §6.5) ---
   photometric:
-    refine_inv_expo_online: true # FAST-LIVO2 path (refined in the CT front-end)
+    refine_inv_expo_online: true # FAST-LIVO2 path (future visual stage; dormant)
     inv_expo_std: 0.1
 
   # --- online refinement gate (§6.4) ---
@@ -815,11 +899,19 @@ calib:
   must have either a prior in `calib.extrinsics` or a default; a sensor with
   **no** extrinsic and `refine_online=false` fails fast (you cannot fuse a sensor
   you cannot place).
+* **The camera extrinsic (`T_imu_cam`, `[tx,ty,tz,qx,qy,qz,qw]`) is mandatory
+  whenever the visual stage is enabled — `validate()` must fail fast on its
+  absence, never silently default to identity.** An identity `T_imu_cam` does *not*
+  raise `have_cam_extrinsic_` to false (the importer still inserts a `CamLink`
+  `Extrinsic`, so the visual stage thinks it has a placement); instead it places
+  every map point at the IMU origin, which silently breaks promotion and leaves the
+  visual map empty for the whole run. A missing-but-defaulted extrinsic is the worst
+  failure class — it looks healthy and produces nothing — so the validator rejects
+  it up front rather than letting the default-constructed identity through.
 * `max_drift_*` must be ≥ a few prior σ (a box tighter than the prior is a
   configuration error).
-* A sensor may not be both `refine_online: true` here **and** flagged for the
-  iEKF oracle's private extrinsic refinement (arch §5.4); validation rejects the
-  double-owner case so an extrinsic is refined in exactly one place (§6.6).
+* An extrinsic is refined in exactly one place — L3 (§6.6). `validate()` rejects
+  any configuration that names a second refinement owner for the same extrinsic.
 
 ---
 
@@ -900,7 +992,7 @@ default refine-flagged transform (thermal/mounting drift is real) and it is
 observed through the FAST-LIVO2 photometric factors.
 
 1. **Bootstrap.** `meridian_calib::load_kalibr("…/camchain-imucam.yaml")` +
-   `load_fusionportable_extrinsics(...)` build `CalibrationSet v0`. Config sets
+   `load_newer_college_extrinsics(...)` build `CalibrationSet v0`. Config sets
    the camera (`cam0`) `refine_online: true`, `prior_trans_std_m: 0.01`,
    `prior_rot_std_deg: 0.3`, `max_drift_trans_m: 0.05`, `max_drift_rot_deg: 1.5`.
    Its `Extrinsic{source=Kalibr, version=0, T_parent_child = inv(T_cam_imu)}` is
@@ -914,7 +1006,8 @@ observed through the FAST-LIVO2 photometric factors.
    that and emits `event("calib/offline_obs", cam0, scores)`. (FAST-LIVO2 has no
    such step; it would load a bare value.)
 
-3. **Live, t = 0–30 s.** The CT front-end projects through the live $T_{F_e\_C}$
+3. **Live, t = 0–30 s.** The front-end's visual stage (dormant today; the flow
+   is shown for the full design) projects through the live $T_{F_e\_C}$
    from `provider->current()` for every sparse-direct photometric residual. L3 has
    created `X_calib(cam0)` with a `PriorFactor` (§6.1). Early keyframes are mostly
    forward driving → camera-roll and camera-Z stay near the prior (gate §6.4
@@ -926,7 +1019,7 @@ observed through the FAST-LIVO2 photometric factors.
    opens. L3 `publish()`es `CalibrationSet v1`; `event("calib/snapshot_published",
    1)`.
 
-5. **Front-end picks it up.** At the next keyframe boundary the CT front-end sees
+5. **Front-end picks it up.** At the next keyframe boundary the front-end sees
    `provider->version() == 1 ≠` its cached `0`, re-caches $T_{F_e\_C}$, resets its
    linearisation (§9.2). Subsequent `KeyframePacket`s carry `calib_version = 1`.
 
@@ -956,8 +1049,13 @@ without a middleware, arch §1).
 **Unit (no ROS, synthetic):**
 * **Kalibr round-trip:** load a known `camchain-imucam.yaml`, assert
   `IntrinsicsCamera` and the **inverted** `T_imu_cam`, and the `timeshift`→
-  `time_offset_ns` sign+scale (guards F8). Golden file from a FusionPortable
-  sample.
+  `time_offset_ns` sign+scale (guards F8). Golden file: the Newer College
+  collection-1 camchain (`_2021-07-01-13-36-53-cam0-1-camchain-imucam.yaml`) —
+  pinhole + `Equidistant` $k_1..k_4$, 720×540, timeshift +1.8008 ms.
+* **Rig-chain import:** load `os_imu_lidar_transforms.yaml`, assert the
+  `(qx, qy, qz, qw)` quaternion order and that `os_sensor_to_as_imu` comes out as
+  the 180° X-flip, **not** identity — guards the classic wxyz/xyzw swap, which
+  would silently mount the LiDAR upside-down.
 * **Prior→PriorFactor:** build an `Extrinsic` with a known `prior_cov`, assert the
   GTSAM `PriorFactor` information equals `prior_cov.inverse()` in the right
   ordering (spec 01 §3.1).
@@ -971,18 +1069,22 @@ without a middleware, arch §1).
   `publish()` runs; assert every read is a complete, self-consistent set and the
   version is monotonic (§9.1).
 
-**Replay (datasets, [`DATASET.md`](../DATASET.md)):**
-* **Prior-vs-refined ATE:** run FusionPortable with `refine_online: false` (all
-  fixed) and with the camera `refine_online: true`; assert ATE (evo `evo_ape`) does
-  **not regress** and improves on sequences with rotation diversity — proving the
-  online path helps, not hurts.
-* **Perturbed-prior recovery:** inject a 1° / 3 cm error into the camera prior;
+**Replay (the Newer College benchmark set, [`DATASET.md`](../DATASET.md);
+ATE via `tools/eval_ate.py` against `gt/tum_asimu/`; tuning sequences only —
+quad-hard is the holdout):**
+* **Prior-vs-refined ATE:** run quad-easy / math-medium with `refine_online:
+  false` (all fixed) and with the LiDAR extrinsic `refine_online: true`; assert
+  ATE does **not regress** and improves on sequences with rotation diversity —
+  proving the online path helps, not hurts. The camera twin of this test
+  activates with the visual stage (auto-disabled on the equidistant cameras,
+  §4.1).
+* **Perturbed-prior recovery:** inject a 1° / 3 cm error into the LiDAR prior;
   assert the online refinement recovers it to within the posterior σ over a
-  sequence with enough motion (this is the dataset doc's "useful test of the
-  online-refinement path"). On a degenerate sequence assert it **stays clamped**
+  sequence with enough motion. On a degenerate stretch assert it **stays clamped**
   (does not chase noise).
 * **Temporal seed:** assert the Kalibr `timeshift` seed plus L0's §7 estimator
-  keeps L0 `SyncResidualHigh` (spec 02 §7.3) from firing on a synced dataset.
+  keeps L0 `SyncResidualHigh` (spec 02 §7.3) from firing on the FPGA-synced
+  Newer College bags.
 
 ---
 

@@ -1,0 +1,182 @@
+# Meridian configuration for Newer College multi-cam (2021 OS0-128 + Alphasense)
+# bag replay -- collection 1 sequences (quad-easy / quad-medium / quad-hard / stairs).
+#
+# Topics verified against the converted bags (bags/newer-college). The calibration
+# blocks (LiDAR/camera extrinsics, camera intrinsics, IMU noise) are written by
+# tools/import_ncd.py from the per-collection Kalibr camchain + the shared
+# os_imu_lidar_transforms.yaml; rerun it rather than editing them by hand:
+#     python3 tools/import_ncd.py \
+#         --camchain bags/newer-college/calib/collection1/cam0-1/<camchain-imucam>.yaml \
+#         --config src/meridian_ros/config/newer-college-quad.yaml
+# Estimation frame is the Alphasense IMU; clouds arrive in the os_sensor frame and
+# ground truth for ATE is gt/tum_asimu/*.csv (base-frame GT re-expressed in the
+# IMU frame).
+meridian:
+  pipeline:
+    mode: live              # the node ingests from topics; ros2 bag play drives them
+    queue:
+      meas_capacity: 8      # Q_meas (lossy under overload); ~0.8 s at 10 Hz
+      kf_capacity: 64       # Q_kf (lossless back-pressure)
+      map_capacity: 64      # Q_map (lossless back-pressure)
+  time:
+    source: host            # bag replay: no live PTP discipline; stamps pass through
+    max_skew_ms: 5.0
+    validator:              # standing live stamp-integrity gate, always on
+      gap_periods: 2.5      # dropout when a raw gap exceeds 2.5 nominal periods
+      skew_warn_ppm: 200
+      nan_ratio_warn: 0.05  # reject only an all-NaN scan; drop offending points below this
+  sensors:
+    lidar:
+      topic: /os_cloud_node/points
+      model: ouster_os0_128
+      nominal_rate_hz: 10.0
+      ptp: false            # no PTP servo during replay; recorded stamps are final
+      # Ouster and Alphasense share the FPGA clock; per-point t is zero-based per
+      # sweep with clean ~97.7 us column cadence (verified on the converted bags).
+      time_offset_ms: 0.0
+      # Replay pairs with the player's reliable-writer override
+      # (tools/replay_qos_overrides.yaml): best-effort loses a double-digit
+      # fraction of the multi-MB scans in flight under pipeline load (no
+      # retransmission). Set false against a best-effort sensor driver -- a
+      # reliable reader will not pair with it.
+      qos_reliable: true
+      extrinsic_T: [-0.037, -0.008, -0.026]
+      extrinsic_R: [1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0]
+    imu:
+      topic: /alphasense_driver_ros/imu   # 200 Hz in the bags (Kalibr file says 400; the stream is 200)
+      rate_hz: 200.0
+      cov_acc: 0.000361
+      cov_gyr: 4e-06
+      b_acc_cov: 1.849e-05
+      # Gyro-bias random walk (4e-6 rad/s^2/sqrt(Hz), squared). The dataset's Kalibr
+      # value (7.0756e-08 = 2.66e-4 squared) lets the bias absorb LiDAR misfit within
+      # a single window: it pegs the bias.gyr_max box during brisk spans and heading
+      # diverges at meters scale (quad-easy full bag 16 m -> 0.23 m ATE with this
+      # value). Real BMI085 bias drift over a minutes-long run stays far below it.
+      b_gyr_cov: 1.6e-11
+    camera:
+      # Alphasense cam0 (front-left of the stereo pair), mono8 JPEG in the bags,
+      # FPGA-synchronized with the IMU. cam1 (right) is available for later stereo.
+      topic: /alphasense_driver_ros/cam0/compressed
+      compressed: true        # JPEG stream; decoded to mono8 at ingest
+      # Constant stamp correction onto the body-IMU timeline (t_corr = t + offset).
+      # Written by import_ncd.py from the camchain timeshift_cam_imu (t_imu = t_cam
+      # + shift; ~+1.8 ms here). Same-rig FPGA sync, so the session value is
+      # expected to transfer; A/B against 0 on the bag before trusting sub-ms ATE.
+      time_offset_ms: 1.8008003299918547
+      model: pinhole
+      nominal_rate_hz: 30.0
+      shutter: global         # rolling-shutter path is designed but not built
+      trigger: fpga
+      exposure_from_meta: false  # JPEG stream carries no exposure metadata; the estimator owns it
+      # [fx, fy, cx, cy] — imported from the camchain by tools/import_ncd.py.
+      intrinsics: [352.779, 354.609, 359.035, 260.546]
+      # Lens distortion, also imported; equidistant coeffs are k1..k4. width/height
+      # are the image size.
+      # T_imu_cam (body-IMU <- camera) as [tx,ty,tz,qx,qy,qz,qw], inverted from the
+      # camchain's T_cam_imu. Camera +Z maps to body +X: forward.
+      extrinsic: [0.0492216800230841, 0.04723672068895839, -0.009399568563035596, 0.49909750068148495, 0.5003884708118163, 0.497887337397446, 0.5026144271222117]
+      distortion_model: equidistant
+      distortion_coeffs: [-0.04217, -0.00413, 0.00179, -0.00063]
+      width: 720
+      height: 540
+      photometric:
+        exposure_comp: true
+    gnss:
+      topic: /gnss/fix
+      enable: false   # Newer College has no GNSS; LIVO core only
+  preprocess:
+    blind: 1.0            # operator carries the rig; cut body/leg returns
+    det_range: 50.0       # OS0 usable range; OS1's 120 m keeps empty bins only
+    point_filter_num: 2
+    voxel_surf_m: 0.5         # surf-voxel downsample edge
+    sweep_floor_frac: 0.5     # min sweep_duration = half a 10 Hz period
+    surf_max_pts: 1           # one representative per voxel (nearest centre)
+    surf_seed: 0              # only used when surf_max_pts > 1
+  frontend:
+    kind: lio
+    lio:
+      voxel_size_m: 1.0           # map voxel edge [m]
+      max_points_per_voxel: 20
+      max_range_m: 50.0           # matches preprocess.det_range: keep what the filter keeps
+      keypoint_voxel_factor: 1.5  # keypoint downsample voxel = factor * voxel_size_m
+      min_keypoints: 30           # below this the sweep is rejected for registration
+      icp_max_iterations: 100
+      convergence_eps: 1.0e-5
+      max_corr_dist_m: 0.5
+      min_beta: 200.0             # floor on the gravity-regularizer weight
+      max_expected_jerk: 3.0      # [m/s^3]
+      init_stationary_s: 1.0      # standstill window for static init
+      max_gap_s: 0.5              # sensor gap beyond this triggers a reseed
+      reseed_cov_inflation: 100.0 # constraint-cov inflation on the reseeded keyframe
+    keyframe:
+      dist_m: 1.0
+      rot_deg: 10.0
+      time_s: 1.0
+  place:
+    # L5 loop closure: Scan Context retrieval -> small_gicp verify -> single-loop self-test
+    # (staged cascade; STD/BTC re-rank deferred). On quad-easy it auto-detects ~9 revisit
+    # loops; net ATE is ~neutral (0.088 m with or without) because the LIO odometry barely
+    # drifts here, so there is little to correct. Kept on so the loop-closure path runs by
+    # default; sync replay is byte-identical with it enabled (the discrete LIO map carries no
+    # async rebuild, so the detector's extra work no longer perturbs deterministic timing).
+    enable: true
+    detect_period_kf: 1
+    min_kf_gap: 30          # ~25 s at the quad keyframe rate; the revisit is ~240 kf away
+    min_time_gap: 20.0      # [s]
+    cooldown_kf: 20
+    sc_Nr: 20
+    sc_Ns: 60
+    sc_rmax: 50.0           # OS0 usable range
+    sc_knn: 15
+    sc_dist_thresh: 0.13    # tight retrieval: only strong place matches
+    sc_max_xy: 40.0         # quad scale; gate candidates by drifted-estimate distance
+    sc_topK: 5
+    submap_window: 5
+    submap_voxel: 0.3
+    submap_cache: 64
+    gicp_downsample: 0.3
+    gicp_max_corr_dist: 1.5
+    gicp_fitness_min: 0.8
+    gicp_overlap_min: 0.6
+    gicp_rmse_max: 0.4
+    gicp_cond_max: 1.0e4
+    gicp_fit_sigma: 0.2
+    pcm_chi2_conf: 0.99     # must equal backend.pcm_chi2_alpha
+    # Gentle loop covariance: quad-easy barely drifts, so loops must not fight an already
+    # accurate odometry chain (a stiff loop adds cm-level noise). A large regulariser keeps
+    # them soft here; on a drifting sequence the chained residual still accumulates correction.
+    cov_lambda: 0.1
+  debug:
+    level: info
+    publish_clouds: true
+    publish_markers: true
+    publish_odom: true      # /meridian/odom feeds the ATE recorder (tools/record_tum.py); the rviz arrow is removed at the display layer
+    timing: true
+    # Baked per-point colour on every published cloud's `rgb` field (turbo map), so a viewer
+    # shows the gradient with no colour-map setup. intensity = LiDAR reflectivity; height = z.
+    # min/max pin the colour range; max <= min auto-normalises each cloud over its own range.
+    cloud_color: height
+    cloud_color_min: 0.0
+    cloud_color_max: 0.0
+    # Scalar token-bucket rate. Keep this WELL ABOVE the 10 Hz sweep cadence: a limit
+    # at exactly the emission cadence beats against per-key jitter and decimates keys
+    # unevenly (measured: 1..98% capture per key at 10). 50 captures every sweep's
+    # scalars; heavy payloads (clouds/images) keep their own 2 Hz class default.
+    telemetry_rate_hz: 50.0
+    # Front-end debug groups (key-prefix wildcards; see docs/REALTIME_DEBUGGING.md
+    # "Debug groups & costs"). ON here: this config is the accuracy-hunt exemplar;
+    # other configs leave them at the default (off, except map_health). max_hz 0 =
+    # class default per key (scalars at telemetry_rate_hz, heavy at 2 Hz). Toggle live:
+    #   ros2 service call /meridian/set_debug_key meridian_msgs/SetDebugKey \
+    #       "{key: 'frontend/assoc/*', enable: false, max_hz: 0.0}"
+    assoc:      { enable: true, max_hz: 0.0 }   # association funnel/quality + outlier cloud
+    solver:     { enable: true, max_hz: 0.0 }   # per-GN-iteration trace
+    lio:        { enable: true, max_hz: 0.0 }   # internal-deskew / IMU-tracker / init / reseed detail
+    map_health: { enable: true, max_hz: 0.0 }   # map growth counters (cheap; default-on)
+    # /meridian/path: the odometry pose stream sampled at path_sample_hz, republished
+    # as one nav_msgs/Path at path_publish_hz, ring-capped at path_max_poses.
+    publish_path: true
+    path_sample_hz: 30.0
+    path_publish_hz: 1.0
+    path_max_poses: 40000

@@ -1,0 +1,138 @@
+# Jetson sensor-driver stack — one container per driver, all on host networking.
+# Each driver reaches its sensor directly (Ouster on end0; SBG and ZED to come)
+# and publishes to ROS 2; the containers share the DDS graph over host loopback.
+# The Mac previews everything through the `foxglove` service — nothing extra to run.
+#
+#   docker compose -f compose.jetson.yaml up -d --build
+#   docker compose -f compose.jetson.yaml logs -f ouster
+#   (Mac) Foxglove → Open connection → Foxglove WebSocket → ws://11.0.0.68:8765
+#
+# Sensor addresses default to the values discovered on this rig; override them via
+# the environment (or a sibling .env file) without editing this file:
+#   OUSTER_HOSTNAME  the LiDAR's address (IPv4 link-local or os-<serial>.local)
+#   OUSTER_UDP_DEST  this host's end0 IP, where the sensor streams UDP
+services:
+  # Free-running PTP grandmaster on end0: ptp4l serves IEEE-1588 to the Ouster and
+  # phc2sys ties the end0 PHC to the host system clock, so the LiDAR's hardware
+  # PTP timestamps land on the same clock (ROS time) as everything host-stamped.
+  ptp:
+    build:
+      context: ./docker/jetson/ptp
+    image: meridian-ptp:latest
+    container_name: meridian-ptp
+    network_mode: host
+    restart: unless-stopped
+    cap_add:
+      - SYS_TIME                    # discipline the NIC PHC / system clock
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/ptp0:/dev/ptp0
+    environment:
+      PTP_IFACE: "${PTP_IFACE:-end0}"
+
+  ouster:
+    build:
+      context: ./docker/jetson/ouster
+      args:
+        ROS_DISTRO: humble
+    image: meridian-ouster:humble
+    container_name: meridian-ouster
+    network_mode: host
+    ipc: host                       # share host /dev/shm so FastDDS shared-memory
+                                    # transport works across containers (UDP-only
+                                    # discovery succeeds without this, but data drops)
+    restart: unless-stopped
+    depends_on:
+      - ptp
+    environment:
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+    # TIME_FROM_PTP_1588: stamp from the PTP-disciplined clock. ptp_utc_tai_offset=0
+    # because our grandmaster is free-running host time, not UTC (the -37s default
+    # would inject a 37 s cross-sensor offset).
+    command: >
+      ros2 launch ouster_ros sensor.launch.xml
+      sensor_hostname:=${OUSTER_HOSTNAME:-192.168.100.10}
+      udp_dest:=${OUSTER_UDP_DEST:-192.168.100.1}
+      timestamp_mode:=TIME_FROM_PTP_1588
+      ptp_utc_tai_offset:=0.0
+      viz:=false
+
+  sbg:
+    build:
+      context: ./docker/jetson/sbg
+      args:
+        ROS_DISTRO: humble
+    image: meridian-sbg:humble
+    container_name: meridian-sbg
+    network_mode: host
+    ipc: host                       # share host /dev/shm so FastDDS shared-memory
+                                    # transport works across containers (UDP-only
+                                    # discovery succeeds without this, but data drops)
+    restart: unless-stopped
+    devices:
+      - "${SBG_PORT:-/dev/ttyUSB0}:/dev/ttyUSB0"
+    group_add:
+      - dialout
+    environment:
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+    volumes:
+      - ./docker/jetson/sbg/sbg_config.yaml:/config/sbg_config.yaml:ro
+      - ./docker/jetson/sbg/sbg.launch.py:/sbg.launch.py:ro
+    command: ros2 launch /sbg.launch.py
+
+  # ZED 2i as a plain UVC stereo camera (no ZED SDK; none ships for this L4T).
+  zed:
+    build:
+      context: ./docker/jetson/zed
+      args:
+        ROS_DISTRO: humble
+    image: meridian-zed:humble
+    container_name: meridian-zed
+    network_mode: host
+    ipc: host                       # share host /dev/shm so FastDDS shared-memory
+                                    # transport works across containers (UDP-only
+                                    # discovery succeeds without this, but data drops)
+    restart: unless-stopped
+    devices:
+      - "${ZED_VIDEO:-/dev/video0}:/dev/video0"
+    group_add:
+      - video
+    environment:
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+    volumes:
+      - ./docker/jetson/zed/zed_uvc.launch.py:/zed_uvc.launch.py:ro
+    command: ros2 launch /zed_uvc.launch.py
+
+  # Mirrors latched /tf_static onto /tf so late-connecting viewers (Foxglove) get
+  # the transform tree. Viz aid; remove with the foxglove service.
+  tf_relay:
+    image: meridian-ouster:humble
+    container_name: meridian-tf-relay
+    network_mode: host
+    ipc: host                       # share host /dev/shm so FastDDS shared-memory
+                                    # transport works across containers (UDP-only
+                                    # discovery succeeds without this, but data drops)
+    restart: unless-stopped
+    depends_on:
+      - ouster
+    environment:
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+    volumes:
+      - ./docker/jetson/ouster/tf_relay.py:/tf_relay.py:ro
+    command: python3 /tf_relay.py
+
+  foxglove:
+    build:
+      context: ./docker/jetson/foxglove
+      args:
+        ROS_DISTRO: humble
+    image: meridian-foxglove:humble
+    container_name: meridian-foxglove
+    network_mode: host
+    ipc: host                       # share host /dev/shm so FastDDS shared-memory
+                                    # transport works across containers (UDP-only
+                                    # discovery succeeds without this, but data drops)
+    restart: unless-stopped
+    environment:
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
