@@ -157,7 +157,7 @@ void ImuSource::ingest_raw(const RawImuFrame& f) {
   // device's mid/start-of-interval convention onto interval-end.
   s.stamp = impl_->base.note_stamp(base + impl_->cfg.interval_end_shift_ns, src);
 
-  // A non-finite acc/gyro component would become a corrupt spline residual; reject it.
+  // A non-finite acc/gyro component would poison deskew and the motion prior; reject it.
   if (!impl_->base.accept_imu(s)) return;
   if (impl_->cb) impl_->cb(std::move(s));
 }

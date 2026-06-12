@@ -1,16 +1,16 @@
 # Meridian — Documentation
 
-**Meridian** is a from-scratch, SOTA, **continuous-time tightly-coupled LiDAR-Inertial-Visual-GNSS SLAM** system for tactical operational mapping. It produces a **colourised 3D mesh** in real time on an **NVIDIA Jetson Orin**.
+**Meridian** is a from-scratch, **tightly-coupled LiDAR-Inertial SLAM** system for tactical operational mapping. It produces a **colourised 3D mesh** in real time on an **NVIDIA Jetson Orin**.
 
-It is a clean-slate rebuild — it reuses no prior code. Every technical claim in these docs is grounded in the apex open-source references (FAST-LIO2, FAST-LIVO2, Point-LIO, ikd-Tree) and the canonical papers (Coco-LIC/CLINS for continuous-time, iSAM2/GTSAM, nvblox, Scan Context++); that reference grounding lives in each spec's non-normative **Appendix R**, verified against the clones in `/home/user/slam-reference`.
+It is a clean-slate rebuild — it reuses no prior code. Every technical claim in these docs is grounded in the apex open-source references (FAST-LIO2, FAST-LIVO2, Point-LIO) and the canonical papers (iSAM2/GTSAM, nvblox, Scan Context++); that reference grounding lives in each spec's non-normative **Appendix R**, verified against the clones in `/home/user/slam-reference`.
 
 ## The system in one paragraph
 
-One LiDAR + one IMU + one camera + GNSS feed a **continuous-time B-spline trajectory** (the front-end, L2): every measurement attaches a residual to the spline at its true timestamp — direct LiDAR point-to-plane, FAST-LIVO2-style sparse-direct photometric (LiDAR gives depth, so no triangulation), IMU as a derivative residual, and GNSS — all fused into one trajectory by a sliding-window solver. Keyframes flow to a **GTSAM iSAM2 back-end** (L3) for global consistency and loop closure (Scan Context++ → STD/BTC → GICP → PCM, L5). Keyframe poses drive an **nvblox GPU map** (L4) — TSDF + colour → Marching Cubes mesh — corrected by clear-and-rebuild on loop closure. The result streams to the operator as a colour mesh with a confidence overlay (L6).
+One LiDAR + one IMU (plus a camera and GNSS carried through unfused) feed a **discrete LIO front-end** (L2): each sweep is deskewed internally with a constant-screw model from its own IMU samples, then registered against a voxel-hash local map by a Gauss-Newton ICP seeded and regularised by an interval-averaged IMU prior. Keyframes flow to a **GTSAM iSAM2 back-end** (L3) for global consistency and loop closure (Scan Context++ → STD/BTC → GICP → PCM, L5). Keyframe poses drive an **nvblox GPU map** (L4) — TSDF + colour → Marching Cubes mesh — corrected by clear-and-rebuild on loop closure. The result streams to the operator as a colour mesh with a confidence overlay (L6).
 
 **Design commitments (deliberately simple — best option per job, no fallbacks):**
 
-- Full CT LIVO+GNSS from the start. No phased rollout, no "iEKF v1 then CT v2". (The interim iEKF test oracle has been removed; CT correctness is validated directly against ground truth.)
+- One front-end: the discrete LIO estimator, validated directly against ground truth. (Two predecessors — an iEKF test oracle and a continuous-time estimator — are retired; camera/GNSS fusion are future stages on the same seams.)
 - Single LiDAR. (Multi-LiDAR is a future extension behind the same interfaces, not designed now.)
 - nvblox, GPU-only. No CPU fallback, no second map backend.
 - ROS 2 **Humble**, C++20, colcon/ament_cmake. ROS-agnostic core C++ library + thin ROS 2 wrappers.
@@ -30,8 +30,8 @@ One LiDAR + one IMU + one camera + GNSS feed a **continuous-time B-spline trajec
 | 00  | [`00_architecture.md`](specs/00_architecture.md)                           | ROS-agnostic core vs thin ROS 2 wrappers; package/dependency graph; threading; config; debug bus              |
 | 01  | [`01_interfaces_and_data_types.md`](specs/01_interfaces_and_data_types.md) | **The contracts.** Core math/sensor/calibration types, the `KeyframePacket` (L2→L3), the six layer interfaces |
 | 02  | [`02_sensors_timesync.md`](specs/02_sensors_timesync.md)                   | L0 — sensor abstraction; PTP time sync (linuxptp) from GNSS PPS                                               |
-| 03  | [`03_preprocessing.md`](specs/03_preprocessing.md)                         | L1 — filtering, organized cloud, deskew (spline-query + IMU-only cold-start)                                  |
-| 04  | [`04_frontend_estimation.md`](specs/04_frontend_estimation.md)             | **L2 — the CT B-spline tightly-coupled LIVO+GNSS estimator** (basalt-headers + Ceres)                         |
+| 03  | [`03_preprocessing.md`](specs/03_preprocessing.md)                         | L1 — filtering, organized cloud, GNSS gate (deskew lives inside L2)                                           |
+| 04  | [`04_frontend_estimation.md`](specs/04_frontend_estimation.md)             | **L2 — the discrete tightly-coupled LIO estimator** (internal screw deskew + voxel map + GN ICP)              |
 | 05  | [`05_backend_graph.md`](specs/05_backend_graph.md)                         | L3 — GTSAM iSAM2 keyframe graph; no-double-counting hand-off; robust factors                                  |
 | 06  | [`06_mapping.md`](specs/06_mapping.md)                                     | L4 — nvblox GPU TSDF+RGB → Marching Cubes mesh; clear-and-rebuild de-integration                              |
 | 07  | [`07_loop_closure.md`](specs/07_loop_closure.md)                           | L5 — Scan Context++ → STD/BTC → small_gicp → PCM                                                              |
@@ -42,7 +42,7 @@ One LiDAR + one IMU + one camera + GNSS feed a **continuous-time B-spline trajec
 
 ## Reference grounding — each spec's Appendix R
 
-Each spec carries a non-normative **Appendix R — SOTA reference grounding** that cites the apex open-source references by `repo@sha` and `file:symbol` (plus paper eq/section for the math), verified against the clones in `/home/user/slam-reference`. By topic: manifold/ESIKF, IMU/deskew, LiDAR/ikd-Tree, FAST-LIVO2 visual, and the CT B-spline → `04_frontend_estimation.md`; iSAM2/GTSAM → `05_backend_graph.md`; TSDF/mesh → `06_mapping.md`; loop closure → `07_loop_closure.md`; engineering/debug → `03_preprocessing.md` and `09_debug_introspection.md`.
+Each spec carries a non-normative **Appendix R — SOTA reference grounding** that cites the apex open-source references by `repo@sha` and `file:symbol` (plus paper eq/section for the math), verified against the clones in `/home/user/slam-reference`. By topic: manifold/ESIKF and IMU/deskew → `04_frontend_estimation.md`; iSAM2/GTSAM → `05_backend_graph.md`; TSDF/mesh → `06_mapping.md`; loop closure → `07_loop_closure.md`; engineering/debug → `03_preprocessing.md` and `09_debug_introspection.md`.
 
 ## Other
 

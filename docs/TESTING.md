@@ -40,8 +40,9 @@ colcon test --packages-select meridian_frontend meridian_pipeline meridian_confi
   && colcon test-result --verbose
 ```
 
-The front-end unit/integration tests (spline, IMU/LiDAR residual parity,
-marginalization, oracle differential) must be green before judging a bag run.
+The front-end unit/integration tests (voxel map, IMU tracker, registration,
+covariance chain, end-to-end synthetic tracking) must be green before judging a
+bag run.
 
 ## 1. Preflight
 
@@ -79,8 +80,9 @@ are plain TUM (`stamp x y z qx qy qz qw`, whitespace-separated, no header) —
 
 Healthy quad-easy run, for calibration of expectations: all ~1991 scans reach
 the node (`wrapper/lidar/cb_n` ≈ published count, `lost_upstream_n` = 0), no
-`TRANSPORT LOSS` warning, no window restarts, `pipeline/q_meas_dropped` absent
-or ~0, ATE in the 0.1–0.3 m band (LIO-only reference: ~0.2 m rmse full bag).
+`TRANSPORT LOSS` warning, no `frontend/lio/{gap,reject,reseed}` events,
+`pipeline/q_meas_dropped` absent
+or ~0, ATE in the 0.1–0.3 m band (reference: ~0.2 m rmse full bag).
 
 ## 3. Interactive run (rviz)
 
@@ -105,9 +107,9 @@ What you should see:
   put as the rig moves — no smearing or swimming per sweep.
 - **Smooth odom track**: `/meridian/odom` traces a continuous path, no
   teleports; the stationary start holds still.
-- **Events**: one `preprocess/imu_init_done` (static init needs the ~10 s
+- **Events**: one `frontend/lio/init_done` (static init needs the ~10 s
   still period at the sequence start), recurring `frontend/keyframe`, and
-  **no** window-restart / no-effective-points events.
+  **no** `frontend/lio/{gap,reject,reseed}` events.
 
 ```bash
 ros2 topic hz /meridian/odom               # ≈10 Hz (sweep rate)
@@ -121,7 +123,7 @@ ros2 topic echo /meridian/telemetry        # rates, queue gauges, waterfall coun
 | Symptom | Likely cause |
 |---|---|
 | `TRANSPORT LOSS` in the node log | QoS pairing broken — player override not passed, or `sensors.lidar.qos_reliable` edited; see `docs/REALTIME_DEBUGGING.md` |
-| `q_meas_dropped` / `window_restart` events | overload — triage with the stage-timing budget in `docs/REALTIME_DEBUGGING.md` |
+| `q_meas_dropped` / `frontend/lio/gap` events | overload — triage with the stage-timing budget in `docs/REALTIME_DEBUGGING.md` |
 | `dropping scan: missing ... per-point time field` | wrong LiDAR topic, or a bag prepared without the verification pass in `docs/DATASET.md` |
 | nothing at all | `use_sim_time:=true` on the node but the bag played without `--clock` (or vice versa) |
 | ATE meters-scale on a healthy log | wrong per-collection config for the sequence, or scored against `gt/tum/` instead of `gt/tum_asimu/` |

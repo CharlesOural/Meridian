@@ -66,9 +66,10 @@ InputValidator::Verdict InputValidator::on_stamp(Timestamp proposed, StampSource
 
   Verdict v{proposed, Verdict::Accept};
 
-  // Rewind: a stamp that does not strictly advance would corrupt preintegration and knot
-  // ordering. Clamp it up to the last emitted stamp and report the regression; never emit
-  // a regressing stamp. A sustained regression is edge-throttled and counted.
+  // Rewind: a stamp that does not strictly advance would corrupt IMU integration and
+  // per-point time ordering. Clamp it up to the last emitted stamp and report the
+  // regression; never emit a regressing stamp. A sustained regression is edge-throttled
+  // and counted.
   if (proposed < last_stamp_) {
     enter(HealthCode::ClockStepDetected, last_stamp_);
     v.stamp = last_stamp_;
@@ -213,7 +214,7 @@ InputValidator::Verdict InputValidator::on_lidar(LidarScan& scan) {
 
 InputValidator::Verdict InputValidator::on_imu(const ImuSample& s) {
   // A non-finite acc/gyro component is corrupt content; reject the sample so it never
-  // becomes a spline residual.
+  // enters IMU propagation.
   if (!s.acc.allFinite() || !s.gyro.allFinite()) {
     enter(HealthCode::ImuNonFinite, s.stamp);
     return {s.stamp, Verdict::Reject};

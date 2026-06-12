@@ -1,9 +1,3 @@
-[submodule "vendor/basalt-headers"]
-	path = vendor/basalt-headers
-	url = https://gitlab.com/VladyslavUsenko/basalt-headers.git
-[submodule "vendor/ikd-Tree"]
-	path = vendor/ikd-Tree
-	url = https://github.com/hku-mars/ikd-Tree.git
 [submodule "vendor/scancontext"]
 	path = vendor/scancontext
 	url = https://github.com/gisbi-kim/scancontext_tro.git

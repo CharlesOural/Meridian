@@ -5,23 +5,15 @@ Reproducible setup for the Newer College Dataset, 2021 collection (Ouster OS0-12
 This is the benchmark set: three tuning sequences + one **holdout**. No GNSS on
 this rig (`sensors.gnss.enable: false`).
 
-**Current scope: LIO benchmark.** All Newer College cameras are fisheye
-(Kalibr `equidistant`), which the front-end's `CameraModel` deliberately rejects
-(pinhole+radtan only; rectification is an unwired seam in `CameraPreprocessor`),
-so the visual stage auto-disables on these bags (`frontend/visual/disabled`,
-`cam_valid=0`). The configs still carry the full camera calibration — the moment
-equidistant projection or the rectify map lands, the visual stage lights up with
-no config change. Until then, ATE numbers here are LiDAR-inertial only.
-
 The `bags/` tree is **not** committed; the three Meridian configs and the import
 tools are. Follow this doc to rebuild the identical local layout.
 
-| sequence | collection | role | raw size |
-|---|---|---|---|
-| quad-easy | 1 (newer college) | bring-up baseline — gentle motion, open quad | 10 GB |
-| math-medium | 3 (maths institute) | mid-band tuning — mixed open/building | 8.5 GB |
-| park (bags 0–2 of 8) | 2 (newer college) | vegetation/parkland tuning — the off-road analog | 28 GB |
-| quad-hard | 1 | **HOLDOUT — do not tune on it.** Blind validation only | 9.5 GB |
+| sequence             | collection          | role                                                   | raw size |
+| -------------------- | ------------------- | ------------------------------------------------------ | -------- |
+| quad-easy            | 1 (newer college)   | bring-up baseline — gentle motion, open quad           | 10 GB    |
+| math-medium          | 3 (maths institute) | mid-band tuning — mixed open/building                  | 8.5 GB   |
+| park (bags 0–2 of 8) | 2 (newer college)   | vegetation/parkland tuning — the off-road analog       | 28 GB    |
+| quad-hard            | 1                   | **HOLDOUT — do not tune on it.** Blind validation only | 9.5 GB   |
 
 ## 1. Download
 
@@ -93,19 +85,13 @@ rosbags-convert --src ros1/2021-11-30-17-09-49_0-park.bag ros1/2021-11-30-17-13-
                 --src ros1/2021-11-30-17-16-38_2-park.bag      --dst ros2-raw/park        --dst-typestore ros2_humble
 rosbags-convert --src ros1/2021-07-01-11-35-14_0-quad-hard.bag --dst ros2-raw/quad-hard   --dst-typestore ros2_humble
 
-# 2) one-time post-conversion pass (ALREADY APPLIED to the bags in bags/): verify
-#    per-point timestamps (NC's column clock is CLEAN — 0 scans needed repair on all
-#    four bags), strip ouster_ros/PacketMsg (~GBs, no Humble typesupport), and rewrite
-#    metadata v9 -> v5 (Humble's player refuses v9). The throwaway script that did this
-#    has been removed; redoing it from scratch means: copy PointCloud2/Imu/CompressedImage
-#    topics into a fresh bag and patch metadata version — no timestamp surgery needed.
 rm -rf ros2-raw ros1   # keep ros1-extra
 
-# 3) clip the park GT to the bags-0..2 window (the full-run GT covers all 8 bags).
+# 2) clip the park GT to the bags-0..2 window (the full-run GT covers all 8 bags).
 #    Window from park/metadata.yaml: start 1638292236.000718678, duration 571.053319292 s.
 #    (Already-clipped files keep the originals as gt/{tum,state}/gt-nc-park-full8.csv.)
 
-# 4) re-express GT into the estimation frame (GT is the *base* frame; /meridian/odom is
+# 3) re-express GT into the estimation frame (GT is the *base* frame; /meridian/odom is
 #    the Alphasense-IMU frame; the constant ~7.6 cm body offset does NOT wash out under
 #    Umeyama alignment):
 cd gt && mkdir -p tum_asimu
@@ -188,7 +174,7 @@ Same pattern for `math-medium` (math config) and `park` (park config). ATE must
 be evaluated against **`gt/tum_asimu/`**, not `gt/tum/`.
 
 **Holdout discipline:** `quad-hard` is for blind validation after a tuning round
-converges on the other three. If a change is tuned *on* quad-hard, it stops
+converges on the other three. If a change is tuned _on_ quad-hard, it stops
 measuring generalization — record any quad-hard run in OPTIMIZE.md as a
 validation result, never as a tuning input.
 

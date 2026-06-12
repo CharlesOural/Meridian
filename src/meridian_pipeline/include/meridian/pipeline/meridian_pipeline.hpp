@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -38,15 +37,14 @@ class GnssSource;
 class HealthSink;
 class IFrontEnd;
 class ILidarPreprocessor;
-class ImuInitializer;
 class ImuSource;
 class OusterLidarSource;
 class TelemetrySink;
 
 // Owns and wires the processing stages: the sensor sources (stamping + health), the
-// lossy sensor queue, the L0/L1 stage (validity filter, IMU init, GNSS gate,
-// aggregation, cold-start deskew), the L2 front-end (CT LIVO+GNSS estimator), the L3
-// back-end (global graph optimizer), and the telemetry sink every module borrows.
+// lossy sensor queue, the L0/L1 stage (validity filter, GNSS gate, aggregation), the
+// L2 front-end (LIO estimator), the L3 back-end (global graph optimizer), and the
+// telemetry sink every module borrows.
 //
 // Threading: in Live mode three stage threads run. T1 drains the sensor queue and runs
 // the L0/L1 stage; each preprocessed sweep plus its live IMU samples cross a second
@@ -96,12 +94,11 @@ public:
   using GroupSink = std::function<void(PreprocessedGroup&&)>;
   void set_group_sink(GroupSink sink);
 
-  // Receives every keyframe the front-end emits, moved, on the front-end's keyframe
-  // finalizer thread (Live; packets arrive in id order with constraint_cov filled) or
-  // the caller's thread (Replay, inline). Set before start(); must only enqueue. When
+  // Receives every keyframe the front-end emits, moved, on the front-end thread (Live)
+  // or the caller's thread (Replay, inline); packets arrive in id order with
+  // constraint_cov filled synchronously. Set before start(); must only enqueue. When
   // unset the pipeline still counts keyframes and raises the "frontend/keyframe"
-  // telemetry event. The first keyframe flips the front-end into steady-state deskew,
-  // so emitted groups stop reporting cold_start after it.
+  // telemetry event.
   using KeyframeSink = std::function<void(KeyframePacket&&)>;
   void set_keyframe_sink(KeyframeSink sink);
 
@@ -156,12 +153,8 @@ private:
   void stage_loop();
   // One sample through the L0/L1 stage (thread-confined to the sensor stage thread).
   void process(SensorSample&& s);
-  // Aggregated-group tail: bootstrap buffering, cold-start deskew, telemetry, emit.
+  // Aggregated-group tail: telemetry, then hand-off to the front-end stage.
   void on_group(MeasureGroup&& g);
-  // Deskew + telemetry + hand-off of one group past the bootstrap gate.
-  void emit_group(MeasureGroup&& g);
-  // Deskews one group's scan against an IMU-only trajectory built from its IMU set.
-  std::optional<LidarScan> deskew_group(const MeasureGroup& g);
 
   // Hands a measurement to the front-end stage: through Q_meas in Live mode, inline in
   // Replay mode (deterministic, on the caller/sensor thread).
@@ -171,8 +164,8 @@ private:
   // Runs the group sink then feeds one measurement to the front-end (thread-confined to
   // the front-end thread, or the caller's thread in Replay).
   void process_meas(MeasSample&& m);
-  // The front-end's keyframe callback: counts, raises telemetry, flips spline_active_ on
-  // the first keyframe, and forwards to the wrapper sink.
+  // The front-end's keyframe callback: counts, raises telemetry, and forwards to the
+  // wrapper sink.
   void on_keyframe(KeyframePacket&& kf);
   // The single feed point of the back-end input stream; every item passes through here
   // (and the tap, when set) in feed order.
@@ -205,10 +198,6 @@ private:
 
   Config cfg_;
   bool sync_mode_ = false;  // Replay: process inline, no thread/queue
-  // Flipped true once the front-end takes over deskew with its own trajectory; until
-  // then every emitted group reports cold_start. Written on the front-end thread (first
-  // keyframe), read on the sensor stage thread, so it is atomic.
-  std::atomic<bool> spline_active_{false};
 
   std::unique_ptr<TelemetrySink> sink_;
   std::unique_ptr<ClockModel> clock_;
@@ -220,7 +209,6 @@ private:
   std::unique_ptr<GnssSource> gnss_source_;
 
   std::unique_ptr<ILidarPreprocessor> lidar_preprocessor_;
-  std::unique_ptr<ImuInitializer> imu_init_;
   std::unique_ptr<GnssGate> gnss_gate_;
   std::unique_ptr<CameraPreprocessor> camera_preprocessor_;
   std::unique_ptr<Aggregator> aggregator_;
@@ -246,8 +234,6 @@ private:
   // once in ingest() before validation/aggregation. Zero means no correction.
   Timestamp lidar_offset_ns_ = 0;
   Timestamp camera_offset_ns_ = 0;
-  // Sweeps held back until the IMU bootstrap converges; bounded, oldest dropped.
-  std::deque<MeasureGroup> bootstrap_groups_;
 
   GroupSink group_sink_;
   KeyframeSink keyframe_sink_;

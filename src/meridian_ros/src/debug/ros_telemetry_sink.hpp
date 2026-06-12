@@ -2,19 +2,18 @@
 
 #include <chrono>
 #include <map>
-#include <mutex>
-#include <string>
-#include <unordered_map>
-#include <vector>
-
-#include <rclcpp/rclcpp.hpp>
-
 #include <meridian_msgs/msg/event.hpp>
 #include <meridian_msgs/msg/stage_timing.hpp>
 #include <meridian_msgs/msg/telemetry.hpp>
+#include <mutex>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "meridian/config/config.hpp"
@@ -32,7 +31,7 @@ namespace meridian {
 //
 // Thread-safe: called from source (wrapper) threads and the stage thread concurrently.
 class RosTelemetrySink final : public TelemetrySink {
- public:
+public:
   RosTelemetrySink(rclcpp::Node* node, const DebugConfig& cfg);
 
   bool enabled(const char* key) const override;
@@ -54,7 +53,7 @@ class RosTelemetrySink final : public TelemetrySink {
   void set_default_rate(double hz);
   void reset_timing();
 
- private:
+private:
   using Clock = std::chrono::steady_clock;
 
   struct KeyState {
@@ -74,6 +73,9 @@ class RosTelemetrySink final : public TelemetrySink {
   bool pass(const std::string& key, bool heavy);
   // Default publication rate for a key class.
   double default_hz(bool heavy) const;
+  // PathAggregator: appends one odometry pose sample to the /meridian/path ring and
+  // republishes the whole path at most cfg.path_publish_hz.
+  void append_path(const Pose& p, Timestamp t);
 
   static std::string sanitize(const std::string& key);  // '/' -> '_' for topic suffixes
   std::string cloud_topic(const std::string& key) const;
@@ -89,6 +91,7 @@ class RosTelemetrySink final : public TelemetrySink {
   rclcpp::Publisher<meridian_msgs::msg::StageTiming>::SharedPtr pub_timing_;
   rclcpp::Publisher<meridian_msgs::msg::Event>::SharedPtr pub_events_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_markers_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;  // null when publish_path off
 
   mutable std::mutex m_;
   std::unordered_map<std::string, KeyState> keys_;
@@ -96,10 +99,14 @@ class RosTelemetrySink final : public TelemetrySink {
   double default_rate_hz_;
   std::map<std::string, StageStats> stages_;
 
+  // PathAggregator state (guarded by m_): the growing nav_msgs/Path ring plus the
+  // steady-clock stamp of the last republish.
+  nav_msgs::msg::Path path_;
+  Clock::time_point path_last_pub_{};
+
   std::unordered_map<std::string, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr>
       cloud_pubs_;
-  std::unordered_map<std::string, rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr>
-      pose_pubs_;
+  std::unordered_map<std::string, rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr> pose_pubs_;
   std::unordered_map<std::string, rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr>
       image_pubs_;
 };
@@ -107,7 +114,7 @@ class RosTelemetrySink final : public TelemetrySink {
 // Bridges core logging onto the node's rclcpp logger, with a runtime-settable
 // per-module minimum level.
 class RclcppLogSink final : public LogSink {
- public:
+public:
   RclcppLogSink(rclcpp::Logger logger, LogLevel min_level);
 
   void log(Level level, const char* module, std::string_view kvline, Timestamp t) override;
@@ -116,7 +123,7 @@ class RclcppLogSink final : public LogSink {
   // "" sets the default level for every module without an explicit override.
   void set_level(const std::string& module, Level level);
 
- private:
+private:
   rclcpp::Logger logger_;
   mutable std::mutex m_;
   Level default_level_;

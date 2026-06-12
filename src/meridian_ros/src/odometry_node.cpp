@@ -1,24 +1,23 @@
+#include <tf2_ros/transform_broadcaster.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstdint>
-#include <memory>
-#include <stdexcept>
-#include <string>
-#include <vector>
-
-#include <rclcpp/rclcpp.hpp>
-#include <tf2_ros/transform_broadcaster.h>
-
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <memory>
 #include <meridian_msgs/srv/reset_timing.hpp>
 #include <meridian_msgs/srv/set_debug_key.hpp>
 #include <meridian_msgs/srv/set_log_level.hpp>
 #include <meridian_msgs/srv/set_telemetry_rate.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "conversions/core2ros.hpp"
 #include "conversions/ros2core.hpp"
@@ -33,7 +32,7 @@ namespace meridian {
 // subscribe (convert msg -> core, push) -> expose the DebugControl services. Every
 // algorithm lives below the pipeline boundary.
 class OdometryNode : public rclcpp::Node {
- public:
+public:
   OdometryNode() : rclcpp::Node("meridian_odometry") {
     const std::string config_file = declare_parameter<std::string>("config_file", "");
     if (config_file.empty()) {
@@ -64,7 +63,7 @@ class OdometryNode : public rclcpp::Node {
     set_log_sink(nullptr);
   }
 
- private:
+private:
   Timestamp now_ns() { return static_cast<Timestamp>(get_clock()->now().nanoseconds()); }
 
   void create_subscriptions() {
@@ -98,8 +97,8 @@ class OdometryNode : public rclcpp::Node {
           // the one place it can be detected; a sustained ratio means the subscription
           // reliability does not match the publisher or the transport is saturated.
           ++lidar_cb_n_;
-          const Timestamp stamp = Timestamp(msg->header.stamp.sec) * 1000000000ll +
-                                  msg->header.stamp.nanosec;
+          const Timestamp stamp =
+              Timestamp(msg->header.stamp.sec) * 1000000000ll + msg->header.stamp.nanosec;
           if (last_lidar_stamp_ > 0 && cfg_.sensors.lidar.nominal_rate_hz > 0) {
             const double period_ns = 1e9 / cfg_.sensors.lidar.nominal_rate_hz;
             const double gap = static_cast<double>(stamp - last_lidar_stamp_);
@@ -135,8 +134,7 @@ class OdometryNode : public rclcpp::Node {
         });
 
     sub_imu_ = create_subscription<sensor_msgs::msg::Imu>(
-        cfg_.sensors.imu.topic, qos_imu,
-        [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) {
+        cfg_.sensors.imu.topic, qos_imu, [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) {
           pipeline_->ingest(to_raw_imu(*msg, now_ns()));
         });
 
@@ -195,9 +193,8 @@ class OdometryNode : public rclcpp::Node {
           res->ok = true;
         });
     srv_reset_timing_ = create_service<meridian_msgs::srv::ResetTiming>(
-        "/meridian/reset_timing",
-        [this](meridian_msgs::srv::ResetTiming::Request::ConstSharedPtr,
-               meridian_msgs::srv::ResetTiming::Response::SharedPtr res) {
+        "/meridian/reset_timing", [this](meridian_msgs::srv::ResetTiming::Request::ConstSharedPtr,
+                                         meridian_msgs::srv::ResetTiming::Response::SharedPtr res) {
           sink_->reset_timing();
           res->ok = true;
         });
@@ -216,12 +213,10 @@ class OdometryNode : public rclcpp::Node {
 
   void on_group(const PreprocessedGroup& g) {
     const auto n = ++group_count_;
-    RCLCPP_INFO_THROTTLE(
-        get_logger(), *get_clock(), 5000,
-        "group #%lu: %zu pts, %zu imu, image=%d, deskewed=%d",
-        static_cast<unsigned long>(n), g.group.scan.points ? g.group.scan.points->size() : 0,
-        g.group.imu.size(), g.group.image.has_value() ? 1 : 0,
-        g.deskewed.has_value() ? 1 : 0);
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "group #%lu: %zu pts, %zu imu, image=%d",
+                         static_cast<unsigned long>(n),
+                         g.group.scan.points ? g.group.scan.points->size() : 0, g.group.imu.size(),
+                         g.group.image.has_value() ? 1 : 0);
 
     // This callback runs on the front-end stage thread, where live_state() is valid, so
     // the odom->body TF tracks the estimate at group rate. The front-end also pushes the

@@ -27,44 +27,6 @@ function(_meridian_vendor_missing submodule)
     "git submodule update --init --recursive vendor/${submodule}")
 endfunction()
 
-# basalt-headers: header-only CT spline kernel; needs Eigen + Sophus.
-if(NOT TARGET meridian::vendor_basalt)
-  if(EXISTS "${MERIDIAN_VENDOR_DIR}/basalt-headers/include")
-    add_library(meridian_vendor_basalt INTERFACE)
-    # SYSTEM so the vendored spline kernel is exempt from the house -Werror set (matches the
-    # ikd-Tree treatment below): newer GCCs emit a false-positive maybe-uninitialized in
-    # ceres_spline_helper.h that would otherwise fail the build.
-    target_include_directories(meridian_vendor_basalt SYSTEM INTERFACE
-      "${MERIDIAN_VENDOR_DIR}/basalt-headers/include")
-    target_link_libraries(meridian_vendor_basalt INTERFACE Eigen3::Eigen Sophus::Sophus)
-    add_library(meridian::vendor_basalt ALIAS meridian_vendor_basalt)
-  elseif(MERIDIAN_NEED_VENDOR_BASALT)
-    _meridian_vendor_missing("basalt-headers")
-  endif()
-endif()
-
-# ikd-Tree: header + one .cpp (nested ikd-Tree/ dir upstream), built as a tiny static
-# lib (registration oracle). Its header includes pcl/point_types.h, so the consumer
-# must have found PCL (MERIDIAN_NEED_PCL) before this module runs; the includes are
-# SYSTEM so the vendored code is exempt from the house -Werror warning set.
-if(NOT TARGET meridian::vendor_ikdtree)
-  if(EXISTS "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree/ikd_Tree.cpp" AND PCL_FOUND)
-    add_library(meridian_vendor_ikdtree STATIC
-      "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree/ikd_Tree.cpp")
-    target_include_directories(meridian_vendor_ikdtree SYSTEM PUBLIC
-      "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree"
-      ${PCL_INCLUDE_DIRS})
-    target_link_libraries(meridian_vendor_ikdtree PUBLIC Eigen3::Eigen)
-    find_package(Threads REQUIRED)
-    target_link_libraries(meridian_vendor_ikdtree PUBLIC Threads::Threads)
-    set_target_properties(meridian_vendor_ikdtree PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    add_library(meridian::vendor_ikdtree ALIAS meridian_vendor_ikdtree)
-  elseif(MERIDIAN_NEED_VENDOR_IKDTREE
-         AND NOT EXISTS "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree/ikd_Tree.cpp")
-    _meridian_vendor_missing("ikd-Tree")
-  endif()
-endif()
-
 # Scan Context++: the C++ module inside the upstream evaluation repo.
 if(NOT TARGET meridian::vendor_scancontext)
   if(EXISTS "${MERIDIAN_VENDOR_DIR}/scancontext/cpp/module/Scancontext")

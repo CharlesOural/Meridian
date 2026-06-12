@@ -29,7 +29,10 @@ TEST(TelemetryKeys, UnitStringMatchesCatalog) {
   EXPECT_STREQ(unit_string("frontend/solve_ms"), "ms");
   EXPECT_STREQ(unit_string("backend/n_factors"), "count");
   EXPECT_STREQ(unit_string("frontend/observability"), "ratio");
-  EXPECT_STREQ(unit_string("frontend/gnss/innovation_m"), "m");
+  EXPECT_STREQ(unit_string("frontend/state/vel_norm"), "m/s");
+  EXPECT_STREQ(unit_string("frontend/lio/n_corr"), "count");
+  EXPECT_STREQ(unit_string("frontend.lio.ingest"), "ms");
+  EXPECT_STREQ(unit_string("backend/gnss/residual"), "m");
 }
 
 // Dynamic-suffix keys resolve their unit through the registered prefix.

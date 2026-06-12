@@ -13,22 +13,17 @@ constexpr std::array kAll{
     // gnss
     gnss::Accepted, gnss::Rejected, gnss::Spoof,
     // preprocess
-    preprocess::ImuInitProgress, preprocess::CameraPyramid, preprocess::CameraPyramidLevels,
-    preprocess::CameraRaw, preprocess::CameraIntensity, preprocess::ImuInitDone,
-    preprocess::ImuInitRetry, preprocess::BootstrapDrop, preprocess::DeskewHorizon,
+    preprocess::CameraPyramid, preprocess::CameraPyramidLevels, preprocess::CameraRaw,
+    preprocess::CameraIntensity,
     // frontend
-    frontend::IterCount, frontend::OuterIters, frontend::SolveMs, frontend::DeadlineHit,
-    frontend::BiasBounded, frontend::PriorDim, frontend::CtNCp, frontend::KeyframeCount,
-    frontend::Observability, frontend::ObsMin, frontend::ObsMinScore, frontend::BiasGyrNorm,
-    frontend::BiasAccNorm, frontend::VelNorm, frontend::InnovTransM, frontend::InnovRotDeg,
-    frontend::LidarNInlier, frontend::LidarNFactorsKept, frontend::LidarNFactorsDropped,
-    frontend::LidarInliers, frontend::VisualNTracked, frontend::VisualNCandidates,
-    frontend::VisualNConverged, frontend::VisualMapPoints, frontend::VisualResMean,
-    frontend::VisualExposureGain, frontend::VisualPatches, frontend::MapSize,
-    frontend::MapInsertRejected, frontend::GnssAcceptRate, frontend::GnssInnovationM,
-    frontend::SplineKnots, frontend::WindowBox, frontend::Keyframe, frontend::WindowRestart,
-    frontend::SweepGapBridged, frontend::VisualDisabled, frontend::GnssInactive,
-    frontend::GnssReject,
+    frontend::OuterIters, frontend::SolveMs, frontend::KeyframeCount, frontend::Observability,
+    frontend::ObsMin, frontend::BiasGyrNorm, frontend::BiasAccNorm, frontend::VelNorm,
+    frontend::AssocNAttempted, frontend::AssocNMatched, frontend::SolverGnIters,
+    frontend::SolverDxNorm, frontend::SolverChi, frontend::MapVoxels, frontend::MapPoints,
+    frontend::MapSize, frontend::LidarInliers, frontend::LioBeta, frontend::LioAccelVar,
+    frontend::LioNCorr, frontend::LioDeskewSpanTMs, frontend::PathSample, frontend::Keyframe,
+    frontend::LioInitBacklog, frontend::LioInitDone, frontend::LioError, frontend::LioGap,
+    frontend::LioReject, frontend::LioReseed,
     // backend
     backend::Chi2, backend::NFactors, backend::NLoops, backend::NGnss, backend::UpdateMs,
     backend::RelinCount, backend::QueueDepth, backend::OptimizeLag, backend::FallbackCount,
@@ -60,12 +55,7 @@ constexpr std::array kAll{
     health::Degrade,
     // timing stages
     stage::Preprocess, stage::PreprocessDeskew, stage::PreprocessCamera,
-    stage::PreprocessLidarValidity, stage::BackendOptimize, stage::CtAssoc, stage::CtAssemble,
-    stage::CtVisual, stage::CtVisualMap, stage::CtSolve, stage::CtSolveResidualEval,
-    stage::CtSolveJacobianEval, stage::CtSolveLinearSolver, stage::CtPosecov,
-    stage::CtPosecovWorker, stage::CtCovsnapshot, stage::CtCovsubmit, stage::CtMarg,
-    stage::CtObs, stage::CtMap, stage::CtMapWarp, stage::CtMapInsert, stage::CtMapTrim,
-    stage::CtVmapSelect, stage::CtVmapUpdate, stage::CtVmapPromote, stage::CtVmapEvict,
+    stage::PreprocessLidarValidity, stage::BackendOptimize, stage::LioIngest,
 };
 
 const char* to_str(Unit u) {

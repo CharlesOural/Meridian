@@ -4,7 +4,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <map>
 #include <span>
 #include <stdexcept>
@@ -23,8 +22,6 @@
 #include "meridian/preprocess/camera_preprocess.hpp"
 #include "meridian/preprocess/gnss_gate.hpp"
 #include "meridian/preprocess/ilidar_preprocessor.hpp"
-#include "meridian/preprocess/imu_init.hpp"
-#include "meridian/preprocess/imu_only_deskew.hpp"
 #include "meridian/sensors/aggregator.hpp"
 #include "meridian/sensors/sources.hpp"
 #include "meridian/time/clock_model.hpp"
@@ -45,8 +42,8 @@ constexpr std::size_t kMeasQueueCapacity = 8 * 24;
 constexpr std::uint64_t kMapCloudFoldPeriod = 10;
 constexpr float kMapCloudVoxel = 0.3f;
 
-SensorInfo make_info(std::uint8_t id, Modality modality, Frame frame,
-                     const std::string& model, double rate_hz, StampSource src) {
+SensorInfo make_info(std::uint8_t id, Modality modality, Frame frame, const std::string& model,
+                     double rate_hz, StampSource src) {
   SensorInfo info;
   info.id = id;
   info.modality = modality;
@@ -57,13 +54,12 @@ SensorInfo make_info(std::uint8_t id, Modality modality, Frame frame,
   return info;
 }
 
-// The LiDAR->body extrinsic from config, packaged for the validity filter / deskew.
+// The LiDAR->body extrinsic from config, packaged for the validity filter.
 Extrinsic lidar_extrinsic(const LidarSensorConfig& lidar) {
   Extrinsic ext;
   ext.child = Frame::OsSensor0;
   ext.parent = Frame::ImuLink;
-  ext.T_parent_child =
-      Pose{Eigen::Quaterniond(lidar.extrinsic_R), lidar.extrinsic_T};
+  ext.T_parent_child = Pose{Eigen::Quaterniond(lidar.extrinsic_R), lidar.extrinsic_T};
   return ext;
 }
 
@@ -78,8 +74,10 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
       q_sensors_(kSensorQueueCapacity),
       q_meas_(kMeasQueueCapacity),
       q_backend_(static_cast<std::size_t>(cfg.pipeline.queue.kf_capacity)),
-      lidar_offset_ns_(static_cast<Timestamp>(std::llround(cfg.sensors.lidar.time_offset_ms * 1e6))),
-      camera_offset_ns_(static_cast<Timestamp>(std::llround(cfg.sensors.camera.time_offset_ms * 1e6))) {
+      lidar_offset_ns_(
+          static_cast<Timestamp>(std::llround(cfg.sensors.lidar.time_offset_ms * 1e6))),
+      camera_offset_ns_(
+          static_cast<Timestamp>(std::llround(cfg.sensors.camera.time_offset_ms * 1e6))) {
   const auto& s = cfg_.sensors;
   const auto& th = cfg_.time.health;
   const auto& vc = cfg_.time.validator;
@@ -90,8 +88,8 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
                 s.lidar.ptp ? StampSource::HwPtp : StampSource::SwOffset),
       s.lidar, clock_.get(), health_.get(), sink_.get(), th, vc);
   imu_source_ = std::make_unique<ImuSource>(
-      make_info(static_cast<std::uint8_t>(s.imu.id), Modality::Imu, Frame::ImuLink,
-                s.imu.model, s.imu.rate_hz,
+      make_info(static_cast<std::uint8_t>(s.imu.id), Modality::Imu, Frame::ImuLink, s.imu.model,
+                s.imu.rate_hz,
                 s.imu.has_device_clock ? StampSource::HwPtp : StampSource::ArrivalOnly),
       s.imu, clock_.get(), health_.get(), sink_.get(), th, vc);
   camera_source_ = std::make_unique<CameraSource>(
@@ -99,10 +97,8 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
                 s.camera.model, s.camera.nominal_rate_hz, StampSource::SwOffset),
       s.camera, clock_.get(), health_.get(), sink_.get(), th, vc);
   gnss_source_ = std::make_unique<GnssSource>(
-      make_info(static_cast<std::uint8_t>(s.gnss.id), Modality::Gnss, Frame::GnssLink,
-                "gnss", 1.0,
-                s.gnss.pps_disciplines_clock ? StampSource::HwPps
-                                             : StampSource::SwOffset),
+      make_info(static_cast<std::uint8_t>(s.gnss.id), Modality::Gnss, Frame::GnssLink, "gnss", 1.0,
+                s.gnss.pps_disciplines_clock ? StampSource::HwPps : StampSource::SwOffset),
       s.gnss, clock_.get(), health_.get(), sink_.get(), th, vc);
 
   // A defaulted (identity) LiDAR extrinsic is a valid-looking value the estimator
@@ -112,10 +108,8 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
                  "lidar extrinsic not configured; using identity T_imu_lidar", 0);
   }
 
-  lidar_preprocessor_ = makeLidarPreprocessor(
-      cfg_.preprocess, lidar_extrinsic(s.lidar), s.lidar.nominal_rate_hz, sink_.get());
-  imu_init_ = std::make_unique<ImuInitializer>(cfg_.preprocess.imu,
-                                               cfg_.preprocess.deskew.imu_init_count);
+  lidar_preprocessor_ = makeLidarPreprocessor(cfg_.preprocess, lidar_extrinsic(s.lidar),
+                                              s.lidar.nominal_rate_hz, sink_.get());
   gnss_gate_ = std::make_unique<GnssGate>(cfg_.preprocess.gnss,
                                           /*velocity_source=*/nullptr, sink_.get());
   // The full camera intrinsics (distortion model + coeffs + size) drive the undistort
@@ -126,22 +120,26 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
       cam_it != calib->cam_intrinsics.end() ? cam_it->second : IntrinsicsCamera{};
   camera_preprocessor_ = std::make_unique<CameraPreprocessor>(
       cfg_.preprocess.camera, cam_intr, sink_.get());
-  aggregator_ = std::make_unique<Aggregator>(cfg_.aggregation, cfg_.sensors,
-                                             health_.get(), sink_.get());
+  aggregator_ =
+      std::make_unique<Aggregator>(cfg_.aggregation, cfg_.sensors, health_.get(), sink_.get());
   aggregator_->set_sink([this](MeasureGroup&& g) { on_group(std::move(g)); });
 
   // Every stamped sample funnels into the one stage entry, whatever its modality.
   lidar_source_->set_callback([this](LidarScan&& scan) { enqueue(std::move(scan)); });
   imu_source_->set_callback([this](ImuSample&& imu) { enqueue(std::move(imu)); });
-  camera_source_->set_callback(
-      [this](CameraFrame&& frame) { enqueue(std::move(frame)); });
+  camera_source_->set_callback([this](CameraFrame&& frame) { enqueue(std::move(frame)); });
   gnss_source_->set_callback([this](GnssFix&& fix) { enqueue(std::move(fix)); });
 
-  // The L2 estimator. A construction failure (bad config, missing vendored kernel) is
-  // fatal — the pipeline has no useful output without it — so surface it as a clear
-  // exception rather than running a half-wired pipeline.
+  // The L2 estimator. A construction failure (bad config) is fatal — the pipeline has
+  // no useful output without it — so surface it as a clear exception rather than
+  // running a half-wired pipeline.
   try {
-    frontend_ = makeFrontEnd(cfg_.frontend, calib, sink_.get(), /*deterministic=*/sync_mode_);
+    // The path-sample cadence is authored under debug: (a telemetry knob, not an
+    // estimator parameter); hand it to the front-end through its config copy. The
+    // calibration snapshot is shared with the back-end so both layers agree.
+    FrontendConfig fe_cfg = cfg_.frontend;
+    fe_cfg.debug_path_sample_hz = cfg_.debug.path_sample_hz;
+    frontend_ = makeFrontEnd(fe_cfg, calib, sink_.get(), /*deterministic=*/sync_mode_);
   } catch (const std::exception& e) {
     throw std::runtime_error(std::string("front-end construction failed: ") + e.what());
   }
@@ -176,7 +174,9 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
   }
 }
 
-MeridianPipeline::~MeridianPipeline() { stop(); }
+MeridianPipeline::~MeridianPipeline() {
+  stop();
+}
 
 void MeridianPipeline::start() {
   if (sync_mode_ || running_.load()) return;
@@ -223,7 +223,9 @@ void MeridianPipeline::ingest(const RawLidarFrame& f) {
   }
   lidar_source_->ingest_raw(f);
 }
-void MeridianPipeline::ingest(const RawImuFrame& f) { imu_source_->ingest_raw(f); }
+void MeridianPipeline::ingest(const RawImuFrame& f) {
+  imu_source_->ingest_raw(f);
+}
 void MeridianPipeline::ingest(const RawCameraFrame& f) {
   if (camera_offset_ns_ != 0 && f.has_device_ns) {
     RawCameraFrame shifted = f;
@@ -233,9 +235,13 @@ void MeridianPipeline::ingest(const RawCameraFrame& f) {
   }
   camera_source_->ingest_raw(f);
 }
-void MeridianPipeline::ingest(const RawGnssFrame& f) { gnss_source_->ingest_raw(f); }
+void MeridianPipeline::ingest(const RawGnssFrame& f) {
+  gnss_source_->ingest_raw(f);
+}
 
-void MeridianPipeline::set_group_sink(GroupSink sink) { group_sink_ = std::move(sink); }
+void MeridianPipeline::set_group_sink(GroupSink sink) {
+  group_sink_ = std::move(sink);
+}
 
 void MeridianPipeline::set_keyframe_sink(KeyframeSink sink) {
   keyframe_sink_ = std::move(sink);
@@ -257,7 +263,9 @@ bool MeridianPipeline::backend_enabled() const { return backend_ != nullptr; }
 
 NavState MeridianPipeline::live_state() const { return frontend_->live_state(); }
 
-TelemetrySink* MeridianPipeline::telemetry() { return sink_.get(); }
+TelemetrySink* MeridianPipeline::telemetry() {
+  return sink_.get();
+}
 
 void MeridianPipeline::enqueue(SensorSample&& s) {
   if (sync_mode_) {
@@ -267,8 +275,10 @@ void MeridianPipeline::enqueue(SensorSample&& s) {
   const Timestamp t = std::visit(
       [](const auto& sample) {
         using T = std::decay_t<decltype(sample)>;
-        if constexpr (std::is_same_v<T, LidarScan>) return sample.stamp_start;
-        else return sample.stamp;
+        if constexpr (std::is_same_v<T, LidarScan>)
+          return sample.stamp_start;
+        else
+          return sample.stamp;
       },
       s);
   // After close() the queue accepts nothing: samples still arriving on an ingest thread
@@ -293,10 +303,9 @@ void MeridianPipeline::dispatch_to_frontend(MeasSample&& m) {
   // state seed would then extrapolate across a span whose IMU were in the dropped
   // sweep and are gone. So evict the oldest IMU sample first, and only fall back to a
   // sweep when nothing else is in flight (handled inside the queue).
-  auto outcome = q_meas_.push_protecting(
-      std::move(m), [](const MeasSample& s) {
-        return std::holds_alternative<PreprocessedGroup>(s);
-      });
+  auto outcome = q_meas_.push_protecting(std::move(m), [](const MeasSample& s) {
+    return std::holds_alternative<PreprocessedGroup>(s);
+  });
   if (outcome.evicted) {
     if (std::holds_alternative<PreprocessedGroup>(*outcome.evicted)) {
       const Timestamp te = std::get<PreprocessedGroup>(*outcome.evicted).group.t_end;
@@ -346,9 +355,6 @@ void MeridianPipeline::process_meas(MeasSample&& m) {
 
 void MeridianPipeline::on_keyframe(KeyframePacket&& kf) {
   const auto n = ++keyframe_count_;
-  // The first keyframe means the front-end's window now spans the sweep, so it deskews
-  // with its own trajectory; later groups are no longer cold_start.
-  if (!spline_active_) spline_active_ = true;
   sink_->event(Level::Info, keys::frontend::Keyframe, "front-end emitted a keyframe", kf.stamp);
   sink_->scalar(keys::frontend::KeyframeCount, static_cast<double>(n), kf.stamp);
   last_kf_id_ = kf.id;
@@ -587,17 +593,6 @@ void MeridianPipeline::process(SensorSample&& s) {
       [this](auto&& sample) {
         using T = std::decay_t<decltype(sample)>;
         if constexpr (std::is_same_v<T, ImuSample>) {
-          if (!imu_init_->done()) {
-            const bool became_done = imu_init_->add(sample);
-            if (became_done) {
-              sink_->event(Level::Info, keys::preprocess::ImuInitDone, "static init converged",
-                           sample.stamp);
-            } else if (imu_init_->failed()) {
-              sink_->event(Level::Warn, keys::preprocess::ImuInitRetry,
-                           "motion gate rejected the static window", sample.stamp);
-              imu_init_->clear();
-            }
-          }
           // The same sample feeds the aggregator (which the next sweep optimises
           // against) and the front-end's live-state advance between sweeps.
           dispatch_to_frontend(MeasSample{std::in_place_type<ImuSample>, sample});
@@ -611,8 +606,7 @@ void MeridianPipeline::process(SensorSample&& s) {
           // Measured on the filtered scan: start-vs-end spacing is the tripwire for a
           // driver stamping the end of the sweep instead of the first column.
           sink_->scalar(keys::sensors::LidarSweepDurationMs,
-                        static_cast<double>(filtered.sweep_duration) / 1e6,
-                        filtered.stamp_start);
+                        static_cast<double>(filtered.sweep_duration) / 1e6, filtered.stamp_start);
           aggregator_->on(std::move(filtered));
         } else if constexpr (std::is_same_v<T, CameraFrame>) {
           aggregator_->on(std::move(sample));
@@ -625,58 +619,20 @@ void MeridianPipeline::process(SensorSample&& s) {
 }
 
 void MeridianPipeline::on_group(MeasureGroup&& g) {
-  sink_->scalar(keys::pipeline::QSensorsDepth, static_cast<double>(q_sensors_.size()),
-                g.t_end);
-
-  if (!imu_init_->done()) {
-    // Surface bootstrap progress so the operator can see why nothing is published yet.
-    const double target = static_cast<double>(cfg_.preprocess.deskew.imu_init_count);
-    sink_->scalar(keys::preprocess::ImuInitProgress,
-                  static_cast<double>(imu_init_->state().count) / target, g.t_end);
-    // Hold sweeps until the static init converges; the freshest scans win.
-    const auto cap = static_cast<std::size_t>(cfg_.preprocess.deskew.bootstrap_max_scans);
-    if (bootstrap_groups_.size() >= cap) {
-      bootstrap_groups_.pop_front();
-      sink_->event(Level::Warn, keys::preprocess::BootstrapDrop,
-                   "bootstrap buffer full, dropped oldest sweep", g.t_end);
-    }
-    bootstrap_groups_.push_back(std::move(g));
-    return;
-  }
-
-  // Init just converged: flush held sweeps in order before the current one.
-  while (!bootstrap_groups_.empty()) {
-    MeasureGroup held = std::move(bootstrap_groups_.front());
-    bootstrap_groups_.pop_front();
-    emit_group(std::move(held));
-  }
-  emit_group(std::move(g));
-}
-
-void MeridianPipeline::emit_group(MeasureGroup&& g) {
-  std::optional<LidarScan> deskewed;
-  {
-    MERIDIAN_SCOPED_TIME(sink_.get(), keys::stage::PreprocessDeskew, g.t_end);
-    deskewed = deskew_group(g);
-  }
-
-  if (deskewed && sink_->enabled(keys::body::Scan)) {
-    sink_->cloud(keys::body::Scan, PointCloudView{*deskewed->points}, Frame::Body, g.t_end);
-  }
+  sink_->scalar(keys::pipeline::QSensorsDepth, static_cast<double>(q_sensors_.size()), g.t_end);
   sink_->scalar(keys::pipeline::GroupImuCount, static_cast<double>(g.imu.size()), g.t_end);
   sink_->scalar(keys::pipeline::GroupPoints,
                 static_cast<double>(g.scan.points ? g.scan.points->size() : 0), g.t_end);
 
   if (g.image && sink_->enabled(keys::preprocess::CameraPyramid)) {
     const ProcessedCamera cam = camera_preprocessor_->process(*g.image);
-    sink_->scalar(keys::preprocess::CameraPyramidLevels,
-                  static_cast<double>(cam.pyramid.size()), g.image->stamp);
+    sink_->scalar(keys::preprocess::CameraPyramidLevels, static_cast<double>(cam.pyramid.size()),
+                  g.image->stamp);
     // Surface both the decoded original and its undistorted form so the rectification can
     // be watched side by side. This is an inspection path; the front-end is fed the raw
     // group image, not this processed buffer.
     const auto publish_mono = [&](const char* key, const cv::Mat& img) {
-      if (img.empty() || !img.isContinuous() || img.type() != CV_8UC1 ||
-          !sink_->enabled(key)) {
+      if (img.empty() || !img.isContinuous() || img.type() != CV_8UC1 || !sink_->enabled(key)) {
         return;
       }
       ImageOverlay ov;
@@ -691,36 +647,7 @@ void MeridianPipeline::emit_group(MeasureGroup&& g) {
     publish_mono(keys::preprocess::CameraIntensity, cam.intensity);
   }
 
-  PreprocessedGroup pg{std::move(g), std::move(deskewed),
-                       /*cold_start=*/!spline_active_.load()};
-  dispatch_to_frontend(MeasSample{std::move(pg)});
-}
-
-std::optional<LidarScan> MeridianPipeline::deskew_group(const MeasureGroup& g) {
-  if (g.imu.empty() || !g.scan.points) return std::nullopt;
-
-  // Cold-start trajectory: identity start pose and zero initial velocity. The warp uses
-  // only relative motion within the sweep, so the arbitrary start pose cancels; the
-  // zero-velocity seed means within-sweep translation is what the IMU alone integrates.
-  ImuOnlyDeskew provider(imu_init_->state(),
-                         lidar_extrinsic(cfg_.sensors.lidar), Pose{},
-                         Eigen::Vector3d::Zero());
-  // The provider integrates the group's IMU set and pads its valid horizon to the sweep
-  // [t_begin, t_end] with the bounded zero-order holds, setting the warp anchor to t_end.
-  provider.integrateSweep(g.imu, g.t_begin, g.t_end);
-
-  LidarScan out;
-  if (!provider.deskew(g.scan, &out)) {
-    // Positive head: first IMU after t_begin; positive tail: last IMU before t_end.
-    char msg[96];
-    std::snprintf(msg, sizeof(msg),
-                  "imu horizon misses the sweep: head %+.0f us, tail %+.0f us",
-                  static_cast<double>(g.imu.front().stamp - g.t_begin) / 1e3,
-                  static_cast<double>(g.t_end - g.imu.back().stamp) / 1e3);
-    sink_->event(Level::Warn, keys::preprocess::DeskewHorizon, msg, g.t_end);
-    return std::nullopt;
-  }
-  return out;
+  dispatch_to_frontend(MeasSample{PreprocessedGroup{std::move(g)}});
 }
 
 }  // namespace meridian

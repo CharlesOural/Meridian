@@ -14,8 +14,6 @@ find_package(meridian_calib REQUIRED)
 
 add_library(meridian_preprocess
   src/lidar_validity_filter.cpp
-  src/imu_init.cpp
-  src/imu_only_deskew.cpp
   src/gnss_gate.cpp
   src/camera_preprocess.cpp)
 
@@ -45,10 +43,6 @@ if(BUILD_TESTING)
   include(MeridianTesting)
   meridian_add_gtest(test_lidar_validity_filter test/test_lidar_validity_filter.cpp)
   target_link_libraries(test_lidar_validity_filter meridian_preprocess)
-  meridian_add_gtest(test_imu_init test/test_imu_init.cpp)
-  target_link_libraries(test_imu_init meridian_preprocess)
-  meridian_add_gtest(test_imu_only_deskew test/test_imu_only_deskew.cpp)
-  target_link_libraries(test_imu_only_deskew meridian_preprocess)
   meridian_add_gtest(test_gnss_gate test/test_gnss_gate.cpp)
   target_link_libraries(test_gnss_gate meridian_preprocess)
   meridian_add_gtest(test_camera_preprocess test/test_camera_preprocess.cpp)

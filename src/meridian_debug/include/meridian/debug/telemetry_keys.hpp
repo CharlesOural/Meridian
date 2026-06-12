@@ -72,72 +72,53 @@ inline constexpr Key Spoof{"gnss/spoof", Unit::Count};
 
 // ---- L1 camera preprocessing --------------------------------------------------------
 namespace preprocess {
-inline constexpr Key ImuInitProgress{"preprocess/imu_init_progress", Unit::Ratio};
 inline constexpr Key CameraPyramid{"preprocess/camera_pyramid"};  // enable gate
 inline constexpr Key CameraPyramidLevels{"preprocess/camera_pyramid_levels", Unit::Count};
 inline constexpr Key CameraRaw{"preprocess/camera_raw"};        // image
 inline constexpr Key CameraIntensity{"preprocess/camera_intensity"};  // image
-// event tags
-inline constexpr Key ImuInitDone{"preprocess/imu_init_done"};
-inline constexpr Key ImuInitRetry{"preprocess/imu_init_retry"};
-inline constexpr Key BootstrapDrop{"preprocess/bootstrap_drop"};
-inline constexpr Key DeskewHorizon{"preprocess/deskew_horizon"};
 }  // namespace preprocess
 
 // ---- L2 front-end -------------------------------------------------------------------
 namespace frontend {
 // solver / trajectory
-inline constexpr Key IterCount{"frontend/iter_count", Unit::Count};
 inline constexpr Key OuterIters{"frontend/outer_iters", Unit::Count};
 inline constexpr Key SolveMs{"frontend/solve_ms", Unit::Ms};
-inline constexpr Key DeadlineHit{"frontend/deadline_hit", Unit::Count};
-inline constexpr Key BiasBounded{"frontend/bias_bounded", Unit::Count};
-inline constexpr Key PriorDim{"frontend/prior/dim", Unit::Count};
-inline constexpr Key CtNCp{"frontend/ct/n_cp", Unit::Count};
 inline constexpr Key KeyframeCount{"frontend/keyframe_count", Unit::Count};
-// per-axis observability (vec, translation-first) + scalars; the marker ns reuses the id
+// per-axis observability (vec, translation-first) + the worst-axis scalar
 inline constexpr Key Observability{"frontend/observability", Unit::Ratio};
 inline constexpr Key ObsMin{"frontend/obs_min", Unit::Ratio};
-inline constexpr Key ObsMinScore{"frontend/obs/min_score", Unit::Ratio};
 // state
 inline constexpr Key BiasGyrNorm{"frontend/state/bias_gyr_norm", Unit::RadPerSec};
 inline constexpr Key BiasAccNorm{"frontend/state/bias_acc_norm", Unit::MetersPerSec2};
 inline constexpr Key VelNorm{"frontend/state/vel_norm", Unit::MetersPerSec};
-// innovation
-inline constexpr Key InnovTransM{"frontend/innov/trans_m", Unit::Meters};
-inline constexpr Key InnovRotDeg{"frontend/innov/rot_deg", Unit::Degrees};
-// lidar stream
-inline constexpr Key LidarNInlier{"frontend/lidar/n_inlier", Unit::Count};
-inline constexpr Key LidarNFactorsKept{"frontend/lidar/n_factors_kept", Unit::Count};
-inline constexpr Key LidarNFactorsDropped{"frontend/lidar/n_factors_dropped", Unit::Count};
-inline constexpr Key LidarInliers{"frontend/lidar/inliers"};  // cloud
-// visual stream
-inline constexpr Key VisualNTracked{"frontend/visual/n_tracked", Unit::Count};
-inline constexpr Key VisualNCandidates{"frontend/visual/n_candidates", Unit::Count};
-inline constexpr Key VisualNConverged{"frontend/visual/n_converged", Unit::Count};
-inline constexpr Key VisualMapPoints{"frontend/visual/map_points", Unit::Count};
-inline constexpr Key VisualResMean{"frontend/visual/res_mean", Unit::Meters};
-inline constexpr Key VisualExposureGain{"frontend/visual/exposure_gain"};  // vec
-inline constexpr Key VisualPatches{"frontend/visual/patches"};             // image
-// map
+// scan-to-map association
+inline constexpr Key AssocNAttempted{"frontend/assoc/n_attempted", Unit::Count};
+inline constexpr Key AssocNMatched{"frontend/assoc/n_matched", Unit::Count};
+// Gauss-Newton solver
+inline constexpr Key SolverGnIters{"frontend/solver/gn_iters", Unit::Count};
+inline constexpr Key SolverDxNorm{"frontend/solver/dx_norm"};
+inline constexpr Key SolverChi{"frontend/solver/chi"};
+// local map
+inline constexpr Key MapVoxels{"frontend/map/voxels", Unit::Count};
+inline constexpr Key MapPoints{"frontend/map/points", Unit::Count};
 inline constexpr Key MapSize{"frontend/map/size", Unit::Count};
-inline constexpr Key MapInsertRejected{"frontend/map/insert_rejected", Unit::Count};
-// gnss
-inline constexpr Key GnssAcceptRate{"frontend/gnss/accept_rate", Unit::Ratio};
-inline constexpr Key GnssInnovationM{"frontend/gnss/innovation_m", Unit::Meters};
-// markers
-inline constexpr Key SplineKnots{"frontend/spline_knots"};
-inline constexpr Key WindowBox{"frontend/window_box"};
+// lidar stream
+inline constexpr Key LidarInliers{"frontend/lidar/inliers"};  // cloud
+// LIO scalars
+inline constexpr Key LioBeta{"frontend/lio/beta"};
+inline constexpr Key LioAccelVar{"frontend/lio/accel_var"};
+inline constexpr Key LioNCorr{"frontend/lio/n_corr", Unit::Count};
+inline constexpr Key LioDeskewSpanTMs{"frontend/lio/deskew_span_t_ms", Unit::Ms};
+// odometry path sample (pose)
+inline constexpr Key PathSample{"frontend/path_sample"};
 // event tags
 inline constexpr Key Keyframe{"frontend/keyframe"};
-inline constexpr Key WindowRestart{"frontend/window_restart"};
-inline constexpr Key SweepGapBridged{"frontend/sweep_gap_bridged"};
-inline constexpr Key VisualDisabled{"frontend/visual/disabled"};
-inline constexpr Key GnssInactive{"frontend/gnss/inactive"};
-inline constexpr Key GnssReject{"frontend/gnss/reject"};  // gate + event tag
-// Per-residual-family stats are emitted under "frontend/resid/<family>/{rms,mean_abs,n_rows}"
-// — the family name is interpolated at the call site, so these are not single constants and
-// are not catalogued as Key values.
+inline constexpr Key LioInitBacklog{"frontend/lio/init_backlog"};
+inline constexpr Key LioInitDone{"frontend/lio/init_done"};
+inline constexpr Key LioError{"frontend/lio/error"};
+inline constexpr Key LioGap{"frontend/lio/gap"};
+inline constexpr Key LioReject{"frontend/lio/reject"};
+inline constexpr Key LioReseed{"frontend/lio/reseed"};
 }  // namespace frontend
 
 // ---- L3 back-end --------------------------------------------------------------------
@@ -261,28 +242,7 @@ inline constexpr Key PreprocessDeskew{"preprocess.deskew"};
 inline constexpr Key PreprocessCamera{"preprocess.camera"};
 inline constexpr Key PreprocessLidarValidity{"preprocess.lidar.validity"};
 inline constexpr Key BackendOptimize{"backend.optimize"};
-inline constexpr Key CtAssoc{"frontend.ct.assoc"};
-inline constexpr Key CtAssemble{"frontend.ct.assemble"};
-inline constexpr Key CtVisual{"frontend.ct.visual"};
-inline constexpr Key CtVisualMap{"frontend.ct.visual_map"};
-inline constexpr Key CtSolve{"frontend.ct.solve"};
-inline constexpr Key CtSolveResidualEval{"frontend.ct.solve.residual_eval"};
-inline constexpr Key CtSolveJacobianEval{"frontend.ct.solve.jacobian_eval"};
-inline constexpr Key CtSolveLinearSolver{"frontend.ct.solve.linear_solver"};
-inline constexpr Key CtPosecov{"frontend.ct.posecov"};
-inline constexpr Key CtPosecovWorker{"frontend.ct.posecov.worker"};
-inline constexpr Key CtCovsnapshot{"frontend.ct.covsnapshot"};
-inline constexpr Key CtCovsubmit{"frontend.ct.covsubmit"};
-inline constexpr Key CtMarg{"frontend.ct.marg"};
-inline constexpr Key CtObs{"frontend.ct.obs"};
-inline constexpr Key CtMap{"frontend.ct.map"};
-inline constexpr Key CtMapWarp{"frontend.ct.map.warp"};
-inline constexpr Key CtMapInsert{"frontend.ct.map.insert"};
-inline constexpr Key CtMapTrim{"frontend.ct.map.trim"};
-inline constexpr Key CtVmapSelect{"frontend.ct.vmap.select"};
-inline constexpr Key CtVmapUpdate{"frontend.ct.vmap.update"};
-inline constexpr Key CtVmapPromote{"frontend.ct.vmap.promote"};
-inline constexpr Key CtVmapEvict{"frontend.ct.vmap.evict"};
+inline constexpr Key LioIngest{"frontend.lio.ingest", Unit::Ms};
 }  // namespace stage
 
 // The whole catalog as a flat range, for tooling: the unit table, the no-duplicate-id

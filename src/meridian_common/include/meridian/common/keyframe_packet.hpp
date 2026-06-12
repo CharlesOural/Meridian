@@ -1,10 +1,9 @@
 #pragma once
 
+#include <Eigen/Core>
 #include <cstdint>
 #include <memory>
 #include <optional>
-
-#include <Eigen/Core>
 
 #include "meridian/common/cloud.hpp"
 #include "meridian/common/frame.hpp"
@@ -63,7 +62,7 @@ struct KeyframePacket {
 
   // provenance
   std::uint32_t calib_version = 0;  // CalibrationSet snapshot that produced this
-  std::uint32_t frontend_kind = 1;  // 1 = CT, the only producer; diagnostics only
+  std::uint32_t frontend_kind = 1;  // 1 = retired CT front-end, 2 = LIO; diagnostics only
 };
 
 }  // namespace meridian

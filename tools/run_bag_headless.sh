@@ -37,11 +37,11 @@ sleep 3
 
 python3 tools/record_tum.py "$OUT/traj_tum.txt" > "$OUT/record_tum.log" 2>&1 &
 TUM_PID=$!
-ros2 topic echo /meridian/events > "$OUT/events.yaml" 2>&1 &
+ros2 topic echo --qos-depth 2000 /meridian/events > "$OUT/events.yaml" 2>&1 &
 EV_PID=$!
-ros2 topic echo /meridian/stage_timing > "$OUT/timing.yaml" 2>&1 &
+ros2 topic echo --qos-depth 2000 /meridian/stage_timing > "$OUT/timing.yaml" 2>&1 &
 TM_PID=$!
-ros2 topic echo /meridian/telemetry > "$OUT/telemetry.yaml" 2>&1 &
+ros2 topic echo --qos-depth 4000 /meridian/telemetry > "$OUT/telemetry.yaml" 2>&1 &
 TL_PID=$!
 
 # Cap playback with a wall-clock timeout (bag plays ~real-time under --clock); this
