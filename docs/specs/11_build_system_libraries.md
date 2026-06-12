@@ -15,25 +15,24 @@
 > so their libraries (none new) are not in the build.
 >
 > **System framing (supersedes any earlier phased plan).** Meridian is **one
-> complete system**: a continuous-time (CT), tightly-coupled
-> LiDAR-Inertial-Visual-GNSS estimator. The L2 front-end is a **CT cubic
-> B-spline sliding-window** solve (direct LiDAR point-to-plane at each point's
-> true time + FAST-LIVO2-style sparse-direct photometric visual with LiDAR-depth
-> and exposure compensation + direct-derivative IMU residuals + GNSS), all behind
-> the `IFrontEnd` interface (spec 01 §7.3). A FAST-LIO2-style iEKF MAY exist
-> behind that same interface purely as a reference/baseline and test oracle; it is
-> not a milestone and the build does not organise around it. The deployment
+> complete system**: a discrete, tightly-coupled LiDAR-Inertial estimator. The
+> L2 front-end is a **per-sweep Gauss-Newton point-to-point ICP** against a
+> voxel-hash local map, with internal constant-screw deskew and an
+> interval-averaged IMU prior, all behind
+> the `IFrontEnd` interface (spec 01 §7.3); camera and GNSS are carried through
+> the pipeline unfused. The estimator links **no solver, NN, or image library**
+> — Eigen + Sophus only. The deployment
 > target is an **NVIDIA Jetson Orin with CUDA always present**; mapping is
 > **nvblox, GPU-only, no CPU fallback**.
 >
 > **Companion specs.** `00_architecture.md` (package layout §2, dependency rules
 > §4, build system §9 — this spec is the full expansion of §9), `01_interfaces_
 > and_data_types.md` (the core value types the math packages compile against),
-> `06_mapping.md` (L4 / nvblox runtime), `04_frontend_estimation.md` (CT spline
-> runtime), `05_backend_graph.md` (GTSAM/iSAM2 runtime). Reference grounding for
+> `06_mapping.md` (L4 / nvblox runtime), `04_frontend_estimation.md` (the LIO
+> front-end), `05_backend_graph.md` (GTSAM/iSAM2 runtime). Reference grounding for
 > the libraries chosen here lives in those specs' non-normative Appendix R: TSDF/
 > mesh in `06_mapping.md` Appendix R, iSAM2/GTSAM in `05_backend_graph.md`
-> Appendix R, and the CT B-spline in `04_frontend_estimation.md` Appendix R.1.
+> Appendix R.
 
 ---
 
@@ -44,7 +43,7 @@
 3. [Version pin table](#3-version-pin-table)
 4. [colcon workspace layout](#4-colcon-workspace-layout)
 5. [ament_cmake target & dependency graph](#5-ament_cmake-target--dependency-graph)
-6. [Vendored headers (basalt-headers, ikd-Tree, Scan Context)](#6-vendored-headers-basalt-headers-ikd-tree-scan-context)
+6. [Vendored headers (Scan Context)](#6-vendored-headers-scan-context)
 7. [CUDA / nvblox build setup for Jetson Orin](#7-cuda--nvblox-build-setup-for-jetson-orin)
 8. [Finding & exporting each dependency in CMake](#8-finding--exporting-each-dependency-in-cmake)
 9. [colcon invocation, mixins, and CI](#9-colcon-invocation-mixins-and-ci)
@@ -64,16 +63,15 @@ takes exactly one option.
 
 | Job | **Chosen library** | One-line justification | Rejected (→ §11) |
 |---|---|---|---|
-| Linear algebra (vectors, matrices, dense solves) | **Eigen 3.4** | The de-facto C++ numerical core; every other library here (Sophus, GTSAM, basalt-headers, Ceres, PCL, OpenCV) already speaks `Eigen::`, so it is the lingua franca with zero glue. | Blaze, Armadillo |
-| Lie groups (SO(3)/SE(3) exp/log, manifolds) | **Sophus** | Header-only `SO3`/`SE3` on Eigen, matching the box-plus/box-minus and right-perturbation convention spec 01 §3.1 mandates; it is exactly what basalt-headers' splines store as control points. | hand-rolled so3_math, manif |
+| Linear algebra (vectors, matrices, dense solves) | **Eigen 3.4** | The de-facto C++ numerical core; every other library here (Sophus, GTSAM, PCL, OpenCV) already speaks `Eigen::`, so it is the lingua franca with zero glue. | Blaze, Armadillo |
+| Lie groups (SO(3)/SE(3) exp/log, manifolds) | **Sophus** | Header-only `SO3`/`SE3` on Eigen, matching the box-plus/box-minus and right-perturbation convention spec 01 §3.1 mandates. | hand-rolled so3_math, manif |
 | Back-end optimiser (incremental factor graph) | **GTSAM 4.2** | Ships `ISAM2` (the incremental Bayes-tree smoother spec 05 needs), `CombinedImuFactor`, `noiseModel::Robust`+`Huber`, and `GncOptimizer` — the exact factor/robustness set spec 05 specifies, in one BSD library. | g2o, Ceres-only back-end, SE-Sync |
-| CT spline kernel (cubic split SO(3)×ℝ³, analytic Jacobians) | **basalt-headers (vendored)** | The canonical, battle-tested implementation of the Sommer-et-al. O(k) cumulative-spline derivatives *and analytic Jacobians w.r.t. control points* — the hard, error-prone part — header-only on Eigen+Sophus; it is what CLINS/Coco-LIC reuse (spec 04 Appendix R.1). | hand-derived spline, Kontiki |
-| Sliding-window NLLS solver + Schur marginalisation (CT window) | **Ceres 2.x** | The solver all three CT references (CLINS, Coco-LIC, basalt) use: LM, analytic cost functions, `Manifold`/`LocalParameterization` for SO(3), and built-in Schur complement for the boundary-control-point marginalisation prior (spec 04 Appendix R.1). GTSAM stays the *global* back-end; Ceres is the *front-end window* solver. | GTSAM for the window, custom LM |
+| Per-sweep registration solver | **Meridian GN (in `meridian_frontend/src/lio/`)** | The front-end's solve is a 6-DoF Gauss-Newton point-to-point ICP whose normal equations are a closed-form 6×6 LDLT — small enough that a library solver buys nothing and costs determinism. (Ceres remains installed in the container but is **unlinked**: its consumer, the removed CT window solver, no longer exists.) | Ceres, GTSAM for the per-sweep solve |
 | Dense mapping: TSDF + colour + mesh | **nvblox (isaac_ros_nvblox)** | GPU TSDF + GPU colour fusion + GPU Marching Cubes in one CUDA library with a maintained ROS 2 wrapper; on the guaranteed-CUDA Jetson Orin it is the only map backend (spec 06 Appendix R). **No CPU fallback.** | VDBFusion, Voxblox, OpenVDB/NanoVDB |
-| Nearest-neighbour map for registration | **adaptive voxel-hash (Meridian, in `meridian_map`)** backed by **ikd-Tree (vendored) as the reference/oracle** | Spec 06 §3 replaces ikd-Tree's *layout* with an adaptive voxel hash but keeps its incremental-insert / box-delete / k-NN *behaviour*; the vendored ikd-Tree header is retained as the correctness oracle the voxel-hash is tested against. | nanoflann, PCL KdTree, raw ikd-Tree as primary |
+| Nearest-neighbour map for registration | **voxel-hash maps (Meridian)** | The front-end's local map (`meridian_frontend/src/lio/`) and the L4 registration map (spec 06 §3) are both `std::unordered_map`-based voxel hashes with fixed-order neighbour probes — deterministic by construction and validated against brute-force references in unit tests, with no external NN library. | nanoflann, PCL KdTree, reference k-d trees |
 | Fine registration (loop-closure GICP verify) | **small_gicp** | Header-light, multi-threaded GICP/VGICP that takes Eigen point buffers directly — the L5 verify step (spec 07) wants a fast, dependency-thin GICP, not full PCL registration. | PCL GICP, libpointmatcher |
 | Point-cloud I/O & filters | **PCL** (io/filters only, sparingly) | Used *only* for bag/file I/O and a couple of filters at the edges; the hot path computes on `meridian::LidarPoint` buffers, never `pcl::PointCloud` (spec 01 §1 R1). PCL is a heavy dependency, so it is fenced to `meridian_preprocess`/`meridian_tools`. | PCL everywhere (rejected by R1) |
-| Images (pyramids, KLT, undistort, Bayer) | **OpenCV 4** | The CT front-end's sparse-direct visual track (LiDAR-depth reprojection, KLT optical flow, image pyramids, exposure handling) needs exactly OpenCV's `imgproc`/`video`/`calib3d`; it is also what FAST-LIVO2 and Coco-LIC use. | bespoke image code |
+| Images (pyramids, undistort, Bayer) | **OpenCV 4** | L1 image conditioning (debayer, rectify, pyramid; spec 03 §5) and the ROS edge need exactly OpenCV's `imgproc`/`calib3d`. Fenced to `meridian_preprocess`/`meridian_ros`/`meridian_tools`; the estimator never links it. | bespoke image code |
 | Loop / place descriptors | **vendored Scan Context++** (+ optional STD/BTC hooks) | A small vendored header implementing the rotation-invariant ring-key descriptor spec 07's pre-filter needs; no external package, no version drift. | DBoW2/3, learned descriptors |
 | ROS 2 middleware & message types | **ROS 2 Humble** (`rclcpp`, `sensor_msgs`, `message_filters`, `tf2`, `visualization_msgs`, `diagnostic_updater`, `rosbag2`) | Humble is the current Jetson/JetPack-aligned LTS; confined to `meridian_ros` only (spec 00 §1.1) so the core stays middleware-free. | ROS 2 Iron/Jazzy (not Jetson-LTS), ROS 1 |
 | LiDAR driver | **ouster-ros** | The single-LiDAR target is an Ouster; the official driver already emits per-point time (`ouster_ros::Point::t`) which spec 01 §4.2 makes mandatory for deskew. | bespoke UDP parser |
@@ -97,7 +95,7 @@ Everything below is the *plumbing* for this one table.
 | CUDA architecture | `CMAKE_CUDA_ARCHITECTURES = 87` (Orin = SM 8.7) | One arch, the deployment SoC. Add `89`/`86` only if an x86+RTX dev box is used for offline runs; the Orin build pins `87`. |
 | Warnings | `-Wall -Wextra -Wpedantic`, warnings-as-errors in **core** packages | spec 00 §9.4; the wrapper and third-party-heavy edges (PCL/OpenCV includes) relax `-Werror` selectively. Vendored upstreams are brought in through **`SYSTEM` include directories** so their headers are exempt from the house warning set (a third-party header must never be able to fail a `-Werror` core build). |
 | Default build type | **`Release` when `CMAKE_BUILD_TYPE` is unset** | An unset build type compiles `-O0`, which silently disables Eigen's vectorisation and inlining and makes the per-scan hot loops unusably slow (the "unoptimized-Eigen trap"). `MeridianToolchain.cmake` forces `CMAKE_BUILD_TYPE=Release` into the cache when neither it nor `CMAKE_CONFIGURATION_TYPES` is set; an explicit `-DCMAKE_BUILD_TYPE=...` (or a colcon mixin, §9.1) always overrides it. |
-| Position-independent code | **`CMAKE_POSITION_INDEPENDENT_CODE ON` workspace-wide** | Set in `MeridianToolchain.cmake` so every static archive (the vendored ikd-Tree oracle, any per-package `STATIC` helper) is `-fPIC` and folds cleanly into the `SHARED` layer libraries and into Python bindings. Without it a static-into-shared link fails on x86-64. |
+| Position-independent code | **`CMAKE_POSITION_INDEPENDENT_CODE ON` workspace-wide** | Set in `MeridianToolchain.cmake` so every static archive (any per-package `STATIC` helper) is `-fPIC` and folds cleanly into the `SHARED` layer libraries and into Python bindings. Without it a static-into-shared link fails on x86-64. |
 | Sanitizers | ASan/UBSan via a colcon mixin for the test build (host only, not on-device) | §9. |
 | Formatting / lint | `clang-format` + `clang-tidy` on every core TU | spec 00 §9.4. |
 
@@ -120,7 +118,7 @@ These are the exact versions the workspace is validated against. Pins live in
 | Eigen | **3.4.0** | apt `libeigen3-dev` (3.4.0 on jammy) | Header-only; ABI-stable. The single most pinned-down dep because everything aligns its `Eigen::` types to it. |
 | Sophus | **1.22.10** (the 2022 tagged release) | vcs source build *or* apt where available | Header-only; must be the Eigen-3.4-compatible tag. |
 | GTSAM | **4.2.0** | source build (CMake), `GTSAM_USE_SYSTEM_EIGEN=ON` | Build with `GTSAM_BUILD_WITH_MARCH_NATIVE=OFF` (reproducible Orin binary), `GTSAM_USE_SYSTEM_EIGEN=ON` (one Eigen, §8), `GTSAM_WITH_TBB=OFF` unless TBB is also pinned. Provides ISAM2 / CombinedImuFactor / Robust+Huber / GncOptimizer (spec 05 Appendix R). |
-| Ceres | **2.1.0** (≥2.0; 2.1 for the `Manifold` API) | apt `libceres-dev` (2.1 on jammy) or source | CT-window solver (spec 04 Appendix R.1). Pulls SuiteSparse/glog/gflags via apt. |
+| Ceres | **2.1.0** | apt `libceres-dev` (2.1 on jammy) | **Installed in the container but unlinked**: its consumer, the CT window solver, was removed with the CT front-end. The pin documents the container image (avoids an image rebuild), not a link dependency — no `meridian_*` package may link it. |
 | nvblox | **isaac_ros_nvblox, Humble release line** (pin the commit in `dependencies.repos`) | vcs source build (CUDA) | The only map backend; §7. Built against system CUDA 12.x. |
 | CUDA | **12.x** (JetPack 6 system CUDA) | JetPack / apt | `nvcc`, cuBLAS, Thrust — all nvblox needs. |
 | PCL | **1.12.x** (jammy) | apt `libpcl-dev` | io/filters only; fenced to `meridian_preprocess`/`meridian_tools`. |
@@ -130,11 +128,9 @@ These are the exact versions the workspace is validated against. Pins live in
 | linuxptp | distro `linuxptp` (apt) | apt | Host PTP daemons; runtime, not linked. |
 | GoogleTest | the `ament_cmake_gtest` / `gtest_vendor` that ships with Humble | ament | Test framework. |
 | evo | latest `pip` `evo` | pip (offline tooling) | Not a build dependency; used by spec 10's harness scripts. |
-| **basalt-headers** | pinned commit, **vendored** | git submodule (§6) | CT spline kernel. |
-| **ikd-Tree** | pinned commit, **vendored** | git submodule (§6) | Registration oracle. |
-| **Scan Context++** | pinned commit/file, **vendored** | git submodule / copied header (§6) | Loop descriptor. |
+| **Scan Context++** | pinned commit/file, **vendored** | git submodule / copied header (§6) | Loop descriptor; the only vendored upstream. |
 
-> **Pin discipline.** Source-built deps (Sophus, GTSAM, nvblox, Ceres-if-source,
+> **Pin discipline.** Source-built deps (Sophus, GTSAM, nvblox,
 > small_gicp, ouster-ros) are listed in `meridian_ws/dependencies.repos` with an
 > exact `version:` (tag or commit). apt deps are pinned by the Humble/jammy apt
 > snapshot used in the CI container image (a tagged Docker base, §9). Vendored
@@ -154,7 +150,7 @@ meridian_ws/
 │  ├─ meridian_cmake/              # NEW: shared CMake — toolchain, deps finder, helpers
 │  │   cmake/MeridianToolchain.cmake     #   C++20 / CUDA arch / warning flags
 │  │   cmake/MeridianDeps.cmake          #   find_package() wrappers for every §1 lib
-│  │   cmake/MeridianVendored.cmake      #   INTERFACE targets for basalt/ikd/scancontext
+│  │   cmake/MeridianVendored.cmake      #   INTERFACE target for vendor/scancontext
 │  │   cmake/MeridianTesting.cmake       #   gtest + sanitizer mixins
 │  │   package.xml                    #   ament_cmake, exports the cmake/ dir
 │  │
@@ -165,16 +161,16 @@ meridian_ws/
 │  ├─ meridian_calib/             # X-cut: extrinsic/intrinsic models     (Eigen, Sophus)
 │  │
 │  ├─ meridian_sensors/           # L0: ISensorSource + sync             (Eigen)
-│  ├─ meridian_preprocess/        # L1: deskew/downsample/validity        (Eigen, PCL[io/filters])
-│  ├─ meridian_frontend/          # L2: IFrontEnd = CT B-spline LIVO+GNSS (Eigen, Sophus, Ceres,
-│  │   include/meridian/frontend/ #       basalt-headers, OpenCV, ikd-Tree-oracle)
-│  │   src/ct/                 #       THE front-end: CT spline window solve
-│  │   src/iekf/               #       reference/oracle iEKF (baseline only)
+│  ├─ meridian_preprocess/        # L1: downsample/validity/gnss-gate     (Eigen, OpenCV[image])
+│  ├─ meridian_frontend/          # L2: IFrontEnd = discrete LIO          (Eigen, Sophus — nothing else)
+│  │   include/meridian/frontend/
+│  │   src/lio/                #       THE front-end: voxel map, IMU tracker,
+│  │   │                       #       screw deskew + GN ICP, orchestration
 │  │   src/frontend_factory.cpp
 │  │
 │  ├─ meridian_backend/           # L3: IBackEnd = GTSAM iSAM2            (GTSAM)
-│  ├─ meridian_map/               # L4: IMapLayer = nvblox + voxel-hash   (CUDA, nvblox, Eigen,
-│  │   include/meridian/map/      #       ikd-Tree-oracle)
+│  ├─ meridian_map/               # L4: IMapLayer = nvblox + voxel-hash   (CUDA, nvblox, Eigen)
+│  │   include/meridian/map/
 │  ├─ meridian_place/             # L5: IPlaceRecognizer                  (Eigen, small_gicp,
 │  │                           #       vendored Scan Context++)
 │  │
@@ -190,14 +186,12 @@ meridian_ws/
 │  └─ meridian_tools/             # offline: bag replay, evo eval, calib  (rosbag2, PCL, ouster-ros)
 │
 ├─ vendor/                     # vendored upstreams as git SUBMODULES (§6)
-│  ├─ basalt-headers/          #   pinned SHA — CT spline kernel
-│  ├─ ikd-Tree/                #   pinned SHA — registration oracle
 │  └─ scancontext/             #   pinned SHA — loop descriptor
 │
 ├─ dependencies.repos          # vcs: source-built deps (Sophus, GTSAM, nvblox, small_gicp, ouster-ros)
 ├─ colcon.meta                 # per-package CMake args (e.g. GTSAM flags propagation)
 ├─ colcon-mixins/              # release / debug / asan / cuda mixins (§9)
-├─ .gitmodules                 # the three vendor/ submodules
+├─ .gitmodules                 # the vendor/ submodule
 ├─ docs/specs/                 # this file
 └─ .clang-format  .clang-tidy
 ```
@@ -211,9 +205,9 @@ Two additions over spec 00 §2 that the build needs:
    This is what stops 18 packages from each re-discovering Eigen/GTSAM/nvblox
    slightly differently.
 
-2. **`vendor/`** with git submodules — the physical home of the three vendored
-   upstreams (§6). They are **not** colcon packages (no `package.xml`); they are
-   pulled in as CMake `INTERFACE` targets by `MeridianVendored.cmake`.
+2. **`vendor/`** with git submodules — the physical home of the vendored
+   upstream (§6). It is **not** a colcon package (no `package.xml`); it is
+   pulled in as a CMake `INTERFACE` target by `MeridianVendored.cmake`.
 
 ---
 
@@ -223,14 +217,14 @@ Each core package exports exactly one library target with a namespaced alias and
 a clean public include dir (spec 00 §9.2). The dependency edges below are the
 spec 00 §4 DAG, annotated with the *third-party* deps each node pulls. **The
 load-bearing rule: core layer/X-cut packages depend on Eigen / Sophus / GTSAM /
-Ceres / nvblox as needed, but NOT on `rclcpp` — only `meridian_ros` does** (spec 00
+nvblox as needed, but NOT on `rclcpp` — only `meridian_ros` does** (spec 00
 §1.1, §4 R4; CI-enforced §9).
 
 ```
                 third-party (system / vendored)
-   Eigen3  Sophus  GTSAM  Ceres  PCL  OpenCV  CUDA+nvblox  small_gicp  yaml-cpp
-       │      │      │      │      │     │         │            │          │
- ┌─────┴──────┴──────┼──────┼──────┼─────┼─────────┼────────────┼──────────┴─────┐
+   Eigen3  Sophus  GTSAM  PCL  OpenCV  CUDA+nvblox  small_gicp  yaml-cpp
+       │      │      │      │     │         │            │          │
+ ┌─────┴──────┴──────┼──────┼─────┼─────────┼────────────┼──────────┴──────────┐
  │  meridian_cmake  (exports MeridianToolchain / MeridianDeps / MeridianVendored)            │
  └───────────────────────────────────────────────────────────────────────────────┘
        ▲ (every package find_package(meridian_cmake))
@@ -241,9 +235,8 @@ Ceres / nvblox as needed, but NOT on `rclcpp` — only `meridian_ros` does** (sp
        │   (all layer packages depend on the X-cut set + meridian_cmake)
  ┌─────┴──────────┬──────────────┬───────────────┬───────────────┬──────────────┐
  │ meridian_sensors  │ meridian_preproc│ meridian_frontend│ meridian_backend │ meridian_map     │
- │ (Eigen)        │ (Eigen,PCL)  │ (Eigen,Sophus,│ (GTSAM)       │ (CUDA,nvblox, │
- │                │              │  Ceres,basalt,│               │  Eigen,       │
- │                │              │  OpenCV,ikd)  │               │  ikd-oracle)  │
+ │ (Eigen)        │ (Eigen,      │ (Eigen,Sophus │ (GTSAM)       │ (CUDA,nvblox, │
+ │                │  OpenCV)     │  — only)      │               │  Eigen)       │
  └────────────────┴──────────────┴───────┬───────┴───────┬───────┴──────┬────────┘
                                           │   meridian_place (Eigen, small_gicp, scancontext)
                                           ▼               ▼              ▼
@@ -265,43 +258,28 @@ Ceres / nvblox as needed, but NOT on `rclcpp` — only `meridian_ros` does** (sp
 
 ### 5.1 Canonical core-library `CMakeLists.txt` (non-CUDA, no ROS)
 
-`meridian_frontend` is the richest non-CUDA core package; it is the template.
+`meridian_frontend` is the leanest layer package; it is the template.
 
 ```cmake
-cmake_minimum_required(VERSION 3.22)            # Humble floor; CUDA-arch list needs ≥3.18
+cmake_minimum_required(VERSION 3.22)            # Humble floor
 project(meridian_frontend LANGUAGES CXX)
 
 find_package(ament_cmake REQUIRED)
 find_package(meridian_cmake REQUIRED)              # shared toolchain/deps
 include(MeridianToolchain)                         # C++20, Release-default, PIC, warnings-as-errors
-
-# Heavier deps are opt-in: a package sets the MERIDIAN_NEED_* switch *before*
-# include(MeridianDeps), and MeridianDeps find_package()s only what is switched on.
-# The vendored ikd-Tree header pulls in pcl/point_types.h, so PCL must be found
-# before MeridianVendored runs — hence MERIDIAN_NEED_PCL here even though the
-# front-end never touches a pcl::PointCloud itself.
-set(MERIDIAN_NEED_CERES ON)
-set(MERIDIAN_NEED_PCL   ON)                        # required by the ikd-Tree oracle header
-include(MeridianDeps)                              # find Eigen/Sophus/Ceres/PCL ...
-include(MeridianVendored)                          # basalt-headers (INTERFACE), ikd-Tree (STATIC)
+include(MeridianDeps)                              # Eigen + Sophus (no MERIDIAN_NEED_* set)
 
 find_package(meridian_common REQUIRED)
-find_package(meridian_config  REQUIRED)
-find_package(meridian_debug   REQUIRED)
-find_package(meridian_calib   REQUIRED)
+find_package(meridian_config REQUIRED)
+find_package(meridian_debug REQUIRED)
+find_package(meridian_calib REQUIRED)
 
-# SHARED so the privately-linked vendored kernels (basalt spline, ikd-Tree) are
-# resolved *into* this library and never leak through the exported link interface;
-# downstream packages see only the meridian targets.
 add_library(meridian_frontend SHARED
-  src/ct/ct_frontend.cpp
-  src/ct/spline_window.cpp
-  src/ct/residuals_lidar.cpp
-  src/ct/residuals_imu.cpp
-  src/ct/residuals_visual.cpp
-  src/ct/marginalization.cpp
-  src/iekf/iekf_frontend.cpp        # reference/oracle baseline only
-  src/frontend_factory.cpp)
+  src/frontend_factory.cpp
+  src/lio/voxel_grid_map.cpp
+  src/lio/imu_tracker.cpp
+  src/lio/scan_registration.cpp
+  src/lio/lio_frontend.cpp)
 
 target_include_directories(meridian_frontend PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -313,25 +291,34 @@ target_compile_features(meridian_frontend PUBLIC cxx_std_20)
 meridian_apply_warnings(meridian_frontend)         # house -Wall/-Wextra/-Wpedantic [-Werror]
 
 target_link_libraries(meridian_frontend PUBLIC
-  meridian_common::meridian_common meridian_config::meridian_config meridian_debug::meridian_debug meridian_calib::meridian_calib
-  Eigen3::Eigen Sophus::Sophus
-  Ceres::ceres)
-target_link_libraries(meridian_frontend PRIVATE
-  meridian::vendor_basalt          # basalt-headers include dir (§6) — implementation detail
-  meridian::vendor_ikdtree)        # ikd-Tree oracle (STATIC) — folded in, never re-exported
-# NO rclcpp, NO *_msgs here — CI no-ROS gate (spec 00 §9.4) enforces this.
+  meridian_common::meridian_common
+  meridian_config::meridian_config
+  meridian_debug::meridian_debug
+  meridian_calib::meridian_calib
+  Eigen3::Eigen
+  Sophus::Sophus)
+# NO rclcpp, NO *_msgs — CI no-ROS gate (spec 00 §9.4); no Ceres/OpenCV/PCL/TBB/
+# OpenMP/Threads — the estimator is Eigen+Sophus only and strictly sequential.
 
 ament_export_targets(meridian_frontendTargets HAS_LIBRARY_TARGET)
-ament_export_dependencies(meridian_common meridian_config meridian_debug meridian_calib
-                          Eigen3 Sophus Ceres OpenCV)
+ament_export_dependencies(
+  meridian_common meridian_config meridian_debug meridian_calib
+  Eigen3 Sophus)
+install(DIRECTORY include/ DESTINATION include)
 install(TARGETS meridian_frontend EXPORT meridian_frontendTargets
         ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
-install(DIRECTORY include/ DESTINATION include)
 
 if(BUILD_TESTING)
   include(MeridianTesting)                         # meridian_add_gtest helper
-  meridian_add_gtest(test_ct_spline test/test_ct_spline.cpp)
-  target_link_libraries(test_ct_spline meridian_frontend meridian::vendor_basalt)
+  # Tests exercise internal estimator classes, so they see src/ directly.
+  meridian_add_gtest(test_voxel_grid_map test/test_voxel_grid_map.cpp)
+  meridian_add_gtest(test_imu_tracker test/test_imu_tracker.cpp)
+  meridian_add_gtest(test_scan_registration test/test_scan_registration.cpp)
+  meridian_add_gtest(test_lio_frontend test/test_lio_frontend.cpp TIMEOUT 180)
+  foreach(t test_voxel_grid_map test_imu_tracker test_scan_registration test_lio_frontend)
+    target_link_libraries(${t} meridian_frontend)
+    target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  endforeach()
 endif()
 
 ament_package()
@@ -339,10 +326,8 @@ ament_package()
 
 Key points: the package **only** names third-party math libs and lower
 Meridian packages; the `cxx_std_20` is `PUBLIC` so consumers inherit it; the
-library is **`SHARED`** and the vendored `meridian::vendor_*` targets are linked
-**`PRIVATE`** so basalt/ikd-Tree are folded in and never appear in the exported
-link interface (`ament_export_dependencies` therefore lists only the public math
-deps, **not** the vendored targets); and there is no
+heavier `MERIDIAN_NEED_*` switches (OpenCV, GTSAM, PCL, yaml-cpp) stay unset
+because the estimator needs none of them; and there is no
 `ament_target_dependencies(... rclcpp)` anywhere — that line existing in a core
 package is exactly what the CI no-ROS gate greps for.
 
@@ -399,7 +384,7 @@ layer) and on `rclcpp` + the message/transform/bag packages — and that is the
 - Core packages list their math deps by **rosdep key** (the lowercase name rosdep
   resolves to an apt package, *not* the CMake config name): `<depend>eigen</depend>`
   (→ `libeigen3-dev`), `<depend>sophus</depend>`, `<depend>gtsam</depend>`,
-  `<depend>libceres-dev</depend>`, `<depend>libpcl-all-dev</depend>` — plus the lower
+  `<depend>libopencv-dev</depend>` — plus the lower
   `meridian_*` packages and **nothing ROS-runtime**. A core `package.xml` containing
   `<depend>rclcpp</depend>` fails the CI dependency lint (spec 00 §9.4).
 - `meridian_map` additionally `<depend>`s the nvblox package key and declares the
@@ -412,83 +397,50 @@ layer) and on `rclcpp` + the message/transform/bag packages — and that is the
 
 ---
 
-## 6. Vendored headers (basalt-headers, ikd-Tree, Scan Context)
+## 6. Vendored headers (Scan Context)
 
-Three upstreams are **vendored as git submodules** under `vendor/` rather than
-fetched at build time. Rationale: they are pinned by SHA (reproducible,
-offline-buildable on the Orin), they are small/header-dominant, and (basalt,
-ikd-Tree) they are reference code we may need to read and patch. `FetchContent`
+One upstream is **vendored as a git submodule** under `vendor/` rather than
+fetched at build time. Rationale: it is pinned by SHA (reproducible,
+offline-buildable on the Orin) and small/header-dominant. `FetchContent`
 is **not** used — it adds a network dependency to every clean build and is
 harder to pin auditable on an air-gapped tactical box.
 
 `.gitmodules`:
 
 ```
-[submodule "vendor/basalt-headers"]
-    path = vendor/basalt-headers
-    url  = https://gitlab.com/VladyslavUsenko/basalt-headers.git
-[submodule "vendor/ikd-Tree"]
-    path = vendor/ikd-Tree
-    url  = https://github.com/hku-mars/ikd-Tree.git
 [submodule "vendor/scancontext"]
     path = vendor/scancontext
     url  = https://github.com/gisbi-kim/scancontext_tro.git
 ```
 
-(Exact pinned SHAs live in the superproject's submodule entries / §3 row.)
+(The exact pinned SHA lives in the superproject's submodule entry / §3 row.)
 
-`MeridianVendored.cmake` (in `meridian_cmake`, included by the packages that need them)
-wraps each as an `INTERFACE` library so consumers just `target_link_libraries`:
-
-Each wrapper is **guarded on the submodule actually being checked out** (the
-`EXISTS` test) so a package that does not link a given vendored upstream still
-configures even before `git submodule update` has populated it. `MERIDIAN_VENDOR_DIR`
+`MeridianVendored.cmake` (in `meridian_cmake`, included by the packages that need it)
+wraps it as an `INTERFACE` library so consumers just `target_link_libraries`.
+A consuming package declares the vendored targets it links by setting the matching
+`MERIDIAN_NEED_VENDOR_*` flag before `include(MeridianVendored)`; a needed-but-absent
+submodule then fails the configure immediately with the fetch command, while
+packages that link no vendored target still configure cleanly. `MERIDIAN_VENDOR_DIR`
 defaults to `<workspace>/src/../../vendor` (i.e. `meridian_ws/vendor`) but the
 caller may override it.
 
 ```cmake
-# MeridianVendored.cmake
+# MeridianVendored.cmake (excerpt)
 if(NOT DEFINED MERIDIAN_VENDOR_DIR)
   get_filename_component(MERIDIAN_VENDOR_DIR "${CMAKE_SOURCE_DIR}/../../vendor" ABSOLUTE)
 endif()
 
-# basalt-headers: header-only, needs Eigen + Sophus on the include path.
-if(NOT TARGET meridian::vendor_basalt AND EXISTS "${MERIDIAN_VENDOR_DIR}/basalt-headers/include")
-  add_library(meridian_vendor_basalt INTERFACE)
-  target_include_directories(meridian_vendor_basalt INTERFACE
-    "${MERIDIAN_VENDOR_DIR}/basalt-headers/include")
-  target_link_libraries(meridian_vendor_basalt INTERFACE Eigen3::Eigen Sophus::Sophus)
-  add_library(meridian::vendor_basalt ALIAS meridian_vendor_basalt)
-endif()
-
-# ikd-Tree: header + one .cpp (in the nested ikd-Tree/ikd-Tree/ dir upstream), built
-# as a tiny static lib (oracle/registration). Its header includes <pcl/point_types.h>
-# and uses <pthread.h>, so the consuming package must have set MERIDIAN_NEED_PCL (PCL
-# found) *before* this module runs, and the lib links Threads. Includes are SYSTEM so
-# the vendored headers are exempt from the house -Werror set.
-if(NOT TARGET meridian::vendor_ikdtree
-   AND EXISTS "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree/ikd_Tree.cpp"
-   AND PCL_FOUND)
-  add_library(meridian_vendor_ikdtree STATIC
-    "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree/ikd_Tree.cpp")
-  target_include_directories(meridian_vendor_ikdtree SYSTEM PUBLIC
-    "${MERIDIAN_VENDOR_DIR}/ikd-Tree/ikd-Tree"
-    ${PCL_INCLUDE_DIRS})
-  target_link_libraries(meridian_vendor_ikdtree PUBLIC Eigen3::Eigen)
-  find_package(Threads REQUIRED)
-  target_link_libraries(meridian_vendor_ikdtree PUBLIC Threads::Threads)
-  set_target_properties(meridian_vendor_ikdtree PROPERTIES POSITION_INDEPENDENT_CODE ON)
-  add_library(meridian::vendor_ikdtree ALIAS meridian_vendor_ikdtree)
-endif()
-
 # Scan Context++: the C++ module inside the upstream evaluation repo; header(s) only.
-if(NOT TARGET meridian::vendor_scancontext
-   AND EXISTS "${MERIDIAN_VENDOR_DIR}/scancontext/cpp/module/Scancontext")
-  add_library(meridian_vendor_scancontext INTERFACE)
-  target_include_directories(meridian_vendor_scancontext INTERFACE
-    "${MERIDIAN_VENDOR_DIR}/scancontext/cpp/module/Scancontext")
-  target_link_libraries(meridian_vendor_scancontext INTERFACE Eigen3::Eigen)
-  add_library(meridian::vendor_scancontext ALIAS meridian_vendor_scancontext)
+if(NOT TARGET meridian::vendor_scancontext)
+  if(EXISTS "${MERIDIAN_VENDOR_DIR}/scancontext/cpp/module/Scancontext")
+    add_library(meridian_vendor_scancontext INTERFACE)
+    target_include_directories(meridian_vendor_scancontext INTERFACE
+      "${MERIDIAN_VENDOR_DIR}/scancontext/cpp/module/Scancontext")
+    target_link_libraries(meridian_vendor_scancontext INTERFACE Eigen3::Eigen)
+    add_library(meridian::vendor_scancontext ALIAS meridian_vendor_scancontext)
+  elseif(MERIDIAN_NEED_VENDOR_SCANCONTEXT)
+    _meridian_vendor_missing("scancontext")
+  endif()
 endif()
 ```
 
@@ -496,14 +448,13 @@ Usage:
 
 | Vendored upstream | Consumed by | As | Why vendored not packaged |
 |---|---|---|---|
-| **basalt-headers** | `meridian_frontend` (CT spline kernel) | `meridian::vendor_basalt` INTERFACE (header-only, +Eigen/Sophus) | spec 04 Appendix R.1: it is the canonical analytic-Jacobian spline; we may wrap it in virtual-time for adaptive knots, so we want the source pinned and patchable. |
-| **ikd-Tree** | `meridian_frontend`/`meridian_map` (registration oracle) | `meridian::vendor_ikdtree` tiny STATIC lib | spec 06 §3: we keep its *behaviour* as the correctness oracle for the adaptive voxel-hash; reference code, read-and-test. |
 | **Scan Context++** | `meridian_place` (loop pre-filter) | `meridian::vendor_scancontext` INTERFACE | spec 07: a small self-contained descriptor; no upstream package, no version drift. |
 
+(The vendored estimator kernels that served the retired CT front-end have
+been removed; the front-end vendors nothing.)
+
 > **Patching policy.** Vendored code is consumed *as-is* through the include
-> path; any Meridian modification is a thin wrapper in `meridian_*` (e.g. the
-> virtual-time adaptive-knot shim around basalt lives in
-> `meridian_frontend/src/ct/`, not inside `vendor/basalt-headers/`). If an upstream
+> path; any Meridian modification is a thin wrapper in `meridian_*`. If an upstream
 > bug must be patched in place, the patch is a tracked commit on the submodule
 > fork, and §3's pinned SHA points at the fork. We never carry an unpinned local
 > edit.
@@ -580,8 +531,7 @@ target_link_libraries(meridian_map PUBLIC
   meridian_common::meridian_common meridian_debug::meridian_debug meridian_calib::meridian_calib
   Eigen3::Eigen
   nvblox::nvblox                   # TSDF + colour + Marching Cubes (GPU)
-  CUDA::cudart
-  meridian::vendor_ikdtree)           # registration oracle
+  CUDA::cudart)
 # NO rclcpp — meridian_map is core.
 
 ament_export_targets(meridian_mapTargets HAS_LIBRARY_TARGET)
@@ -670,9 +620,6 @@ discovers (and only pays the configure cost of) what it actually links.
 find_package(Eigen3 3.4 REQUIRED NO_MODULE)        # → Eigen3::Eigen  (universal)
 find_package(Sophus REQUIRED)                       # → Sophus::Sophus (universal, header-only)
 
-if(MERIDIAN_NEED_CERES)
-  find_package(Ceres 2.1 REQUIRED)                  # → Ceres::ceres   (front-end window solver)
-endif()
 if(MERIDIAN_NEED_OPENCV)
   find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc video calib3d)  # → ${OpenCV_LIBS}
 endif()
@@ -687,27 +634,24 @@ if(MERIDIAN_NEED_YAMLCPP)
 endif()
 ```
 
-`MERIDIAN_NEED_PCL` is set not only by `meridian_preprocess`/`meridian_tools` (which
-use PCL io/filters directly) but also by `meridian_frontend`/`meridian_map`, because
-the vendored ikd-Tree oracle header transitively needs `<pcl/point_types.h>` and must
-have PCL found before `MeridianVendored.cmake` builds the oracle target (§6).
+There is **no `MERIDIAN_NEED_CERES`**: nothing links Ceres any more (§3) and a
+switch with no consumer is a trap, so it was removed with the CT window solver.
 
 | Dep | `find_package` | Imported target | Notes |
 |---|---|---|---|
 | Eigen | `find_package(Eigen3 3.4 REQUIRED NO_MODULE)` | `Eigen3::Eigen` | `NO_MODULE` to take Eigen's own config; one Eigen for the whole tree (GTSAM built `GTSAM_USE_SYSTEM_EIGEN=ON`). |
 | Sophus | `find_package(Sophus REQUIRED)` | `Sophus::Sophus` | Header-only; depends on Eigen. |
 | GTSAM | `find_package(GTSAM 4.2 REQUIRED)` | `gtsam` | Only `meridian_backend` sets `MERIDIAN_NEED_GTSAM`. |
-| Ceres | `find_package(Ceres 2.1 REQUIRED)` | `Ceres::ceres` | `MERIDIAN_NEED_CERES` (only `meridian_frontend`). Pulls glog/SuiteSparse transitively. Ceres 2.1's `Manifold` API: `ceres::SphereManifold<3>` (constraining the gravity direction to the unit sphere) lives in **`<ceres/sphere_manifold.h>`**, which `<ceres/manifold.h>` does **not** pull in — both headers must be included. |
 | nvblox | `find_package(nvblox REQUIRED)` | `nvblox::nvblox` | Only `meridian_map`; requires `CUDAToolkit`. |
 | CUDA | `find_package(CUDAToolkit REQUIRED)` | `CUDA::cudart`, `CUDA::cublas` | Only `meridian_map`. |
-| PCL | `find_package(PCL 1.12 ... )` | `${PCL_LIBRARIES}` (or `pcl_*` targets) | `MERIDIAN_NEED_PCL`: `meridian_preprocess`/`meridian_tools` (io/filters) **and** `meridian_frontend`/`meridian_map` (transitively, for the ikd-Tree oracle header — §6). |
-| OpenCV | `find_package(OpenCV 4 ...)` | `${OpenCV_LIBS}` | `MERIDIAN_NEED_OPENCV`: `meridian_frontend` (visual track), `meridian_tools`. |
+| PCL | `find_package(PCL 1.12 ... )` | `${PCL_LIBRARIES}` (or `pcl_*` targets) | `MERIDIAN_NEED_PCL`: `meridian_tools` (io/filters at the offline edges). |
+| OpenCV | `find_package(OpenCV 4 ...)` | `${OpenCV_LIBS}` | `MERIDIAN_NEED_OPENCV`: `meridian_preprocess` (image conditioning), `meridian_tools`. |
 | small_gicp | `find_package(small_gicp REQUIRED)` or vendored | `small_gicp::small_gicp` | Only `meridian_place`. |
 | vendored | (no find_package) | `meridian::vendor_*` | via `MeridianVendored.cmake` (§6). |
 
 Every package that produces a library calls `ament_export_dependencies(...)`
 listing the deps a downstream consumer needs to re-find, so
-`find_package(meridian_frontend)` transitively pulls Eigen/Sophus/Ceres/OpenCV
+`find_package(meridian_frontend)` transitively pulls Eigen/Sophus
 target definitions. This is what lets `meridian_ros` depend on the whole core via a
 single `find_package(meridian_pipeline)`.
 
@@ -732,7 +676,7 @@ orin:      { cmake-args: ["-DCMAKE_BUILD_TYPE=Release",
 # one-time: pull source deps and vendored submodules
 cd meridian_ws
 vcs import src < dependencies.repos          # Sophus, GTSAM, nvblox, small_gicp, ouster-ros
-git submodule update --init --recursive      # vendor/basalt-headers, ikd-Tree, scancontext
+git submodule update --init --recursive      # vendor/scancontext
 rosdep install --from-paths src --ignore-src -y   # apt deps (Eigen, PCL, OpenCV, ROS pkgs)
 
 # build (Orin)
@@ -756,17 +700,21 @@ the LSP. On the x86 dev box, swap `--mixin orin` for `--mixin release` (and set
    `#include`s a sibling's `src/`.
 3. **No-CUDA-outside-map gate.** Only `meridian_map` may declare the `CUDA`
    language; any other package enabling CUDA fails (keeps GPU fenced).
-4. **No-grounding-in-code gate.** Grep `src/meridian_*` source (`*.hpp`/`*.cpp`/`*.cu`,
+4. **Sequential-front-end gate.** Grep `meridian_frontend/src/lio/` for
+   `omp|tbb|std::thread|std::async` → must be empty; the estimator is
+   single-threaded by contract (spec 00 §11.2) so two identical replays stay
+   bit-identical.
+5. **No-grounding-in-code gate.** Grep `src/meridian_*` source (`*.hpp`/`*.cpp`/`*.cu`,
    comments included) for the regex `grounding[ /][0-9]` → must be empty. Code comments
    must read self-contained, with no pointer into the reference dossiers; the character
    class `[ /]` catches both the slash form (`grounding/07`) and the space-separated
    form (`grounding 07`) — the earlier slash-only pattern missed the latter.
-5. **clang-tidy / clang-format** on every core TU; `-Werror` in core.
-6. **Build + unit + replay tests** under `colcon test` (GoogleTest); the replay
+6. **clang-tidy / clang-format** on every core TU; `-Werror` in core.
+7. **Build + unit + replay tests** under `colcon test` (GoogleTest); the replay
    test drives `meridian_pipeline` from a bag via `meridian_tools` with no ROS spinning
    (proves the off-ROS path). The non-map build (`MERIDIAN_WITH_MAP=OFF`, §7.6) runs
    the non-map unit/replay tests so the no-GPU dev-box path stays green.
-7. **Reproducible, dual base images.** CI runs in **two** tagged Docker images that
+8. **Reproducible, dual base images.** CI runs in **two** tagged Docker images that
    snapshot the §3 apt versions so apt deps never float: an **Orin/JetPack** image
    (`nvcr.io/nvidia/l4t-jetpack`-based, CUDA 12.x, `CMAKE_CUDA_ARCHITECTURES=87`,
    builds `MERIDIAN_WITH_MAP=ON`) and an **x86 dev** image (`ros:humble`-based, builds
@@ -790,12 +738,11 @@ A real engineer, fresh Jetson Orin with JetPack 6, follows this exactly:
    correctly stamped without it.
 3. **Clone + submodules.**
    `git clone <meridian> meridian_ws && cd meridian_ws && git submodule update --init --recursive`
-   (pulls `vendor/basalt-headers`, `vendor/ikd-Tree`, `vendor/scancontext` at
-   their pinned SHAs).
+   (pulls `vendor/scancontext` at its pinned SHA).
 4. **Source deps.** `vcs import src < dependencies.repos` (Sophus, GTSAM 4.2,
    nvblox, small_gicp, ouster-ros at pinned tags/commits).
 5. **System deps.** `rosdep install --from-paths src --ignore-src -y` (Eigen 3.4,
-   Ceres 2.1, PCL 1.12, OpenCV 4, yaml-cpp, the ROS message/tf/bag packages).
+   PCL 1.12, OpenCV 4, yaml-cpp, the ROS message/tf/bag packages).
 6. **Build GTSAM** (if not already an install prefix): CMake with
    `GTSAM_USE_SYSTEM_EIGEN=ON`, `GTSAM_BUILD_WITH_MARCH_NATIVE=OFF`,
    `GTSAM_WITH_TBB=OFF`; install to a prefix on `CMAKE_PREFIX_PATH`. (Or let
@@ -813,7 +760,7 @@ A real engineer, fresh Jetson Orin with JetPack 6, follows this exactly:
     `mapping_node` with `config/*.yaml`, or replay a bag through
     `meridian_tools replay`.
 
-If steps 1–10 succeed, the single-system CT LIVO+GNSS estimator builds, the
+If steps 1–10 succeed, the LIO estimator builds, the
 nvblox GPU map links, and the off-ROS replay path runs — which is the bar this
 spec must clear.
 
@@ -824,7 +771,7 @@ spec must clear.
 > back-end, place recognition, sensors, all cross-cutting). It is a development
 > convenience only — the deployed Orin build is always `MERIDIAN_WITH_MAP=ON`
 > with the full GPU map; there is never a runtime CPU map path (spec 00 §9.5).
-> Both configurations are produced from the same pinned Docker bases (§9.3 gate 7),
+> Both configurations are produced from the same pinned Docker bases (§9.3 gate 8),
 > whose dependency stack comes from a single `docker/install-deps.sh` so the Orin
 > and x86 toolchains cannot drift.
 
@@ -841,14 +788,13 @@ choices, here is the one-line reason the alternative lost. This section is the
 | **Dense mapping** | **VDBFusion / OpenVDB / NanoVDB (CPU, km-scale)** | The deployment target is a CUDA Jetson Orin where nvblox does GPU TSDF + colour + Marching Cubes in one library; a CPU OpenVDB path is a second, untested map backend that the simplicity mandate forbids. We do **not** ship it even as a fallback. (Earlier drafts floated VDBFusion as a "CPU/km-scale fallback" and a NanoVDB "Tier G archive" — both are dropped here; if extreme-extent outdoor mapping is ever needed it is a *future* `IMapLayer` implementation, not a current dual path.) |
 | **Dense mapping** | **Voxblox (CPU)** | Ageing CPU codebase; nvblox supersedes it on GPU with the same block-hash semantics. Kept only as the ESDF *algorithm* reference (spec 06 Appendix R), never linked. |
 | Back-end optimiser | **g2o** | GTSAM ships `ISAM2` (true incremental Bayes tree), `GncOptimizer`, and `CombinedImuFactor` out of the box (spec 05 Appendix R); g2o would mean re-implementing incremental smoothing and GNC. |
-| Back-end optimiser | **Ceres as the global back-end** | Ceres is batch; the global graph needs *incremental* iSAM2. Ceres is used for the *front-end window* instead (where batch-per-window is correct). |
-| CT spline kernel | **hand-derived spline Jacobians** | The O(k) analytic derivatives + control-point Jacobians are the highest-risk code to get right; basalt-headers is the proven implementation CLINS/Coco-LIC reuse (spec 04 Appendix R.1). Writing them from scratch is months of subtle bugs. |
-| CT spline representation | **full SE(3) (non-split) spline** | Couples rotation/translation into an unnatural screw interpolation, slower and no more accurate than split SO(3)×ℝ³ (spec 04 Appendix R.1); basalt's split is the consensus. |
-| NN / registration | **nanoflann / PCL KdTree as primary** | Spec 06 §3 needs incremental insert + box-delete + on-tree downsample near the robot; a static k-d tree forces rebuilds. The adaptive voxel-hash (with ikd-Tree as oracle) gives incremental behaviour without ikd-Tree's layout cost. |
+| Back-end optimiser | **Ceres as the global back-end** | Ceres is batch; the global graph needs *incremental* iSAM2. |
+| Per-sweep solver | **Ceres / GTSAM for the registration solve** | The GN normal equations are a closed-form 6×6 LDLT; a general NLLS framework adds link weight, allocation churn, and (with internal threading) nondeterminism for zero benefit at this problem size. |
+| NN / registration | **nanoflann / PCL KdTree as primary** | The maps need incremental insert + range-clip near the robot; a static k-d tree forces rebuilds. The voxel-hash gives incremental behaviour, O(1) insert, and a fixed-order neighbour probe that keeps the solve deterministic. |
 | GICP | **PCL GICP** | Drags the full PCL registration stack; small_gicp is faster, multi-threaded, and takes Eigen buffers directly — matching the L5 verify need without the PCL weight in the hot path. |
-| Lie groups | **manif / hand-rolled** | Sophus is what basalt-headers stores as control points and what the references use; using anything else adds a conversion seam at the spline boundary. |
+| Lie groups | **manif / hand-rolled** | Sophus is the convention the codebase and the references share; using anything else adds a conversion seam at every boundary. |
 | ROS distro | **Iron / Jazzy** | Not the Jetson/JetPack-aligned LTS; Humble is the supported on-device distro. |
-| Front-end framing | **"v1 iEKF, ship CT later"** | Superseded by the DIRECTION: Meridian is one complete CT system from the start. The iEKF remains only as a reference/oracle behind `IFrontEnd`, never a milestone the build is organised around. |
+| Front-end parallelism | **OpenMP/TBB in the estimator** | Parallel reductions sum in nondeterministic order, breaking the bit-identical replay guarantee; the per-sweep GN fits the budget single-threaded, so the estimator stays strictly sequential (CI-enforced, §9.3). |
 | Single vs multi-LiDAR | **multi-LiDAR / dome-Ouster merge** | The system is single LiDAR + single IMU + single camera + GNSS; multi-LiDAR is at most a future extension behind the same `ISensorSource`/`IFrontEnd` interfaces, not designed or built now. |
 
 ---

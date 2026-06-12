@@ -26,11 +26,11 @@
 > (per-point time is first-class, a per-sensor handler, a time-unit scale) and
 > fix what it got wrong (no health signal, no offset estimation, time smuggled
 > through `curvature`, sync done by a single `time_sync_en` boolean). The
-> system Meridian builds — a **continuous-time (CT), tightly-coupled
-> LiDAR-Inertial-Visual-GNSS** estimator (arch §0) — places harder demands on L0
-> than any LiDAR-only reference: it queries the trajectory `T(t)` at *each
-> point's true sample time*, at *mid-exposure* for the sparse-direct photometric
-> residual, and at *every IMU instant* for the derivative residual. All three
+> system Meridian builds — a **discrete, tightly-coupled
+> LiDAR-Inertial** estimator (arch §0) — depends on the timeline everywhere: it
+> warps *each point at its true sample time*, integrates *every IMU instant*
+> into propagation and the motion prior, and stamps the camera at
+> *mid-exposure* for the passthrough image. All three
 > demands are demands on the **single timeline** L0 produces.
 >
 > **Scope of L0.** L0 owns: per-sensor acquisition (`ISensorSource`), conversion
@@ -83,10 +83,9 @@
 
 A tightly-coupled multi-sensor estimator is, mathematically, a function of a set
 of measurements $\{z_i\}$ each indexed by the **true instant** $t_i$ at which the
-physical quantity was sampled. Every downstream guarantee — registration of each
-LiDAR point against the continuous trajectory `T(t_i)` evaluated at that point's
-true sample time (arch §7.5), IMU-derivative residuals along the spline,
-photometric reprojection at mid-exposure, B-spline knot placement — depends on
+physical quantity was sampled. Every downstream guarantee — the per-point deskew
+warp at each point's true sample time (arch §7.1), IMU propagation and the
+interval-averaged motion prior, the camera's mid-exposure stamp — depends on
 $t_i$ being **correct on a single timeline to a known tolerance**. If two sensors
 disagree about "now" by $\delta t$, a tightly-coupled fuse of them injects an
 error proportional to the platform velocity times $\delta t$: at 5 m/s, a 10 ms
@@ -231,7 +230,7 @@ L0 obligations on **every** implementation:
 * **B2 — monotonic per sensor.** Stamps are non-decreasing within one
   `sensor_id`. A regression (clock step backwards, §11) is *clamped and
   reported*, never silently emitted, because a non-monotonic stamp corrupts
-  preintegration and B-spline knot ordering.
+  IMU integration and the time-sorted deskew order.
 * **B3 — no blocking in the callback's caller.** The source thread must not block
   on the consumer. The consumer (L1 stage T1) is fed through the bounded
   `Q_sensors` queue (arch §11.1); the source pushes non-blocking and the queue's
@@ -247,8 +246,8 @@ L0 obligations on **every** implementation:
   emptiness rejects. A `Reject` verdict means the sample never reaches `cb` (nor
   `Q_sensors`); a `Clamped` verdict means the stamp was repaired to hold B2 and the
   repair was reported on the health channel. The validator is always on (not a
-  debug option), because a bad stamp mis-places a B-spline knot rather than adding
-  one noisy measurement.
+  debug option), because a bad stamp corrupts the deskew warp and the IMU
+  integration interval rather than adding one noisy measurement.
 
 ### 3.2 `SensorInfo` (static descriptor)
 
@@ -363,8 +362,8 @@ PTP-disciplined clock) and the host arrival time.
   *milliseconds* inside `curvature` (`preprocess.cpp:226`, with
   `time_unit_scale` chosen from the `TIME_UNIT` enum `preprocess.h:18`,
   `preprocess.cpp:52–68`); we keep native ns and never round-trip through a
-  float. Per-point time is exactly what the CT front-end needs: it registers each
-  point against `T(stamp_start + t_offset_ns)` directly (arch §7.5), so the
+  float. Per-point time is exactly what the front-end needs: it warps each
+  point by its own offset within the constant-screw model (arch §7.1), so the
   fidelity of this field is the fidelity of deskew.
 * `sweep_duration = max t_offset_ns` over the cloud (≈100 ms at 10 Hz). Offsets
   are relative to `stamp_start` and are **not** guaranteed ordered by column time,
@@ -454,10 +453,9 @@ trusting vendor fusion; the estimator owns orientation.
 **Interval-end convention.** The `stamp` denotes the **end** of the integration
 interval the sample summarises. If a device documents mid-interval or
 start-of-interval semantics, the source shifts by ±half the nominal period so the
-contract (spec 01 §4.1, "interval end") holds. This matters because the CT
-front-end places the IMU-derivative residual at `stamp` along the spline (and the
-restart-fallback preintegration integrates over $[\text{stamp}_{k-1},
-\text{stamp}_k]$, arch §6.3); getting the convention wrong biases every IMU
+contract (spec 01 §4.1, "interval end") holds. This matters because the
+front-end integrates each sample over $[\text{stamp}_{k-1},
+\text{stamp}_k]$; getting the convention wrong biases every IMU
 contribution by one sample.
 
 ```cpp
@@ -1004,12 +1002,11 @@ Rules:
 
 ### 8.3 Bootstrap interaction (MUST-FIX #2)
 
-The Aggregator does not deskew (that is L1/L2). But it *labels* the first group(s)
-with `is_cold_start = true` until the front-end reports init complete (arch §7.2),
-so L1 knows to use IMU-only deskew before a CT window exists. This label is
-carried as a transient flag the pipeline sets, not a permanent field of
-`MeasureGroup`; once the CT front-end has initialised its first control points and
-takes over per-point registration (arch §7.2, §7.5) the flag clears.
+The Aggregator does not deskew and carries no bootstrap state (deskew and
+initialization are L2-internal, arch §7.1–§7.2). Groups are forwarded
+immediately and identically from the first one; the front-end holds them itself
+until its static initialization completes. There is no cold-start label, flag,
+or staging anywhere in L0/L1.
 
 ---
 
@@ -1096,10 +1093,10 @@ every stream passes through before it is handed to the callback: the
 pulled out as one named gate so the checks are identical across all four modalities
 and so the *one* place that decides "this stamp is trustworthy" is testable in
 isolation. It runs **always-on, live** — not a
-debug-build option — because the continuous-time front-end is far more sensitive to
-a bad knot time than a discrete-time filter: a single out-of-order or skewed stamp
-does not merely add one noisy measurement, it mis-places a B-spline knot and bends
-`T(t)` for every point and image that interpolate across it. Validating stamp
+debug-build option — because a single out-of-order or skewed stamp does not merely
+add one noisy measurement: it corrupts the deskew warp for every point in the
+sweep and the integration interval of every IMU sample that brackets it.
+Validating stamp
 integrity at the source is therefore a correctness obligation, not instrumentation.
 
 ```cpp
@@ -1325,8 +1322,8 @@ The system is initialised; PTP locked; GNSS has fix.
    `offset_std_ns=60000`; `RigHealth.timeline_absolute=true`. Telemetry publishes
    `time/offset/imu0=37000`, `sensors/imu_in_group=21`,
    `sensors/group_latency=2.0`.
-6. **Downstream.** L2's CT front-end registers each LiDAR point against
-   `T(stamp_start + t_offset_ns)` and the camera patch against `T(image.stamp)`;
+6. **Downstream.** L2's LIO front-end warps each LiDAR point by its
+   `t_offset_ns` within the sweep's screw model and solves at `t_end`;
    the IMU's 60 µs timing σ inflates its noise slightly. None of L0's stamps are
    ever revisited.
 

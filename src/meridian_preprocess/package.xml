@@ -3,10 +3,9 @@
 <package format="3">
   <name>meridian_preprocess</name>
   <version>0.0.0</version>
-  <description>L1 per-sensor preprocessing: LiDAR validity gate + decimation, stationary
-    IMU init (gravity/gyro-bias) and IMU-only cold-start deskew, GNSS quality + spoof
-    gate with LLA-to-ENU, and camera debayer/photometric/pyramid. Outputs undeskewed
-    validated scans; deskew against the trajectory belongs to L2. No ROS.</description>
+  <description>L1 per-sensor preprocessing: LiDAR validity gate + decimation, GNSS
+    quality + spoof gate with LLA-to-ENU, and camera debayer/photometric/pyramid.
+    Outputs undeskewed validated scans; deskew belongs to L2. No ROS.</description>
   <maintainer email="charles@cfglobal.fr">Charles Farhat</maintainer>
   <license>Proprietary</license>
 

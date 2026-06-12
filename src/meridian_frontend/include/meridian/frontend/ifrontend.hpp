@@ -22,7 +22,7 @@ class TelemetrySink;
 // thread and must only enqueue. Ingested samples are borrowed (the front-end
 // copies what it keeps); emitted packets are moved.
 class IFrontEnd {
- public:
+public:
   virtual ~IFrontEnd() = default;
 
   // Calibration snapshot: once at start, and again whenever a refined snapshot is
@@ -30,10 +30,8 @@ class IFrontEnd {
   // for packet provenance.
   virtual void set_calibration(std::shared_ptr<const CalibrationSet> calib) = 0;
 
-  // The primary input: one preprocessed sweep bundle. Triggers the window
-  // optimisation. While the bundle reports cold_start the front-end seeds from the
-  // included IMU-only deskew; once its own trajectory spans the sweep it evaluates
-  // poses at each point's own time and ignores the bundled deskew.
+  // The primary input: one preprocessed sweep bundle. Triggers the registration
+  // against the local map; deskew is performed internally at each point's own time.
   virtual void ingest(const PreprocessedGroup& group) = 0;
 
   // High-rate IMU between sweeps: advances live_state() only, never a solve. The

@@ -1,6 +1,8 @@
 #include "debug/ros_telemetry_sink.hpp"
 
 #include <algorithm>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <string_view>
 
 #include "conversions/core2ros.hpp"
 
@@ -15,15 +17,22 @@ bool is_wildcard(const std::string& key) {
   return key.size() >= 2 && key.compare(key.size() - 2, 2, "/*") == 0;
 }
 
-std::uint8_t to_u8(Level level) { return static_cast<std::uint8_t>(level); }
+std::uint8_t to_u8(Level level) {
+  return static_cast<std::uint8_t>(level);
+}
 
 Level from_log_level(LogLevel level) {
   switch (level) {
-    case LogLevel::Trace: return Level::Trace;
-    case LogLevel::Debug: return Level::Debug;
-    case LogLevel::Info: return Level::Info;
-    case LogLevel::Warn: return Level::Warn;
-    case LogLevel::Error: return Level::Error;
+    case LogLevel::Trace:
+      return Level::Trace;
+    case LogLevel::Debug:
+      return Level::Debug;
+    case LogLevel::Info:
+      return Level::Info;
+    case LogLevel::Warn:
+      return Level::Warn;
+    case LogLevel::Error:
+      return Level::Error;
   }
   return Level::Info;
 }
@@ -32,13 +41,16 @@ Level from_log_level(LogLevel level) {
 
 RosTelemetrySink::RosTelemetrySink(rclcpp::Node* node, const DebugConfig& cfg)
     : node_(node), cfg_(cfg), default_rate_hz_(cfg.telemetry_rate_hz) {
-  const auto reliable = rclcpp::QoS(50).reliable();
-  pub_telemetry_ =
-      node_->create_publisher<meridian_msgs::msg::Telemetry>("/meridian/telemetry", reliable);
+  // The multiplexed scalar/vec topic bursts once per sweep: with every debug group
+  // on that is ~60 messages in one instant, so the publisher history must hold
+  // several full bursts or the oldest (earliest-emitted) keys of each burst are
+  // silently dropped toward a slow subscriber. 512 ≈ 8 bursts ≈ <1 MB.
+  pub_telemetry_ = node_->create_publisher<meridian_msgs::msg::Telemetry>(
+      "/meridian/telemetry", rclcpp::QoS(512).reliable());
   pub_timing_ = node_->create_publisher<meridian_msgs::msg::StageTiming>(
-      "/meridian/stage_timing", reliable);
-  pub_events_ =
-      node_->create_publisher<meridian_msgs::msg::Event>("/meridian/events", reliable);
+      "/meridian/stage_timing", rclcpp::QoS(256).reliable());
+  pub_events_ = node_->create_publisher<meridian_msgs::msg::Event>("/meridian/events",
+                                                                   rclcpp::QoS(50).reliable());
   pub_markers_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
       "/meridian/markers", rclcpp::QoS(5).reliable());
 
@@ -46,6 +58,34 @@ RosTelemetrySink::RosTelemetrySink(rclcpp::Node* node, const DebugConfig& cfg)
   // lazy create_publisher path on its first publish.
   cloud_pubs_["body/scan"] = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
       cloud_topic("body/scan"), rclcpp::QoS(5).best_effort());
+
+  // Seed the wildcard gate table from the config debug groups. Each group is exactly
+  // one key-prefix wildcard, the same entries /meridian/set_debug_key writes, so the
+  // config posture and a live toggle go through one mechanism. A group max_hz of 0
+  // keeps the per-key class default (scalars at telemetry_rate_hz, heavy at 2 Hz).
+  const auto seed = [this](const char* prefix, const DebugGroup& g) {
+    KeyState st;
+    st.enabled = g.enable;
+    st.max_hz = g.max_hz;  // 0 = class default, resolved per key in pass()
+    wildcards_.emplace_back(prefix, st);
+  };
+  seed("frontend/assoc/", cfg.assoc);
+  seed("frontend/solver/", cfg.solver);
+  seed("frontend/lio/", cfg.lio);
+  seed("frontend/map/", cfg.map_health);
+
+  // The odometry path stream: an exact-key entry so /meridian/path works without any
+  // debug group. Unlimited key rate — the front-end already samples at the configured
+  // cadence and the aggregator throttles the republish to path_publish_hz.
+  KeyState path_state;
+  path_state.enabled = cfg.publish_path;
+  path_state.max_hz = -1.0;  // negative = explicitly unlimited (pass() treats <=0 as no limit)
+  keys_["frontend/path_sample"] = path_state;
+  if (cfg.publish_path) {
+    pub_path_ =
+        node_->create_publisher<nav_msgs::msg::Path>("/meridian/path", rclcpp::QoS(1).reliable());
+    path_.header.frame_id = frame_name(Frame::Odom);
+  }
 }
 
 bool RosTelemetrySink::enabled(const char* key) const {
@@ -72,15 +112,24 @@ bool RosTelemetrySink::pass(const std::string& key, bool heavy) {
 
   auto [it, inserted] = keys_.try_emplace(key);
   KeyState& st = it->second;
-  if (inserted) st.max_hz = default_hz(heavy);
+  if (inserted) {
+    // First publication of this key: rate from the matching wildcard group when it
+    // carries an explicit max_hz, otherwise the key-class default.
+    st.max_hz = default_hz(heavy);
+    for (const auto& [prefix, wst] : wildcards_) {
+      if (key.compare(0, prefix.size(), prefix) == 0) {
+        if (wst.max_hz > 0.0) st.max_hz = wst.max_hz;
+        break;
+      }
+    }
+  }
   if (st.max_hz <= 0.0) {
     st.last = Clock::now();
     return true;
   }
   const auto now = Clock::now();
   const auto min_interval = std::chrono::duration<double>(1.0 / st.max_hz);
-  if (st.last.time_since_epoch().count() != 0 && (now - st.last) < min_interval)
-    return false;
+  if (st.last.time_since_epoch().count() != 0 && (now - st.last) < min_interval) return false;
   st.last = now;
   return true;
 }
@@ -100,8 +149,8 @@ void RosTelemetrySink::scalar(const char* key, double v, Timestamp t) {
   pub_telemetry_->publish(m);
 }
 
-void RosTelemetrySink::vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v,
-                           Timestamp t, const char* axis_order) {
+void RosTelemetrySink::vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v, Timestamp t,
+                           const char* axis_order) {
   if (!pass(key, /*heavy=*/false)) return;
   meridian_msgs::msg::Telemetry m;
   m.stamp = to_ros(t);
@@ -112,16 +161,15 @@ void RosTelemetrySink::vec(const char* key, const Eigen::Ref<const Eigen::Vector
   pub_telemetry_->publish(m);
 }
 
-void RosTelemetrySink::cloud(const char* key, const PointCloudView& view, Frame f,
-                             Timestamp t) {
+void RosTelemetrySink::cloud(const char* key, const PointCloudView& view, Frame f, Timestamp t) {
   if (!pass(key, /*heavy=*/true)) return;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub;
   {
     std::lock_guard<std::mutex> lock(m_);
     auto& slot = cloud_pubs_[key];
     if (!slot) {
-      slot = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-          cloud_topic(key), rclcpp::QoS(5).best_effort());
+      slot = node_->create_publisher<sensor_msgs::msg::PointCloud2>(cloud_topic(key),
+                                                                    rclcpp::QoS(5).best_effort());
     }
     pub = slot;
   }
@@ -129,6 +177,12 @@ void RosTelemetrySink::cloud(const char* key, const PointCloudView& view, Frame 
 }
 
 void RosTelemetrySink::pose(const char* key, const Pose& p, Frame f, Timestamp t) {
+  // Odometry path samples aggregate into one nav_msgs/Path instead of a per-key
+  // Odometry topic.
+  if (std::string_view(key) == "frontend/path_sample") {
+    append_path(p, t);
+    return;
+  }
   if (!cfg_.publish_odom && std::string(key) == "odom/body") return;
   if (!pass(key, /*heavy=*/false)) return;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub;
@@ -142,6 +196,46 @@ void RosTelemetrySink::pose(const char* key, const Pose& p, Frame f, Timestamp t
     pub = slot;
   }
   pub->publish(to_odometry(p, frame_name(f), t));
+}
+
+void RosTelemetrySink::append_path(const Pose& p, Timestamp t) {
+  if (!pub_path_) return;
+  nav_msgs::msg::Path snapshot;
+  bool publish_now = false;
+  {
+    std::lock_guard<std::mutex> lock(m_);
+    if (!flag_enabled("frontend/path_sample")) return;  // runtime toggle
+    geometry_msgs::msg::PoseStamped ps;
+    ps.header.stamp = to_ros(t);
+    ps.header.frame_id = path_.header.frame_id;
+    ps.pose.position.x = p.t.x();
+    ps.pose.position.y = p.t.y();
+    ps.pose.position.z = p.t.z();
+    ps.pose.orientation.w = p.q.w();
+    ps.pose.orientation.x = p.q.x();
+    ps.pose.orientation.y = p.q.y();
+    ps.pose.orientation.z = p.q.z();
+    path_.poses.push_back(ps);
+    // Ring cap: nav_msgs/Path republishes the whole array, so the cap bounds both
+    // memory and per-publish serialisation on a long mission.
+    const auto cap = static_cast<std::size_t>(std::max(cfg_.path_max_poses, 1));
+    if (path_.poses.size() > cap) {
+      path_.poses.erase(path_.poses.begin(), path_.poses.begin() + static_cast<std::ptrdiff_t>(
+                                                                       path_.poses.size() - cap));
+    }
+    path_.header.stamp = ps.header.stamp;
+    const auto now = Clock::now();
+    const auto min_interval =
+        std::chrono::duration<double>(1.0 / std::max(cfg_.path_publish_hz, 1e-3));
+    if (path_last_pub_.time_since_epoch().count() == 0 || (now - path_last_pub_) >= min_interval) {
+      path_last_pub_ = now;
+      snapshot = path_;  // copy under the lock; publish outside it
+      publish_now = true;
+    }
+  }
+  if (publish_now) {
+    pub_path_->publish(snapshot);
+  }
 }
 
 void RosTelemetrySink::marker(const Marker& m, Timestamp t) {
@@ -186,8 +280,7 @@ void RosTelemetrySink::timing(const char* stage, double ms, Timestamp t) {
   pub_timing_->publish(m);
 }
 
-void RosTelemetrySink::event(Level level, const char* tag, std::string_view msg,
-                             Timestamp t) {
+void RosTelemetrySink::event(Level level, const char* tag, std::string_view msg, Timestamp t) {
   meridian_msgs::msg::Event m;
   m.stamp = to_ros(t);
   m.level = to_u8(level);
@@ -218,9 +311,17 @@ bool RosTelemetrySink::set_key(const std::string& key, bool enable, double max_h
   std::lock_guard<std::mutex> lock(m_);
   KeyState st;
   st.enabled = enable;
-  st.max_hz = max_hz > 0.0 ? max_hz : default_rate_hz_;
   if (is_wildcard(key)) {
+    // Wildcard rate semantics: 0 keeps each key's class default; > 0 overrides. The
+    // override is also pushed onto already-materialised keys under the prefix so a
+    // live group toggle takes effect without waiting for re-creation.
+    st.max_hz = max_hz;
     const std::string prefix = key.substr(0, key.size() - 1);  // keep trailing '/'
+    if (max_hz > 0.0) {
+      for (auto& [k, s] : keys_) {
+        if (k.compare(0, prefix.size(), prefix) == 0) s.max_hz = max_hz;
+      }
+    }
     for (auto& [p, s] : wildcards_) {
       if (p == prefix) {
         s = st;
@@ -230,6 +331,7 @@ bool RosTelemetrySink::set_key(const std::string& key, bool enable, double max_h
     wildcards_.emplace_back(prefix, st);
     return true;
   }
+  st.max_hz = max_hz > 0.0 ? max_hz : default_rate_hz_;
   keys_[key] = st;
   return true;
 }
@@ -251,11 +353,44 @@ std::string RosTelemetrySink::sanitize(const std::string& key) {
 }
 
 const char* RosTelemetrySink::unit_of(const std::string& key) {
+  // Exact physical-unit keys first, so they are never shadowed by the generic
+  // suffix / count heuristics below.
+  static const std::unordered_map<std::string, const char*> kExact = {
+      {"frontend/lidar/res_mean", "m"},
+      {"frontend/lidar/res_max", "m"},
+      {"frontend/assoc/res_p95", "m"},
+      {"frontend/assoc/nn_dist_mean", "m"},
+      {"frontend/assoc/nn_dist_p95", "m"},
+      {"frontend/assoc/plane_rms_mean", "m"},
+      {"frontend/assoc/plane_rms_p95", "m"},
+      {"frontend/assoc/res_hist", "count"},
+      {"frontend/imu/res_acc", "m/s^2"},
+      {"frontend/imu/res_gyr", "rad/s"},
+      {"frontend/bias_acc", "m/s^2"},
+      {"frontend/bias_gyr", "rad/s"},
+      {"frontend/grav_norm", "m/s^2"},
+      {"frontend/window_span_s", "s"},
+      {"frontend/lidar/inlier_ratio", "ratio"},
+      {"frontend/state/vel_norm", "m/s"},
+      {"frontend/state/bias_gyr_norm", "rad/s"},
+      {"frontend/state/bias_acc_norm", "m/s^2"},
+  };
+  const auto it = kExact.find(key);
+  if (it != kExact.end()) return it->second;
+  const auto ends_with = [&key](const char* suffix) {
+    const std::size_t n = std::string_view(suffix).size();
+    return key.size() >= n && key.compare(key.size() - n, n, suffix) == 0;
+  };
   if (key.find("rate_hz") != std::string::npos) return "hz";
   if (key.find("_ms") != std::string::npos) return "ms";
+  if (ends_with("_m")) return "m";
+  if (ends_with("_deg")) return "deg";
+  if (key.find("ratio") != std::string::npos || key.find("frac") != std::string::npos)
+    return "ratio";
   if (key.find("n_") != std::string::npos || key.find("count") != std::string::npos ||
       key.find("depth") != std::string::npos || key.find("dropped") != std::string::npos ||
-      key.find("points") != std::string::npos || key.find("levels") != std::string::npos)
+      key.find("points") != std::string::npos || key.find("levels") != std::string::npos ||
+      key.find("reject_") != std::string::npos || key.find("strata") != std::string::npos)
     return "count";
   return "";
 }
@@ -264,6 +399,7 @@ std::string RosTelemetrySink::cloud_topic(const std::string& key) const {
   if (key == "body/scan") return "/meridian/cloud_body";
   if (key == "map/registered") return "/meridian/cloud_registered";
   if (key == "frontend/lidar/inliers") return "/meridian/cloud_effective";
+  if (key == "frontend/assoc/outliers") return "/meridian/cloud_outliers";
   return "/meridian/cloud/" + sanitize(key);
 }
 
@@ -275,32 +411,26 @@ std::string RosTelemetrySink::pose_topic(const std::string& key) const {
 }
 
 std::string RosTelemetrySink::image_topic(const std::string& key) const {
-  if (key == "frontend/visual/patches") return "/meridian/visual_patches";
   return "/meridian/image/" + sanitize(key);
 }
 
 RclcppLogSink::RclcppLogSink(rclcpp::Logger logger, LogLevel min_level)
     : logger_(std::move(logger)), default_level_(from_log_level(min_level)) {}
 
-void RclcppLogSink::log(Level level, const char* module, std::string_view kvline,
-                        Timestamp /*t*/) {
+void RclcppLogSink::log(Level level, const char* module, std::string_view kvline, Timestamp /*t*/) {
   switch (level) {
     case Level::Trace:
     case Level::Debug:
-      RCLCPP_DEBUG(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()),
-                   kvline.data());
+      RCLCPP_DEBUG(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()), kvline.data());
       break;
     case Level::Info:
-      RCLCPP_INFO(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()),
-                  kvline.data());
+      RCLCPP_INFO(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()), kvline.data());
       break;
     case Level::Warn:
-      RCLCPP_WARN(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()),
-                  kvline.data());
+      RCLCPP_WARN(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()), kvline.data());
       break;
     case Level::Error:
-      RCLCPP_ERROR(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()),
-                   kvline.data());
+      RCLCPP_ERROR(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()), kvline.data());
       break;
   }
 }

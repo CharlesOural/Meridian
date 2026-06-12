@@ -9,12 +9,12 @@
 > amends spec 01, per spec 01's own rule. Everything below is *internal* to
 > `meridian_backend` except where it names a spec-01 type.
 >
-> **Where L3 sits.** The **L2 CT LIVO+GNSS front-end** fuses a single LiDAR, IMU,
-> camera, and GNSS inside a sliding B-spline window and summarises each keyframe
+> **Where L3 sits.** The **L2 LIO front-end** fuses a single LiDAR and IMU in a
+> per-sweep registration solve and summarises each keyframe
 > interval as **one** `KeyframePacket`. **L3 is the global, drift-free layer:** it
 > stitches those packets, loop closures, and GNSS into a single iSAM2 factor graph
 > in the `map` frame and broadcasts corrections to the live front-end (L2) and the
-> nvblox map (L4). L3 does not estimate the trajectory inside a window — that is
+> nvblox map (L4). L3 does not estimate the per-sweep trajectory — that is
 > L2's job; L3 estimates the *globally consistent* keyframe poses, the GNSS-datum
 > alignment, and the online extrinsics.
 >
@@ -29,7 +29,8 @@
 > built from the packet's `RelativeBetween` constraint, with its marginal
 > covariance. There is **no** companion absolute prior and **no** IMU factor on
 > that edge. The IMU factor (`CombinedImuFactor`) appears **only** on the
-> window-restart fallback (`constraint_kind == ImuPreintegration`), where it
+> restart fallback (`constraint_kind == ImuPreintegration`, reserved — the
+> current front-end's restart path is the `AbsolutePrior` chain break), where it
 > *replaces* the between-factor. The two are mutually exclusive *by construction*
 > because `KeyframePacket::constraint_kind` is a single enum (`01 §6.4`). This
 > L2→L3 hand-off rule (Appendix R.2) is the most load-bearing part of the
@@ -137,12 +138,11 @@ observability streams. (Multi-LiDAR would be a future extension behind the same
 
 ### 1.4 Current L2 emission state (implementation status — read before building L3)
 
-> **Implementation status, not design.** This records what the L2 CT front-end
+> **Implementation status, not design.** This records what the L2 LIO front-end
 > **actually emits today**, so an L3 implementer knows which factor paths can be
 > exercised against the live system and which are spec-complete but dormant. The
 > normative contract above is unchanged. Verify against
-> `meridian_frontend/src/ct/ct_frontend.cpp::emitKeyframe` (and
-> `src/ct/keyframe_finalizer.cpp`) before relying on it.
+> `meridian_frontend/src/lio/lio_frontend.cpp::emitKeyframe` before relying on it.
 >
 > The boundary type is real: `KeyframePacket` is defined in
 > `meridian_common/include/meridian/common/keyframe_packet.hpp` and is emitted on a
@@ -158,47 +158,45 @@ What L2 populates per packet today:
 |-------|---------------|--------------|
 | `constraint_kind` | `AbsolutePrior` (first keyframe **and** the first keyframe after a hard reseed — the chain break of `01 §6.4`); `RelativeBetween` (all others) | **`ImuPreintegration` is never emitted** — see GAP-A. A mid-stream `AbsolutePrior` in `Frame::Odom` opens a new relative segment: anchor it value-free like the first keyframe (§3), do not read it as an absolute measurement |
 | `kinematics_included` | always `false` | `V`/`B` never cross the boundary today (§2.2 steady state) |
-| `constraint_cov` | populated, `Covariance` form, **rotation-first** (`01 §6.1`) | normal edge: the **conservative sum** of the two endpoints' absolute pose marginals (upper-bounds the true relative marginal, which would subtract their cross-covariance); anchor keyframes ship the absolute pose marginal. Source is the **exact window-posterior marginal** (LiDAR+IMU+prior), LiDAR-only marginal as rank-deficiency fallback |
-| `observability` | populated every sweep (`computeObservability` over the LiDAR hit set) | §4.3 inflation has real per-axis scores to act on |
-| `cloud_body` | populated (downsampled scan deskewed to the body frame at `stamp`) | ready for L5 / the `KeyframeStore` |
+| `constraint_cov` | populated, `Covariance` form, **rotation-first** (`01 §6.1`) | normal edge: the **rung-0 Laplace chain** — each sweep's data-term covariance σ̂²·(H_data+εI)⁻¹ from the GN registration (no regulariser term), adjoint-transported to the body chart and **composed along the interval** since the previous keyframe (map-correlation ignored — a deliberate, documented optimism), reset at each keyframe; reordered rotation-first exactly once at pack time. Anchor keyframes ship the absolute prior covariance (first keyframe: a fixed gauge prior; post-reseed: the first converged solve covariance × `lio.reseed_cov_inflation`) |
+| `observability` | populated every sweep (per-axis conditioning of the GN data Hessian in the body frame) | §4.3 inflation has real per-axis scores to act on |
+| `cloud_body` | populated (deskewed sweep, body frame at `stamp`) | ready for L5 / the `KeyframeStore` |
 | `calib_version` | populated | |
-| `image`, `T_body_cam` | **not yet populated** (`image` stays null even when the visual path is active) | no live input for colourisation / visual loop verification yet |
+| `image`, `T_body_cam` | populated as **passthrough**: the latest `group.image` (may be null) + the calibration `T_body_cam` snapshot | colourisation input only; no visual estimation behind it |
 
-**Async covariance, complete stream.** On the live path `constraint_cov` is filled
-by an **async finalizer worker** (`KeyframeFinalizer`): the hot thread captures the
-final solve round's build inputs, the worker rebuilds a bit-identical window
-problem off-thread, recovers the exact window-posterior pose marginal, chains the
-relative covariance, fills the packet, and forwards it to the sink. The worker is
-FIFO over a bounded **blocking** queue: packets are never dropped or reordered, so
-the L3 input stream is **complete and in order** — only delayed by up to one
-keyframe interval. The deterministic/replay path computes the same marginal inline
-so replay stays bit-exact against live.
+**Synchronous covariance, complete stream.** `constraint_cov` is a closed-form
+6×6 computed **synchronously at emit time** on the front-end thread (the per-scan
+Laplace covariance is a by-product of the GN solve; composing it is microseconds).
+There is no finalizer worker and no partially-filled packet: packets reach the
+sink complete and in id order on both the live and replay paths, which are the
+identical code path.
 
 **GAP-A — the restart edge (§5) is spec-complete but FE-dormant.** A data hole up
-to five spline-knot intervals is *bridged*: the FE integrates IMU across it and
-solves normally, so the chain stays contiguous and the packet is an ordinary
-`RelativeBetween`. The FE therefore **never** emits
+to `lio.max_gap_s` is *bridged*: the next group's IMU integrates across it and
+the sweep solves normally, so the chain stays contiguous and the packet is an
+ordinary `RelativeBetween`. The FE therefore **never** emits
 `constraint_kind == ImuPreintegration` and never populates `imu_summary`. Build §5
 (`CombinedImuFactor`) to spec, but cover it with synthetic `ImuPreintegration`
 packets in unit tests — it has no live trigger today.
 
-**Hard reseed (the chain break; closes the old GAP-B).** Beyond the bridge
-horizon the FE *reseeds*: it carries the anchor across the hole on a
-constant-velocity prediction, restarts the window, and emits **no** keyframe for
-the reseed sweep. There is no data inside the hole, so an `ImuPreintegration`
-summary is not constructible; instead the **next** keyframe is emitted as
-`AbsolutePrior` (window-posterior absolute marginal — the chain-break form of
+**Hard reseed (the chain break; closes the old GAP-B).** Beyond `lio.max_gap_s`
+the FE bridges the state on a constant-velocity prediction and arms a reseed; if
+the first post-gap registration then fails its gates, the FE **clears its local
+map and re-anchors** on the predicted pose. There is no data inside the hole, so
+an `ImuPreintegration` summary is not constructible; instead the **next**
+keyframe is emitted as `AbsolutePrior` (priced by the first converged solve
+covariance inflated by `lio.reseed_cov_inflation` — the chain-break form of
 `01 §6.4`) and the relative chain resumes off it. No relative edge ever spans the
 predicted discontinuity. L3 anchors the new segment value-free (§3); the
 trajectory becomes two relatively-constrained segments that only loops/GNSS can
 stitch in `map` — the honest representation of an unobserved hole.
 
-**Covariance-honesty note (bridged sweeps).** A sweep whose hole was IMU-bridged
-carries more real uncertainty than its window-posterior marginal reflects (the
-marginal sees only the factors that were present, not the missing LiDAR). The
-effect is second-order and largely absorbed by the conservative-sum relative
-covariance; a future FE improvement is to inflate `constraint_cov` on sweeps
-flagged `frontend/sweep_gap_bridged`. Flagged here so the contract stays honest.
+**Covariance-honesty note (rung 0).** The chained covariance ignores the
+correlation each sweep shares with the map it registered against, and a sweep
+whose hole was IMU-bridged carries more real uncertainty than its data-term
+covariance reflects. Both effects make `constraint_cov` optimistic; the rung-0
+choice is deliberate and documented (spec 04), and NEES calibration against
+ground truth is the planned follow-up. Flagged here so the contract stays honest.
 
 ---
 
@@ -247,7 +245,7 @@ pose-only — the cheap, well-conditioned regime (Appendix R.5).
 
 > **Grounding.** A FAST-LIO2-style filter keeps the full inertial state (pose,
 > vel, biases, gravity, extrinsic) live in one filter state; Meridian's L2 carries
-> the equivalent inside its window. The relative `BetweenFactor` already carries
+> the equivalent in its propagated state. The relative `BetweenFactor` already carries
 > the vel/bias information through its marginal covariance (`01 §6.4`). Carrying
 > `V`/`B` on every edge **and** a relative factor would re-inject the same IMU
 > evidence twice — the double-count the hand-off contract forbids (Appendix R.2).
@@ -307,7 +305,7 @@ anchor.
 
 The failure the hand-off contract prevents: an absolute marginal prior per
 keyframe, a relative between-factor, **and** an IMU-preintegration factor — all
-derived from the **same** measurements the L2 window already fused — would
+derived from the **same** measurements L2 already fused — would
 triple-count the evidence. Summing their information shrinks covariances
 unrealistically; the over-confident graph rejects loop/GNSS corrections and
 collapses the marginal-covariance search radius, silently *missing loop closures*
@@ -507,7 +505,7 @@ the smooth curve might under-inflate — and emits a degeneracy marker (§14).
 
 ## 5. The restart edge (the only IMU factor)
 
-When the front-end restarts its sliding window and can summarise IMU across the
+When a front-end restarts and can summarise IMU across the
 gap (`00 §7.4`, `01 §6.4`), it emits a packet with
 `constraint_kind == ImuPreintegration` and a populated
 `imu_summary : ImuPreintegrationSummary` (`01 §6.5`). L3 turns this into a single
@@ -1229,7 +1227,7 @@ indeterminate-system alarms.
 | `vec("backend/gnss/residual")` | vec | on fix | residual, χ², robust weight, accepted? + `G` estimate |
 | `event("backend/gnss/datum_locked")` | event | on lock | the §6.2 datum fit accepted: fitted yaw, `σ_yaw`, baseline, # fixes used |
 | `pose("calib/T_body_sensor/<s>")` | pose | on change | `E(s)` estimate, deviation from prior, marginal σ, frozen? (§10) |
-| `event("backend/window_restart_bridge")` | event | on restart edge | the §5 bridge made visible |
+| `event("backend/restart_bridge")` | event | on restart edge | the §5 bridge made visible |
 | `scalar("backend/queue_depth")` | scalar | per optimize | depth of the back-end input queue (KEYFRAME/LOOP/GNSS), the back-pressure signal — the L3-input twin of the pipeline `q_kf_depth` gauge (spec 09 §5.6) |
 | `scalar("backend/optimize_lag")` | scalar | per optimize | number of queued items folded into the last `optimize()` (§9.2/§17), spec 09 §5.3's canonical key for the cadence/batch-size signal |
 | `scalar("backend/fallback_count")` | scalar | on event | cumulative count of FM-3b iSAM2 rebuilds (last-resort recovery); a nonzero value is a field-survival alarm |

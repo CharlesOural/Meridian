@@ -28,14 +28,10 @@ constexpr Timestamp kMs = 1'000'000 * kNs;
 struct Fixture {
   Fixture() {
     cfg.pipeline.mode = PipelineMode::Replay;
-    cfg.preprocess.deskew.imu_init_count = 10;
     cfg.preprocess.lidar.point_filter_num = 1;
-    // Exercise the L0/L1 stage and its hand-off to the front-end; the CT front-end's
+    // Exercise the L0/L1 stage and its hand-off to the front-end; the LIO front-end's
     // own estimation behaviour is covered in depth by its package tests.
-    cfg.frontend.kind = meridian::FrontEndKind::CtLivo;
-    // Each flushed group carries only its straddling IMU sample, so let the front-end
-    // initialise from a single static sample and emit its first keyframe immediately.
-    cfg.frontend.init_time_s = 0.0;
+    cfg.frontend.kind = meridian::FrontEndKind::Lio;
     auto sink = std::make_unique<RecordingSink>();
     rec = sink.get();
     pipeline = std::make_unique<MeridianPipeline>(cfg, std::move(sink));
@@ -83,82 +79,39 @@ struct Fixture {
 
 }  // namespace
 
-TEST(MeridianPipeline, BuffersSweepsUntilImuInitThenFlushesDeskewed) {
+TEST(MeridianPipeline, ForwardsGroupsImmediately) {
   Fixture fx;
   const Timestamp t0 = 1'000 * kMs;
 
-  // 5 IMU samples (init needs 10), a sweep [t0+50, t0+148], then one IMU sample past
-  // the sweep end: the group closes (coverage gate satisfied) but must be HELD because
-  // the bootstrap has not converged (only 6 samples folded).
+  // A few IMU samples, then a sweep [t0+50, t0+148]: no group yet, because the
+  // aggregator's coverage gate needs an IMU sample past the sweep end.
   for (int i = 0; i < 5; ++i) fx.push_imu(t0 + i * 10 * kMs);
   fx.push_scan(t0 + 50 * kMs);
-  fx.push_imu(t0 + 150 * kMs);
   EXPECT_TRUE(fx.groups.empty());
 
-  // Four more IMU samples complete the init (10 total). The flush happens on the next
-  // group: a second sweep + its coverage sample must release BOTH held groups, in order.
-  for (int i = 16; i < 20; ++i) fx.push_imu(t0 + i * 10 * kMs);
-  EXPECT_TRUE(fx.groups.empty());
+  // The covering sample closes the group and it must be forwarded immediately:
+  // the pipeline holds nothing back ahead of the front-end.
+  fx.push_imu(t0 + 150 * kMs);
+  ASSERT_EQ(fx.groups.size(), 1u);
+
+  // Two more covered sweeps forward two more groups, in arrival order.
   fx.push_scan(t0 + 200 * kMs);
   fx.push_imu(t0 + 300 * kMs);
-
-  ASSERT_EQ(fx.groups.size(), 2u);
-
-  // A third sweep + its coverage sample releases a third group. The front-end bootstraps
-  // on the first solved group and emits its first keyframe on the second, so the third
-  // group is the first to be flushed after the front-end owns the trajectory.
   fx.push_scan(t0 + 350 * kMs);
   fx.push_imu(t0 + 460 * kMs);
-
   ASSERT_EQ(fx.groups.size(), 3u);
+
   EXPECT_LT(fx.groups[0].group.t_begin, fx.groups[1].group.t_begin);
   EXPECT_LT(fx.groups[1].group.t_begin, fx.groups[2].group.t_begin);
   for (const auto& g : fx.groups) {
     ASSERT_TRUE(g.group.scan.points);
     EXPECT_EQ(g.group.scan.points->size(), 50u);
-    ASSERT_TRUE(g.deskewed.has_value());
-    EXPECT_EQ(g.deskewed->points->size(), 50u);
+    EXPECT_FALSE(g.group.imu.empty());
   }
-  // The first group bootstraps the spline window (no keyframe yet); the second is the
-  // first solve and emits the first keyframe. Both are flushed before any keyframe came
-  // back, so both are cold-start. The third group is flushed after the front-end owns
-  // the trajectory, so it is no longer cold-start.
-  EXPECT_TRUE(fx.groups[0].cold_start);
-  EXPECT_TRUE(fx.groups[1].cold_start);
-  EXPECT_FALSE(fx.groups[2].cold_start);
 
-  // The init-converged event fired exactly once.
-  int init_events = 0;
-  for (const auto& e : fx.rec->events)
-    if (e.tag == std::string("preprocess/imu_init_done")) ++init_events;
-  EXPECT_EQ(init_events, 1);
-
-  // The deskewed cloud went out on the body/scan telemetry key.
-  bool saw_body_scan = false;
-  for (const auto& c : fx.rec->clouds)
-    if (c.key == std::string("body/scan")) saw_body_scan = true;
-  EXPECT_TRUE(saw_body_scan);
-}
-
-TEST(MeridianPipeline, StationaryDeskewIsNearIdentity) {
-  Fixture fx;
-  const Timestamp t0 = 1'000 * kMs;
-
-  // Converge init first, then deliver one covered sweep.
-  for (int i = 0; i < 12; ++i) fx.push_imu(t0 + i * 10 * kMs);
-  fx.push_scan(t0 + 130 * kMs);
-  fx.push_imu(t0 + 240 * kMs);
-  fx.push_imu(t0 + 250 * kMs);
-
-  ASSERT_EQ(fx.groups.size(), 1u);
-  ASSERT_TRUE(fx.groups[0].deskewed.has_value());
-  const auto& in = *fx.groups[0].group.scan.points;
-  const auto& out = *fx.groups[0].deskewed->points;
-  ASSERT_EQ(in.size(), out.size());
-  // A stationary rig must leave the geometry (numerically) unchanged.
-  for (std::size_t i = 0; i < in.size(); ++i) {
-    EXPECT_NEAR(in[i].xyz.x(), out[i].xyz.x(), 1e-3f);
-    EXPECT_NEAR(in[i].xyz.y(), out[i].xyz.y(), 1e-3f);
-    EXPECT_NEAR(in[i].xyz.z(), out[i].xyz.z(), 1e-3f);
-  }
+  // Every forwarded group raised its size telemetry.
+  int group_points = 0;
+  for (const auto& s : fx.rec->scalars)
+    if (s.key == std::string("pipeline/group_points")) ++group_points;
+  EXPECT_EQ(group_points, 3);
 }

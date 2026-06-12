@@ -6,7 +6,6 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace meridian {
 namespace {
@@ -73,19 +72,6 @@ void load_time(const YAML::Node& root, TimeConfig& c) {
   get(val, "gap_periods", c.validator.gap_periods);
   get(val, "skew_warn_ppm", c.validator.skew_warn_ppm);
   get(val, "nan_ratio_warn", c.validator.nan_ratio_warn);
-}
-
-// Read an arbitrary-length numeric sequence; absent/empty leaves dst untouched.
-void get_vec(const YAML::Node& parent, const char* key, std::vector<double>& dst) {
-  if (!parent || !parent[key]) return;
-  const YAML::Node n = parent[key];
-  if (!n.IsSequence()) {
-    throw std::runtime_error(std::string("config: key '") + key + "' must be a numeric sequence");
-  }
-  std::vector<double> v;
-  v.reserve(n.size());
-  for (const auto& e : n) v.push_back(e.as<double>());
-  dst = std::move(v);
 }
 
 Eigen::Vector3d read_vec3(const YAML::Node& n, const std::string& key) {
@@ -232,84 +218,22 @@ void load_frontend(const YAML::Node& root, FrontendConfig& c) {
   const YAML::Node n = root["frontend"];
   if (!n) return;
   if (n["kind"]) {
-    c.kind =
-        parse_enum<FrontEndKind>(n["kind"], "frontend.kind", {{"ct_livo", FrontEndKind::CtLivo}});
+    c.kind = parse_enum<FrontEndKind>(n["kind"], "frontend.kind", {{"lio", FrontEndKind::Lio}});
   }
-  get(n, "init_time_s", c.init_time_s);
-  get(n, "solver_max_iterations", c.solver_max_iterations);
-  get(n, "solver_epsi", c.solver_epsi);
-  get(n, "degeneracy_thresh", c.degeneracy_thresh);
-  get(n, "max_outer_iters", c.max_outer_iters);
-  get(n, "reassoc_steps", c.reassoc_steps);
-  get(n, "assoc_shift_thresh_m", c.assoc_shift_thresh_m);
-  get(n, "assoc_shift_thresh_deg", c.assoc_shift_thresh_deg);
-  get(n, "marg_prior_scale", c.marg_prior_scale);
-  const YAML::Node solver = n["solver"];
-  // max_iterations / epsi keep their legacy flat keys; the solver block carries the
-  // deadline bracket. Accept max_iterations under the block too for spec-name parity.
-  get(solver, "max_iterations", c.solver_max_iterations);
-  get(solver, "epsi", c.solver_epsi);
-  get(solver, "time_limit_ms", c.solver.time_limit_ms);
-  get(solver, "min_iterations", c.solver.min_iterations);
-  const YAML::Node bias = n["bias"];
-  get(bias, "gyr_max", c.bias.gyr_max);
-  get(bias, "acc_max", c.bias.acc_max);
-  get(bias, "knot_dt_ms", c.bias.knot_dt_ms);
-  const YAML::Node mreg = n["motion_reg"];
-  get(mreg, "enable", c.motion_reg.enable);
-  get(mreg, "weight", c.motion_reg.weight);
-  get(mreg, "excitation_floor", c.motion_reg.excitation_floor);
-  const YAML::Node sp = n["spline"];
-  if (sp) {
-    if (sp["order"]) {
-      c.spline.order = parse_enum<SplineOrder>(sp["order"], "frontend.spline.order",
-                                               {{"cubic", SplineOrder::Cubic}});
-    }
-    get(sp, "knot_dt_ms", c.spline.knot_dt_ms);
-    get(sp, "window_knots", c.spline.window_knots);
-    get(sp, "n_cp_max", c.spline.n_cp_max);
-    get(sp, "time_offset_estimate", c.spline.time_offset_estimate);
-    get_vec(sp, "knot_omega_thresh", c.spline.knot_omega_thresh);
-    get_vec(sp, "knot_accel_thresh", c.spline.knot_accel_thresh);
-    get(sp, "knot_density_hysteresis", c.spline.knot_density_hysteresis);
-  }
-  const YAML::Node lid = n["lidar"];
-  get(lid, "voxel_map_m", c.lidar.voxel_map_m);
-  get(lid, "num_match_points", c.lidar.num_match_points);
-  get(lid, "max_match_dist_sq", c.lidar.max_match_dist_sq);
-  get(lid, "plane_thresh", c.lidar.plane_thresh);
-  get(lid, "point_cov", c.lidar.point_cov);
-  get(lid, "max_lidar_factors", c.lidar.max_lidar_factors);
-  get(lid, "min_factors_per_normal", c.lidar.min_factors_per_normal);
-  get(lid, "normal_strata", c.lidar.normal_strata);
-  get(lid, "local_map_cube_m", c.lidar.local_map_cube_m);
-  const YAML::Node vis = n["visual"];
-  get(vis, "enable", c.visual.enable);
-  get(vis, "patch", c.visual.patch);
-  get(vis, "levels", c.visual.levels);
-  get(vis, "img_point_cov", c.visual.img_point_cov);
-  get(vis, "outlier_threshold", c.visual.outlier_threshold);
-  get(vis, "ncc_thre", c.visual.ncc_thre);
-  get(vis, "exposure_estimate_en", c.visual.exposure_estimate_en);
-  get(vis, "inv_expo_cov", c.visual.inv_expo_cov);
-  get(vis, "inv_expo_min", c.visual.inv_expo_min);
-  get(vis, "grid_cell_px", c.visual.grid_cell_px);
-  get(vis, "warp_det_min", c.visual.warp_det_min);
-  get(vis, "warp_det_max", c.visual.warp_det_max);
-  get(vis, "warp_cond_max", c.visual.warp_cond_max);
-  get(vis, "active_box_m", c.visual.active_box_m);
-  const YAML::Node g = n["gnss"];
-  get(g, "use", c.gnss.use);
-  get(g, "floor_fixed_h", c.gnss.floor_fixed_h);
-  get(g, "floor_fixed_v", c.gnss.floor_fixed_v);
-  get(g, "floor_float_h", c.gnss.floor_float_h);
-  get(g, "floor_float_v", c.gnss.floor_float_v);
-  get(g, "floor_dgps_h", c.gnss.floor_dgps_h);
-  get(g, "floor_dgps_v", c.gnss.floor_dgps_v);
-  get(g, "floor_spp_h", c.gnss.floor_spp_h);
-  get(g, "floor_spp_v", c.gnss.floor_spp_v);
-  get(g, "innovation_k", c.gnss.innovation_k);
-  get(g, "reacquire_count", c.gnss.reacquire_count);
+  const YAML::Node lio = n["lio"];
+  get(lio, "voxel_size_m", c.lio.voxel_size_m);
+  get(lio, "max_points_per_voxel", c.lio.max_points_per_voxel);
+  get(lio, "max_range_m", c.lio.max_range_m);
+  get(lio, "keypoint_voxel_factor", c.lio.keypoint_voxel_factor);
+  get(lio, "min_keypoints", c.lio.min_keypoints);
+  get(lio, "icp_max_iterations", c.lio.icp_max_iterations);
+  get(lio, "convergence_eps", c.lio.convergence_eps);
+  get(lio, "max_corr_dist_m", c.lio.max_corr_dist_m);
+  get(lio, "min_beta", c.lio.min_beta);
+  get(lio, "max_expected_jerk", c.lio.max_expected_jerk);
+  get(lio, "init_stationary_s", c.lio.init_stationary_s);
+  get(lio, "max_gap_s", c.lio.max_gap_s);
+  get(lio, "reseed_cov_inflation", c.lio.reseed_cov_inflation);
   const YAML::Node kf = n["keyframe"];
   get(kf, "dist_m", c.keyframe.dist_m);
   get(kf, "rot_deg", c.keyframe.rot_deg);
@@ -376,6 +300,20 @@ void load_debug(const YAML::Node& root, DebugConfig& c) {
   get(n, "publish_odom", c.publish_odom);
   get(n, "timing", c.timing);
   get(n, "telemetry_rate_hz", c.telemetry_rate_hz);
+  // Debug groups: each block seeds one key-prefix wildcard in the sink's gate table.
+  const auto group = [&n](const char* key, DebugGroup& g) {
+    const YAML::Node b = n[key];
+    get(b, "enable", g.enable);
+    get(b, "max_hz", g.max_hz);
+  };
+  group("assoc", c.assoc);
+  group("solver", c.solver);
+  group("lio", c.lio);
+  group("map_health", c.map_health);
+  get(n, "publish_path", c.publish_path);
+  get(n, "path_sample_hz", c.path_sample_hz);
+  get(n, "path_publish_hz", c.path_publish_hz);
+  get(n, "path_max_poses", c.path_max_poses);
 }
 
 }  // namespace
@@ -406,148 +344,45 @@ bool Config::validate(std::string* error_out) const {
                 ") must be <= map.reg_voxel_m (" + std::to_string(map.reg_voxel_m) + ")");
   }
 
-  // --- CT spline knot spacing ---
-  if (frontend.spline.knot_dt_ms <= 0.0) {
-    return fail("frontend.spline.knot_dt_ms must be > 0");
+  // --- front-end LIO ---
+  if (frontend.lio.voxel_size_m <= 0.0) {
+    return fail("frontend.lio.voxel_size_m must be > 0");
   }
-  if (frontend.spline.window_knots < 1) {
-    return fail("frontend.spline.window_knots must be >= 1");
+  if (frontend.lio.max_points_per_voxel < 1) {
+    return fail("frontend.lio.max_points_per_voxel must be >= 1");
   }
-  // 0 (or 1) disables adaptive density to one control point per segment; a negative
-  // cap is invalid.
-  if (frontend.spline.n_cp_max < 0) {
-    return fail("frontend.spline.n_cp_max must be >= 0 (<=1 disables adaptive density)");
+  if (frontend.lio.max_range_m <= 0.0) {
+    return fail("frontend.lio.max_range_m must be > 0");
   }
-
-  // --- front-end solver ---
-  if (frontend.init_time_s <= 0.0) {
-    return fail("frontend.init_time_s must be > 0");
+  if (frontend.lio.keypoint_voxel_factor <= 0.0) {
+    return fail("frontend.lio.keypoint_voxel_factor must be > 0");
   }
-  if (frontend.solver_max_iterations < 1) {
-    return fail("frontend.solver_max_iterations must be >= 1");
+  if (frontend.lio.min_keypoints < 1) {
+    return fail("frontend.lio.min_keypoints must be >= 1");
   }
-  if (frontend.solver_epsi <= 0.0) {
-    return fail("frontend.solver_epsi must be > 0");
+  if (frontend.lio.icp_max_iterations < 1) {
+    return fail("frontend.lio.icp_max_iterations must be >= 1");
   }
-  if (frontend.degeneracy_thresh < 0.0) {
-    return fail("frontend.degeneracy_thresh must be >= 0");
+  if (frontend.lio.convergence_eps <= 0.0) {
+    return fail("frontend.lio.convergence_eps must be > 0");
   }
-  if (frontend.solver.time_limit_ms <= 0.0) {
-    return fail("frontend.solver.time_limit_ms must be > 0");
+  if (frontend.lio.max_corr_dist_m <= 0.0) {
+    return fail("frontend.lio.max_corr_dist_m must be > 0");
   }
-  if (frontend.solver.min_iterations < 1) {
-    return fail("frontend.solver.min_iterations must be >= 1");
+  if (frontend.lio.min_beta <= 0.0) {
+    return fail("frontend.lio.min_beta must be > 0");
   }
-  if (frontend.solver.min_iterations > frontend.solver_max_iterations) {
-    return fail("frontend.solver.min_iterations (" +
-                std::to_string(frontend.solver.min_iterations) +
-                ") must be <= frontend.solver_max_iterations (" +
-                std::to_string(frontend.solver_max_iterations) + ")");
+  if (frontend.lio.max_expected_jerk <= 0.0) {
+    return fail("frontend.lio.max_expected_jerk must be > 0");
   }
-  if (frontend.max_outer_iters < 1) {
-    return fail("frontend.max_outer_iters must be >= 1");
+  if (frontend.lio.init_stationary_s < 0.0) {
+    return fail("frontend.lio.init_stationary_s must be >= 0");
   }
-  if (frontend.reassoc_steps < 1) {
-    return fail("frontend.reassoc_steps must be >= 1");
+  if (frontend.lio.max_gap_s <= 0.0) {
+    return fail("frontend.lio.max_gap_s must be > 0");
   }
-  if (frontend.assoc_shift_thresh_m < 0.0 || frontend.assoc_shift_thresh_deg < 0.0) {
-    return fail("frontend.assoc_shift_thresh_{m,deg} must be >= 0");
-  }
-  if (frontend.marg_prior_scale <= 0.0 || frontend.marg_prior_scale > 1.0) {
-    return fail("frontend.marg_prior_scale must be in (0, 1]");
-  }
-  if (frontend.bias.gyr_max <= 0.0 || frontend.bias.acc_max <= 0.0) {
-    return fail("frontend.bias.{gyr_max,acc_max} must be > 0");
-  }
-  if (frontend.bias.knot_dt_ms <= 0.0) {
-    return fail("frontend.bias.knot_dt_ms must be > 0");
-  }
-  if (frontend.motion_reg.weight < 0.0) {
-    return fail("frontend.motion_reg.weight must be >= 0");
-  }
-  if (frontend.motion_reg.excitation_floor < 0.0) {
-    return fail("frontend.motion_reg.excitation_floor must be >= 0");
-  }
-
-  // --- front-end LiDAR association ---
-  if (frontend.lidar.voxel_map_m <= 0.0) {
-    return fail("frontend.lidar.voxel_map_m must be > 0");
-  }
-  if (frontend.lidar.num_match_points < 3) {
-    return fail("frontend.lidar.num_match_points must be >= 3 (a plane needs 3 points)");
-  }
-  if (frontend.lidar.max_match_dist_sq <= 0.0) {
-    return fail("frontend.lidar.max_match_dist_sq must be > 0");
-  }
-  if (frontend.lidar.plane_thresh <= 0.0) {
-    return fail("frontend.lidar.plane_thresh must be > 0");
-  }
-  if (frontend.lidar.point_cov <= 0.0) {
-    return fail("frontend.lidar.point_cov must be > 0");
-  }
-  if (frontend.lidar.max_lidar_factors < 1) {
-    return fail("frontend.lidar.max_lidar_factors must be >= 1");
-  }
-  if (frontend.lidar.min_factors_per_normal < 0) {
-    return fail("frontend.lidar.min_factors_per_normal must be >= 0");
-  }
-  if (frontend.lidar.normal_strata < 1) {
-    return fail("frontend.lidar.normal_strata must be >= 1");
-  }
-  // Each stratum's guaranteed floor must fit inside the global cap.
-  if (frontend.lidar.min_factors_per_normal * frontend.lidar.normal_strata >
-      frontend.lidar.max_lidar_factors) {
-    return fail(
-        "frontend.lidar.min_factors_per_normal * normal_strata (" +
-        std::to_string(frontend.lidar.min_factors_per_normal * frontend.lidar.normal_strata) +
-        ") must be <= max_lidar_factors (" + std::to_string(frontend.lidar.max_lidar_factors) +
-        ")");
-  }
-
-  // --- adaptive-knot density ---
-  if (frontend.spline.knot_density_hysteresis < 0.0 ||
-      frontend.spline.knot_density_hysteresis >= 1.0) {
-    return fail("frontend.spline.knot_density_hysteresis must be in [0, 1)");
-  }
-  const auto monotone_nonneg = [](const std::vector<double>& v) {
-    for (std::size_t i = 0; i < v.size(); ++i) {
-      if (v[i] < 0.0) return false;
-      if (i > 0 && v[i] <= v[i - 1]) return false;
-    }
-    return true;
-  };
-  if (!monotone_nonneg(frontend.spline.knot_omega_thresh)) {
-    return fail("frontend.spline.knot_omega_thresh must be strictly increasing and >= 0");
-  }
-  if (!monotone_nonneg(frontend.spline.knot_accel_thresh)) {
-    return fail("frontend.spline.knot_accel_thresh must be strictly increasing and >= 0");
-  }
-
-  // --- front-end visual ---
-  if (frontend.visual.patch < 1) {
-    return fail("frontend.visual.patch must be >= 1");
-  }
-  if (frontend.visual.img_point_cov <= 0.0) {
-    return fail("frontend.visual.img_point_cov must be > 0");
-  }
-  if (frontend.visual.outlier_threshold <= 0.0) {
-    return fail("frontend.visual.outlier_threshold must be > 0");
-  }
-  if (frontend.visual.inv_expo_cov <= 0.0) {
-    return fail("frontend.visual.inv_expo_cov must be > 0");
-  }
-  if (frontend.visual.inv_expo_min <= 0.0) {
-    return fail("frontend.visual.inv_expo_min must be > 0");
-  }
-  if (frontend.visual.grid_cell_px < 1) {
-    return fail("frontend.visual.grid_cell_px must be >= 1");
-  }
-  if (frontend.visual.warp_det_min <= 0.0 ||
-      frontend.visual.warp_det_max <= frontend.visual.warp_det_min) {
-    return fail("frontend.visual.warp_det_min/max must satisfy 0 < min < max");
-  }
-  if (frontend.visual.warp_cond_max < 1.0) {
-    return fail("frontend.visual.warp_cond_max must be >= 1");
+  if (frontend.lio.reseed_cov_inflation < 1.0) {
+    return fail("frontend.lio.reseed_cov_inflation must be >= 1");
   }
 
   // --- LiDAR range gate ---
@@ -576,9 +411,6 @@ bool Config::validate(std::string* error_out) const {
   // --- camera pyramid ---
   if (preprocess.camera.pyramid_levels < 1) {
     return fail("preprocess.camera.pyramid_levels must be >= 1");
-  }
-  if (frontend.visual.levels < 1) {
-    return fail("frontend.visual.levels must be >= 1");
   }
 
   // --- sensor rates ---
@@ -618,6 +450,25 @@ bool Config::validate(std::string* error_out) const {
   if (sensors.camera.shutter != "global") {
     return fail("sensors.camera.shutter must be 'global' (got '" + sensors.camera.shutter +
                 "'); the rolling-shutter path is not built");
+  }
+
+  // --- debug groups & path aggregation ---
+  for (const auto& [name, g] : {std::pair<const char*, const DebugGroup*>{"assoc", &debug.assoc},
+                                {"solver", &debug.solver},
+                                {"lio", &debug.lio},
+                                {"map_health", &debug.map_health}}) {
+    if (g->max_hz < 0.0) {
+      return fail(std::string("debug.") + name + ".max_hz must be >= 0");
+    }
+  }
+  if (debug.path_sample_hz <= 0.0 || debug.path_sample_hz > 200.0) {
+    return fail("debug.path_sample_hz must be in (0, 200]");
+  }
+  if (debug.path_publish_hz <= 0.0) {
+    return fail("debug.path_publish_hz must be > 0");
+  }
+  if (debug.path_max_poses < 1) {
+    return fail("debug.path_max_poses must be >= 1");
   }
 
   // --- camera distortion model (closed string set; reject unknowns loudly) ---

@@ -23,8 +23,8 @@ class TelemetrySink;
 // "this stamp is trustworthy" is identical across all four modalities.
 //
 // It runs always-on (not a debug option): a single out-of-order or skewed stamp does not
-// merely add one noisy measurement, it mis-places a continuous-time spline knot and bends
-// the trajectory for every point and image that interpolates across it.
+// merely add one noisy measurement, it corrupts the IMU integration interval and the
+// per-point deskew times, bending the pose for every sample that spans it.
 //
 // Six standing checks, each mapped to a HealthCode and edge-throttled: the first sample
 // entering a fault state raises the code once (one event, one bit set); subsequent samples

@@ -1,7 +1,7 @@
+#include <gtest/gtest.h>
+
 #include <fstream>
 #include <string>
-
-#include <gtest/gtest.h>
 
 #include "meridian/config/config.hpp"
 #include "meridian/config/config_loader.hpp"
@@ -26,14 +26,6 @@ TEST(Config, CrossFieldFailsWithMessage) {
   EXPECT_NE(err.find("voxel_surf_m"), std::string::npos) << err;
 }
 
-TEST(Config, ZeroKnotDtFails) {
-  Config c;
-  c.frontend.spline.knot_dt_ms = 0.0;
-  std::string err;
-  EXPECT_FALSE(c.validate(&err));
-  EXPECT_NE(err.find("knot_dt_ms"), std::string::npos) << err;
-}
-
 TEST(Config, BlindBeyondRangeFails) {
   Config c;
   c.preprocess.lidar.blind = 200.0;
@@ -54,7 +46,6 @@ TEST(ConfigLoader, RoundTripsFields) {
          "    lidar: { topic: /lidar/points, nominal_rate_hz: 10, ptp: false }\n"
          "  preprocess: { voxel_surf_m: 0.4 }\n"
          "  frontend:\n"
-         "    spline: { order: cubic, knot_dt_ms: 20, window_knots: 6 }\n"
          "    keyframe: { dist_m: 2.0 }\n"
          "  map: { tsdf_voxel_m: 0.05, colour: false }\n"
          "  debug: { level: warn, telemetry_rate_hz: 5 }\n";
@@ -68,8 +59,6 @@ TEST(ConfigLoader, RoundTripsFields) {
   EXPECT_EQ(c.sensors.lidar.topic, "/lidar/points");
   EXPECT_FALSE(c.sensors.lidar.ptp);
   EXPECT_DOUBLE_EQ(c.preprocess.lidar.voxel_surf_m, 0.4);
-  EXPECT_DOUBLE_EQ(c.frontend.spline.knot_dt_ms, 20.0);
-  EXPECT_EQ(c.frontend.spline.window_knots, 6);
   EXPECT_DOUBLE_EQ(c.frontend.keyframe.dist_m, 2.0);
   EXPECT_DOUBLE_EQ(c.map.tsdf_voxel_m, 0.05);
   EXPECT_FALSE(c.map.colour);
@@ -101,21 +90,7 @@ TEST(ConfigLoader, RoundTripsNewKeys) {
          "    voxel_surf_m: 0.6\n"
          "    sweep_floor_frac: 0.4\n"
          "    surf_max_pts: 3\n"
-         "    surf_seed: 42\n"
-         "  frontend:\n"
-         "    degeneracy_thresh: 12.5\n"
-         "    max_outer_iters: 5\n"
-         "    reassoc_steps: 3\n"
-         "    assoc_shift_thresh_m: 0.03\n"
-         "    assoc_shift_thresh_deg: 0.5\n"
-         "    solver: { max_iterations: 6, epsi: 2.0e-3, time_limit_ms: 80, min_iterations: 3 }\n"
-         "    bias: { gyr_max: 0.6, acc_max: 4.0 }\n"
-         "    motion_reg: { enable: false, weight: 5.0e-3, excitation_floor: 0.2 }\n"
-         "    spline:\n"
-         "      knot_omega_thresh: [0.5, 1.0, 2.0]\n"
-         "      knot_accel_thresh: [1.0, 3.0]\n"
-         "      knot_density_hysteresis: 0.2\n"
-         "    lidar: { max_lidar_factors: 2000, min_factors_per_normal: 40, normal_strata: 6 }\n";
+         "    surf_seed: 42\n";
   }
 
   const Config c = load_config_yaml(path);
@@ -136,33 +111,80 @@ TEST(ConfigLoader, RoundTripsNewKeys) {
   EXPECT_DOUBLE_EQ(c.preprocess.lidar.sweep_floor_frac, 0.4);
   EXPECT_EQ(c.preprocess.lidar.surf_max_pts, 3);
   EXPECT_EQ(c.preprocess.lidar.surf_seed, 42u);
-
-  EXPECT_DOUBLE_EQ(c.frontend.degeneracy_thresh, 12.5);
-  EXPECT_EQ(c.frontend.max_outer_iters, 5);
-  EXPECT_EQ(c.frontend.reassoc_steps, 3);
-  EXPECT_DOUBLE_EQ(c.frontend.assoc_shift_thresh_m, 0.03);
-  EXPECT_DOUBLE_EQ(c.frontend.assoc_shift_thresh_deg, 0.5);
-  EXPECT_EQ(c.frontend.solver_max_iterations, 6);
-  EXPECT_DOUBLE_EQ(c.frontend.solver_epsi, 2.0e-3);
-  EXPECT_DOUBLE_EQ(c.frontend.solver.time_limit_ms, 80.0);
-  EXPECT_EQ(c.frontend.solver.min_iterations, 3);
-  EXPECT_DOUBLE_EQ(c.frontend.bias.gyr_max, 0.6);
-  EXPECT_DOUBLE_EQ(c.frontend.bias.acc_max, 4.0);
-  EXPECT_FALSE(c.frontend.motion_reg.enable);
-  EXPECT_DOUBLE_EQ(c.frontend.motion_reg.weight, 5.0e-3);
-  EXPECT_DOUBLE_EQ(c.frontend.motion_reg.excitation_floor, 0.2);
-  ASSERT_EQ(c.frontend.spline.knot_omega_thresh.size(), 3u);
-  EXPECT_DOUBLE_EQ(c.frontend.spline.knot_omega_thresh[2], 2.0);
-  ASSERT_EQ(c.frontend.spline.knot_accel_thresh.size(), 2u);
-  EXPECT_DOUBLE_EQ(c.frontend.spline.knot_density_hysteresis, 0.2);
-  EXPECT_EQ(c.frontend.lidar.max_lidar_factors, 2000);
-  EXPECT_EQ(c.frontend.lidar.min_factors_per_normal, 40);
-  EXPECT_EQ(c.frontend.lidar.normal_strata, 6);
 }
 
-TEST(Config, DefaultDegeneracyThreshIsNonZero) {
+// ---- frontend LIO ----
+
+TEST(ConfigLoader, RoundTripsLioKeys) {
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_lio_keys.yaml";
+  {
+    std::ofstream f(path);
+    f << "meridian:\n"
+         "  frontend:\n"
+         "    kind: lio\n"
+         "    lio:\n"
+         "      voxel_size_m: 0.8\n"
+         "      max_points_per_voxel: 15\n"
+         "      max_range_m: 60.0\n"
+         "      keypoint_voxel_factor: 2.0\n"
+         "      min_keypoints: 24\n"
+         "      icp_max_iterations: 50\n"
+         "      convergence_eps: 1.0e-4\n"
+         "      max_corr_dist_m: 0.7\n"
+         "      min_beta: 150.0\n"
+         "      max_expected_jerk: 4.0\n"
+         "      init_stationary_s: 0.5\n"
+         "      max_gap_s: 0.8\n"
+         "      reseed_cov_inflation: 50.0\n"
+         "    keyframe: { dist_m: 1.5, rot_deg: 15.0, time_s: 2.0 }\n";
+  }
+
+  const Config c = load_config_yaml(path);
+
+  EXPECT_EQ(c.frontend.kind, FrontEndKind::Lio);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.voxel_size_m, 0.8);
+  EXPECT_EQ(c.frontend.lio.max_points_per_voxel, 15);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.max_range_m, 60.0);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.keypoint_voxel_factor, 2.0);
+  EXPECT_EQ(c.frontend.lio.min_keypoints, 24);
+  EXPECT_EQ(c.frontend.lio.icp_max_iterations, 50);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.convergence_eps, 1.0e-4);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.max_corr_dist_m, 0.7);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.min_beta, 150.0);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.max_expected_jerk, 4.0);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.init_stationary_s, 0.5);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.max_gap_s, 0.8);
+  EXPECT_DOUBLE_EQ(c.frontend.lio.reseed_cov_inflation, 50.0);
+  EXPECT_DOUBLE_EQ(c.frontend.keyframe.dist_m, 1.5);
+  EXPECT_DOUBLE_EQ(c.frontend.keyframe.rot_deg, 15.0);
+  EXPECT_DOUBLE_EQ(c.frontend.keyframe.time_s, 2.0);
+}
+
+TEST(ConfigLoader, RejectsUnknownFrontendKind) {
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_bad_frontend_kind.yaml";
+  {
+    std::ofstream f(path);
+    f << "meridian:\n  frontend: { kind: ct_livo }\n";
+  }
+  EXPECT_THROW(load_config_yaml(path), std::runtime_error);
+}
+
+TEST(Config, LioValidationFails) {
   Config c;
-  EXPECT_GT(c.frontend.degeneracy_thresh, 0.0);
+  c.frontend.lio.voxel_size_m = 0.0;
+  std::string err;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("voxel_size_m"), std::string::npos) << err;
+
+  c = Config{};
+  c.frontend.lio.icp_max_iterations = 0;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("icp_max_iterations"), std::string::npos) << err;
+
+  c = Config{};
+  c.frontend.lio.reseed_cov_inflation = 0.5;
+  EXPECT_FALSE(c.validate(&err));
+  EXPECT_NE(err.find("reseed_cov_inflation"), std::string::npos) << err;
 }
 
 // ---- new validate rules ----
@@ -186,8 +208,7 @@ TEST(Config, ZeroQueueCapacityFails) {
 // ---- camera distortion keys ----
 
 TEST(ConfigLoader, LoadsCameraDistortionKeys) {
-  const std::string path =
-      std::string(::testing::TempDir()) + "/meridian_cam_distortion.yaml";
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_cam_distortion.yaml";
   {
     std::ofstream f(path);
     f << "meridian:\n"
@@ -224,8 +245,7 @@ TEST(ConfigLoader, ShortDistortionCoeffsZeroFill) {
 }
 
 TEST(ConfigLoader, TooManyDistortionCoeffsThrows) {
-  const std::string path =
-      std::string(::testing::TempDir()) + "/meridian_cam_distortion_long.yaml";
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_cam_distortion_long.yaml";
   {
     std::ofstream f(path);
     f << "meridian:\n"
@@ -269,55 +289,70 @@ TEST(Config, SurfMaxPtsZeroFails) {
   EXPECT_NE(err.find("surf_max_pts"), std::string::npos) << err;
 }
 
-TEST(Config, MinIterationsAboveMaxFails) {
-  Config c;
-  c.frontend.solver.min_iterations = 10;
-  c.frontend.solver_max_iterations = 5;
-  std::string err;
-  EXPECT_FALSE(c.validate(&err));
-  EXPECT_NE(err.find("min_iterations"), std::string::npos) << err;
+}  // namespace
+}  // namespace meridian
+
+// ---- loader round-trips: debug groups, path aggregation ----
+
+namespace meridian {
+namespace {
+
+TEST(ConfigLoader, RoundTripsDebugGroupKeys) {
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_debug_groups.yaml";
+  {
+    std::ofstream f(path);
+    f << "meridian:\n"
+         "  debug:\n"
+         "    assoc: { enable: true, max_hz: 5.0 }\n"
+         "    solver: { enable: true }\n"
+         "    lio: { max_hz: 2.0 }\n"
+         "    map_health: { enable: false }\n"
+         "    publish_path: false\n"
+         "    path_sample_hz: 15.0\n"
+         "    path_publish_hz: 2.0\n"
+         "    path_max_poses: 1000\n";
+  }
+  const Config c = load_config_yaml(path);
+  EXPECT_TRUE(c.debug.assoc.enable);
+  EXPECT_DOUBLE_EQ(c.debug.assoc.max_hz, 5.0);
+  EXPECT_TRUE(c.debug.solver.enable);
+  EXPECT_DOUBLE_EQ(c.debug.solver.max_hz, 0.0);
+  EXPECT_FALSE(c.debug.lio.enable);  // enable absent -> default off
+  EXPECT_DOUBLE_EQ(c.debug.lio.max_hz, 2.0);
+  EXPECT_FALSE(c.debug.map_health.enable);
+  EXPECT_FALSE(c.debug.publish_path);
+  EXPECT_DOUBLE_EQ(c.debug.path_sample_hz, 15.0);
+  EXPECT_DOUBLE_EQ(c.debug.path_publish_hz, 2.0);
+  EXPECT_EQ(c.debug.path_max_poses, 1000);
 }
 
-TEST(Config, ZeroTimeLimitFails) {
-  Config c;
-  c.frontend.solver.time_limit_ms = 0.0;
+TEST(Config, DebugGroupDefaultsAreOffExceptMapHealth) {
+  const Config c;
+  EXPECT_FALSE(c.debug.assoc.enable);
+  EXPECT_FALSE(c.debug.solver.enable);
+  EXPECT_FALSE(c.debug.lio.enable);
+  EXPECT_TRUE(c.debug.map_health.enable);  // cheap counters keep the legacy default-on
+  EXPECT_TRUE(c.debug.publish_path);
   std::string err;
-  EXPECT_FALSE(c.validate(&err));
-  EXPECT_NE(err.find("time_limit_ms"), std::string::npos) << err;
+  EXPECT_TRUE(c.validate(&err)) << err;
 }
 
-TEST(Config, NonPositiveBiasBoundFails) {
+TEST(Config, DebugPathValidation) {
   Config c;
-  c.frontend.bias.acc_max = -1.0;
+  c.debug.path_sample_hz = 0.0;
   std::string err;
   EXPECT_FALSE(c.validate(&err));
-  EXPECT_NE(err.find("bias"), std::string::npos) << err;
-}
+  EXPECT_NE(err.find("path_sample_hz"), std::string::npos) << err;
 
-TEST(Config, StratumFloorExceedingCapFails) {
-  Config c;
-  c.frontend.lidar.max_lidar_factors = 100;
-  c.frontend.lidar.min_factors_per_normal = 50;
-  c.frontend.lidar.normal_strata = 7;  // 350 > 100
-  std::string err;
+  c = Config{};
+  c.debug.assoc.max_hz = -1.0;
   EXPECT_FALSE(c.validate(&err));
-  EXPECT_NE(err.find("max_lidar_factors"), std::string::npos) << err;
-}
+  EXPECT_NE(err.find("assoc.max_hz"), std::string::npos) << err;
 
-TEST(Config, KnotThreshNonMonotoneFails) {
-  Config c;
-  c.frontend.spline.knot_omega_thresh = {1.0, 0.5};  // decreasing
-  std::string err;
+  c = Config{};
+  c.debug.path_max_poses = 0;
   EXPECT_FALSE(c.validate(&err));
-  EXPECT_NE(err.find("knot_omega_thresh"), std::string::npos) << err;
-}
-
-TEST(Config, KnotHysteresisOutOfRangeFails) {
-  Config c;
-  c.frontend.spline.knot_density_hysteresis = 1.0;
-  std::string err;
-  EXPECT_FALSE(c.validate(&err));
-  EXPECT_NE(err.find("hysteresis"), std::string::npos) << err;
+  EXPECT_NE(err.find("path_max_poses"), std::string::npos) << err;
 }
 
 }  // namespace

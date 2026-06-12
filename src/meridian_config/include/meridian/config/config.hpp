@@ -5,7 +5,6 @@
 #include <array>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 #include "meridian/common/pose.hpp"
 #include "meridian/common/sample.hpp"
@@ -16,17 +15,15 @@ namespace meridian {
 // the YAML loader rejects any value outside the set.
 enum class PipelineMode { Live, Replay };
 enum class TimeSource { Ptp, Pps, Host };
-enum class FrontEndKind { CtLivo };
+enum class FrontEndKind { Lio };
 enum class BackEndKind { Isam2 };
 enum class MapBackend { Nvblox };
 enum class MeshKind { MarchingCubes };
 enum class PlaceKind { ScanContextPp };
 enum class RobustKernel { Cauchy, Gm, Tls };
-enum class SplineOrder { Cubic };
 enum class LogLevel { Trace, Debug, Info, Warn, Error };
 enum class StoreBackend { Ram, Mmap };
 enum class SensorModel { OusterOS1_128, Pinhole, Vn100, BlackflyS, Generic };
-enum class NoiseSource { Allan, Measured };
 
 // ---- pipeline ----
 struct ThreadCounts {
@@ -213,11 +210,6 @@ struct PreprocLidar {
   bool organize = false;
   std::string selfhit_mask = "";  // mask-set name resolved in the calibration set
 };
-struct PreprocDeskew {
-  int imu_init_count = 10;
-  int bootstrap_max_scans = 5;
-  int restart_window_scans = 5;
-};
 struct PreprocCamera {
   bool photometric_calib = true;
   std::string vignette_map = "";
@@ -225,15 +217,6 @@ struct PreprocCamera {
   double ref_exposure_s = 0.01;
   double ref_gain = 1.0;
   int pyramid_levels = 3;
-};
-struct PreprocImu {
-  NoiseSource noise_source = NoiseSource::Allan;
-  double init_max_var = 0.1;
-  double init_max_grav_err = 0.5;  // [m/s^2]
-  double noise_sanity_ratio = 10.0;
-  double imu_acc_fs = 156.0;  // [m/s^2] accel full scale
-  double imu_gyr_fs = 34.9;   // [rad/s] gyro full scale
-  bool drop_saturated = false;
 };
 struct PreprocGnss {
   bool enable = true;
@@ -250,147 +233,41 @@ struct PreprocGnss {
 };
 struct PreprocessConfig {
   PreprocLidar lidar{};
-  PreprocDeskew deskew{};
   PreprocCamera camera{};
-  PreprocImu imu{};
   PreprocGnss gnss{};
 };
 
 // ---- frontend (L2) ----
-struct FrontendSpline {
-  SplineOrder order = SplineOrder::Cubic;
-  double knot_dt_ms = 25.0;  // outer-knot spacing [ms]
-  int window_knots = 8;
-  int n_cp_max = 0;  // adaptive control-point cap; <=1 disables adaptive density
-  bool time_offset_estimate = false;
-  // Adaptive-knot band edges: each crossed threshold adds one control point. The
-  // rising edges are matched against peak per-sample IMU excitation in the segment;
-  // a band-down requires falling below the edge by knot_density_hysteresis (fraction).
-  std::vector<double> knot_omega_thresh{};  // [rad/s] angular-rate band edges
-  std::vector<double> knot_accel_thresh{};  // [m/s^2] specific-force band edges
-  double knot_density_hysteresis = 0.15;
-};
-struct FrontendLidar {
-  double voxel_map_m = 0.5;
-  int num_match_points = 5;
-  double max_match_dist_sq = 5.0;  // [m^2]
-  double plane_thresh = 0.1;       // [m]
-  double point_cov = 1e-3;
-  // Factor-count budget: cap residuals at max_lidar_factors, allocated across
-  // normal_strata stratified bins with a per-stratum floor of min_factors_per_normal.
-  int max_lidar_factors = 1500;
-  int min_factors_per_normal = 50;
-  int normal_strata = 7;
-  // Side length of the cubic local map kept around the current body position [m]. The
-  // ikd-Tree is segmented so points farther than half this from the body are deleted,
-  // bounding map RAM and nearest-neighbour search depth. Non-positive disables trimming
-  // (the map grows for the whole trajectory).
-  double local_map_cube_m = 500.0;
-};
-struct FrontendVisual {
-  // Master gate for the sparse-direct photometric stage. When off (or when the
-  // camera intrinsics are zero/invalid) the front-end runs LIO only and the visual
-  // code path is skipped entirely.
-  bool enable = true;
-  int patch = 8;
-  int levels = 3;
-  double img_point_cov = 100.0;
-  double outlier_threshold = 1000.0;
-  double ncc_thre = 0.0;
-  bool exposure_estimate_en = true;
-  // Exposure random-walk tie + positivity clamp: consecutive in-window inverse
-  // exposures are tied with weight 1/(inv_expo_cov * dt), and each tau is lower-
-  // bounded at inv_expo_min so it can never reach a non-positive value.
-  double inv_expo_cov = 1e-2;  // [1/s] random-walk density sigma_tau^2
-  double inv_expo_min = 1e-3;  // strict positivity lower bound on tau
-  // One-best-per-cell selection grid and the homography degenerate-warp guards.
-  int grid_cell_px = 32;
-  double warp_det_min = 0.1;
-  double warp_det_max = 10.0;
-  double warp_cond_max = 50.0;
-  // Half-extent [m] of the active visual-map box: points farther than this from the
-  // current pose are evicted. Bounds the per-sweep map-maintenance cost to O(local
-  // points), independent of trajectory length. Must be near the camera's
-  // re-observability range, NOT the LiDAR map scale -- the visual map re-scores its
-  // resident points every sweep, so an over-large box makes per-sweep cost grow with
-  // distance travelled and starves the real-time budget.
-  double active_box_m = 20.0;
-};
-// Conservative absolute-position GNSS residual. `use` is the master gate: with it off
-// (or with no fixes present) the GNSS code path is never entered and the trajectory is
-// bit-identical to a build without it. The floors are per-fix-type position-std pairs
-// (horizontal, vertical) in metres; the per-fix ENU covariance is floored element-wise
-// against them before weighting, since a receiver's reported covariance is optimistic.
-// innovation_k is the Mahalanobis k-sigma acceptance gate; reacquire_count is the run
-// of consecutive in-gate fixes required to re-admit GNSS after a gap or a gated-out run.
-struct FrontendGnss {
-  bool use = true;
-  double floor_fixed_h = 0.05;  // RTK_Fixed horizontal std [m]
-  double floor_fixed_v = 0.10;  // RTK_Fixed vertical std [m]
-  double floor_float_h = 0.50;  // RTK_Float horizontal std [m]
-  double floor_float_v = 1.00;  // RTK_Float vertical std [m]
-  double floor_dgps_h = 1.50;   // DGPS horizontal std [m]
-  double floor_dgps_v = 3.00;   // DGPS vertical std [m]
-  double floor_spp_h = 3.00;    // SPP horizontal std [m]
-  double floor_spp_v = 6.00;    // SPP vertical std [m]
-  double innovation_k = 3.0;    // Mahalanobis innovation gate
-  int reacquire_count = 5;      // consecutive in-gate fixes to re-admit
+struct FrontendLio {
+  double voxel_size_m = 1.0;  // map voxel edge [m]
+  int max_points_per_voxel = 20;
+  double max_range_m = 100.0;          // crop + map clip radius [m]
+  double keypoint_voxel_factor = 1.5;  // keypoint downsample voxel = factor * voxel_size_m
+  int min_keypoints = 30;              // below this the sweep is rejected for registration
+  int icp_max_iterations = 100;
+  double convergence_eps = 1e-5;
+  double max_corr_dist_m = 0.5;
+  double min_beta = 200.0;              // floor on the gravity-regularizer weight
+  double max_expected_jerk = 3.0;       // [m/s^3]
+  double init_stationary_s = 1.0;       // standstill window for static init; 0 = start immediately
+  double max_gap_s = 0.5;               // sensor gap beyond this triggers a reseed
+  double reseed_cov_inflation = 100.0;  // constraint-cov inflation on the reseeded keyframe
 };
 struct FrontendKeyframe {
   double dist_m = 1.0;
   double rot_deg = 10.0;
   double time_s = 1.0;
 };
-// Deadline bracket for the wall-clock solve path. min_iterations always run before a
-// cutoff so a starved step never publishes a barely-improved pose; the replay path
-// ignores time_limit_ms and runs the fixed schedule.
-struct FrontendSolver {
-  double time_limit_ms = 90.0;
-  int min_iterations = 2;
-};
-// Physical box bounds on the IMU biases so an outlier burst cannot drive a bias
-// absurd, plus the cadence of the piecewise-linear bias timeline. Both biases are
-// free states tied by a continuous-time random walk between consecutive knots.
-struct FrontendBias {
-  double gyr_max = 0.5;     // [rad/s]
-  double acc_max = 5.0;     // [m/s^2]
-  double knot_dt_ms = 500;  // bias knot cadence [ms]
-};
-// Off-by-default low-weight jerk / angular-acceleration regularizer; engaged only on
-// under-excited spans (excitation below the floor and a degenerate eigenaxis).
-struct FrontendMotionReg {
-  bool enable = true;
-  double weight = 1e-3;           // relative to the IMU accel weight
-  double excitation_floor = 0.0;  // engage below this excitation level
-};
 struct FrontendConfig {
-  FrontEndKind kind = FrontEndKind::CtLivo;
-  double init_time_s = 0.1;
-  int solver_max_iterations = 5;
-  double solver_epsi = 1e-3;
-  // Eigenvalue floor for the per-axis degeneracy score lambda/(lambda+thresh); a zero
-  // floor makes every axis score 1 and the degeneracy gate never fires, so keep > 0.
-  double degeneracy_thresh = 10.0;
-  // Fixed-cadence re-association: at most max_outer_iters association passes, each with
-  // reassoc_steps inner LM iterations, stopping early once the keyframe-time pose moves
-  // less than assoc_shift_thresh_m AND assoc_shift_thresh_deg since the prior pass.
-  int max_outer_iters = 4;
-  int reassoc_steps = 2;
-  double assoc_shift_thresh_m = 0.02;
-  double assoc_shift_thresh_deg = 0.2;
-  // Multiplier in (0, 1] on the marginalization prior's information at build time
-  // (sqrt(scale) on its sqrt-information and residual, so the prior's Gauss-Newton
-  // step direction is preserved while its confidence is deflated). 1.0 leaves the
-  // prior untouched and is bit-identical to a build without the knob.
-  double marg_prior_scale = 1.0;
-  FrontendSolver solver{};
-  FrontendBias bias{};
-  FrontendMotionReg motion_reg{};
-  FrontendSpline spline{};
-  FrontendLidar lidar{};
-  FrontendVisual visual{};
-  FrontendGnss gnss{};
+  FrontEndKind kind = FrontEndKind::Lio;
+  FrontendLio lio{};
   FrontendKeyframe keyframe{};
+  // Debug-only: sampling cadence of the discrete odometry-pose stream
+  // (frontend/path_sample, the /meridian/path source). Copied from
+  // debug.path_sample_hz by the pipeline at construction; it gates no estimator
+  // computation and the stream itself is enabled()-gated, so it is not a tuning
+  // constant.
+  double debug_path_sample_hz = 30.0;
 };
 
 // ---- backend (L3) ----
@@ -516,6 +393,16 @@ struct PlaceConfig {
 };
 
 // ---- debug ----
+// One config-seeded debug-key group. Each group maps to one key-prefix wildcard in
+// the telemetry sink's gate table (e.g. assoc -> "frontend/assoc/*"), so the same
+// runtime set_debug_key service that flips a single key can flip the whole group
+// live. enable seeds the flag; max_hz seeds the group's publication rate limit
+// (0 = the sink's class default: telemetry_rate_hz for scalars, 2 Hz for heavy
+// payloads).
+struct DebugGroup {
+  bool enable = false;
+  double max_hz = 0.0;
+};
 struct DebugConfig {
   LogLevel level = LogLevel::Info;
   bool publish_clouds = true;
@@ -523,6 +410,20 @@ struct DebugConfig {
   bool publish_odom = true;  // /meridian/odom (the rviz pose arrow); TF is published regardless
   bool timing = true;
   double telemetry_rate_hz = 10.0;
+  // Front-end debug groups (key prefix each one gates). All emission under a group is
+  // hoisted behind one enabled() check per sweep, so an off group costs one hash
+  // lookup; the always-on basics (counts, residual means, biases, ...) stay ungrouped.
+  DebugGroup assoc{};   // frontend/assoc/*  — association-quality detail + outlier cloud
+  DebugGroup solver{};  // frontend/solver/* — per-iteration trace + cost shares
+  DebugGroup lio{};  // frontend/lio/*    — internal-deskew / IMU-tracker / init / reseed detail
+  DebugGroup map_health{/*enable=*/true, 0.0};  // frontend/map/* — size/insert counters (cheap)
+  // /meridian/path: the odometry pose stream sampled at path_sample_hz and aggregated
+  // by the wrapper into one nav_msgs/Path, republished at most path_publish_hz and
+  // ring-capped at path_max_poses.
+  bool publish_path = true;
+  double path_sample_hz = 30.0;
+  double path_publish_hz = 1.0;
+  int path_max_poses = 40000;
 };
 
 // The root configuration tree, loaded once and held const for the pipeline's life.

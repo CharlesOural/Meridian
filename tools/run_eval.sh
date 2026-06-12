@@ -54,11 +54,11 @@ CAP=$([ "$SECS" -gt 0 ] && echo "$((SECS+25))" || echo 100000)
 timeout --signal=INT "$CAP" python3 "$WS/tools/record_tum.py" "$OUT/${NAME}.tum" \
   > "$OUT/${NAME}_rec.log" 2>&1 &
 TPID=$!
-timeout "$CAP" ros2 topic echo /meridian/events       > "$OUT/${NAME}_events.txt" 2>&1 &
+timeout "$CAP" ros2 topic echo --qos-depth 2000 /meridian/events       > "$OUT/${NAME}_events.txt" 2>&1 &
 EPID=$!
-timeout "$CAP" ros2 topic echo /meridian/stage_timing > "$OUT/${NAME}_stage.txt" 2>&1 &
+timeout "$CAP" ros2 topic echo --qos-depth 2000 /meridian/stage_timing > "$OUT/${NAME}_stage.txt" 2>&1 &
 SPID=$!
-timeout "$CAP" ros2 topic echo /meridian/telemetry    > "$OUT/${NAME}_telemetry.txt" 2>&1 &
+timeout "$CAP" ros2 topic echo --qos-depth 4000 /meridian/telemetry    > "$OUT/${NAME}_telemetry.txt" 2>&1 &
 MPID=$!
 
 if [ "$SECS" -gt 0 ]; then
@@ -79,5 +79,10 @@ if [ "$DIAG" -eq 1 ]; then
   python3 "$WS/tools/diagnose_run.py" --est "$OUT/${NAME}.tum" \
     ${GT:+--gt "$GT"} --events "$OUT/${NAME}_events.txt" \
     --stage-timing "$OUT/${NAME}_stage.txt" --telemetry "$OUT/${NAME}_telemetry.txt" \
+    --name "$NAME" --out "$OUT"
+  # Full front-end debug surface (12-panel figure; panels for off debug groups
+  # render as "group off" so figures stay comparable across postures).
+  python3 "$WS/tools/plot_frontend.py" --telemetry "$OUT/${NAME}_telemetry.txt" \
+    --events "$OUT/${NAME}_events.txt" --stage-timing "$OUT/${NAME}_stage.txt" \
     --name "$NAME" --out "$OUT"
 fi
