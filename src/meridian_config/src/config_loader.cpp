@@ -414,6 +414,14 @@ void load_debug(const YAML::Node& root, DebugConfig& c) {
   get(n, "publish_odom", c.publish_odom);
   get(n, "timing", c.timing);
   get(n, "telemetry_rate_hz", c.telemetry_rate_hz);
+  if (n["cloud_color"]) {
+    c.cloud_color = parse_enum<CloudColor>(n["cloud_color"], "debug.cloud_color",
+                                           {{"intensity", CloudColor::Intensity},
+                                            {"height", CloudColor::Height},
+                                            {"z", CloudColor::Height}});
+  }
+  get(n, "cloud_color_min", c.cloud_color_min);
+  get(n, "cloud_color_max", c.cloud_color_max);
   // Debug groups: each block seeds one key-prefix wildcard in the sink's gate table.
   const auto group = [&n](const char* key, DebugGroup& g) {
     const YAML::Node b = n[key];

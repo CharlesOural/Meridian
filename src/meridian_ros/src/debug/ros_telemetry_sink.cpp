@@ -182,7 +182,9 @@ void RosTelemetrySink::cloud(const char* key, const PointCloudView& view, Frame 
     }
     pub = slot;
   }
-  pub->publish(to_pointcloud2(view, frame_name(f), t));
+  pub->publish(to_pointcloud2(view, frame_name(f), t, cfg_.cloud_color,
+                              static_cast<float>(cfg_.cloud_color_min),
+                              static_cast<float>(cfg_.cloud_color_max)));
 }
 
 void RosTelemetrySink::pose(const char* key, const Pose& p, Frame f, Timestamp t) {

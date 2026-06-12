@@ -24,6 +24,9 @@ enum class RobustKernel { Huber, Cauchy, Gm, Tls };
 enum class LogLevel { Trace, Debug, Info, Warn, Error };
 enum class StoreBackend { Ram, Mmap };
 enum class SensorModel { OusterOS1_128, Pinhole, Vn100, BlackflyS, Generic };
+// Per-point colour the published clouds bake into their `rgb` field. Intensity/Height
+// colour-map a scalar; the seam for camera-projected photometric colour lands here later.
+enum class CloudColor { Intensity, Height };
 
 // ---- pipeline ----
 struct ThreadCounts {
@@ -466,6 +469,14 @@ struct DebugConfig {
   bool publish_odom = true;  // /meridian/odom (the rviz pose arrow); TF is published regardless
   bool timing = true;
   double telemetry_rate_hz = 10.0;
+  // Per-point colour baked into every published cloud's `rgb` field, so a viewer shows the
+  // intended gradient with no per-user colour-map setup. `intensity` colour-maps LiDAR
+  // reflectivity; `height` colour-maps map-frame z. cloud_color_max <= cloud_color_min means
+  // auto-normalise each cloud over its own min/max (always a full gradient). The raw
+  // `intensity` field stays alongside `rgb`, so a viewer can still override.
+  CloudColor cloud_color = CloudColor::Intensity;
+  double cloud_color_min = 0.0;
+  double cloud_color_max = 0.0;
   // Front-end debug groups (key prefix each one gates). All emission under a group is
   // hoisted behind one enabled() check per sweep, so an off group costs one hash
   // lookup; the always-on basics (counts, residual means, biases, ...) stay ungrouped.

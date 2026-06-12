@@ -11,6 +11,7 @@
 #include "meridian/common/frame.hpp"
 #include "meridian/common/pose.hpp"
 #include "meridian/common/time.hpp"
+#include "meridian/config/config.hpp"
 #include "meridian/debug/telemetry.hpp"
 
 namespace meridian {
@@ -29,9 +30,15 @@ inline builtin_interfaces::msg::Time to_ros(Timestamp t) {
 // TF-style name for a core frame.
 const char* frame_name(Frame f);
 
-// Serializes a point view as x,y,z,intensity (float32), t (uint32 ns), ring (uint16).
+// Serializes a point view as x,y,z,intensity,rgb (float32), t (uint32 ns), ring (uint16).
+// `rgb` carries a baked colour so a viewer renders the cloud without per-user colour-map
+// setup: `color` selects the scalar (intensity reflectivity / map-frame height) the turbo
+// map runs on, normalised over [color_min, color_max]; color_max <= color_min auto-normalises
+// over the view's own range.
 sensor_msgs::msg::PointCloud2 to_pointcloud2(const PointCloudView& view,
-                                             const std::string& frame_id, Timestamp t);
+                                             const std::string& frame_id, Timestamp t,
+                                             CloudColor color = CloudColor::Intensity,
+                                             float color_min = 0.0F, float color_max = 0.0F);
 
 nav_msgs::msg::Odometry to_odometry(const Pose& pose, const std::string& frame_id,
                                     Timestamp t);

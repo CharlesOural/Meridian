@@ -331,9 +331,15 @@ TEST(ConfigLoader, RoundTripsDebugGroupKeys) {
          "    publish_path: false\n"
          "    path_sample_hz: 15.0\n"
          "    path_publish_hz: 2.0\n"
-         "    path_max_poses: 1000\n";
+         "    path_max_poses: 1000\n"
+         "    cloud_color: height\n"
+         "    cloud_color_min: -1.0\n"
+         "    cloud_color_max: 12.0\n";
   }
   const Config c = load_config_yaml(path);
+  EXPECT_EQ(c.debug.cloud_color, CloudColor::Height);
+  EXPECT_DOUBLE_EQ(c.debug.cloud_color_min, -1.0);
+  EXPECT_DOUBLE_EQ(c.debug.cloud_color_max, 12.0);
   EXPECT_TRUE(c.debug.assoc.enable);
   EXPECT_DOUBLE_EQ(c.debug.assoc.max_hz, 5.0);
   EXPECT_TRUE(c.debug.solver.enable);
@@ -354,6 +360,7 @@ TEST(Config, DebugGroupDefaultsAreOffExceptMapHealth) {
   EXPECT_FALSE(c.debug.lio.enable);
   EXPECT_TRUE(c.debug.map_health.enable);  // cheap counters keep the legacy default-on
   EXPECT_TRUE(c.debug.publish_path);
+  EXPECT_EQ(c.debug.cloud_color, CloudColor::Intensity);  // default-on baked colour
   std::string err;
   EXPECT_TRUE(c.validate(&err)) << err;
 }

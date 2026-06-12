@@ -153,6 +153,12 @@ meridian:
     publish_markers: true
     publish_odom: true      # /meridian/odom feeds the ATE recorder (tools/record_tum.py); the rviz arrow is removed at the display layer
     timing: true
+    # Baked per-point colour on every published cloud's `rgb` field (turbo map), so a viewer
+    # shows the gradient with no colour-map setup. intensity = LiDAR reflectivity; height = z.
+    # min/max pin the colour range; max <= min auto-normalises each cloud over its own range.
+    cloud_color: height
+    cloud_color_min: 0.0
+    cloud_color_max: 0.0
     # Scalar token-bucket rate. Keep this WELL ABOVE the 10 Hz sweep cadence: a limit
     # at exactly the emission cadence beats against per-key jitter and decimates keys
     # unevenly (measured: 1..98% capture per key at 10). 50 captures every sweep's

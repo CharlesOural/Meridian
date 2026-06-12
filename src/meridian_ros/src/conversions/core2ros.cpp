@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <sensor_msgs/msg/point_field.hpp>
 
 namespace meridian {
@@ -18,6 +20,28 @@ void add_field(sensor_msgs::msg::PointCloud2& msg, const char* name, std::uint32
   f.datatype = datatype;
   f.count = 1;
   msg.fields.push_back(f);
+}
+
+// Turbo colour map (degree-5 polynomial approximation, x in [0,1] -> packed 0x00RRGGBB).
+// Turbo is perceptually ordered dark-blue -> green -> yellow -> red, so a self-coloured
+// cloud reads as a clear gradient in any viewer with no colour-map configuration.
+std::uint32_t turbo_packed(float x) {
+  x = std::clamp(x, 0.0F, 1.0F);
+  const float x2 = x * x;
+  const float x3 = x2 * x;
+  const float x4 = x2 * x2;
+  const float x5 = x4 * x;
+  const auto chan = [&](float c0, float c1, float c2, float c3, float c4, float c5) {
+    const float v = c0 + c1 * x + c2 * x2 + c3 * x3 + c4 * x4 + c5 * x5;
+    return static_cast<std::uint32_t>(std::clamp(v, 0.0F, 1.0F) * 255.0F + 0.5F);
+  };
+  const std::uint32_t r =
+      chan(0.13572138F, 4.61539260F, -42.66032258F, 132.13108234F, -152.94239396F, 59.28637943F);
+  const std::uint32_t g =
+      chan(0.09140261F, 2.19418839F, 4.84296658F, -14.18503333F, 4.27729857F, 2.82956604F);
+  const std::uint32_t b =
+      chan(0.10667330F, 12.64194608F, -60.58204836F, 110.36276771F, -89.90310912F, 27.34824973F);
+  return (r << 16) | (g << 8) | b;
 }
 }  // namespace
 
@@ -46,7 +70,8 @@ const char* frame_name(Frame f) {
 }
 
 sensor_msgs::msg::PointCloud2 to_pointcloud2(const PointCloudView& view,
-                                             const std::string& frame_id, Timestamp t) {
+                                             const std::string& frame_id, Timestamp t,
+                                             CloudColor color, float color_min, float color_max) {
   sensor_msgs::msg::PointCloud2 msg;
   msg.header.stamp = to_ros(t);
   msg.header.frame_id = frame_id;
@@ -56,22 +81,47 @@ sensor_msgs::msg::PointCloud2 to_pointcloud2(const PointCloudView& view,
   add_field(msg, "y", 4, PointField::FLOAT32);
   add_field(msg, "z", 8, PointField::FLOAT32);
   add_field(msg, "intensity", 12, PointField::FLOAT32);
-  add_field(msg, "t", 16, PointField::UINT32);
-  add_field(msg, "ring", 20, PointField::UINT16);
-  msg.point_step = 24;
+  // Packed colour: 0x00RRGGBB reinterpreted as float32, the convention RViz/Foxglove read
+  // as point colour when a field is named "rgb".
+  add_field(msg, "rgb", 16, PointField::FLOAT32);
+  add_field(msg, "t", 20, PointField::UINT32);
+  add_field(msg, "ring", 24, PointField::UINT16);
+  msg.point_step = 28;
   msg.row_step = msg.point_step * msg.width;
   msg.is_bigendian = false;
   msg.is_dense = false;
   msg.data.resize(static_cast<std::size_t>(msg.row_step));
+
+  // The scalar the turbo map runs on, per the selected mode.
+  const auto scalar = [color](const LidarPoint& p) {
+    return color == CloudColor::Height ? p.xyz.z() : p.intensity;
+  };
+  // Resolve the normalisation window: an explicit [min,max], else auto over the view's range
+  // (so the gradient always spans the data; a degenerate range collapses to mid-scale).
+  float lo = color_min;
+  float hi = color_max;
+  if (hi <= lo) {
+    lo = std::numeric_limits<float>::max();
+    hi = std::numeric_limits<float>::lowest();
+    for (const LidarPoint& p : view.points) {
+      const float s = scalar(p);
+      lo = std::min(lo, s);
+      hi = std::max(hi, s);
+    }
+  }
+  const float span = hi - lo;
 
   std::uint8_t* dst = msg.data.data();
   for (const LidarPoint& p : view.points) {
     const float xyz[3] = {p.xyz.x(), p.xyz.y(), p.xyz.z()};
     std::memcpy(dst + 0, xyz, 12);
     std::memcpy(dst + 12, &p.intensity, 4);
+    const float norm = span > 0.0F ? (scalar(p) - lo) / span : 0.5F;
+    const std::uint32_t rgb = turbo_packed(norm);
+    std::memcpy(dst + 16, &rgb, 4);
     const std::uint32_t t_off = p.t_offset_ns >= 0 ? static_cast<std::uint32_t>(p.t_offset_ns) : 0u;
-    std::memcpy(dst + 16, &t_off, 4);
-    std::memcpy(dst + 20, &p.ring, 2);
+    std::memcpy(dst + 20, &t_off, 4);
+    std::memcpy(dst + 24, &p.ring, 2);
     dst += msg.point_step;
   }
   return msg;
