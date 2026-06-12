@@ -6,10 +6,10 @@ events, stage timing — the same files diagnose_run.py reads, or the replay_run
 sidecars, which share the format) and renders the full front-end debug surface on
 one 3x4 grid:
 
-  (1) association funnel        (2) per-family residual RMS     (3) residual histogram heatmap
-  (4) solver health             (5) IMU innovation              (6) deskew / CT correction
-  (7) spline kinematics         (8) IMU consistency + biases    (9) per-axis observability
- (10) queue depths / drops     (11) stage timing (top 8)       (12) visual / GNSS funnel
+  (1) association funnel        (2) solver GN trace             (3) gravity regularizer
+  (4) state norms               (5) per-axis observability      (6) map growth
+  (7) sweep span                (8) group composition           (9) queue depths / drops
+ (10) stage timing (top 8)     (11) event stream               (12) keyframe cadence
 
 Panels for keys the run did not record (debug group off) render as "group off",
 so the figure layout is stable across postures and runs are visually comparable.
@@ -126,150 +126,128 @@ def plot(tele, events, stages, name, outdir):
     # (1) association funnel
     ax = axes[0, 0]
     any_funnel = False
-    for key, lab in [("frontend/lidar/n_input", "input"),
-                     ("frontend/assoc/n_attempted", "attempted"),
-                     ("frontend/assoc/n_matched", "matched"),
-                     ("frontend/lidar/n_inlier", "accepted"),
-                     ("frontend/lidar/n_factors_kept", "kept(cap)")]:
+    for key, lab in [("frontend/assoc/n_attempted", "keypoints"),
+                     ("frontend/assoc/n_matched", "matched")]:
         any_funnel |= _line(ax, tele, key, t0, lab)
     if any_funnel:
         ax.set_title("association funnel [count]")
         ax.legend(fontsize=6)
-        if "frontend/lidar/inlier_ratio" in tele:
+        att = tele.get("frontend/assoc/n_attempted")
+        mat = tele.get("frontend/assoc/n_matched")
+        # Per-key rate limiting can desync the two streams; the ratio only makes
+        # sense when the captured samples line up one-to-one.
+        if att and mat and len(att[0]) == len(mat[0]):
             ax2 = ax.twinx()
-            t, v = tele["frontend/lidar/inlier_ratio"]
-            ax2.plot(t - t0, v[:, 0], color="k", alpha=0.4, lw=0.7)
+            ratio = np.divide(mat[1][:, 0], att[1][:, 0],
+                              out=np.zeros_like(mat[1][:, 0]), where=att[1][:, 0] > 0)
+            ax2.plot(att[0] - t0, ratio, color="k", alpha=0.4, lw=0.7)
             ax2.set_ylim(0, 1.05)
-            ax2.set_ylabel("inlier ratio", fontsize=7)
+            ax2.set_ylabel("match ratio", fontsize=7)
     else:
-        _off(ax, "association funnel: no data")
+        _off(ax, "assoc group off:\nfrontend/assoc/*")
 
-    # (2) per-family residual RMS
+    # (2) solver GN trace
     ax = axes[0, 1]
-    families = ["lidar", "imu", "bias", "anchor", "motionreg", "visual", "gnss", "prior"]
-    got = False
-    for fam in families:
-        got |= _line(ax, tele, f"frontend/resid/{fam}/rms", t0, fam)
-    if got:
-        ax.set_yscale("log")
-        ax.set_title("per-family residual RMS (whitened)")
-        ax.legend(fontsize=6, ncol=2)
-    else:
-        _off(ax, "resid probe: no data")
-
-    # (3) residual histogram heatmap
-    ax = axes[0, 2]
-    if "frontend/assoc/res_hist" in tele:
-        t, v = tele["frontend/assoc/res_hist"]
-        row_sum = v.sum(axis=1, keepdims=True)
-        norm = np.divide(v, row_sum, out=np.zeros_like(v), where=row_sum > 0)
-        ax.imshow(norm.T, aspect="auto", origin="lower", cmap="inferno",
-                  extent=[t[0] - t0, t[-1] - t0, 0, v.shape[1]])
-        ax.set_title("|r| histogram vs time (row-normalised)")
-        ax.set_ylabel("bin (0 .. 2*plane_thresh)")
-    else:
-        _off(ax, "assoc group off:\nfrontend/assoc/res_hist")
-
-    # (4) solver health
-    ax = axes[0, 3]
-    got = _line(ax, tele, "frontend/cost_total", t0, "cost_total")
-    got |= _line(ax, tele, "frontend/dx_norm", t0, "dx_norm")
+    got = _line(ax, tele, "frontend/solver/chi", t0, "chi")
+    got |= _line(ax, tele, "frontend/solver/dx_norm", t0, "dx_norm")
     if got:
         ax.set_yscale("log")
         ax.legend(fontsize=6, loc="upper left")
-    ax2 = ax.twinx()
-    _line(ax2, tele, "frontend/iter_count", t0, "iters", color="g", alpha=0.5)
-    _line(ax2, tele, "frontend/deadline_hit", t0, "deadline", color="r", alpha=0.5)
-    ax2.legend(fontsize=6, loc="upper right")
-    ax.set_title("solver: cost / step / iters / deadline")
-
-    # (5) IMU innovation
-    ax = axes[1, 0]
-    got = _line(ax, tele, "frontend/innov/trans_m", t0, "trans [m]")
-    ax2 = ax.twinx()
-    got |= _line(ax2, tele, "frontend/innov/rot_deg", t0, "rot [deg]", color="orange")
-    if got:
-        ax.set_title("innovation vs IMU seed")
-        ax.legend(fontsize=6, loc="upper left")
-        ax2.legend(fontsize=6, loc="upper right")
-    else:
-        _off(ax, "innovation: no data")
-
-    # (6) deskew / CT correction
-    ax = axes[1, 1]
-    got = False
-    for key, lab in [("frontend/deskew/corr_mean_m", "corr mean"),
-                     ("frontend/deskew/corr_p95_m", "corr p95"),
-                     ("frontend/deskew/corr_max_m", "corr max"),
-                     ("frontend/deskew/sweep_trans_m", "sweep trans")]:
-        got |= _line(ax, tele, key, t0, lab)
-    if got:
-        ax.set_title("deskew correction [m]")
-        ax.legend(fontsize=6)
         ax2 = ax.twinx()
-        _line(ax2, tele, "frontend/deskew/sweep_rot_deg", t0, "sweep rot", color="purple",
-              alpha=0.5)
-        ax2.set_ylabel("deg", fontsize=7)
+        _line(ax2, tele, "frontend/solver/gn_iters", t0, "iters", color="g", alpha=0.5)
+        ax2.legend(fontsize=6, loc="upper right")
+        ax.set_title("solver: chi / step / iters")
     else:
-        _off(ax, "deskew group off:\nfrontend/deskew/*")
+        _off(ax, "solver group off:\nfrontend/solver/*")
 
-    # (7) spline kinematics
-    ax = axes[1, 2]
-    got = False
-    if "frontend/spline/vel" in tele:
-        t, v = tele["frontend/spline/vel"]
-        ax.plot(t - t0, np.linalg.norm(v[:, :3], axis=1), label="|v| [m/s]", lw=0.8)
-        got = True
-    for key, lab in [("frontend/spline/acc_rms_span", "|a| rms [m/s^2]"),
-                     ("frontend/spline/omega_rms_span", "|w| rms [rad/s]"),
-                     ("frontend/spline/jerk_rms", "jerk rms [m/s^3]")]:
-        got |= _line(ax, tele, key, t0, lab)
+    # (3) gravity regularizer
+    ax = axes[0, 2]
+    if "frontend/lio/beta" in tele:
+        t, v = tele["frontend/lio/beta"]
+        beta = np.where(v[:, 0] < 0, np.nan, v[:, 0])  # negative = regularizer off
+        ax.plot(t - t0, beta, label="beta", lw=0.8)
+        ax.set_title("gravity regularizer")
+        ax.legend(fontsize=6, loc="upper left")
+        ax2 = ax.twinx()
+        _line(ax2, tele, "frontend/lio/accel_var", t0, "accel var", color="orange",
+              alpha=0.6)
+        ax2.legend(fontsize=6, loc="upper right")
+        ax2.set_ylabel("(m/s^2)^2", fontsize=7)
+    else:
+        _off(ax, "lio group off:\nfrontend/lio/*")
+
+    # (4) state norms
+    ax = axes[0, 3]
+    got = _line(ax, tele, "frontend/state/vel_norm", t0, "|v| [m/s]")
     if got:
-        ax.set_yscale("log")
-        ax.set_title("spline kinematics (span RMS)")
-        ax.legend(fontsize=6)
+        ax.set_title("state: velocity + bias norms")
+        ax.legend(fontsize=6, loc="upper left")
+        ax2 = ax.twinx()
+        got2 = _line(ax2, tele, "frontend/state/bias_gyr_norm", t0, "|bg| [rad/s]",
+                     color="tab:red", alpha=0.6)
+        got2 |= _line(ax2, tele, "frontend/state/bias_acc_norm", t0, "|ba| [m/s^2]",
+                      color="tab:purple", alpha=0.6)
+        if got2:
+            ax2.legend(fontsize=6, loc="upper right")
     else:
-        _off(ax, "spline group off:\nfrontend/spline/*")
+        _off(ax, "state norms: no data")
 
-    # (8) IMU consistency + biases
-    ax = axes[1, 3]
-    got = _line(ax, tele, "frontend/imu/res_acc", t0, "res_acc [m/s^2]")
-    got |= _line(ax, tele, "frontend/imu/res_gyr", t0, "res_gyr [rad/s]")
-    if "frontend/bias_acc" in tele:
-        t, v = tele["frontend/bias_acc"]
-        for i, axis in enumerate("xyz"):
-            ax.plot(t - t0, np.abs(v[:, i]), ls="--", lw=0.6, alpha=0.6,
-                    label=f"|ba_{axis}|")
-        got = True
-    if "frontend/bias_gyr" in tele:
-        t, v = tele["frontend/bias_gyr"]
-        ax.plot(t - t0, np.linalg.norm(v[:, :3], axis=1), ls=":", lw=0.8, label="|bg|")
-        got = True
-    if got:
-        ax.set_yscale("log")
-        ax.set_title("IMU consistency + biases")
-        ax.legend(fontsize=6, ncol=2)
-    else:
-        _off(ax, "IMU consistency: no data")
-
-    # (9) per-axis observability
-    ax = axes[2, 0]
+    # (5) per-axis observability
+    ax = axes[1, 0]
     if "frontend/obs" in tele:
         t, v = tele["frontend/obs"]
         for i, axis in enumerate(["tx", "ty", "tz", "rx", "ry", "rz"][: v.shape[1]]):
             ax.plot(t - t0, v[:, i], lw=0.8, label=axis)
+        _line(ax, tele, "frontend/obs_min", t0, "min", color="k", ls="--")
         ax.set_ylim(-0.05, 1.05)
         ax.set_title("per-axis observability score")
         ax.legend(fontsize=6, ncol=3)
     else:
         _off(ax, "observability: no data")
 
-    # (10) queue depths / drops
-    ax = axes[2, 1]
+    # (6) map growth
+    ax = axes[1, 1]
+    got = _line(ax, tele, "frontend/map/points", t0, "points")
+    got |= _line(ax, tele, "frontend/map/voxels", t0, "voxels")
+    if got:
+        ax.set_yscale("log")
+        ax.set_title("map growth [count]")
+        ax.legend(fontsize=6)
+    else:
+        _off(ax, "map_health group off:\nfrontend/map/*")
+
+    # (7) sweep span: the deskew window vs the driver-stamped sweep duration
+    ax = axes[1, 2]
+    got = _line(ax, tele, "frontend/lio/deskew_span_t_ms", t0, "deskew span")
+    got |= _line(ax, tele, "sensors/lidar/sweep_duration_ms", t0, "sweep duration")
+    if got:
+        ax.set_title("sweep span [ms]")
+        ax.legend(fontsize=6)
+    else:
+        _off(ax, "sweep span: no data")
+
+    # (8) group composition
+    ax = axes[1, 3]
+    got = _line(ax, tele, "pipeline/group_imu_count", t0, "imu/group")
+    if got:
+        ax.legend(fontsize=6, loc="upper left")
+    if "pipeline/group_points" in tele:
+        ax2 = ax.twinx()
+        _line(ax2, tele, "pipeline/group_points", t0, "points/group", color="orange",
+              alpha=0.6)
+        ax2.legend(fontsize=6, loc="upper right")
+        got = True
+    if got:
+        ax.set_title("group composition")
+    else:
+        _off(ax, "group composition: no data")
+
+    # (9) queue depths / drops
+    ax = axes[2, 0]
     got = False
-    for key in ["pipeline/q_sensors_depth", "pipeline/q_meas_depth", "pipeline/q_kf_depth",
-                "pipeline/q_map_depth", "pipeline/q_meas_dropped",
-                "pipeline/q_meas_dropped_sweep", "pipeline/group_imu_count"]:
+    for key in ["pipeline/q_sensors_depth", "pipeline/q_sensors_dropped",
+                "pipeline/q_meas_dropped", "pipeline/q_meas_dropped_sweep",
+                "pipeline/q_meas_dropped_imu"]:
         got |= _line(ax, tele, key, t0)
     if got:
         ax.set_title("queue depths / drops")
@@ -277,11 +255,11 @@ def plot(tele, events, stages, name, outdir):
     else:
         _off(ax, "queues: no data")
     for t_ev, tag in events:
-        if tag in ("frontend/window_restart", "frontend/sweep_gap_bridged"):
-            ax.axvline(t_ev - t0, color="r" if "restart" in tag else "y", alpha=0.4, lw=0.7)
+        if tag in ("frontend/lio/gap", "frontend/lio/reseed"):
+            ax.axvline(t_ev - t0, color="r" if "reseed" in tag else "y", alpha=0.4, lw=0.7)
 
-    # (11) stage timing (top 8 by avg)
-    ax = axes[2, 2]
+    # (10) stage timing (top 8 by avg)
+    ax = axes[2, 1]
     if stages:
         top = sorted(stages.items(), key=lambda kv: -kv[1][0])[:8]
         labels = [k for k, _ in top]
@@ -298,21 +276,36 @@ def plot(tele, events, stages, name, outdir):
     else:
         _off(ax, "stage timing: no data")
 
-    # (12) visual / GNSS funnel
-    ax = axes[2, 3]
-    got = False
-    for key, lab in [("frontend/visual/map_points", "map pts"),
-                     ("frontend/visual/n_candidates", "candidates"),
-                     ("frontend/visual/n_tracked", "tracked"),
-                     ("frontend/visual/n_converged", "converged"),
-                     ("frontend/gnss/innovation_m", "gnss innov [m]"),
-                     ("frontend/gnss/accept_rate", "gnss accept")]:
-        got |= _line(ax, tele, key, t0, lab)
-    if got:
-        ax.set_title("visual / GNSS funnel")
-        ax.legend(fontsize=6)
+    # (11) event stream
+    ax = axes[2, 2]
+    if events:
+        tags = sorted({tag for _, tag in events})
+        y_of = {tag: i for i, tag in enumerate(tags)}
+        warn = ("gap", "reseed", "reject", "dropped", "error", "backlog")
+        for t_ev, tag in events:
+            col = "tab:red" if any(w in tag for w in warn) else "0.5"
+            ax.plot(t_ev - t0, y_of[tag], "|", color=col, ms=8)
+        ax.set_yticks(range(len(tags)))
+        ax.set_yticklabels(tags, fontsize=6)
+        ax.set_ylim(-0.5, len(tags) - 0.5)
+        ax.set_title("event stream")
     else:
-        _off(ax, "visual & GNSS: inactive")
+        _off(ax, "events: no data")
+
+    # (12) keyframe cadence
+    ax = axes[2, 3]
+    if "frontend/keyframe_count" in tele:
+        t, v = tele["frontend/keyframe_count"]
+        ax.step(t - t0, v[:, 0], where="post", lw=0.8, label="count")
+        ax.set_title("keyframe cadence")
+        ax.legend(fontsize=6, loc="upper left")
+        if len(t) > 1:
+            ax2 = ax.twinx()
+            ax2.plot((t[1:] + t[:-1]) / 2 - t0, np.diff(t), ".", color="orange",
+                     ms=2, alpha=0.6)
+            ax2.set_ylabel("interval [s]", fontsize=7)
+    else:
+        _off(ax, "keyframes: no data")
 
     for ax in axes.flat:
         ax.tick_params(labelsize=7)

@@ -26,9 +26,8 @@
 > consumes the time model of [`02_sensors_timesync.md`](02_sensors_timesync.md)
 > (the `ClockModel`, `StampSource`, and the **time-offset estimation** of §7 —
 > *temporal* calibration lives partly there and is referenced, not duplicated,
-> here). It is consumed by **L2** (the CT LIVO+GNSS front-end, which transforms
-> every sensor into the estimation frame $F_e$ and refines the photometric
-> intrinsic internally), **L3** (back-end, the *authority* for online-refined
+> here). It is consumed by **L2** (the LIO front-end, which transforms
+> every sensor into the estimation frame $F_e$), **L3** (back-end, the *authority* for online-refined
 > extrinsics held as graph variables), and **L4** (nvblox colourisation needs
 > `T_body_cam` and camera intrinsics). Where this spec needs a type not yet in
 > spec 01, it says so explicitly and the change is **amended into spec 01**, never
@@ -86,12 +85,11 @@
 Calibration is not a layer; it is a *substrate* every layer reads and one layer
 (L3) writes. A tightly-coupled multi-sensor estimator is, at root, the assertion
 that several sensors observe **the same rigid body** through **known relative
-transforms**. Every fused residual in Meridian's CT LIVO+GNSS front-end is
+transforms**. Every fused residual in Meridian's front-end is
 conditioned on a calibration parameter:
 
-* The direct LiDAR point-to-plane residual
-  $r = n^\top(R_e\,(T_{F_e\_L}\,p_L) + p_e) + d$ (spec 04), evaluated for each
-  point at its true sample time on the CT trajectory, brings a point $p_L$ from
+* The LiDAR registration residual (spec 04) deskews and
+  registers each point at its true sample time, bringing a point $p_L$ from
   the LiDAR frame into $F_e$ through the **extrinsic** $T_{F_e\_L}$. A 1° error in
   $T_{F_e\_L}$ rotation at 30 m range is a ~0.5 m phantom shift — orders of
   magnitude above the few-cm map resolution.
@@ -103,8 +101,8 @@ conditioned on a calibration parameter:
   antenna phase centre, or the absolute factor is biased by the lever arm times
   the orientation.
 * Every cross-sensor fuse needs a **temporal** calibration — the per-sensor time
-  offset that places measurements on one timeline (spec 02 §5, §7) so the CT
-  spline samples each at the right instant.
+  offset that places measurements on one timeline (spec 02 §5, §7) so the
+  estimator integrates and warps each at the right instant.
 
 Because *all* of these condition the estimate, the architecture (arch §1.1, R1)
 forbids scattering them through the layers the way FAST-LIO inlines a single
@@ -246,7 +244,7 @@ struct IntrinsicsCamera {            // (geometric fields from spec 01 §5.1)
   // --- NEW (this spec): photometric intrinsic for direct visual (FAST-LIVO2) ---
   // Brightness constancy is broken by auto-exposure; FAST-LIVO2 estimates the
   // inverse exposure time online. We carry it as an intrinsic with a prior so a
-  // calibrated camera seeds it and the CT front-end refines it per frame (§6.5).
+  // calibrated camera seeds it and the future visual stage refines it per frame (§6.5).
   double inv_expo_prior   = 1.0;   // 1/exposure scale prior (1.0 = none)
   double inv_expo_std     = 0.0;   // prior 1σ; 0 ⇒ fixed
   bool   refine_photometric_online = true;   // FAST-LIVO2 path: on (§6.5)
@@ -341,8 +339,9 @@ off). Meridian allows an **optional** weak-prior online refinement of $f_x,f_y$ 
 unless explicitly enabled in config. The **photometric** intrinsic
 (`inv_expo_prior`, §3.2) is different: it *is* refined live, because brightness
 constancy without it is hopeless under auto-exposure (FAST-LIVO2 estimates it per
-frame). It is refined in the **CT front-end** (it is a per-frame nuisance, not a
-slowly-varying rig parameter), not in L3 — see §6.5.
+frame). It belongs to the **front-end's visual stage** (a per-frame nuisance, not a
+slowly-varying rig parameter), not to L3 — see §6.5; dormant until that stage
+exists.
 
 ### 4.4 LiDAR intrinsics
 
@@ -552,11 +551,12 @@ prior is **rejected**, the variable reset to the prior, and
 (soft prior) + braces (hard box) + observability signal — because a silently bad
 extrinsic poisons the entire map and every loop closure.
 
-### 6.5 Photometric intrinsic refinement (CT front-end, not L3)
+### 6.5 Photometric intrinsic refinement (front-end visual stage, not L3)
 
 The inverse-exposure intrinsic (`inv_expo_prior`, §3.2) is a **per-frame
 nuisance**, not a rig constant, so it is estimated **inside L2** (the FAST-LIVO2
-sparse-direct path), appended to the CT front-end's sliding-window solve, and
+sparse-direct path) when the visual stage exists — today the front-end is
+LiDAR-inertial only and this refinement is **dormant** — and is
 **not** crossed to L3 as a graph variable (R1: implementation-internal). It is
 reported on the telemetry bus (§12) and its prior is re-seeded from a slow running
 mean so a clean exposure recovers the prior. This keeps L3's graph minimal (the
@@ -569,7 +569,7 @@ To preserve the clean information budget (spec 01 §6.4, MUST-FIX #3): a refined
 extrinsic crosses **L3→L2** only as a *versioned snapshot* (spec 01 §5.3), never
 as a live shared mutable. Each geometric extrinsic (LiDAR, camera, GNSS lever-arm)
 that is refine-flagged is refined in **exactly one** place — **L3**, the
-authoritative multi-sensor owner. The CT front-end consumes the published
+authoritative multi-sensor owner. The front-end consumes the published
 snapshot and resets its linearisation; it does not separately ship the same
 extrinsic back as an L3 variable, so no information is double-counted.
 **Rule:** any single
@@ -616,8 +616,8 @@ property), while `meridian_calib`'s $t_d$ captures the *fixed sensor-to-$F_e$ ph
 relative to the IMU). They compose:
 $t_{F_e} = \text{ClockModel}.to\_meridian(t_{\text{dev}}) - t_d$. L0 makes all
 sensors agree on *when now is*; `meridian_calib` makes the **fused geometry** agree
-on *which $F_e$ instant a sensor's measurement corresponds to* — which the CT
-spline needs to sample each sensor at the correct knot phase.
+on *which $F_e$ instant a sensor's measurement corresponds to* — which the
+estimator needs to place each sensor's measurement on the trajectory correctly.
 
 ### 7.2 The temporal-offset prior
 
@@ -818,7 +818,7 @@ and the L3→L2 boundary row in spec 01 §9.
 
 | Consumer | Reads | When | Reaction to a version bump |
 |---|---|---|---|
-| L1 preprocess | (none directly; deskew is implicit in L2's CT trajectory) | — | — |
+| L1 preprocess | (none directly; deskew is internal to L2) | — | — |
 | L2 front-end | extrinsics (transform sensors → $F_e$), cam intrinsics, IMU noise | every scan; re-cache at keyframe boundary | reset linearisation (§9.2) |
 | L3 back-end | the refine-flagged extrinsics it *owns*; priors | each `optimize()` | it is the writer |
 | L4 map | `T_body_cam` + cam intrinsics for **colourisation** | per integrated keyframe | use the snapshot pinned in `KeyframePacket::T_body_cam` (spec 01 §6.1) for reproducibility, *not* live |
@@ -882,7 +882,7 @@ calib:
 
   # --- photometric intrinsic (§4.3, §6.5) ---
   photometric:
-    refine_inv_expo_online: true # FAST-LIVO2 path (refined in the CT front-end)
+    refine_inv_expo_online: true # FAST-LIVO2 path (future visual stage; dormant)
     inv_expo_std: 0.1
 
   # --- online refinement gate (§6.4) ---
@@ -1006,7 +1006,8 @@ observed through the FAST-LIVO2 photometric factors.
    that and emits `event("calib/offline_obs", cam0, scores)`. (FAST-LIVO2 has no
    such step; it would load a bare value.)
 
-3. **Live, t = 0–30 s.** The CT front-end projects through the live $T_{F_e\_C}$
+3. **Live, t = 0–30 s.** The front-end's visual stage (dormant today; the flow
+   is shown for the full design) projects through the live $T_{F_e\_C}$
    from `provider->current()` for every sparse-direct photometric residual. L3 has
    created `X_calib(cam0)` with a `PriorFactor` (§6.1). Early keyframes are mostly
    forward driving → camera-roll and camera-Z stay near the prior (gate §6.4
@@ -1018,7 +1019,7 @@ observed through the FAST-LIVO2 photometric factors.
    opens. L3 `publish()`es `CalibrationSet v1`; `event("calib/snapshot_published",
    1)`.
 
-5. **Front-end picks it up.** At the next keyframe boundary the CT front-end sees
+5. **Front-end picks it up.** At the next keyframe boundary the front-end sees
    `provider->version() == 1 ≠` its cached `0`, re-caches $T_{F_e\_C}$, resets its
    linearisation (§9.2). Subsequent `KeyframePacket`s carry `calib_version = 1`.
 

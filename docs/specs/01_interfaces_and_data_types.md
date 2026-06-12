@@ -11,10 +11,10 @@
 > **owns** it, on which **thread** it is produced/consumed, and how **long** it
 > lives. The keystone is the L2→L3 keyframe-handoff contract (**MUST-FIX #1**),
 > which is what makes the front-end swappable behind `IFrontEnd`. Meridian's
-> front-end is the continuous-time (B-spline) LIVO+GNSS estimator; the
-> FAST-LIO2-style iEKF that once shared this contract as a test oracle has been
-> removed (spec 04 §5.6), but §8 keeps the two-estimator demonstration because
-> it is the proof the boundary is estimator-agnostic.
+> front-end is the discrete LIO estimator (spec 04); the FAST-LIO2-style iEKF
+> test oracle and the continuous-time estimator that previously sat
+> behind this contract have both been removed, but §8 keeps the two-estimator
+> demonstration because it is the proof the boundary is estimator-agnostic.
 >
 > Notation follows the shared block (course section 02): state $x$; rotation
 > $R \in SO(3)$; position $p$; velocity $v$; gyro/accel biases $b_g, b_a$;
@@ -23,7 +23,7 @@
 > residual $r$, measurement $z$, prediction $h(x)$, Jacobian $H$, covariance
 > $\Sigma$, information $\Omega = \Sigma^{-1}$, Kalman gain $K$; LiDAR point $p_L$,
 > plane $(n, d)$ with $n\cdot x + d = 0$; camera intensity $I$, projection $\pi$,
-> intrinsics $K_{cam}$; B-spline control points $c_k$, trajectory $T(t) \in SE(3)$.
+> intrinsics $K_{cam}$; trajectory pose $T \in SE(3)$.
 
 ---
 
@@ -36,7 +36,7 @@
 5. [Calibration & extrinsic types](#5-calibration--extrinsic-types)
 6. [The KeyframePacket — MUST-FIX #1](#6-the-keyframepacket--must-fix-1)
 7. [Abstract interfaces](#7-abstract-interfaces)
-8. [How both an iEKF and a CT front-end satisfy `IFrontEnd`](#8-how-both-an-iekf-and-a-ct-front-end-satisfy-ifrontend)
+8. [How two different estimators satisfy `IFrontEnd`](#8-how-two-different-estimators-satisfy-ifrontend)
 9. [Boundary summary: the one thing each edge passes](#9-boundary-summary-the-one-thing-each-edge-passes)
 10. [Worked example: a packet's life](#10-worked-example-a-packets-life)
 
@@ -45,7 +45,7 @@
 ## 1. Design philosophy: contracts, not classes
 
 A SLAM system is a pipeline of estimators. If those estimators reach into each
-other's representations — if L3 reads the front-end's sliding window directly,
+other's representations — if L3 reads the front-end's internal state directly,
 or L4 reads L3's GTSAM `Values` object — then swapping any one means rewriting
 its neighbours, and the handoff between them can double-count information with
 no contract to audit against. The reference systems already separate estimator
@@ -59,7 +59,7 @@ Three rules make this real:
 
 * **R1 — Value types cross boundaries; implementation types do not.** A
   `KeyframePacket` (§6) crosses L2→L3. A GTSAM `NonlinearFactorGraph`, a
-  filter's internal covariance, a B-spline control-point buffer — these are
+  filter's internal covariance, a voxel-hash map cell — these are
   *implementation* types and never appear in an interface signature.
 
 * **R2 — Each boundary passes exactly one thing.** Not "a pose and a cloud and
@@ -390,13 +390,12 @@ and is rejected at L1. `t_offset_ns` is a signed 32-bit offset from
 saving 4 bytes/point on multi-million-point clouds while keeping nanosecond
 resolution.
 
-> **MUST-FIX #2 hook.** Deskew is a *feedback edge*, not strict bottom-up: L1
-> needs a trajectory from L2 to deskew, but L2 needs a (deskewed) scan to update
-> the trajectory. The bootstrap is specified in §7.3 (`IFrontEnd::ingest`) and
-> spec 02: the **first** scan(s) are deskewed with IMU-only integration, after
-> which L2 publishes a trajectory and L1 switches to trajectory-based deskew. The
-> `LidarScan` type is identical in both modes — only *who computes the deskew
-> transform* changes — so the type does not encode the bootstrap state.
+> **MUST-FIX #2 hook.** Deskew happens **inside L2**, never in L0/L1: the
+> front-end warps each point to the sweep-end instant with a constant-screw
+> model built from the group's own IMU samples (spec 04), so no layer below L2
+> ever needs a trajectory and no feedback edge exists. The `LidarScan` type
+> therefore stays raw end-to-end — per-point time is the only deskew input it
+> must carry.
 
 ### 4.3 `CameraFrame`
 
@@ -422,8 +421,8 @@ I_2(\pi(\cdot))$ assumes brightness constancy; auto-exposure breaks it. Carrying
 `exposure_s`/`gain` lets L2 normalise intensities (or estimate an affine
 brightness transform) — the data the photometric front-end needs, kept at the
 boundary so L0 stays dumb. We store the **mid-exposure** timestamp because that
-is the instant the camera pose should be queried at on the continuous trajectory
-$T(t)$ (CT front-end) or the IMU-propagated pose (iEKF front-end).
+is the instant a camera pose should be queried at (the IMU-propagated pose of
+whatever estimator consumes the frame).
 
 ### 4.4 `GnssFix`
 
@@ -614,7 +613,7 @@ struct KeyframePacket {
 
   // --- Provenance ---
   std::uint32_t  calib_version = 0;      // which CalibrationSet snapshot produced this (extrinsic provenance)
-  std::uint32_t  frontend_kind = 1;      // 1=CT, the only producer (0 was the retired iEKF oracle);
+  std::uint32_t  frontend_kind = 1;      // 1 = retired CT front-end, 2 = LIO (the only live producer);
                                          // diagnostics only — the back-end must not branch on it
 };
 ```
@@ -626,10 +625,10 @@ struct KeyframePacket {
   GNSS/loop factors that are time-correlated.
 
 * **(1) T_ref_body.** Always $T_{\text{ref}\_F_e}$ — the pose of the *estimation
-  frame* in the named `ref_frame`. By fixing this, an iEKF front-end (whose
-  native state is the IMU pose) and a CT front-end (whose native object is the
-  spline $T(t)$ sampled at `stamp`) produce *the same typed thing*. The back-end
-  never has to know which.
+  frame* in the named `ref_frame`. By fixing this, any estimator — a discrete
+  LIO solving one pose per sweep, an iEKF whose native state is the IMU pose, a
+  continuous-time trajectory sampled at `stamp` — produces *the same typed
+  thing*. The back-end never has to know which.
 
 * **(2) kinematics_included.** This is the explicit flag MUST-FIX #1 demands.
   Velocity and biases are *optional* across the boundary: whether they cross as
@@ -698,8 +697,8 @@ over-confident and inconsistent. Meridian's contract, encoded by
 * **Anchor — `AbsolutePrior`.** Used for the **first** keyframe (to fix the
   gauge), when an external absolute reference applies (a fresh GNSS-anchored
   pose), and as a **chain break** when the front-end cannot vouch for a relative
-  edge to the previous keyframe (e.g. the first keyframe after a hard window
-  reseed, where the pose was carried across a data hole on a prediction whose
+  edge to the previous keyframe (e.g. the first keyframe after a hard reseed,
+  where the pose was carried across a data hole on a prediction whose
   error no covariance accounts for). The block is the marginal covariance of
   $T_{\text{ref}\_body}$ itself. This does not double-count because there is no
   companion relative factor for an anchor; the very next keyframe goes back to
@@ -708,14 +707,16 @@ over-confident and inconsistent. Meridian's contract, encoded by
   the first-keyframe gauge anchor for the segment it opens, not as an absolute
   measurement.
 
-* **Restart fallback — `ImuPreintegration` (mutually exclusive).** *Only* when
-  the front-end window had to **restart** (a tracking failure / cold-start;
-  MUST-FIX #2), there is no reliable fused relative summary across the gap. In
-  that single case the packet ships the raw `imu_summary` (§6.5) and
+* **Restart fallback — `ImuPreintegration` (mutually exclusive, reserved).**
+  For a producer that can vouch for the IMU across a tracking gap but not for a
+  fused relative pose, the packet ships the raw `imu_summary` (§6.5) and
   `kinematics_included = true`, and the back-end builds a single GTSAM
   **`CombinedImuFactor`** (bias random-walk folded in — see spec 05 §5.1) across
-  the gap *instead of* the `RelativeBetween` factor. Because `constraint_kind` is a single enum, the two are
-  **mutually exclusive by construction** — you cannot ship both.
+  the gap *instead of* the `RelativeBetween` factor. The current LIO front-end
+  **never emits this kind** — its restart path is the `AbsolutePrior` chain
+  break above — but the contract keeps it for future producers. Because
+  `constraint_kind` is a single enum, the kinds are **mutually exclusive by
+  construction** — you cannot ship both.
 
 In all three cases, **exactly one constraint** carries the L2 information for a
 given keyframe edge. The `Form`-tagged `GaussianBlock` (§3.3) makes the adapter
@@ -735,7 +736,7 @@ resolution of MUST-FIX #3.
 
 ```cpp
 // A self-contained IMU preintegration between two keyframe stamps, used ONLY on
-// the window-restart fallback so the back-end can bridge a gap the front-end
+// the restart fallback so the back-end can bridge a gap the front-end
 // could not summarise as a relative transform. Mirrors the classic
 // (ΔR, Δv, Δp) preintegrated measurements + their covariance + bias Jacobians.
 struct ImuPreintegrationSummary {
@@ -809,7 +810,7 @@ class ILidarPreprocessor {
 public:
   virtual ~ILidarPreprocessor() = default;
   // Input: raw scan (Shared-immutable points). Output: filtered scan, ready for
-  // deskew by L2. Deskew is NOT done here (it needs the trajectory; §7.3 / MUST-FIX #2).
+  // deskew by L2. Deskew is NOT done here (it is L2-internal; MUST-FIX #2).
   virtual LidarScan process(const LidarScan& raw) const = 0;
 };
 ```
@@ -818,15 +819,15 @@ public:
 **Threading:** front-end thread, synchronous. **Ownership:** returns a new
 `LidarScan`; reuses `raw.points` (Shared-immutable) when no filtering occurs,
 else allocates a new Shared-immutable buffer. **Note:** deskew is deliberately
-*not* in L1 because it is the feedback edge of MUST-FIX #2 — see §7.3.
+*not* in L1 — it lives inside the front-end (MUST-FIX #2, §4.2).
 
 ### 7.3 `IFrontEnd` (L2) — the swappable estimator
 
 This is the interface that keeps the estimator swappable: Meridian's front-end is
-the continuous-time (B-spline) LIVO+GNSS estimator (§8.2); a FAST-LIO2-style iEKF
-(§8.1) satisfied the identical contract as the bring-up differential-test oracle
-(since removed — spec 04 §5.6). Both are **drop-in** because only the boundary
-types are constrained, never the internal estimator.
+the discrete LIO estimator (§8.2); a FAST-LIO2-style iEKF (§8.1) satisfied the
+identical contract as the bring-up differential-test oracle (since removed), as
+did the retired continuous-time estimator. All are **drop-in** because
+only the boundary types are constrained, never the internal estimator.
 
 ```cpp
 class IFrontEnd {
@@ -841,29 +842,29 @@ public:
   // --- Ingest: the front-end consumes a per-sweep PreprocessedGroup ---
   // The PRIMARY input. L1 bundles one LiDAR sweep + the IMU spanning it (+ any
   // image/GNSS in the interval) into a MeasureGroup (§ "MeasureGroup", spec 02 §8);
-  // the pipeline wraps it as a PreprocessedGroup (Appendix A) carrying the
-  // cold-start deskew product (`deskewed`, `cold_start`) and pushes it once per
-  // sweep. This call triggers the window optimisation. The MUST-FIX #2 bootstrap
-  // splits across the boundary: while `cold_start` is true the front-end seeds
-  // from the bundled IMU-only deskew; once its window is initialized it deskews
-  // implicitly by evaluating the trajectory at each point's own time (§4.2) and
-  // ignores `deskewed`.
+  // the pipeline wraps it as a PreprocessedGroup (Appendix A) and pushes it once
+  // per sweep. This call triggers the per-sweep deskew + registration solve. The
+  // scan arrives raw (undeskewed, time-sorted); the front-end deskews it
+  // internally from the group's own IMU samples (MUST-FIX #2, §4.2).
   virtual void ingest(const PreprocessedGroup& group) = 0;  // one sweep + spanning IMU/image/GNSS
 
   // High-rate IMU path (between sweeps), for live-odometry propagation ONLY — it
-  // updates live_state() at IMU rate and does NOT trigger a window solve. The same
+  // updates live_state() at IMU rate and does NOT trigger a solve. The same
   // samples also arrive (bundled) in the next PreprocessedGroup, which is what the
-  // window actually optimises against; this path is purely for low-latency output.
+  // estimator actually optimises against; this path is purely for low-latency output.
   virtual void ingest_imu_live(const ImuSample& imu) = 0;
 
   // --- Back-end correction feedback (loop closure / relinearization) ---
   // Applied by the pipeline at a safe point between ingests on the front-end
-  // thread. The front-end re-anchors its odom frame and shifts the trajectory
-  // (spline control poses) by the correction; it never restarts the window.
+  // thread. The front-end re-anchors its odom frame and shifts its state by the
+  // correction; it never restarts the estimator.
   virtual void apply_correction(const GraphUpdate& update) = 0;
 
-  // --- Live output: the smooth odom-frame state, published every scan ---
-  // For introspection, control, and L4 live integration. NOT the keyframe handoff.
+  // --- Live output: the IMU-rate propagated odom-frame state ---
+  // Advanced by ingest_imu_live between sweeps and rebased onto each solved pose
+  // by re-propagating the buffered post-sweep samples, so it tracks the solve
+  // without waiting on it. For introspection, control, and L4 live integration.
+  // NOT the keyframe handoff.
   virtual NavState live_state() const = 0;
 
   // --- Keyframe handoff: THE one thing L2 gives L3 (§6) ---
@@ -884,22 +885,21 @@ callback fires on the front-end thread but *enqueues* to the back-end thread
 **[TS]**. **Ownership:** ingested samples are Borrowed (the front-end copies what
 it must); emitted packets are Moved.
 
-**The contract that makes both front-ends drop-in.** `IFrontEnd` says nothing
+**The contract that makes any front-end drop-in.** `IFrontEnd` says nothing
 about *how* the trajectory is represented:
 
 * It never exposes the state *representation* — only the typed `NavState`
   (sampled at a time) and the typed `KeyframePacket`. An iEKF's representation is
-  the 18-DoF error-state covariance (FAST-LIO `esekfom`); a CT front-end's is a
-  buffer of SE(3) control points $c_k$ defining $T(t)$. Neither leaks.
+  the 18-DoF error-state covariance (FAST-LIO `esekfom`); the LIO front-end's is
+  a single pose + velocity + biases and a voxel-hash local map. Neither leaks.
 * It never exposes *how* measurements are fused — only that you `ingest` them.
   An iEKF runs `esekfom`'s iterated update with the `h_share_model` residual
-  functor (esekfom.hpp); a CT front-end runs a sliding-window NLLS over control
-  points. Both reduce, at a keyframe instant, to *a pose + a relative covariance
-  + an observability report + a deskewed cloud* — which is exactly the
-  `KeyframePacket`.
-* The keyframe *time* is a real instant; the iEKF reports its state at that
-  instant, the CT front-end *evaluates the spline* $T(\text{stamp})$ at that
-  instant. Same output type.
+  functor (esekfom.hpp); the LIO front-end runs a per-sweep Gauss-Newton ICP
+  against its local map. Both reduce, at a keyframe instant, to *a pose + a
+  relative covariance + an observability report + a deskewed cloud* — which is
+  exactly the `KeyframePacket`.
+* The keyframe *time* is a real instant; either estimator reports its solved
+  state at that instant (the sweep end). Same output type.
 
 ### 7.4 `IBackEnd` (L3)
 
@@ -1068,13 +1068,13 @@ the L6 operator-interface payload. **Threading:** map/mesh thread.
 
 ---
 
-## 8. How both an iEKF and a CT front-end satisfy `IFrontEnd`
+## 8. How two different estimators satisfy `IFrontEnd`
 
 This section is the explicit demonstration MUST-FIX #1 calls for. The
 `IFrontEnd` contract (§7.3) constrains only the *boundary types*, not the
-internal estimator. Meridian ships the CT front-end (§8.2); the iEKF (§8.1)
-filled the same contract as the bring-up cross-check oracle (since removed —
-spec 04 §5.6) and is kept here as the proof the boundary is estimator-agnostic.
+internal estimator. Meridian ships the discrete LIO front-end (§8.2); the iEKF
+(§8.1) filled the same contract as the bring-up cross-check oracle (since
+removed) and is kept here as the proof the boundary is estimator-agnostic.
 
 ### 8.1 The iEKF (FAST-LIO2-style) — retired test oracle
 
@@ -1097,33 +1097,34 @@ and applies $x \leftarrow x \boxplus K r$ until convergence.
 | keyframe `constraint_cov` | the marginal covariance over consecutive keyframe poses → relative cov (Schur-marginalise to a 6-DoF `RelativeBetween`) |
 | `observability` | per-axis conditioning of $H^\top H$ from the registration block |
 | `cloud_body` | the deskewed scan, retained Shared-immutable |
-| `kinematics_included` | `false` normally; `true` + `imu_summary` only on window restart |
+| `kinematics_included` | `false` normally; `true` + `imu_summary` only on a restart |
 
-### 8.2 The continuous-time (B-spline) front-end — Meridian's front-end
+### 8.2 The discrete LIO front-end — Meridian's front-end
 
-**Internal representation.** A non-uniform cubic B-spline on $SE(3)$ with control
-points $c_k$; the trajectory $T(t) = \prod_k \exp(\lambda_k(t)\,\Omega_k)$ is a
-*function of time*. A sliding window of control points is optimised by NLLS.
+**Internal representation.** A single `NavState` (pose, velocity, biases,
+gravity) propagated at IMU rate, plus a voxel-hash local map of past sweeps.
+Each `ingest` solves one Gauss-Newton point-to-point ICP for the sweep-end pose,
+regularised toward the IMU-propagated prediction (spec 04).
 
 **Filling the contract — the differences are all internal:**
 
-| `IFrontEnd` element | CT realisation (all inside the per-sweep `ingest(group)`) |
+| `IFrontEnd` element | LIO realisation (all inside the per-sweep `ingest(group)`) |
 |---|---|
-| group's `imu` set | IMU residual = spline's analytic acceleration/angular-rate at each sample's $t$ vs. measurement; adds a factor on nearby $c_k$ |
-| group's `scan` | **no separate deskew step** — each point at time $t_i$ is registered using $T(t_i)$ directly (continuous-time deskew is implicit; the bundled `deskewed` scan is consumed only while `cold_start`); point-to-plane residual on the $c_k$ |
-| group's `image` | photometric residual evaluated at $T(\text{mid-exposure})$ |
-| `live_state()` | evaluate the spline + its derivative at "now" → `NavState` (velocity from the analytic derivative) |
-| keyframe `T_ref_body` | **evaluate the spline** $T(\text{stamp})$ at the keyframe instant |
-| keyframe `constraint_cov` | marginal of the relevant $c_k$ mapped to the 6-DoF relative pose between keyframes |
-| `observability` | conditioning of the windowed NLLS Hessian projected to the keyframe pose block |
-| `cloud_body` | points warped to the body frame at `stamp` via $T(t_i)^{-1}T(\text{stamp})$ |
-| `kinematics_included` | `false` normally (same contract) |
+| group's `imu` set | dead-reckoning propagation across the sweep; interval-averaged angular rate + acceleration variance feed the deskew screw and the adaptive gravity regulariser |
+| group's `scan` | constant-screw deskew to the sweep end, voxel downsample to keypoints, GN point-to-point ICP against the voxel-hash map |
+| group's `image` | retained as the latest frame; rides the next `KeyframePacket` as passthrough (no photometric residual) |
+| `live_state()` | the IMU-rate propagated state, rebased onto each solved pose |
+| keyframe `T_ref_body` | the converged GN pose at the sweep-end stamp |
+| keyframe `constraint_cov` | per-scan Laplace covariance of the GN solve, transported and composed over the interval since the previous keyframe |
+| `observability` | per-axis conditioning of the GN data Hessian in the body frame |
+| `cloud_body` | the deskewed sweep, body frame at `stamp`, retained Shared-immutable |
+| `kinematics_included` | `false` always (same contract) |
 
 **The punchline.** The only thing the back-end ever sees is a `KeyframePacket`
-with a `RelativeBetween` constraint (or, rarely, an `ImuPreintegration` restart
-factor). Whether the pose came from evaluating the CT spline or from iterating a
-Kalman gain is invisible to L3–L6 — which is what let the iEKF oracle validate
-the CT front-end on the same bags with **zero** changes downstream.
+with a `RelativeBetween` constraint (or, rarely, an `AbsolutePrior` re-anchor).
+Whether the pose came from a discrete GN solve or from iterating a Kalman gain
+is invisible to L3–L6 — which is what lets front-ends be replaced with **zero**
+changes downstream.
 
 ---
 
@@ -1132,7 +1133,7 @@ the CT front-end on the same bags with **zero** changes downstream.
 | Edge | Producer | Consumer | **The one value** | Ownership | Thread |
 |---|---|---|---|---|---|
 | L0→L1 | `ISensorSource` | `IPreprocessor` | one raw `ImuSample` / `LidarScan` / `CameraFrame` / `GnssFix` | moved (Value) / Shared-immut. buffers | source thread [TS] |
-| L1→L2 | L1 aggregator (pipeline) | `IFrontEnd` | `PreprocessedGroup` (one sweep + spanning IMU/image/GNSS + cold-start deskew) | Value + Shared-immut. points | front-end |
+| L1→L2 | L1 aggregator (pipeline) | `IFrontEnd` | `PreprocessedGroup` (one sweep + spanning IMU/image/GNSS) | Value + Shared-immut. points | front-end |
 | **L2→L3** | **`IFrontEnd`** | **`IBackEnd`** | **`KeyframePacket`** (§6) | **moved; clouds Shared-immut.** | **front-end→back-end [TS]** |
 | L2→(live) | `IFrontEnd` | L4 live / L6 / debug | `NavState` (odom frame) | Value | front-end |
 | L3→L4 | `IBackEnd` | `IMapLayer` | `GraphUpdate` (who moved) | Value | back-end→map [TS] |
@@ -1144,7 +1145,7 @@ the CT front-end on the same bags with **zero** changes downstream.
 The **bold row is MUST-FIX #1**: one type, one direction, self-contained, with
 the information-accounting discipline of MUST-FIX #3 baked into its
 `constraint_kind` enum, the de-integration data (clouds) of MUST-FIX #4 baked
-into its `cloud_body` handle, and the deskew bootstrap of MUST-FIX #2 hidden
+into its `cloud_body` handle, and the internal deskew of MUST-FIX #2 hidden
 behind `IFrontEnd::ingest` so the packet type is bootstrap-agnostic.
 
 ---
@@ -1161,13 +1162,12 @@ Concrete trace of one keyframe, to make the contracts tangible.
 2. `ILidarPreprocessor::process` filters and decimates, returning a smaller
    `LidarScan`. The L1 aggregator (spec 02 §8) bundles it with the IMU spanning
    the sweep (and any image/GNSS in the interval) into a `MeasureGroup`; the
-   pipeline wraps it as a `PreprocessedGroup` with the cold-start deskew product.
+   pipeline wraps it as a `PreprocessedGroup` and forwards it immediately.
 
-3. `IFrontEnd::ingest(group)`. The CT front-end registers each LiDAR point at its
-   true timestamp $t_i$ against the L4 voxel map (`query_plane`) using $T(t_i)$
-   (continuous-time deskew is implicit), adds the sparse-direct photometric,
-   IMU-derivative and GNSS residuals to the overlapping control points, and runs
-   the sliding-window solve. Live `NavState` (from the spline + its derivative) is
+3. `IFrontEnd::ingest(group)`. The LIO front-end propagates across the sweep on
+   the group's IMU, deskews each point to the sweep end with the constant-screw
+   model, downsamples to keypoints, and runs the Gauss-Newton ICP against its
+   voxel-hash local map. Live `NavState` (the rebased IMU-rate propagation) is
    published on `odom`. The front-end decides this sweep is a keyframe
    (translation since last KF > 0.5 m).
 
@@ -1202,7 +1202,7 @@ Concrete trace of one keyframe, to make the contracts tangible.
 9. `IMeshExtractor::extract` re-meshes the dirty blocks → updated `ColorMesh` for
    the operator (L6), with `confidence` low where `observability.tz` was weak.
 
-At no point did L3–L6 know whether L2 was an iEKF or a CT estimator. That is the
+At no point did L3–L6 know whether L2 was an iEKF or a discrete LIO. That is the
 contract working.
 
 ---
@@ -1253,26 +1253,22 @@ struct MeasureGroup {
   std::vector<GnssFix>       gnss;          // fixes in the interval (usually 0 or 1)
 };
 
-// PreprocessedGroup — the L1→L2 currency: the assembled MeasureGroup plus the
-// pipeline's cold-start deskew product. `deskewed` is the IMU-only deskewed sweep
-// (points in the body frame at t_end), absent until the IMU bootstrap converges;
-// `cold_start` stays true until the front-end's own trajectory has taken over
-// deskew. The front-end ingests one PreprocessedGroup per sweep (§7.3).
+// PreprocessedGroup — the L1→L2 currency: the assembled MeasureGroup. A wrapper
+// rather than the group itself so future L1 products can ride along without an
+// IFrontEnd signature change. The front-end ingests one PreprocessedGroup per
+// sweep (§7.3); the scan inside is raw (undeskewed, time-sorted).
 struct PreprocessedGroup {
-  MeasureGroup             group;
-  std::optional<LidarScan> deskewed;
-  bool                     cold_start = true;
+  MeasureGroup group;
 };
 
 struct FrontEndDiagnostics {
   double  scan_time_ms, solve_time_ms, deskew_time_ms;   // per-stage timing
-  int     effective_points;                              // points that found a plane
+  int     effective_points;                              // points that found a correspondence
   double  mean_residual, final_residual;
   ObservabilityReport observability;
   int     iterations, outer_iters;        // solver iterations / re-association passes
   bool    restarted;                      // restart flag (MUST-FIX #2)
   bool    deadline_hit;                   // wall-clock solve cut off early (always false on deterministic replay)
-  int     knots_marginalized, prior_residual_dim;   // sliding-window prior health
 };
 struct BackEndDiagnostics { int num_keyframes, num_loops; double isam_update_ms; bool last_optimize_diverged; };
 struct MapDiagnostics     { std::size_t num_voxels, num_blocks; double integrate_ms, mesh_ms; };
@@ -1288,6 +1284,6 @@ points, residuals, observability, restart flags).
 
 ---
 
-*End of spec 01. Next: `specs/04_frontend_estimation.md` (the CT B-spline LIVO+GNSS
-formulation — deskew-by-spline bootstrap, residuals and Jacobians) consumes the
-types defined here.*
+*End of spec 01. Next: `specs/04_frontend_estimation.md` (the discrete LIO
+formulation — internal screw deskew, the GN system, the covariance chain)
+consumes the types defined here.*

@@ -13,8 +13,8 @@
 > mirrored into `01`.
 >
 > **System framing (supersedes any earlier phased plan).** Meridian is **one
-> complete system** — a continuous-time, tightly-coupled LiDAR-Inertial-Visual-
-> GNSS estimator feeding an iSAM2 back-end and a **GPU nvblox** map. There is no
+> complete system** — a discrete, tightly-coupled LiDAR-Inertial estimator
+> feeding an iSAM2 back-end and a **GPU nvblox** map. There is no
 > "ship a simpler map first" milestone and no v1/v2 split anywhere in L4. The
 > deployment target is an **NVIDIA Jetson Orin with a CUDA GPU always present**;
 > the surface map is **nvblox, GPU-only, with no CPU fallback path** (spec 00 §0,
@@ -232,7 +232,7 @@ per-voxel plane cache so the common query is O(1) and never touches raw points.
 > **Single LiDAR.** Tier R indexes one LiDAR's deskewed points; there is no
 > per-sensor residual stream and no merge-of-N-LiDARs. A second LiDAR, if ever
 > added, would attach behind the same `ISensorSource`/extrinsic machinery as one
-> more measurement stream into the CT window (spec 00 §12) — a future extension,
+> more measurement stream into the front-end (spec 00 §12) — a future extension,
 > not a current contract.
 
 ### 3.2 Data structure

@@ -18,12 +18,12 @@
 > a boundary type. Two genuinely useful additions to `01` are surfaced as
 > **[PROPOSE-TO-01]** for the human to decide.
 >
-> **One system, no phasing.** Meridian is one complete system: a continuous-time (CT),
-> tightly-coupled LiDAR-Inertial-Visual-GNSS estimator (`00` §0). L5 is a permanent
+> **One system, no phasing.** Meridian is one complete system: a discrete,
+> tightly-coupled LiDAR-Inertial estimator (`00` §0). L5 is a permanent
 > part of that system, not a "later phase." There is no "v1 without loops, v2 with
 > loops" rollout: the cascade below is the design from the start. The only
 > bring-up note is module *integration order* — L5 compiles and links against the
-> stable `01` boundary types, so it can be built and unit-tested before the CT
+> stable `01` boundary types, so it can be built and unit-tested before the
 > front-end is fully tuned — but that is a build convenience, not a product
 > milestone.
 >
@@ -132,7 +132,7 @@ that a pure radius-search proximity detector cannot survive (`Appendix R.6`).
 ## 2. Position in the system: data flow and threading
 
 ```
-        L2 CT LIVO+GNSS front-end                         L4 nvblox map
+        L2 LIO front-end                                  L4 nvblox map
             │ KeyframePacket                               (GPU TSDF + colour
             ▼                                               + Marching-Cubes mesh)
    ┌──────────────────────┐                                      ▲
@@ -595,8 +595,8 @@ returns the linearised Hessian $\mathbf H$ at convergence, which §9.2 turns int
 the loop covariance (`Appendix R.3`). PCL GICP and libpointmatcher were
 considered and rejected for dragging the full PCL registration stack / being
 slower (`11` §10 rejected-alternatives table). L5 builds the target's spatial
-index with `small_gicp`'s bundled nanoflann KD-tree; the vendored ikd-Tree is the
-registration *oracle* for the front-end map (`11` §3, spec 06), not Stage C's
+index with `small_gicp`'s bundled nanoflann KD-tree; the front-end's own
+voxel-hash map (`11` §1, spec 06) is unrelated to Stage C's
 index.
 
 ### 7.2 GICP cost
@@ -1227,7 +1227,7 @@ belong to the back-end / map specs, not L5.)
 | 13.8 | **Descriptor DB growth** | memory on long missions | SC images + ring keys are tiny (~5 KB/kf); BTC keypoints+binary codes bounded by `std_max_keypoints` (the binary code is a few bytes/keypoint); clouds live in `KeyframeStore` (its eviction/disk-spill policy applies — L5 holds only ids/descriptors). **Submaps and per-keypoint plane/triangle clouds are recomputed on demand from the store, not cached for the mission**: the submap LRU (`lc.submap_cache`) and surfel side-table hold only a small working set and are recompute-on-miss, so memory is bounded by the working set, not the trajectory length. A speculative long-lived LRU triangle/plane-cloud cache is **not** the default; it is available only as a very-long-mission tuning option when recomputation is measured to cost detection latency. |
 | 13.9 | **Wrong loop already admitted** (slipped PCM) | global map kink | the §9.3 series down-weights then removes it post-admission — committed Huber absorbs a borderline residual, off-thread batch GNC drives a confirmed outlier's weight → 0 and removes the factor (9.3/9.4); a periodic PCM re-audit can flag it (operator-visible, §14). |
 | 13.10 | **First session, no loops yet** | PCM 1-node clique would be a free pass | The single-loop **odometry-consistency self-test** (§8.2.1) filters a lone loop against the chained corrected-odom covariance *before* max-clique, so the very first loop is gated even with no trusted set; §7 GICP gates remain the geometric filter, and the cross-loop max-clique power still grows with loop count. |
-| 13.11 | **Front-end window restart** (`01` §6.4 / MUST-FIX #2) | a keyframe whose constraint is `ImuPreintegration`, not relative | L5 is unaffected: it keys on `id` and reads geometry from the store; PCM's odometry composites use whatever the back-end's `corrected_trajectory()` exposes across the restart, so consistency tests still close. |
+| 13.11 | **Front-end reseed** (`01` §6.4 / MUST-FIX #2) | a keyframe whose constraint is `AbsolutePrior` (chain break), not relative | L5 is unaffected: it keys on `id` and reads geometry from the store; PCM's odometry composites use whatever the back-end's `corrected_trajectory()` exposes across the restart, so consistency tests still close. |
 
 ---
 
@@ -1345,7 +1345,7 @@ single-thread mode (`00` §11.2) for reproducibility.
 - `06_mapping.md` — L4 nvblox map, retained-cloud store, clear-and-rebuild
   re-integration (executor side of §10).
 - `11_build_system_libraries.md` — library canon: small_gicp for the L5 GICP
-  verify (§3), vendored ikd-Tree as the registration oracle, scancontext vendored.
+  verify (§3), scancontext vendored.
 - **Appendix R** (this spec) — non-normative SOTA reference grounding: SC/SC++
   equation+defaults digest (R.1), STD/BTC/iBTC repo pointers (R.2), GICP +
   `small_gicp` verified-API block (R.3), PCM + Kimera-RPGO repo pointers (R.4),
@@ -1372,9 +1372,9 @@ single-thread mode (`00` §11.2) for reproducibility.
 - Body→world point placement (for descriptors/markers + the L4 rebuild):
   `pointBodyToWorld` — `FAST_LIO/src/laserMapping.cpp:178` ($R(R_{LI}p+t_{LI})+t$).
   Reused in §3.1, §10.2.
-- ikd-Tree incremental insert/delete/re-balance (the vendored registration oracle,
-  not Stage C's index): paper `papers/2102.10808.txt`; impl
-  `include/ikd-Tree/ikd_Tree.{h,cpp}`.
+- Reference incremental-map insert/delete/re-balance (the behaviour spec 06's
+  Tier R keeps, not Stage C's index): paper `papers/2102.10808.txt`; impl
+  `FAST_LIO/include/ikd-Tree/ikd_Tree.{h,cpp}`.
 
 > **Grounding caveat (header, restated):** the FAST-LIO2 (`papers/2107.06829.txt`,
 > l.1221) and FAST-LIVO2 (`papers/2408.14035.txt`, l.1103) texts contain **no**

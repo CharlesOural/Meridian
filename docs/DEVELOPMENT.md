@@ -44,7 +44,7 @@ distrobox enter meridian
 Then, one-time workspace bring-up from the repo root:
 
 ```bash
-git submodule update --init          # vendor/ (basalt, ikd-Tree, scancontext)
+git submodule update --init          # vendor/ (scancontext)
 vcs import src < dependencies.repos              # nvblox (GPU)
 rosdep install --from-paths src --ignore-src -y
 CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install \
@@ -92,14 +92,14 @@ docker compose exec meridian bash
 One-time workspace bring-up:
 
 ```bash
-git submodule update --init                 # vendor/ (basalt, ikd-Tree, scancontext)
+git submodule update --init                 # vendor/ (scancontext)
 # do NOT `vcs import` nvblox — it needs CUDA.
 CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install --parallel-workers 1
 colcon test --parallel-workers 1 && colcon test-result --verbose
 ```
 
 This builds and unit-tests every **CPU algorithm layer** in isolation — L0
-sensors, L1 preprocessing, and **L2 the CT front-end** (plus the cross-cutting
+sensors, L1 preprocessing, and **L2 the LIO front-end** (plus the cross-cutting
 packages). The skip list covers `meridian_map` (L4, CUDA-only) and the
 integration/ROS packages; integrated pipeline runs and bag replay happen on the
 Linux/GPU box. (colcon just warns about skip names not yet in the tree.)

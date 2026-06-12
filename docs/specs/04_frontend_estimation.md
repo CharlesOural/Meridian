@@ -1,1851 +1,523 @@
-# 04 — L2 Front-End: Continuous-Time Tightly-Coupled LiDAR-Inertial-Visual-GNSS Estimator
+# 04 — L2 Front-End: Discrete LiDAR-Inertial Odometry
 
-> **Spec status:** normative for the L2 layer. This document specifies **the
-> Meridian front-end**: a real-time, fixed-lag, **continuous-time (CT)** estimator
-> that represents the sensor trajectory as a **split SO(3)×ℝ³ cubic B-spline** and
-> fuses, in **one** sliding-window non-linear least-squares solve, a **single
-> LiDAR** (direct point-to-plane at each point's true time), an **IMU**
-> (derivative residual on the spline), a **camera** (FAST-LIVO2-style sparse-direct
-> photometric, LiDAR-depth, exposure-compensated), and **GNSS** (conservative
-> absolute position). It distills that trajectory into a stream of
-> **`KeyframePacket`** for the back-end (L3). It implements the `IFrontEnd`
-> interface declared in spec 01 §7.3 and obeys the boundary, ownership, and
-> threading contracts fixed there.
->
-> **This IS the design — one complete system.** No "v1 filter we ship first", no
-> phased feature rollout. (A FAST-LIO2-style iEKF once existed as an offline
-> differential-test oracle; it is **removed**. CT's cross-check is direct
-> ground-truth tracking, §5.6.)
+> **Spec status:** normative for the L2 layer, and written **from the implemented
+> system**: `meridian::lio::LioFrontEnd` (`src/meridian_frontend/src/lio/`). This
+> document is the contract for what the front-end does; where prose and code ever
+> disagree, fix one of them — do not let them drift.
 >
 > **It implements, it does not redefine.** The boundary value types
-> (`KeyframePacket`, `NavState`, `ObservabilityReport`, `LidarScan`,
-> `CameraFrame`, `ImuSample`, `GnssFix`, `CalibrationSet`, `FrontEndDiagnostics`)
-> and the `IFrontEnd` interface are **canonically defined in spec 01** and **must
-> not** be redefined here. Structs/signatures shown here are *quotations* for the
-> reader's convenience; if the two ever disagree, **spec 01 wins** and this
-> document is the bug. New fields require amending spec 01 first (spec 01 §1,
-> R-rule).
+> (`KeyframePacket`, `NavState`, `ObservabilityReport`, `LidarScan`, `ImuSample`,
+> `CalibrationSet`, `FrontEndDiagnostics`, `PreprocessedGroup`) and the
+> `IFrontEnd` interface are canonically defined in **spec 01** and must not be
+> redefined here; structs shown here are quotations. If the two disagree, spec 01
+> wins and this document is the bug.
 >
-> **Resolved defaults (system direction).** Deployment target **NVIDIA Jetson
-> Orin (CUDA always present)**; ROS 2 **Humble**; C++20. **Estimation frame is
-> `imu_link`** ($F_e$); operator-facing poses are re-expressed to `base_link` at
-> the ROS edge, not here. **One LiDAR + one IMU + one camera + GNSS.** L2→L3 in the
-> steady state is a **single relative `BetweenFactor`** carrying the front-end
-> marginal covariance; velocity/biases are seeds/telemetry only
-> (`kinematics_included = false`); a GTSAM `CombinedImuFactor` is emitted **only**
-> on the window-restart fallback (mutually exclusive with the between). **Bias
-> estimation lives in L2.** Online extrinsic refinement is **on by default**
-> (gated by observability). Scope **stops at the colourised mesh** (ESDF/semantics
-> are deferred hooks elsewhere).
+> **Scope of the estimator.** L2 is a **discrete LiDAR-inertial odometry**: one
+> LiDAR + one IMU, sweep-at-a-time. Camera frames pass through to the
+> `KeyframePacket` untouched (no visual residual); GNSS is not consumed by L2.
+> The L0/L1 plumbing for both stays in place (spec 02/03) so re-adding them is a
+> spec-04 extension, not a re-architecture.
 >
-> **Cross-refs.** Spec 00 (architecture: `IFrontEnd` seam, deskew feedback edge §7,
-> threading §11, debug telemetry §10), spec 01 (all boundary types; tangent
-> ordering `[ρ(trans); φ(rot)]`, spec 01 §3.1; `KeyframePacket` §6; `IFrontEnd`
-> §7.3), spec 02 (L0 time sync / PTP), spec 03 (L1 preprocessing;
-> `ILidarPreprocessor`; deskew is *not* done in L1), spec 05 (L3 back-end: how
-> `constraint_kind` becomes a factor), spec 06 (L4 nvblox GPU map /
-> `IKeyframeStore` / clear-and-rebuild de-integration), spec 07 (L5 place
-> recognition consumes the retained clouds).
->
-> **Grounding.** The normative design above stands on its own. Non-normative
-> reference grounding — curated equation↔`file:line` maps and parameter tables for
-> the SOTA systems this spec was validated against (CT spline math from
-> CLINS/Coco-LIC/basalt; the LiDAR map's ikd-Tree internals; FAST-LIVO2's
-> photometric residual; FAST-LIO's IMU model/deskew and manifold/ESIKF) — is
-> collected in **Appendix R**. The reference clones live in
-> `/home/user/slam-reference`. Read the real files before quoting a line; do not
-> trust memory.
+> **Provenance.** The registration/IMU-prior algorithm is derived from **rko_lio**
+> (M.V.R. Malladi et al., MIT-licensed); the implementation is an internal
+> rewrite onto Meridian types, conventions, and determinism rules. This note is
+> the one place that lineage is recorded — never in code comments.
 
 ---
 
 ## Table of contents
 
-0. [Scope and module bring-up order](#0-scope-and-module-bring-up-order)
-1. [State: the split SO(3)×ℝ³ spline, biases, nuisances; frames; notation](#1-state-the-split-so3r3-spline-biases-nuisances-frames-notation)
-2. [L1↔L2 handoff and the deskew-by-spline feedback edge](#2-l1l2-handoff-and-the-deskew-by-spline-feedback-edge)
-3. [The CT residual set on control points](#3-the-ct-residual-set-on-control-points)
-4. [Per-axis observability / degeneracy extraction](#4-per-axis-observability--degeneracy-extraction)
-5. [The sliding-window solve, marginalization, and adaptive knots](#5-the-sliding-window-solve-marginalization-and-adaptive-knots)
-6. [The KeyframePacket L2 emits](#6-the-keyframepacket-l2-emits)
-7. [`IFrontEnd`, threading, and back-end feedback](#7-ifrontend-threading-and-back-end-feedback)
-8. [Debug, introspection, timing](#8-debug-introspection-timing)
-9. [Parameters](#9-parameters)
-10. [Failure modes & mitigations](#10-failure-modes--mitigations)
-11. [Library choices and what was rejected](#11-library-choices-and-what-was-rejected)
-12. [Consistency checklist](#12-consistency-checklist)
-13. [Appendix R — SOTA reference grounding (non-normative)](#appendix-r--sota-reference-grounding-non-normative)
+0. [Scope and dataflow](#0-scope-and-dataflow)
+1. [State and frames](#1-state-and-frames)
+2. [L1→L2 handoff](#2-l1l2-handoff)
+3. [Internal constant-screw deskew](#3-internal-constant-screw-deskew)
+4. [The IMU tracker](#4-the-imu-tracker)
+5. [The local voxel map](#5-the-local-voxel-map)
+6. [Registration: Gauss-Newton + adaptive gravity regularizer](#6-registration-gauss-newton--adaptive-gravity-regularizer)
+7. [The covariance chain (rung 0)](#7-the-covariance-chain-rung-0)
+8. [Per-axis observability](#8-per-axis-observability)
+9. [Keyframe cadence and KeyframePacket emission](#9-keyframe-cadence-and-keyframepacket-emission)
+10. [Failure and reseed semantics](#10-failure-and-reseed-semantics)
+11. [Determinism guarantees](#11-determinism-guarantees)
+12. [Threading](#12-threading)
+13. [Telemetry surface](#13-telemetry-surface)
+14. [Parameters](#14-parameters)
+15. [Failure modes](#15-failure-modes)
+16. [Known limitations](#16-known-limitations)
 
 ---
 
-## 0. Scope and module bring-up order
+## 0. Scope and dataflow
 
-L2 is the real-time trajectory estimator. Its inputs are the four ingest streams
-of `IFrontEnd` (spec 01 §7.3: `ImuSample`, `LidarScan`, `CameraFrame`,
-`GnssFix`); its outputs are the live `NavState` (spec 01 §3.2, sideways, for
-telemetry/control/L4 live integration) and the `KeyframePacket` stream (spec 01
-§6, the **only** thing handed to L3). One concrete class — `CtFrontEnd` —
-implements `IFrontEnd`; the seam exists for clean modularity and future
-estimators, not for a phased rollout.
-
-Module compile/integration order (not a phased plan — the **delivered front-end
-is the whole of §1–§6**; each step is bisectable and unit-testable):
-
-1. **Spline kernel + IMU residual** — split SO(3)×ℝ³ basalt spline (§1.2),
-   analytic derivatives (§1.3), IMU derivative residual + bias random-walk
-   (§3.3), Ceres problem skeleton (§5). Bring-up checkpoint only (inertial
-   dead-reckoner).
-2. **LiDAR point-to-plane** — the direct, deskew-free LiDAR residual (§3.1). LIO.
-3. **Sparse-direct visual** — FAST-LIVO2 photometric residual with LiDAR depth
-   and exposure compensation (§3.2). LIVO.
-4. **GNSS + marginalization + observability** — conservative GNSS residual
-   (§3.4), Schur-complement marginalization (§5.4), per-axis observability (§4).
-
----
-
-## 1. State: the split SO(3)×ℝ³ spline, biases, nuisances; frames; notation
-
-### 1.1 Frames
-
-L2 uses the canonical frames of spec 01 §2.2 (REP-105 aligned). Repeated for
-self-containment; spec 01 is authoritative.
-
-| Symbol | `Frame` (spec 01) | Meaning |
-|---|---|---|
-| $W$ | `Odom` | **L2 odometry world frame** — smooth, drift-prone, continuous; gravity-aligned; origin = first keyframe. **L2 owns `odom`** (spec 01 §2.2). |
-| $M$ | `Map` | Global back-end frame. **L3 owns `map`** and the `odom→map` relation; L2 never writes `map`. |
-| $G$ | (ENU datum) | GNSS local ENU; the LLA→ENU datum is an L3/system decision (spec 01 §4.4). L2 holds the latest $T_{MW}$/datum snapshot read-only. |
-| $F_e$ | `ImuLink` | **Estimation frame** — the body frame whose trajectory the spline represents (spec 01 §2.3; resolved default). The spline *is* $T_{W\,F_e}(t)$. |
-| $L$ | `OsSensor0` | The (single) LiDAR sensor frame. |
-| $C$ | `CamLink` | Camera optical frame. |
-| $B$ | `BaseLink` | Operator-facing body frame; poses are re-expressed to $B$ at the ROS edge, not inside L2. |
-
-A transform $T_{A\,B}\in SE(3)$ maps a point in $B$ to $A$: $p_A=T_{A\,B}\,p_B$
-(spec 01 §2.2). The **`KeyframePacket` pose is always $T_{\text{ref}\,F_e}$**
-(spec 01 §2.3, §6.2): the estimation-frame pose in a named `ref` frame. Extrinsics
-$T_{F_e\,L},\,T_{F_e\,C}$, the GNSS antenna lever-arm $t_{F_e,\text{ant}}$, and IMU
-noise densities live in the shared `CalibrationSet` (spec 01 §5.3) — **never** in
-the spline state; that keeps the trajectory dimension fixed regardless of online
-extrinsic refinement.
-
-> **Single LiDAR.** Meridian estimates one LiDAR + one IMU + one camera + GNSS. There
-> is no multi-LiDAR merge, no per-sensor residual stream, no dome-Ouster special
-> case. (A second LiDAR would be a future extension behind the same
-> `CalibrationSet`/residual interfaces — an extra extrinsic and an extra point
-> stream into the same §3.1 residual — and is not designed here.)
-
-### 1.2 The trajectory: a split SO(3)×ℝ³ cubic B-spline
-
-The trajectory is **one continuous function** $T_{W\,F_e}(t)\in SE(3)$, stored as
-a **split** cumulative cubic ($k=4$, degree 3, $C^2$) B-spline — a separate
-`So3Spline<4>` for rotation $R_{W\,F_e}(t)$ and a separate `RdSpline<3,4>` for
-translation $p_{W\,F_e}(t)$ — exactly basalt-headers' `Se3Spline` internals, which
-are themselves a split `So3Spline` + `RdSpline<3,N>`. The split representation is the
-consensus best choice (the literature finds split better than a unified SE(3) spline
-both in trajectory representation and in computation time; it is what CLINS and
-Coco-LIC ship): it is faster (no SE(3) adjoints in cross terms), avoids the
-screw-coupling of a unified SE(3) spline, and cleanly decouples the gyro residual (↔
-SO(3) spline) from the accel residual (↔ ℝ³ spline 2nd derivative). See Appendix R.1.
-
-For $t$ in knot segment $i$ (normalised time $u=u(t)\in[0,1)$), the value depends on
-exactly **four** local control points (the local support of a cubic):
-
-$$
-R_{W\,F_e}(t)=R_i\prod_{j=1}^{3}\mathrm{Exp}\!\big(\lambda_j(u)\,d^{R}_j\big),\quad
-d^{R}_j=\mathrm{Log}\!\big(R_{i+j-1}^{\top}R_{i+j}\big)\in\mathfrak{so}(3),
-$$
-$$
-p_{W\,F_e}(t)=p_i+\sum_{j=1}^{3}\lambda_j(u)\,d^{p}_j,\quad
-d^{p}_j=p_{i+j}-p_{i+j-1},
-$$
-
-with cumulative blending weights $\lambda(u)=\tilde M^{(4)}\,[1,u,u^2,u^3]^\top$ and
-the cubic cumulative matrix (the Kim/basalt convention; cross-check against basalt's
-`computeBlendingMatrix<4,...,true>`, Appendix R.1):
-
-$$
-\tilde M^{(4)}=\tfrac16\begin{bmatrix} 6&5&1&0\\ 0&3&3&0\\ 0&-3&3&0\\ 0&1&-2&1 \end{bmatrix},
-\qquad \lambda_0\equiv 1.
-$$
-
-Control points are non-uniformly spaced (adaptive knots, §5.5); the non-uniform
-behaviour is realised by **true non-uniform B-spline evaluation**: each knot interval
-carries its own blending matrix $M^{(4)}_i$ (and cumulative form $\tilde M^{(4)}_i$)
-computed by the symbolic Cox–de Boor recurrence from the six real knot times its four
-live bases depend on, cached per interval with knot-pointer lifetime. Every factor
-evaluates through the same expressions as the uniform case with the per-interval
-matrix substituted for the cardinal one and $1/\Delta t$ the interval's exact real
-span, so the trajectory is $C^2$ in **real** time across density changes and the
-analytic Jacobians remain closed-form. With adaptive density disabled no per-interval
-matrix code runs and evaluation is bit-identical to the uniform kernels. (The earlier
-virtual-time warp — uniform kernels over a piecewise-linear time remap, Coco-LIC's
-engineering pattern — is retained only as the disabled-mode degenerate case; it was
-$C^1$ in real time at density changes, which the IMU residual had to absorb.)
-
-> **Considered and rejected: the Point-LIO per-point-update model** (angular
-> velocity/acceleration as filter states, sparse Kalman update at every point's
-> true time). The CT spline already gives per-point true-time registration *plus*
-> analytic sub-scan poses for colourisation, native multi-sensor asynchrony, and
-> one joint Hessian over LiDAR + photometric residuals; a per-point EKF would
-> re-introduce a filter recursion and discard the smooth queryable trajectory the
-> colourised-mesh goal depends on (Appendix R.1).
-
-> **A control point is not an on-trajectory pose, and warm-start seeding must
-> account for it.** Because the blending is cumulative, the control point with grid
-> time $t_j$ dominates the curve roughly **one knot interval earlier**: at the start
-> of interval $i$ the spline evaluates to $\approx(C_i+4C_{i+1}+C_{i+2})/6$, so $C_j$
-> peaks in influence near $t_j-\Delta t$, not $t_j$. Consequently the IMU warm start
-> (step (1) of §5.1) does **not** set $C_j = T_{\text{seed}}(t_j)$ — that would
-> reproduce the seed trajectory shifted *late* by one interval. It seeds each new
-> control point from the seed trajectory sampled **one local knot interval back**,
-> $C_j\leftarrow T_{\text{seed}}(t_j-\Delta t_{\text{local}})$ (the ℝ³ seed may carry
-> a small $-\tfrac{\Delta t^2}{6}\ddot p$ second-order correction), so the warm-started
-> curve lands on the seed trajectory rather than a delayed copy of it. Knot seeding by
-> IMU integration is a property of the *curve*, never $C_j=T(t_j)$.
-
-### 1.3 Analytic derivatives (the reason for CT)
-
-Because the basis is polynomial in $u$, **angular velocity, velocity, and
-acceleration are closed-form** in the control points and basis derivatives
-($\dot\lambda=\tilde M\,\dot u/\Delta t$, $\ddot\lambda=\tilde M\,\ddot u/\Delta
-t^2$). From the SO(3) spline, the **body angular velocity** the
-gyro sees is $\omega_{W\,F_e}(t)=(R_{W\,F_e}^\top\dot R_{W\,F_e})^\vee$, computed by
-the $O(k)$ Sommer recurrence (`So3Spline::velocityBody`). From the ℝ³ spline,
-$\ddot p_{W\,F_e}(t)$ is the world linear acceleration (`RdSpline::evaluate<2>`).
-These feed the IMU residual (§3.3) with **no numerical differentiation** and give the
-**exact per-point deskew pose** $T_{W\,F_e}(t_{\text{offset}})$ for every LiDAR point
-(§2.3) — deskew *is* the trajectory, the central advantage over the
-piecewise-constant-$\omega$ backward-propagation of FAST-LIO (Appendix R.1, R.4).
-
-### 1.3.1 The data horizon: tail-knot pinning, re-seeding, and tail anchors
-
-Each cubic interval's value depends on exactly **four** local control points (the
-local support of a cubic, §1.2), so a spline extended to cover a new sweep ends with
-a run of control points that **no measurement reaches** — they lie past the newest
-measured time $t_{\text{end}}$. Their basis support over $[\,\cdot\,,t_{\text{end}}]$
-is zero (or, for the first such knot, near-zero), so the window cost is *flat* in
-them: left free they are an exact null space the solver fills with noise, and a
-poisoned seed at the tail can drag the supported knots through their coupling. The
-front-end handles this unmeasured span with three coordinated mechanisms; the
-overarching discipline is that the tail is governed by **knot index**, never by
-sampling the curve at times (§5.4).
-
-* **Tail-knot pinning.** Knots whose basis weight over all measured times is exactly
-  zero — deque index $\ge \text{interval}(t_{\text{end}})+4$ — are held constant
-  (`SetParameterBlockConstant`) at their IMU warm-start values for this solve. The
-  one near-zero-support knot at index $\text{interval}(t_{\text{end}})+3$ is also
-  pinned **when** its peak basis weight $u_{\text{end}}^3/6$ over the segment falls
-  below a small floor (`< 0.02`, i.e. the sweep ends just past a knot boundary so the
-  knot is effectively unconstrained); above that floor it carries enough support to
-  be left free. Pinned knots **unfreeze naturally** on a later sweep once real data
-  covers them.
-* **Tail re-seeding.** A pinned tail knot's stored value is pure extrapolation, so it
-  is **re-seeded each sweep** from the new IMU-integrated seed
-  (`SplineWindow::reseedFrom`, overwriting from the first stale tail index onward with
-  the same one-interval-back warm-start placement of §1.2) — the freshest IMU
-  prediction always supersedes the previous sweep's guess rather than letting a stale
-  tail persist.
-* **Tail anchors.** To tie the *velocity* and *body rate* of the unmeasured span to
-  the seed's constant extrapolation (the pinning removes the strict null directions;
-  the anchors hold the read-out where the seed carries model error such as an
-  unconverged bias), a **`VelocityAnchorResidual`** on the ℝ³-spline derivative
-  toward the seed's end velocity and a **`RateAnchorResidual`** on the SO(3)-spline
-  body rate toward the seed's end rate are added at a `window_dt/4` stride past
-  $t_{\text{end}}$, with $\sigma_{\text{vel}}=0.2$ m/s and $\sigma_{\text{rate}}=0.1$
-  rad/s — weak enough that any real measurement overrides them. The anchors **never
-  touch the marginalized knot**, so they never enter the marginalization prior (§5.4)
-  and cannot double-count past data.
-
-### 1.4 The non-trajectory state: biases, gravity, exposure
-
-Beyond the control points, the optimised state carries:
-
-* **IMU biases** $b_g,\,b_a\in\mathbb R^3$ — **bias estimation lives in L2**
-  (resolved default). Carried as a **sliding multi-knot bias timeline** (`BiasKnots`):
-  a per-knot $(b_g,b_a)$ pair at a coarse cadence `bias.knot_dt_ms` (default 500 ms),
-  the bias at an arbitrary time being the piecewise-linear interpolation between the
-  bracketing knots, tied by random-walk residuals between consecutive knots (§3.3;
-  Appendix R.1). The timeline is held in **deque storage** so the per-knot pointers
-  handed to Ceres and the marginalization prior stay valid as it grows and slides; it
-  **grows** with the trajectory (`extendTo` appends knots copying the last value) and
-  **slides** in lock-step with the spline (`dropOldest`, front-trim, in `slideWindow`,
-  §5.4). Both $b_g$ and $b_a$ are always free, held inside box bounds (§5.2). There
-  is **no separate velocity state** — velocity is $\dot p_{W\,F_e}(t)$, read from the
-  spline.
-* **Gravity** $g_W\in S^2$ — a 2-DoF direction of fixed magnitude $|g|=9.81$,
-  optionally refined once excitation is sufficient (§3.6). Fixing the magnitude on
-  $S^2$ avoids $|g|$ drift (the FAST-LIO rationale; Appendix R.5). Stored as a
-  **unit 3-vector held on the sphere by a Ceres `SphereManifold`** with the magnitude
-  kept out of the optimised state (so $|g_W|$ is exactly constant across solves, and
-  $g_W=|g|\,\hat g$); this is the same 2-DoF $S^2$ state as the CLINS/VINS
-  tangent-basis $g$-refinement, in the cleaner manifold form. Initialised
-  $g_W=-\,\overline{a_m}/\|\overline{a_m}\|\cdot 9.81$ from a short static start
-  (Appendix R.4).
-* **Inverse exposure** $\tau$ — the FAST-LIVO2 affine photometric nuisance
-  (`inv_expo_time`; Appendix R.3), **one scalar per camera frame in the window**,
-  optimised when `exposure_estimate_en` (§3.2). It is **not** a free per-frame
-  unknown: consecutive in-window exposures are tied by a **random-walk residual**
-  $r^{\tau}_k=\tau_k-\tau_{k-1}$ weighted by $\sigma_\tau^2\Delta t$
-  (`visual.inv_expo_cov`, default 1e-2 /s), so a frame with little photometric
-  evidence inherits its neighbour's exposure rather than floating, and a sudden
-  auto-exposure step is tracked rather than absorbed into the pose. The first
-  in-window exposure is anchored by a prior toward `inv_expo_prior` with std
-  `inv_expo_std` from the camera intrinsics (spec 01 §5.1; `inv_expo_std = 0` ⇒ that
-  frame's $\tau$ is held fixed at the prior). Each $\tau$ is **clamped strictly
-  positive** ($\tau\ge$ `visual.inv_expo_min`, default 1e-3) — a non-positive
-  inverse exposure is physically meaningless and would flip the sign of the
-  photometric residual — realised as a Ceres lower bound on the parameter.
-
-None of these cross the `IFrontEnd` boundary as live variables. At a keyframe
-instant the spline is **evaluated** to produce the `NavState`/`KeyframePacket` pose
-(spec 01 §6.2); biases/velocity are exported only as **seeds/telemetry**
-(`kinematics_included = false`, §6.4) on the normal path.
-
-### 1.5 Manifold operators & tangent ordering
-
-Right-invariant box-plus/box-minus (spec 01 §3.1; Appendix R.5): on $SO(3)$,
-$R\boxplus\theta=R\,\mathrm{Exp}(\theta)$, $R_1\boxminus R_2=\mathrm{Log}(R_2^{\top}R_1)$
-(Rodrigues `so3_math.h:Exp/Log`). Control-point increments use this on each
-$\{R_i\}$ via a Ceres SO(3) manifold/`LocalParameterization`; $\{p_i\}$, biases are
-Euclidean. **All 6-DoF tangents and 6×6 blocks in the core order translation-first
-then rotation** (`[ρ;φ]`, spec 01 §3.1) — with **one exception**: the
-`KeyframePacket.constraint_cov` block crossing L2→L3 is ordered **rotation-first**
-`[rx,ry,rz,tx,ty,tz]` to match the GTSAM `Pose3` boundary (spec 01 §6.1). The
-spline's native rotation Jacobians are rotation-first inside basalt; the packet
-adapter (§6) assembles `constraint_cov` by reordering the window's translation-first
-marginal into that rotation-first layout exactly once (the same reorder FAST-LIO does
-when packing its `pose.covariance`).
-
-### 1.6 The IMU kinematic model (the residual's reference equations)
-
-Continuous-time strapdown, in $W$, with measured specific force $a_m$ and rate
-$\omega_m$ (the strapdown INS model; Appendix R.4, `use-ikfom.hpp::get_f`):
-
-$$
-\dot R_{W\,F_e}=R_{W\,F_e}\,[\omega_m-b_g-n_g]_\times,\quad
-\dot p_{W\,F_e}=v_W,\quad
-\dot v_W=R_{W\,F_e}(a_m-b_a-n_a)+g_W,\quad
-\dot b_g=n_{bg},\ \dot b_a=n_{ba},\ \dot g_W=0.
-$$
-
-White noises $(n_g,n_a)$ and bias random walks $(n_{bg},n_{ba})$ have densities
-$(\sigma_g^2,\sigma_a^2,\sigma_{bg}^2,\sigma_{ba}^2)$ from the `CalibrationSet`
-(Allan-derived, spec 01 §5.3; for reference, FAST-LIO's `avia.yaml` defaults are
-0.1, 0.1, 1e-4, 1e-4 — Appendix R.4). In the CT estimator this ODE is **not
-integrated** — it is the equation the spline's analytic derivatives must satisfy,
-turned into the residual of §3.3.
-
----
-
-## 2. L1↔L2 handoff and the deskew-by-spline feedback edge
-
-### 2.1 What L1 hands up (spec 03)
-
-Per spec 01 §4 and spec 03, on the PTP grandmaster timeline (spec 02;
-`Timestamp = int64 ns`, spec 01 §2.1):
-
-* **LiDAR:** `LidarScan` (spec 01 §4.2) — `stamp_start`, `sweep_duration`,
-  `sensor_frame`, and a Shared-immutable `points` vector of
-  `LidarPoint{xyz (sensor frame, NOT deskewed), intensity, t_offset_ns (int32,
-  per-point time vs stamp_start), ring, range, …}`. L1 has already done
-  range/intensity gating, ring/voxel decimation (`ILidarPreprocessor::process`,
-  spec 03; FAST-LIO `point_filter_num`, `preprocess.cpp`) and NaN removal. **Deskew
-  is deliberately NOT done in L1** (spec 03 §7.2) — in a CT system deskew is not a
-  separate pass at all, see §2.3.
-* **Camera:** `CameraFrame` (spec 01 §4.3) — `stamp` (mid-exposure), Shared-immutable
-  `data`, `exposure_s`, `gain`. L1 builds the 3-level pyramid (FAST-LIVO2
-  `patch_pyrimid_level=3`; Appendix R.3).
-* **IMU:** raw `ImuSample{stamp, acc, gyro}` at full rate (spec 01 §4.1; no
-  orientation — Meridian never trusts a vendor AHRS).
-* **GNSS:** `GnssFix{stamp, lat/lon/alt, cov_enu, fix, num_sats}` (spec 01 §4.4),
-  gated by L1.
-
-### 2.2 Measurement intake (no merge-of-N)
-
-There is no `sync_packages`-style merge of multiple LiDARs. Intake is the per-sweep
-`PreprocessedGroup` (plus the `ingest_imu_live` low-latency tap), but inside the
-window every measurement keeps its own clock: the solve (§5) consumes each one
-**at its own `stamp`/`t_offset_ns`**; asynchrony is native to a CT spline (Appendix R.1) — IMU at 200–400 Hz,
-LiDAR points streaming across the sweep, camera at 10–30 Hz, GNSS at 1–10 Hz all
-evaluate the same $T_{W\,F_e}(\cdot)$ at different $t$. The only batching is the
-**outer optimisation cadence** (§5.1, ~0.1 s): when the spline has been extended to
-cover new measurements and enough new data has arrived, one window solve runs.
-
-> **Sweep gaps: bridged vs unbridgeable.** The steady-state seed integrates a group's
-> IMU forward from `last_solved_t_`, which is only valid when the IMU actually reaches
-> back that far. A gap is detected when a sweep opens more than half a sweep span past
-> `last_solved_t_`, and the response splits on whether the aggregator-supplied group
-> IMU **bridges** it: if the group's earliest IMU sample reaches `last_solved_t_`
-> within **2 IMU periods**, the seed integrates across the hole and the sweep is
-> **solved normally** (logged `frontend/sweep_gap_bridged`). If the IMU itself starts
-> after `last_solved_t_` — a genuine data hole the seed cannot span — the front-end
-> calls **`reseedAfterGap`**: it advances the live anchor across the hole on a
-> **constant-velocity** prediction, **rebuilds the window** (and the bias timeline)
-> from that anchor, and inserts the reseed sweep into the map **without solving**
-> (logged as a window reseed). The next sweep with continuous IMU solves normally
-> against the rebuilt window.
-
-> **Known-timing caveat.** A CT spline absorbs *known* timing;
-> it does **not** self-correct an unknown inter-sensor clock offset $t_d$ — it would
-> faithfully fit the wrong time and bake the offset into the trajectory. Meridian's
-> sensors are PTP-disciplined (spec 02), so per-sensor $t_d$ is nominally zero. The
-> spline supports adding $t_d$ as an optional optimised parameter (evaluate that
-> sensor's residual at $T(t+t_d)$, differentiable since $T(\cdot)$ is),
-> defaulting to fixed-zero post-calibration. This is an L2 hook, off by
-> default, owned with the rest of online calibration (spec 08). See Appendix R.1.
-
-### 2.3 Deskew is the trajectory; the cold-start feedback edge
-
-**The classic circularity** — deskew needs the trajectory over the sweep, but the
-trajectory is estimated from the deskewed sweep — **does not arise in steady
-state**, because there is no deskew pass: each LiDAR point's residual (§3.1) is
-evaluated at $T_{W\,F_e}(t_{\text{offset}})$, its own time, queried from the
-current spline. As the window solve iterates, every point is implicitly
-re-deskewed because the control points it hangs from move. Deskew is exact and
-free — it *is* the trajectory, with no separate motion-compensation pass (Appendix R.1).
-
-Architecturally L1 still transforms points only through an injected
-`IDeskewProvider::poseAt(Timestamp)→Pose` (spec 00 §5.2, §7.3) whose concrete
-implementation is **backed by the L2 spline**, so the build graph stays acyclic
-(L1 depends only on the interface) while data flows L2→L1→L2. **L2 owns the pose
-source.** Two regimes:
-
-* **STEADY (spline-backed).** `poseAt(t)` returns $T_{W\,F_e}(t)$ from spline
-  evaluation; any frame L1 needs to deskew for visualisation uses it. The estimator
-  itself never calls it — it consumes raw `t_offset_ns` directly in §3.1.
-
-* **COLD-START / RESTART (IMU-only).** Before the spline spans valid data (first
-  knots), or after a window restart (§10), there is no trajectory. `poseAt(t)` falls
-  back to **IMU-only forward integration** from the last known state (the FAST-LIO
-  `UndistortPcl` forward pass; Appendix R.4):
-  integrate the bias-corrected IMU over the sweep with constant-$\omega$/constant-
-  accel intra-interval, seed the first control points from it. Require a short
-  static start ≥ `init_time_s` to initialise gravity and gyro bias; a static start of
-  **~1.0 s** materially tightens that initialisation (FAST-LIO's `INIT_TIME=0.1 s`
-  default, Appendix R.4, is too short for the gravity/bias estimate Meridian seeds the
-  window from). **No keyframe is emitted while the window is
-  not yet initialised** (FAST-LIO `flg_EKF_inited` analogue; spec 00 §7.2). Once the
-  first full window has converged, the spline takes over the provider.
-
-**Deskew target frame.** Points are *not* re-baked into a single epoch (that is the
-discrete-time approximation we are replacing). Each point keeps its raw
-`t_offset_ns`; the **retained per-keyframe cloud** is rendered once at keyframe
-emission by evaluating the spline at each point's time into the keyframe
-estimation frame $F_{e,\text{stamp}}$ — a *true* per-point deskew (storage
-contract: §6.5).
-
-### 2.4 Contract summary
+Per sweep, in order, all synchronous inside `ingest()`:
 
 ```
-L1 ──(undeskewed LidarScan + ImuSample + CameraFrame + GnssFix)──▶ L2
-L1 ◀──(IDeskewProvider::poseAt, backed by L2 spline; IMU-only at cold start)── L2
-L2 ──(KeyframePacket)──▶ L3            (the only L2→L3 value, spec 01 §6)
-L3 ──(GraphUpdate / refined CalibrationSet snapshot)──▶ L2   (spec 01 §7.3, §5.3)
+PreprocessedGroup ──▶ gap check ──▶ feed group IMU to tracker ──▶ interval prior
+   ──▶ constant-screw deskew to sweep end ──▶ keypoint downsample
+   ──▶ GN registration against the voxel map (+ gravity regularizer)
+   ──▶ rebase tracker & live state on the solved pose
+   ──▶ map insert + range clip ──▶ relative-covariance accumulation
+   ──▶ observability ──▶ keyframe emission (cadence / chain rules)
+   ──▶ telemetry (body/scan, path sample, scalars)
 ```
 
-Deskew is **owned by L2** and is intrinsic to the spline; L1 publishes raw per-point
-times only. This is the documented break of the circular dependency (spec 00 §7).
+The only L2→L3 product is the `KeyframePacket` stream (spec 01 §6); the sideways
+products are `live_state()` (IMU-rate `NavState`) and `diagnostics()`. There is
+no sliding window, no carried prior, and no asynchronous worker: every sweep
+is solved to completion before `ingest()` returns.
 
----
+`makeFrontEnd` (`frontend_factory.cpp`) builds the implementation selected by
+`frontend.kind`; `lio` is the only kind. Packets carry `frontend_kind = 2`
+(`1` is the retired continuous-time front-end and must never reappear in new
+data; `0` was the even earlier iEKF oracle).
 
-## 3. The CT residual set on control points
+## 1. State and frames
 
-Every residual is a function of the spline $T_{W\,F_e}(t)$ evaluated at the
-measurement's own time $t$, plus biases/gravity/exposure. Its Jacobian w.r.t. the
-active control points is the **measurement Jacobian** (below) chained through the
-**spline Jacobian** $\partial T_{W\,F_e}(t)/\partial\delta c_{i+m}$ (basalt's
-analytic Jacobians; Appendix R.1). Each measurement touches only **4 control
-points per spline** ⇒ the window Hessian is **banded** ⇒ the solve is real-time
-(§5.2). For each residual: measurement model, residual, weight, code anchor.
+**Frames.** The estimation frame $F_e$ is `imu_link` (`Frame::ImuLink`);
+emitted body-frame quantities are tagged `Frame::Body`. The world frame is
+`Frame::Odom`, **gravity-aligned at static initialization**: world $+z$ is the
+measured up direction, the origin is the standstill pose, and yaw is zero by
+construction (§4.1). L2 owns `odom`; L3 owns `map` and the `odom→map` relation.
 
-### 3.1 LiDAR point-to-plane (direct, deskew-free)
+**State.** Three coupled estimates, all `NavState`-shaped
+(`[p, R, v, b_g, b_a, g]`, spec 01 §3.2):
 
-FAST-LIO2's *direct* registration adapted to CT (Coco-LIC's spline form of the same
-point-to-plane factor; Appendix R.1). No edge/planar feature extraction.
-
-**Per-point world transform at true time.** For LiDAR point $\mathbf p^{L}_j$ with
-offset $t_j$, evaluate the spline at $t_j$ and fold in the extrinsic
-$T_{F_e\,L}$ (from `CalibrationSet`):
-$$
-\mathbf p^{W}_j = R_{W\,F_e}(t_j)\big(R_{F_e\,L}\,\mathbf p^{L}_j + t_{F_e\,L}\big) + p_{W\,F_e}(t_j).
-$$
-Because every point uses its own $t_j$, this **is** the deskew (§2.3).
-
-**Association.** Query the map (spec 06; nvblox is the map backend, but the
-front-end's nearest-neighbour query for plane fitting uses a vendored **ikd-Tree**
-or adaptive voxel-hash over the recent point set — the role `ikdtree.Nearest_Search`
-plays in FAST-LIO; the ikd-Tree's internal contract is Appendix R.2) for
-`num_match_points = 5` neighbours. Reject if the farthest squared distance
-> `max_match_dist_sq = 5` m². Fit a plane $(\mathbf n, d)$, $\|\mathbf
-n\|=1$, by 5-point QR least-squares of $A\mathbf u=-\mathbf 1$ (FAST-LIO's
-`esti_plane`); reject unless **all 5** neighbours lie within `plane_thresh = 0.1` m
-of the plane.
-
-**Residual** (scalar signed point-to-plane distance):
-$$
-r^{\text{lid}}_j = \mathbf n^\top \mathbf p^{W}_j + d.
-$$
-
-**Measurement Jacobian w.r.t. the pose at $t_j$** (then chained through the
-spline). With $\mathbf q_j = R_{F_e\,L}\mathbf p^{L}_j + t_{F_e\,L}$:
-$$
-\frac{\partial r_j}{\partial \delta p_{W\,F_e}(t_j)} = \mathbf n^\top,\qquad
-\frac{\partial r_j}{\partial \delta R_{W\,F_e}(t_j)} = -\,\mathbf n^\top R_{W\,F_e}(t_j)\,[\mathbf q_j]_\times
-= \big([\mathbf q_j]_\times R_{W\,F_e}(t_j)^\top\mathbf n\big)^\top,
-$$
-the exact FAST-LIO measurement row ($C=R^\top n$, $A=[q]_\times C$). The extrinsic
-columns ($B=[\mathbf p^L_j]_\times R_{F_e\,L}^\top C$, $C$) feed the **online
-extrinsic variable** $T_{F_e\,L}$ when refinement is active (§3.6).
-
-**Robust weight.** FAST-LIO's range-aware acceptance $s=1-0.9\,|r_j|/\sqrt{\|\mathbf
-p^{L}_j\|}$, keep iff $s>0.9$, as the
-inlier gate, **plus** a robust kernel (Huber, GNC-able; spec 11 / GTSAM
-`noiseModel::Robust`) on the survivors so a few bad correspondences cannot dominate
-the NLLS.
-
-**Measurement covariance.** Range- and incidence-aware (improving on FAST-LIO's
-isotropic `LASER_POINT_COV=0.001`):
-$\sigma^2_{\text{lid}}(j)=\sigma_0^2+\sigma_r^2\|\mathbf p^{L}_j\|^2+\sigma_\theta^2(1-|\mathbf n^\top\hat{\mathbf r}_j|)$,
-$\hat{\mathbf r}_j$ the ray direction (grazing-incidence inflation).
-
-**Bounded factor count (deterministic cost, observability-preserving).** A dense
-sweep can pass thousands of inlier point-to-plane correspondences; admitting all of
-them makes the per-step Hessian-assembly cost and thus the solve latency
-data-dependent and unbounded — incompatible with the deadline-bounded solve (§5.2).
-The number of LiDAR residuals built per outer step is capped at
-`max_lidar_factors` (default 1500). When the inlier set exceeds the cap it is
-**subsampled by plane-normal stratification, never by uniform or spatial
-decimation**, because uniform decimation preferentially thins the rarest normals and
-silently collapses the very axis they constrain — exactly the weak axis the §4
-observability exists to protect:
-
-1. Bin survivors by their fitted plane normal $\mathbf n$ into a fixed set of normal
-   strata (the six axis-aligned hemispheres plus an "oblique" stratum;
-   `lidar_normal_strata`).
-2. Allocate the budget across strata by **equal-then-proportional** filling: first
-   guarantee each non-empty stratum a floor of `min_factors_per_normal` (default 50,
-   clamped to that stratum's population) so a sparsely-sampled axis is never starved;
-   distribute the remainder of the budget proportionally to stratum population.
-3. Within a stratum, pick points by a **deterministic stride over a stable
-   per-point key** (`t_offset_ns`, tie-broken by ring then range) and **rotate the
-   stride phase by outer-step index** so that over consecutive steps the full inlier
-   set is visited — a moving subset, never a frozen one, and identical on replay.
-
-A point whose normal lies along a §4 weak axis (eigenvalue $<\kappa_{\text{deg}}$)
-is **exempt from the cap entirely**: all such points are kept regardless of budget,
-so degeneracy mitigation never competes with the factor cap. The retained
-per-keyframe cloud (§6.5) is unaffected — the cap governs only the residuals built
-for the solve, not the stored cloud.
-
-### 3.2 Sparse-direct visual photometric (FAST-LIVO2)
-
-FAST-LIVO2's *sparse-direct* visual residual (Appendix R.3). No
-descriptors, no feature matching, **no triangulation** — the **LiDAR map points
-double as visual map points** (unified voxel hash), each carrying
-three-level $8\times8$ reference patches (`patch_size=8`, 3 pyramid levels) and the
-reference pose/exposure. Depth always comes from the LiDAR map, so there is no VIO
-initialisation problem.
-
-**Measurement model.** Project map point $\mathbf P^W$ into the current camera using
-the spline pose at the **image** stamp $t$ and the camera extrinsic
-$T_{C\,F_e}$ (from `CalibrationSet`):
-$\mathbf P^C = R_{C\,F_e}\big(R_{W\,F_e}(t)^\top(\mathbf P^W-p_{W\,F_e}(t))\big)+t_{C\,F_e}$,
-$\mathbf u=\pi(\mathbf P^C)$ (`world2cam`). The **patch photometric residual** for
-pixel offset $\Delta$, with the inverse-exposure affine model (Appendix R.3):
-$$
-r^{\text{vis}}_{\Delta} = \tau_{\text{cur}}\,I_{\text{cur}}(\mathbf u+\Delta) - \tau_{\text{ref}}\,P^{\text{warp}}[\Delta],
-$$
-$\tau$ the per-frame inverse exposure (state nuisance, §1.4), $P^{\text{warp}}$ the
-reference patch affine-warped into the current view.
-
-**Jacobian (photometric chain rule).** With image gradient $\nabla I=[I_u,I_v]$
-(central differences), $J_\pi=\partial\mathbf u/\partial\mathbf P^C$ (2×3,
-`computeProjectionJacobian`), $J_{\text{img}}=\tau_{\text{cur}}\,2^{-\text{level}}\nabla
-I$ (Appendix R.3):
-$$
-\frac{\partial r}{\partial\delta R_{W\,F_e}(t)} = J_{\text{img}}J_\pi\,R_{C\,F_e}\,[R_{W\,F_e}(t)^\top(\mathbf P^W-p_{W\,F_e}(t))]_\times,\qquad
-\frac{\partial r}{\partial\delta p_{W\,F_e}(t)} = -J_{\text{img}}J_\pi\,R_{C\,F_e}R_{W\,F_e}(t)^\top,
-$$
-chained through the spline as in §3 head. Exposure gets its own column
-($\partial r/\partial\tau_{\text{cur}}=I_{\text{cur}}$, the 7th column);
-the camera extrinsic $T_{C\,F_e}$ follows the same chain
-(online-refined, gated, §3.6).
-
-**Affine warp + LiDAR-plane prior.** Reference→current patches are affine-warped
-using the **LiDAR plane normal** as the patch depth model (homography form
-`getWarpMatrixAffineHomography`; Appendix R.3) — FAST-LIVO2's key improvement over
-constant-depth. The homography warp is **only valid once the point carries an
-initialised plane normal**: a freshly promoted map point whose normal has not yet
-been fitted (or whose plane fit was rejected, §3.1) is **excluded from the
-photometric residual** for that frame rather than warped against a guessed
-fronto-parallel plane — it is reconsidered next frame once a normal exists, so a
-bad-warp residual never enters the cost. Two further guards make the warp
-numerically safe:
-
-* **Degenerate-warp guard.** The $2\times2$ affine part $A$ of the warp is rejected
-  if it is near-singular or near-degenerate — $|\det A|$ outside
-  $[$`warp_det_min`$,$ `warp_det_max`$]$ (defaults 0.1 and 10.0) or condition number
-  above `warp_cond_max` (default 50) — which is exactly the **pure-rotation / grazing
-  / extreme-scale** regime where the LiDAR-plane homography blows up and would
-  produce a NaN-valued or wildly stretched warped patch. A point whose warp is
-  rejected is dropped for this frame (not fed an unwarped patch), so a degenerate
-  geometry silently *drops* a point instead of silently *corrupting* the solve.
-* **Normal-sign guard.** The plane normal is oriented toward the camera before the
-  warp is formed (flip $\mathbf n\to-\mathbf n$ if $\mathbf n^\top(\,\mathbf P^C\,)>0$
-  in the camera frame); a back-facing normal otherwise mirrors the patch and yields a
-  spurious low residual.
-
-`getBestSearchLevel` picks the pyramid level with a well-conditioned warp
-determinant; coarse-to-fine over the iterated solve widens the basin.
-
-**Candidate selection: one best per grid cell, fixed gate order.** Admitting every
-in-FOV map point would make the visual residual count and the selection outcome
-data- and order-dependent. The image is divided into a fixed cell grid
-(`visual.grid_cell_px`, default 32 px) and **at most one** map point is kept per
-cell — the single best-scoring candidate — capping the visual residual count at the
-number of cells and giving an even spatial spread (no clustering on one
-high-gradient corner). Each candidate is run through a **fixed, deterministic gate
-sequence**, and the *first* gate it fails ends its evaluation, so the accept/reject
-decision and the per-cell winner are a pure function of the input independent of
-iteration order:
-
-1. **grid occupancy** — the cell still has a free or worse-scoring slot;
-2. **depth-continuity** — patch does not straddle an occlusion edge (Δdepth > 0.5 m
-   rejected);
-3. **warp / level** — homography warp passes the degenerate-warp and normal-sign
-   guards above, and `getBestSearchLevel` yields a valid pyramid level;
-4. **NCC** — normalised cross-correlation against the reference patch ≥ `ncc_thre`
-   (`calculateNCC`);
-5. **SSD** — photometric sum-of-squared-difference below `outlier_threshold = 1000`;
-6. **robust kernel** — survivors enter the cost under the Huber/Cauchy kernel.
-
-The per-cell "best" score is the NCC (gate 4); ties broken by the larger image
-gradient then the smaller depth, both deterministic. Oblique-view patches (>60°
-view-angle change between reference and current) are dropped at gate 3.
-
-**Measurement covariance.** `img_point_cov` (FAST-LIVO2 `IMG_POINT_COV=100`;
-Appendix R.3) for the gate-6 survivors, inflated for high-gradient/low-texture
-patches.
-
-### 3.2.1 The active visual-point map: reference-patch lifecycle and bounded growth
-
-The visual map points are the LiDAR map points (shared voxel hash, §3.2 head), but
-each visual point additionally owns the **reference-patch state** the photometric
-residual reads: a small set of observations, each an $8\times8$ three-level patch
-plus the camera pose and exposure $\tau$ it was seen under, and the plane normal
-used for the warp. This state is L2-internal (never crosses the `IFrontEnd`
-boundary), RAII-owned (smart-pointer, no raw `new`/`delete` of `VisualPoint`/
-`Feature`, the sharp edge of Appendix R.3), and must be **bounded** — a multi-hour
-mission would otherwise leak both observation lists and the active point set
-without end.
-
-**Reference-patch lifecycle.** For each visual point:
-
-* **Add gate.** A new observation is appended only when it adds genuine parallax /
-  appearance information: the view direction differs from every existing observation
-  by at least `visual.ref_add_angle_deg` (default 10°) **or** the score improves on
-  the current best by `visual.ref_add_score` — otherwise the frame is used for the
-  residual but not stored, so near-duplicate views do not fill the list.
-* **Observation cap.** The list is capped at `visual.ref_obs_cap` (default 30). When
-  full, the **lowest-scoring** observation is evicted (min-score eviction), so the
-  cap retains the most informative spread rather than the most recent frames.
-* **Reference selection (medoid).** The patch actually warped into the current view
-  is the **medoid** observation — the one whose viewing direction is most central to
-  the retained set (minimises summed angular distance to the others), not simply the
-  first or newest. The medoid is the most representative reference and resists the
-  drift a fixed first-seen reference suffers as the platform moves.
-* **Re-score.** On each use an observation's stored score is refreshed as a
-  combination of NCC against the current patch and the cosine of the view-angle
-  change (`visual.ref_score = w·NCC + (1−w)·cosθ`, `visual.ref_score_w` default
-  0.7), and the medoid is recomputed; a reference whose appearance has decorrelated
-  loses score and is eventually evicted by the cap.
-* **Converged latch.** Once a point has accumulated `visual.ref_converged_obs`
-  (default 8) observations spanning at least `visual.ref_converged_angle_deg`
-  (default 30°) of view change with a stable medoid, it is **latched converged**: its
-  observation list stops growing (re-scoring still runs) so a well-triangulated,
-  well-observed point costs no further memory or per-frame add-gate work.
-
-**Spatial eviction (bounded active set).** The active visual-point map is an
-independent deterministic voxel-keyed store (an ordered map of voxel keys to
-id-sorted point lists — not the LiDAR ikd-Tree; the two structures are separate by
-implementation). As the platform moves, points that fall outside the **active map
-box** — a cube of half-extent `visual.active_box_m` (default 20 m) centred on the
-current live pose — are removed by a box eviction that mirrors the LiDAR map's
-spatial eviction policy. The half-extent is sized to the **camera's
-re-observability range, not the LiDAR map scale**: the visual map re-scores its
-resident points every sweep, so an over-large box makes per-sweep cost grow with
-distance travelled. A
-box-deleted visual point releases its RAII-owned reference-patch state immediately.
-Points are *evicted from the active solving/association set only*; the retained
-per-keyframe clouds (§6.5) and the loop-closure store (spec 06/07) are the
-durable record and are untouched, so a later loop closure re-introducing an old
-region rebuilds its visual points from the store rather than relying on a leaked
-active set. Eviction is deterministic (a pure function of pose and box extent),
-preserving replay equivalence.
-
-### 3.2.2 Rolling-shutter per-row evaluation (designed, deferred)
-
-The camera model above evaluates every pixel of a frame at the single image stamp
-$t$ (§2.1, mid-exposure), which is exact for a **global-shutter** sensor. A
-rolling-shutter sensor exposes image rows sequentially over the readout interval, so
-a pixel in row $y$ is actually seen at $t(y)=t_0 + y\cdot t_{\text{row}}$ — under
-fast motion the constant-$t$ assumption skews the patch geometry just as an
-undeskewed LiDAR sweep skews the cloud. Because the trajectory here is a continuous
-function, the correct treatment is **structurally free**: evaluate each patch's
-photometric residual at the spline pose $T_{W\,F_e}(t(y))$ of **its own row's time**
-rather than the frame stamp — the exact analogue of the per-point LiDAR deskew
-(§3.1), differing only in that the time offset is a function of image row instead of
-`t_offset_ns`. The projection Jacobian chains through the spline at $t(y)$ unchanged.
-
-This mode is **specified now but deferred** (`visual.rolling_shutter_en`, default
-**false**; `visual.row_time_s` the per-row readout time from the camera datasheet).
-It is opt-in because (i) the deployment cameras are global-shutter, where it is a
-no-op, and (ii) it multiplies the spline evaluations per frame by the number of
-distinct row-times sampled. When enabled it changes no interface and no boundary
-type — it is purely a different time argument to the same evaluation — so it can be
-turned on per platform without touching the rest of L2.
-
-### 3.3 IMU derivative residual + bias random-walk (the CT IMU factor)
-
-Unlike the iEKF, where the IMU is the *process model*, here the IMU is a **direct
-residual** on the spline's analytic derivatives (the CLINS/Coco-LIC IMU factor;
-Appendix R.1). For each raw sample $(a_m,\omega_m)$ at $t_i$, with
-$\omega_{W\,F_e}(t_i)$ from the SO(3) spline and $\ddot p_{W\,F_e}(t_i)$ from the ℝ³
-spline (§1.3):
-$$
-r^{\omega}_i = \big(\omega_{W\,F_e}(t_i) + b_g\big) - \omega_m,\qquad
-r^{a}_i = \Big(R_{W\,F_e}(t_i)^\top\big(\ddot p_{W\,F_e}(t_i)-g_W\big) + b_a\Big) - a_m,
-$$
-weighted by $(\sigma_g^2,\sigma_a^2)$. Bias **random-walk** residuals tie
-consecutive bias knots of the sliding timeline (§1.4; the Coco-LIC `BiasFactor`;
-Appendix R.1):
-$$
-r^{b_g}_k = b_g^{k}-b_g^{k-1},\qquad r^{b_a}_k = b_a^{k}-b_a^{k-1},
-$$
-weighted by $(\sigma_{bg}^2,\sigma_{ba}^2)\Delta t$. Because the bias cadence
-(`bias.knot_dt_ms`) is coarser than the outer solve cadence, a single knot bracket is
-crossed by several successive sweeps. To avoid double-counting that one tie, a tie is
-added **per solve only over the knot brackets that overlap the sweep's
-$[t_{\text{begin}},t_{\text{end}}]$**, each weighted by $\sqrt{\text{overlap
-fraction}}$ of its bracket; since quadratic information sums linearly, the
-accumulated information across the overlapping sweeps equals **exactly one full tie**
-once the bracket is fully covered (and a data gap leaves proportionally less
-constraint, as the random-walk model demands). $r^{\omega}$ touches the 4
-active SO(3) control points + the local $b_g$ knot; $r^{a}$ touches 4 SO(3) + 4 ℝ³
-control points + the local $b_a$ knot + gravity. The IMU therefore **densely
-constrains** the spline between sparse LiDAR/visual measurements — this is what
-keeps under-determined control points (§10, failure 2) regularised.
-
-> **Optional under-excitation regularizer (low-weight, gated).** When the IMU is
-> nearly static — `n_cp` has dropped to its floor and the §4 observability shows a
-> weak axis — there can be control points in the segment that no LiDAR, visual, or
-> GNSS residual touches and that the near-constant IMU residual leaves nearly
-> unobservable, producing solver jitter (§10, failure "control points
-> under-constrained"). A **low-weight smoothness residual** penalises the spline's
-> highest unconstrained derivative on exactly those spans: a **jerk** residual
-> $r^{\text{jerk}} = \dddot p_{W\,F_e}(t)$ on the ℝ³ spline (the third virtual-time
-> derivative, available in closed form from the basis) and an **angular-acceleration**
-> residual $r^{\dot\omega} = \dot{\boldsymbol\omega}_{W\,F_e}(t)$ on the SO(3) spline,
-> each evaluated at the segment's knot midpoints. It is **off unless** the segment is
-> flagged under-excited (`motion_reg.enable`, default on; engaged only when the
-> **peak per-sample excitation statistics**
-> $N_\omega=\max_i\|\boldsymbol\omega_{m,i}-b_g\|$ and
-> $N_a=\max_i\big|\|\mathbf a_{m,i}-b_a\|-|g|\big|$ are below
-> `motion_reg.excitation_floor` *and* a §4 eigenvalue is below $\kappa_{\text{deg}}$
-> — the peak form, distinct from §5.5's mean-of-norms gearing statistic, because a
-> single excited sample is enough evidence that the span is not degenerate),
-> and its weight `motion_reg.weight` (default 1e-3, relative to the IMU accel weight)
-> is small enough to bias nothing once any real measurement constrains the span.
-> Because it is a pull toward *constant velocity / constant rate*, not toward a
-> particular pose, it cannot fight a true motion the data supports; it only removes
-> the null-space float. The regularizer is excluded from the §4 information matrix
-> and the marginalization prior so it never inflates apparent observability or
-> double-counts across windows.
-
-> **The IMU residual set is gauge-deficient: a pure-IMU span has a 9-DoF null
-> space.** The gyro residual depends only on the *body* angular velocity and the
-> accel residual only on $R^\top(\ddot p-g)$, so the IMU cost is invariant under (i) a
-> **global left rotation** of the whole trajectory together with the matching rotation
-> of $g_W$ (3 DoF), and (ii) **any affine function added to the position spline**,
-> $p(t)\mapsto p(t)+a+bt$ (6 DoF: constant offset + constant velocity), because an
-> affine term has zero acceleration. That is **9 unobservable DoF** from inertial
-> residuals alone. In production the gauge is anchored by the **other** residuals and
-> the marginalization prior, not by the IMU: the global rotation and absolute
-> position/velocity are pinned by the **LiDAR point-to-plane** factors (§3.1) tying
-> the trajectory to the map, by **GNSS** when present (§3.4), and by the
-> **marginalization prior on the boundary control points** carried from the previous
-> window (§5.4); the very first window fixes it with the first-keyframe
-> `AbsolutePrior` (§6.4). A span covered **only** by IMU residuals (cold start before
-> the first LiDAR association, or a LiDAR dropout interval) is therefore
-> gauge-deficient and its absolute pose, velocity and yaw-vs-gravity are determined
-> only up to this null space until a map-anchoring residual re-enters — such a span
-> must not be emitted as an absolute anchor (§6.2 forbids keyframes while the window
-> is uninitialised; §10 covers the dropout case).
-
-### 3.4 GNSS (conservative absolute position)
-
-Absolute antenna position, fused conservatively, gated by `fix`/`cov_enu` (spec 01
-§4.4). With antenna lever-arm $t_{F_e,\text{ant}}$ (`CalibrationSet`), the antenna
-world position **at the fix's own time** $t$ is
-$p_{W,\text{ant}}=p_{W\,F_e}(t)+R_{W\,F_e}(t)\,t_{F_e,\text{ant}}$;
-convert the fix LLA→ENU→$W$ via the latest datum/$T_{MW}$ snapshot (held fixed in
-L2 — L2 reads, L3 owns it):
-$$
-r^{\text{gnss}} = z_{W}(\text{fix}) - p_{W,\text{ant}} \in\mathbb R^3,
-$$
-$\partial r/\partial\delta p_{W\,F_e}(t)=-I$,
-$\partial r/\partial\delta R_{W\,F_e}(t)=R_{W\,F_e}(t)[t_{F_e,\text{ant}}]_\times$,
-chained through the spline.
-
-**Bind to the spline pose at the fix time — never the nearest keyframe.** Because
-$T_{W\,F_e}(\cdot)$ is a continuous function, the residual is evaluated at exactly
-the fix's PTP timestamp $t$ — $p_{W\,F_e}(t)$ is the spline *interpolated* to $t$,
-not the pose of the nearest control point or keyframe. Snapping a GNSS fix to a
-neighbouring discrete pose would bake the antenna's displacement over the
-intervening interval (up to a full keyframe spacing at vehicle speed) into the
-residual as a systematic position error, the classic latent GNSS bug. Continuous-
-time evaluation removes it for free; this is one of the structural advantages of the
-CT trajectory and L2 relies on it for all four sensors (§2.2). *(Cross-spec
-interaction: the L3 absolute-fix interface `IBackEnd::add_absolute(GnssFix,
-nearest_kf_id)` in spec 01 §7 carries a `nearest_kf_id`. Inside L2 that id is only a
-**graph-attachment hint** for which keyframe node the L3 factor hangs near; the
-**residual geometry is bound to the interpolated spline pose at fix time**, and L3
-must interpolate its own pose to the fix time rather than treat `nearest_kf_id` as
-the measurement location. L3 honours exactly this in spec 05 §6.3.)*
-
-**Fix-quality covariance floors and innovation gating.** The fix is weighted by
-`cov_enu`, but a receiver's reported covariance is optimistic, so each weight is
-**floored by fix type** before use — the actual covariance is
-$\max(\text{cov\_enu},\,\Sigma_{\text{floor}}(\text{fix}))$ element-wise on the ENU
-diagonal:
-
-| `GnssFix::FixType` | horizontal floor $\sigma_h$ | vertical floor $\sigma_v$ | config key |
+| estimate | rate | owner | role |
 |---|---|---|---|
-| `RTK_Fixed` | 0.05 m | 0.10 m | `gnss.floor_fixed_h` / `_v` |
-| `RTK_Float` | 0.50 m | 1.00 m | `gnss.floor_float_h` / `_v` |
-| `DGPS` | 1.50 m | 3.00 m | `gnss.floor_dgps_h` / `_v` |
-| `SPP` | 3.00 m | 6.00 m | `gnss.floor_spp_h` / `_v` |
-| `None` | — fix rejected, never used — | | |
+| registered state | sweep end (10 Hz) | `LioFrontEnd` | the solved pose chain; everything downstream derives from it |
+| propagated state | IMU rate | `ImuTracker` | dead-reckoning between sweeps; the registration initial guess; rebased onto each solved pose |
+| live state | IMU rate | `LioFrontEnd` | `live_state()` output, advanced by `ingest_imu_live` and rebased after every solve; never read by estimation |
 
-Each accepted fix passes an **innovation (Mahalanobis) gate**: the fix is admitted
-only if the normalised innovation
-$\|r^{\text{gnss}}\|_{\Sigma}=\sqrt{r^\top(\Sigma_{\text{floored}}+\Lambda_{\text{pose}}^{-1})^{-1}r}\le k_{\text{gnss}}$
-(`gnss.innovation_k`, default 3.0), where $\Sigma_{\text{floored}}$ is the
-floored fix covariance and $\Lambda_{\text{pose}}^{-1}$ the pose marginal (§4),
-so the gate accounts for the current odometry uncertainty and does not reject good
-fixes after a long GNSS gap when odometry has itself drifted. The pose marginal is
-recovered keyframe-gated on the async finalizer (§7.2), so the gate reads it
-**stale-tolerant with up to one keyframe of lag** — acceptable because odometry
-uncertainty changes on the keyframe scale, not the fix scale. A fix that fails the
-gate is **not** silently dropped: it increments a reject counter and the **re-
-acquisition persistence** rule applies — after any gap or a run of gated-out fixes,
-GNSS is re-admitted only once `gnss.reacquire_count` (default 5) consecutive fixes
-pass the gate, preventing a single post-gap multipath fix from snapping the window.
-Survivors enter the cost under a robust kernel so one in-gate-but-still-bad fix
-cannot dominate. All of this is conservative-by-design (§3.4 policy); the
-authoritative GNSS robustness and datum estimation remain L3's (spec 05 §6).
+Biases are fixed at their static-init values for the whole run (§16.1); gravity
+is fixed at magnitude 9.81 m/s² along world $-z$ after init.
 
-**Policy.** GNSS in **L2 is optional and conservative** — it bounds drift over long
-open-sky stretches and aids yaw. The **authoritative** GNSS fusion and datum
-estimation live in **L3** (spec 05). L2 runs GNSS-disabled (tactical / GNSS-denied)
-with no code-path change — it is just an absent residual.
+**Tangent conventions.** All internal 6-DoF tangents are **translation-first**
+`[ρ; φ]` (spec 01 §3.1). Three charts appear in the math and each is named where
+used: the *left/world* chart of the GN solve (§6), the *right/body* chart of
+the covariance and observability (§7, §8), and the **rotation-first** layout of
+`KeyframePacket.constraint_cov`, produced by exactly one reorder at pack time
+(§9). Do not touch any 6×6 block here without identifying its chart.
 
-### 3.5 The joint window cost
+## 2. L1→L2 handoff
 
-The fixed-lag MAP cost minimised each outer step (the Coco-LIC window cost;
-Appendix R.1) over the active state $X$ = {control points in the window} ∪ {bias knots} ∪
-{gravity} ∪ {window exposures} ∪ {active online extrinsics}:
+The front-end ingests one `PreprocessedGroup` per sweep — a thin wrapper over
+the assembled `MeasureGroup` (spec 01 §7.3, Appendix A):
+
+* **`scan`** — the L1-filtered `LidarScan`: range/validity gated and decimated,
+  **not deskewed** (spec 03: L1 output is raw geometry; motion compensation is
+  L2-internal, §3). Per-point `t_offset_ns` is **mandatory**; a scan without
+  per-point time is rejected upstream and never reaches L2.
+* **`imu`** — the `ImuSample`s spanning `(lower, t_end]` with the one sample
+  straddling `t_begin` re-delivered at the head of the next group. Estimation
+  consumes **only** this bundled stream (deterministic, eviction-protected);
+  the straddle re-delivery is deduplicated by stamp inside the tracker (§4).
+* **`image` / `gnss`** — passed through (§9) / ignored, respectively.
+
+`ingest_imu_live` is the low-latency side tap: it advances the live state only
+and never influences a solve — the same samples arrive again inside the next
+group, which is what registration actually uses.
+
+Raw IMU samples are rotated from `imu_link` into $F_e$ by the extrinsic
+rotation only; the lever arm is deliberately ignored (the transport terms need
+differentiated rates, and with the IMU centimeters from $F_e$ the centripetal
+contribution sits below the accelerometer noise floor). LiDAR points fold in
+the full extrinsic $T_{F_e L}$ during deskew.
+
+## 3. Internal constant-screw deskew
+
+Deskew happens inside the front-end, per sweep, before association
+(`ScanRegistration::deskew`). The sweep's intra-scan motion is modelled as a
+**constant body screw** $\xi = [v_b;\ \omega_b]$:
+
+* $\omega_b$ — the interval-mean unbiased gyro rate over $[t_\text{begin}, t_\text{end}]$ (§4.2);
+* $v_b$ — the tracker's propagated world velocity at $t_\text{end}$, rotated
+  into the body frame.
+
+Each return with absolute time $t_i = \texttt{stamp\_start} + \texttt{t\_offset\_ns}$
+is re-expressed in the body frame at the sweep end:
+
 $$
-\mathcal C(X) = \sum_j \rho\!\big(\|r^{\text{lid}}_j\|^2_{\Sigma_{\text{lid}}}\big)
-+ \sum_{p,\Delta}\rho\!\big(\|r^{\text{vis}}_{p,\Delta}\|^2_{\Sigma_{\text{photo}}}\big)
-+ \sum_i\Big(\|r^{\omega}_i\|^2_{\Sigma_{g}}+\|r^{a}_i\|^2_{\Sigma_{a}}\Big)
-+ \sum_k\|r^{b}_k\|^2_{\Sigma_{b}}
-+ \sum_k\|r^{\tau}_k\|^2_{\Sigma_{\tau}}
-+ \sum\rho\!\big(\|r^{\text{gnss}}\|^2_{\Sigma_{\text{gnss}}}\big)
-+ \underbrace{\sum_m\Big(\|r^{v}_m\|^2_{\sigma_{\text{vel}}^2}+\|r^{\dot\theta}_m\|^2_{\sigma_{\text{rate}}^2}\Big)}_{\text{tail anchors past }t_{\text{end}},\ §1.3.1}
-+ \underbrace{\|X\boxminus X^{\text{prior}}\|^2_{\Omega_{\text{prior}}}}_{\text{marginalization prior, §5.4}}.
+p_{F_e}(t_\text{end}) \;=\; \mathrm{Exp}\big((t_i - t_\text{end})\,\xi\big)\;\big(T_{F_e L}\, p_L\big),
 $$
-$\rho$ is a Huber/Cauchy robust kernel. The **tail-anchor** terms are the §1.3.1
-velocity/rate anchors past $t_{\text{end}}$; they never touch the marginalized
-knot, so they never enter $\Omega_{\text{prior}}$ and cannot double-count. The
-**marginalization prior** is the *single* clean representation of all past data
-inside L2 (§5.4); the IMU appears **exactly once**, as residuals (never also as a
-prior on the same interval). The L2→L3 handoff respects the same
-single-representation discipline (§6.4).
 
-### 3.6 Extrinsic / gravity / exposure refinement gating
+since under a constant screw the body frame at $t_i$ relates to the frame at
+$t_\text{end}$ by $\mathrm{Exp}((t_i - t_\text{end})\xi)$. Returns with
+non-positive range or range > `lio.max_range_m` are dropped here. The deskewed
+sweep is the **one** cloud used for everything downstream: keypoints, map
+insertion, `body/scan` telemetry, and `KeyframePacket.cloud_body`.
 
-Online refinement of $T_{F_e\,L}$, $T_{F_e\,C}$, gravity $g_W$, and inverse-exposure
-$\tau$ is **on by default** (resolved default) but **enabled only when the relevant
-DoF is excited** (extrinsics/gravity: sufficient rotational + translational
-excitation over the window, read from the §4 observability; exposure: sufficient
-photometric evidence this frame). Under degenerate motion the relevant Jacobian
-columns are **frozen** (zeroed — the FAST-LIO `extrinsic_est_en` and FAST-LIVO2
-`exposure_estimate_en` gates; Appendix R.5, R.3), preventing drift. A frozen $\tau$
-is not removed from the state — it is **held at its random-walk prediction** (the
-neighbour-tied / prior value of §1.4), so the photometric residual stays
-well-defined and the exposure chain resumes free refinement once evidence returns.
-The freeze decision is logged (§8). Per spec 01 §5.3 the **authoritative** refined
-extrinsics are an **L3** product fed back as a versioned `CalibrationSet` snapshot;
-L2's online estimate is a fast local refinement that L3 ratifies.
+The keypoint set fed to registration is a voxel downsample of the deskewed
+sweep at edge `keypoint_voxel_factor × voxel_size_m`, keeping the **first**
+point per occupied cell in input order (deterministic, §11).
 
-> **The IMU biases are not part of this gate.** Both the gyro bias $b_g$ and the
-> accel bias $b_a$ are **always free**, regularised by the random-walk ties (§3.3)
-> and held inside the §5.2 box bounds — there is no excitation gate that freezes the
-> gyro bias under poor observability. (An earlier design froze $b_g$ off an
-> observability flag; that gate is removed — a clamped bias adds no robustness the
-> box bound and random-walk tie do not already give, and freezing it merely stalls
-> convergence when excitation returns.)
+## 4. The IMU tracker
 
----
+`ImuTracker` owns static initialization, IMU-rate dead reckoning, and the
+interval statistics the registration prior consumes. Samples at or before its
+watermark stamp are dropped (the group-boundary straddle re-delivery, §2).
 
-## 4. Per-axis observability / degeneracy extraction
+### 4.1 Static initialization
 
-A first-class Meridian requirement (spec 00 §10.2; spec 01 §3.4). L2 measures, per
-6-DoF axis, how well the geometry constrains the **current keyframe pose**, and
-ships it in `ObservabilityReport` (spec 01 §3.4). This is the X-ICP / D²-LIO idea
-on the information matrix — the principled replacement for a binary degeneracy flag.
+The front-end holds incoming groups (bounded backlog, oldest dropped with a
+warning) until the tracker initializes. With `init_stationary_s > 0` the
+tracker averages gyro and accel over that standstill window, then fixes:
 
-### 4.1 The information matrix
+* **attitude**: the minimal rotation taking the mean accelerometer reading onto
+  world $+z$ — roll/pitch from gravity, yaw exactly zero;
+* **gyro bias** $b_g$ = mean gyro (standstill asserted);
+* **accel bias** $b_a$ = mean accel minus the expected rest reaction — only the
+  along-gravity component is observable at rest; the orthogonal part is
+  absorbed into the recovered tilt;
+* **gravity**: $(0, 0, -9.81)$ in world (direction measured, magnitude pinned).
 
-The degeneracy report is built every sweep from the pose-block information
+Held groups then drain in arrival order through the normal path (their IMU is
+already inside the tracker, so the re-feed dedups to a no-op). With
+`init_stationary_s = 0` the tracker starts immediately from identity attitude
+and zero biases — only valid for bench setups that are level and bias-corrected
+upstream.
+
+### 4.2 Propagation and the interval prior
+
+Each new sample propagates the IMU-rate state by gravity-compensated strapdown
+integration (`exp`-on-SO(3) attitude, constant accel over the sample interval).
+Per scan interval the tracker accumulates the mean unbiased rate
+$\bar\omega_b$, the mean gravity-compensated body acceleration $\bar a_b$, and
+the **Welford variance of the specific-force magnitude** — the excitation
+signal that drives the gravity-regularizer weight (§6). `interval_prior()`
+consumes and resets these accumulators; an empty interval returns the last
+measured rate, zero acceleration, and an uninformative variance ($10^9$) so the
+regularizer is suppressed rather than wrongly confident.
+
+A scalar predict/update filter on the body-acceleration magnitude persists
+across intervals, with process noise from a uniform-jerk model (jerk uniform on
+$[-j, j]$ has variance $j^2/3$; over $dt$ it perturbs the acceleration by
+$j\,dt$) using `lio.max_expected_jerk`, and the interval scatter as measurement
+noise. It is exported for diagnostics; the regularizer reads the raw interval
+variance.
+
+After every successful solve (and on every failure path) the tracker is
+**rebased**: its pose/velocity reset to the registered state so dead reckoning
+always resumes from the best estimate. Biases are never updated after init.
+
+## 5. The local voxel map
+
+`VoxelGridMap`: an `std::unordered_map` from integer voxel cell
+(`floor(coord / voxel_size_m)` per axis — floor, not truncation, so negative
+coordinates do not fold onto the origin cell) to a small vector of world-frame
+points.
+
+* **Insertion** respects two bounds per cell: at most `max_points_per_voxel`
+  points, and a minimum spacing of `voxel_size_m / sqrt(max_points_per_voxel)`
+  to any stored point, so one surface patch cannot saturate a cell's budget.
+* **Nearest-neighbour** probes the query's cell and its 26 neighbours in a
+  fixed order (x, then y, then z, each −1..1), accepting the closest point
+  within `max_corr_dist_m`; ties resolve to the first candidate encountered,
+  independent of hash-map iteration order.
+* **Maintenance**: after each solve, voxels whose cell centre is farther than
+  `max_range_m` from the solved position are erased (`clipFarFrom`) — the map
+  is local by construction and its memory is bounded by travel, not mission
+  length. `clear()` exists only for the reseed path (§10).
+
+The map is estimation state, not a product: nothing outside the front-end reads
+it, and `apply_correction` deliberately does not move it (§16.5).
+
+## 6. Registration: Gauss-Newton + adaptive gravity regularizer
+
+`ScanRegistration::registerScan` aligns the keypoint set against the map from
+the tracker's propagated guess. Cost: point-to-point over the nearest-map-point
+associations, re-associated **every iteration**.
+
+**Data term.** For keypoint $p$ (body frame at sweep end) and its matched map
+point $q$, with the pose $T$ acting on points, the residual is
+$r = T\,p - q$. Under the **left/world perturbation** $T \leftarrow
+\mathrm{Exp}(\delta x)\,T$ the Jacobian at $\delta x = 0$ is
+
 $$
-\Lambda_{\text{pose}} = \sum_j w_j\,J_j^\top\Sigma_j^{-1}J_j \in\mathbb R^{6\times6},\qquad J_j=\partial r_j/\partial\delta\boldsymbol\xi(\text{stamp}),
+J = \big[\,I \;\big|\; -[T p]_\times\,\big] \quad\text{(translation-first columns)},
 $$
-accumulated as rank-1 outer products of the **weighted LiDAR point-to-plane rows**
-(§3.1) at the sweep-end pose (`computeObservability`) — a cheap O(hits) pass, run
-every sweep. This is the geometric-degeneracy instrument; the **full
-window-posterior pose marginal** (LiDAR + IMU + prior) used for `constraint_cov`
-is a sparse back-substitution over the whole window and is recovered only on
-keyframe-emitting sweeps, on the async finalizer stage (§7.2).
 
-### 4.2 Per-axis scores
+accumulated strictly in keypoint order into normal equations that are
+**averaged** over the correspondence count $n$: $H = \frac{1}{n}\sum J^\top J$,
+$b = \frac{1}{n}\sum J^\top r$ (averaging makes the regularizer weight
+scale-free in $n$).
 
-`ObservabilityReport` (spec 01 §3.4) carries `frame` (default `Body`/`ImuLink`),
-`score[6]` in `[0,1]` ordered `[tx,ty,tz,rx,ry,rz]` (**translation-first**), and an
-optional `eigvecs` 6×6 for non-axis-aligned degeneracy (e.g. a tunnel at 30°).
-Compute all of the following; map the canonical `score[6]` from #1, expose the rest
-in debug:
+**Adaptive gravity regularizer.** A roll/pitch anchor toward the prior
+attitude, weighted to fade with inertial excitation. With $g_\uparrow$ the
+world up vector ($|g| = 9.81$) and the anchor $a = R_0^\top g_\uparrow$ frozen
+at the guess attitude:
 
-1. **Eigen-decomposition (Zhang/X-ICP):** eigenpairs $(\lambda_m,\mathbf v_m)$ of
-   $\Lambda_{\text{pose}}$. Directions with $\lambda_m<\kappa_{\text{deg}}$ are
-   degenerate; if not axis-aligned, fill `eigvecs`. Normalise to $[0,1]$ by
-   $\lambda_m/(\lambda_m+\kappa_{\text{deg}})$.
-2. **Marginal conditional precision per axis:** $1/[\Lambda_{\text{pose}}^{-1}]_{aa}$.
-3. **Effective points per axis:** count of effective LiDAR points whose plane
-   normal aligns with each axis (operator-friendly: "this axis is held by $N$
-   planes").
-
-### 4.3 Flow into the back-end
-
-The scores ship in the `KeyframePacket` (`observability`, spec 01 §6.1) next to
-`constraint_cov`; **the weak-axis variance inflation is performed by L3** when it
-builds the factor's noise model (spec 05 §4.3, `backend.obs_inflation_*`), so
-ill-constrained directions are down-weighted exactly once. Under full degeneracy
-L2 may additionally **clamp** the update along weak directions (let IMU/GNSS
-carry them — the X-ICP "solution remapping"); this is a designed option, not yet
-implemented or config-exposed. Because LiDAR and visual residuals sum into one
-window Hessian *before* inversion, a geometrically degenerate scene that the
-photometric block constrains (or vice-versa) is automatically rescued in the
-solve itself.
-
----
-
-## 5. The sliding-window solve, marginalization, and adaptive knots
-
-### 5.1 The outer loop
-
-```
-on each measurement ingest:
-  append to per-stream time-ordered buffers; advance spline end if needed
-on outer cadence (~0.1 s of new trajectory, knot_dt):           # Coco-LIC outer step (App. R.1)
-  (1) extend the spline: place adaptive knots over the new segment (§5.5),
-      seeded by IMU-only integration (continuity of pose/vel/orientation)
-      — seeding samples the seed trajectory one local knot interval BACK (§1.2);
-      re-seed the stale tail (reseedFrom, index >= interval(t_end)+4, and +3 when
-      its peak support u_end^3/6 < 0.02) from the fresh IMU seed each sweep (§1.3.1)
-  (2) associate: for each new LiDAR point, kNN + plane fit at its spline pose (§3.1);
-      for the new image, retrieve visual submap with LiDAR depth (§3.2)
-  (3) build the Ceres problem: §3 residuals over active control points + biases
-      + gravity + exposure + active extrinsics, + the marginalization prior (§5.4);
-      PIN the unsupported tail knots constant (SetParameterBlockConstant at their
-      IMU warm-start values; same index rule as step (1)), and add the tail
-      VelocityAnchor/RateAnchor residuals at window_dt/4 stride past t_end (§1.3.1)
-  (4) solve as nested loops (fixed-cadence re-association):                       # §5.1.1, §5.2
-      repeat up to max_outer_iters:
-        - (re)associate LiDAR planes (§3.1) + visual patches (§3.2) at current pose
-        - inner Ceres LM solve: reassoc_steps inner iterations, analytic Jacobians,
-          band-sparsity, deadline-bounded (§5.2)
-        - stop early once the keyframe pose shift since the last association
-          is < assoc_shift_thresh (associations have stopped moving)
-  (5) compute the per-sweep observability from the LiDAR rows (§4.1); on a
-      keyframe-due sweep, capture the final-round problem snapshot for the async
-      covariance finalizer (§7.2) — deterministic path: recover the window-
-      posterior pose marginal inline instead
-  (6) marginalize control points/biases that left the window → update prior (§5.4)
-  (7) update the visual map (promote new LiDAR pts to visual pts; add obs under the
-      add-gate; refine ref patches; recompute medoid; box-delete out-of-box pts) # §3.2.1
-  (8) maybe_emit_keyframe (§6.2): fill the packet, submit the KeyframeJob to the
-      finalizer (live path) or pack constraint_cov inline (deterministic path);
-      push retained per-keyframe cloud to IKeyframeStore (§6.5)
-```
-
-### 5.1.1 Fixed-cadence re-association
-
-LiDAR plane associations (§3.1, the kNN + plane fit) and visual patch selections
-(§3.2) are **linearisation-point dependent**: they are computed against the current
-spline pose, and as the solve moves the control points the correct correspondence
-for a point can change (a different plane, a different patch, or a now-rejected
-outlier). Re-associating on **every** inner Ceres iteration is both expensive and a
-source of non-determinism (the correspondence set churns with each LM trial step);
-never re-associating bakes in stale, possibly wrong matches from the warm-start
-pose. The solve is therefore a **fixed-cadence** alternation of two nested loops:
-
-* The **outer (association) loop** runs at most `max_outer_iters` times (default 4,
-  range 3–5). At the top of each pass it rebuilds the LiDAR and visual residual sets
-  from scratch against the *current* converged-so-far pose, then hands a fresh Ceres
-  problem to the inner loop.
-* The **inner (solve) loop** is `reassoc_steps` LM iterations (default 2) on the
-  fixed correspondence set, under the deadline of §5.2.
-
-The outer loop **terminates early** when associations have stabilised: if the
-keyframe-time pose has moved by less than `assoc_shift_thresh_m` / `_deg`
-(default 0.02 m translation **and** 0.2° rotation, both must hold) since the previous association
-pass, a re-association would not change the correspondence set, so the loop stops.
-This makes association cost proportional to how far the pose actually travelled this
-step — typically one or two passes in steady tracking, the full `max_outer_iters`
-only on a hard manoeuvre or after a window restart. The bias bounds
-of §5.2 apply within every inner solve, so a single bad pass cannot run the pose
-away before the next re-association sees it.
-
-The determinism path (§5.2, fixed-iteration replay) runs exactly `max_outer_iters`
-outer passes with the early-stop disabled, so the correspondence sequence is a pure
-function of the input and is bit-reproducible.
-
-### 5.2 Solver
-
-* **Solver:** **Ceres** (Levenberg-Marquardt; analytic cost functions; SO(3)
-  manifold via `LocalParameterization`; built-in Schur for marginalization) — the
-  choice of all three CT references (Appendix R.1). GTSAM is reserved for the L3
-  global iSAM2 graph; the CT window is its own Ceres problem feeding L3.
-* **Band-sparsity:** each measurement touches 4 control points per spline ⇒ the
-  Hessian is banded ⇒ sparse Cholesky / Schur on biases keeps cost bounded
-  (Appendix R.1). Converges in 4–5 iterations.
-* **Iteration cap / tolerance:** `max_iterations`, per-DoF `epsi` (default 1e-3).
-* **Analytic Jacobians (normative).** The LiDAR point-to-plane, visual
-  photometric, and IMU factor families all use **hand-derived analytic
-  Jacobians** through the 4-knot spline chain; the equivalent autodiff functors
-  are retained behind `*Autodiff` factory twins **solely as parity tests**
-  (analytic-vs-autodiff derivative agreement is asserted in the unit tests, spec
-  10). New residual types must ship the same pair. With the analytic family,
-  parallel association, and the threaded solve, the front-end holds the 90 ms /
-  10 Hz budget on the dev box (`deadline_hit` ≈ 0.05); the measured margins and
-  the Jetson retune live in `docs/OPTIMIZE.md`.
-* **Threading vs determinism.** The live path threads the Ceres solve
-  (`num_threads = min(8, cores)`) and the LiDAR association (OpenMP,
-  `schedule(static)` with per-thread buffers merged in thread order — provably
-  **bit-identical to serial**). The deterministic/replay path runs
-  single-threaded so a recorded run is bit-reproducible.
-
-* **Deadline-bounded solve (real-time control on the wall-clock path).** The window
-  solve runs under a hard wall-clock budget so that front-end latency is *enforced
-  at runtime*, not merely measured after the fact. Ceres is given
-  `solver.time_limit_ms` (default 90, validated at 10 Hz on the dev box) as its
-  `max_solver_time_in_seconds`, with
-  `solver.min_iterations` (default 2) and `solver.max_iterations` (default 5)
-  bracketing the count: the solver always completes at least the minimum iterations
-  (so a single starved step never publishes a barely-improved pose) and is cut off
-  at the deadline or the maximum, whichever comes first. The budget is the sum over
-  the §5.1.1 outer/inner passes, not per inner solve, so re-association cannot blow
-  the step. Hitting the deadline before convergence is **not** a failure — it yields
-  the best iterate so far and is surfaced as telemetry
-  (`scalar("frontend/deadline_hit")`, spec 09 §5.1, §8); a sustained deadline-hit rate is
-  the operator signal that the window/knot budget exceeds the platform, handled by
-  the §10 degraded path, never by silently running long. (A `deadline_hit` boolean
-  on the canonical `FrontEndDiagnostics` would carry the same signal on the
-  synchronous return; that struct is owned by spec 01, so the field is *flagged* for
-  amendment there rather than assumed here.)
-  **The determinism / replay path ignores the time limit** and runs a fixed
-  iteration schedule (exactly `solver.max_iterations` inner steps per the fixed
-  `max_outer_iters` passes of §5.1.1) so a recorded run is bit-reproducible
-  independent of wall-clock load. These two modes are selected by the same
-  `deterministic` flag the rest of L2 honours. A deadline-bound solver converts
-  cheaper derivatives into extra iterations (accuracy at fixed budget), so do
-  **not** lower the deadline to cash compute savings as speed unless
-  `deadline_hit` is already ≈ 0 — a tighter cap starves convergence. Jetson
-  headroom comes from the compute levers ledgered in `docs/OPTIMIZE.md`, not a
-  tighter deadline.
-* **Bias box bounds (pre-restart stability guard).** Before a window restart (§10) is
-  ever triggered, the solve defends itself from a divergent bias estimate. Every knot
-  of the sliding bias timeline (§1.4) — **both** $b_g$ and $b_a$, with no excitation
-  gate on either — is held inside physically-motivated **box bounds**:
-  $|b_g|\le$ `bias.gyr_max` (default 0.5 rad/s) and $|b_a|\le$ `bias.acc_max`
-  (default 5.0 m/s²), installed as Ceres lower/upper parameter bounds on each live
-  knot's gyro and accel block, so a transient outlier burst cannot drive any bias
-  knot to an absurd value that then corrupts the IMU residual for the whole window.
-  The bounds mean §10's window restart is a genuine last resort reached only on true
-  divergence (residual blow-up with a bias knot pinned at a bound), not on a
-  recoverable excursion. There is **no per-iteration step clamp**: the trajectory
-  null space the clamp once guarded is removed structurally by the tail-knot pinning
-  of §1.3.1, and a step clamp over a structurally-sound solve only blocks recovery
-  from a poisoned seed.
-
-### 5.3 Sliding window (true fixed-lag)
-
-The active set is the control points spanning the current window
-(`spline.window_knots` × knot cadence, ≈ 0.8 s deployed) plus a small overlap of recent ones; older control
-points are **marginalized** (§5.4), not held fixed (marginalizing keeps their
-information consistently, unlike CLINS' "hold-fixed" which biases as the window
-slides; Appendix R.1). A fixed number of active control points ⇒ bounded
-per-step cost.
-
-### 5.4 Marginalization (the single clean prior)
-
-When the window slides, the control points/bias knots leaving the window, and the
-residuals connecting *only* to them, are **marginalized via Schur complement** into
-a dense linear prior on the remaining **boundary** variables (VINS-Mono /
-Coco-LIC-style; Appendix R.1). The retained prior set =
-{control points shared between the dropped and kept windows} ∪ {current bias
-knots} ∪ {gravity}. This prior is the **only** memory of past data inside L2 and is
-**mutually exclusive** with re-introducing those measurements — guaranteeing no
-double counting. (Linearization staleness is a known risk; §10 failure 6.) The same
-single-representation discipline is carried to the L2→L3 boundary in §6.4.
-
-> **Prior forgetting (`marg_prior_scale`).** An unbroken per-sweep prior chain
-> accumulates confidence faster than its linearization stays valid: over a long
-> mission the prior residual RMS grows monotonically and weakly-observable states
-> (accel bias) pin at stale values the window can no longer re-estimate. The prior
-> information is therefore **deflated at build time** by `marg_prior_scale`
-> ∈ (0, 1]: $\sqrt{\text{scale}}$ is applied to the prior's sqrt-information and
-> residual, preserving the Gauss-Newton step *direction* while shrinking its
-> confidence — exponential forgetting per slide. `1.0` skips the multiply
-> (bit-identical to a build without the knob); the deployed value and its measured
-> effect live in `docs/OPTIMIZE.md` (plateau across 0.5–0.1 — tune coarsely).
-
-> **Use-after-free guard on the front-trim.** The marginalization prior holds raw
-> pointers into the **kept-block** knot storage (the deque nodes shared with the
-> previous window). The `SplineWindow` front-trim (`dropOldest`) must therefore never
-> free a deque node those pointers reference: the number of knots dropped is bounded
-> by `lowestKnotIndexOf(prior kept-block pointers)`, so the prior never dangles into
-> freed storage. The sliding **bias timeline** carries the identical guard — its
-> `dropOldest` is bounded by `BiasKnots::lowestKnotIndexOf` over the same prior-held
-> pointers — so neither the spline nor the bias front-trim can outrun the prior.
-> (Deque storage is what makes this sound: `pop_front` invalidates only the erased
-> node, leaving every surviving knot's address stable as a Ceres parameter block.)
-
-> **Invariant — enumerate knot indices, never sample by time.** Any code that must
-> *cover a discrete set of knots* — which knots to marginalize (step (6)), which tail
-> knots to pin (§1.3.1), which knots a prior references — must **enumerate the deque
-> indices** of that set, never sample the curve at a set of times and infer the knots
-> from `segmentFor(t)`. Time-sampling cannot guarantee it visits every knot exactly
-> once: near a knot boundary or under a knot-density change two sampled times map to
-> the same support set while a knot between them is missed, or one knot is counted
-> twice. (This was the concrete cause of the clamp-snapshot explosion bug, §10: a
-> per-knot snapshot built by time-sampling skipped knots and the resulting partial
-> coverage poisoned the solve. The clamp is gone, but the discipline binds the
-> marginalization and pinning code that remains.)
-
-### 5.5 Adaptive knots (Coco-LIC)
-
-Knot density follows motion (Coco-LIC's adaptive scheme; Appendix R.1). Fixed **outer cadence**
-`knot_dt ≈ 0.1 s`; within each outer segment, the number of control points (the
-segment's **gear**) `n_cp ∈ {1..ncp.n_cp_max}` is chosen from IMU-measured dynamics
-over the **raw samples of that segment** — a mean of per-sample norms, never a
-summed-then-normed aggregate. The gating statistics are the **segment-mean
-magnitudes**, frame-invariant so attitude change never hides motion:
 $$
-\bar N_\omega = \tfrac1n\sum_{i\in\text{seg}}\big\|\boldsymbol\omega_{m,i}\big\|,\qquad
-\bar N_a = \Big|\,\tfrac1n\sum_{i\in\text{seg}}\|\mathbf a_{m,i}\| - |g|\,\Big|,
+r_\text{ori} = R^\top g_\uparrow - a,\qquad
+J_\text{ori} = \big[\,0 \;\big|\; R^\top [g_\uparrow]_\times\,\big],
 $$
-the **raw body angular-rate magnitude mean** (no bias correction: the bias sits
-orders below the band edges, and a stale bias estimate must never gate density) and
-the **gravity-removed mean specific-force magnitude** ($|g|=9.81$). The gear is the
-larger of the two mapped thresholds. Both statistics average the *magnitude of each
-sample taken individually*, so a fast pure rotation — where the world-frame vectors
-$R_i\boldsymbol\omega_i$ sweep through every direction and a vector sum cancels
-toward zero — still produces a **large** $\bar N_\omega$ and correctly raises the
-knot density; the mean (vs the earlier peak form) makes a single spike unable to
-over-gear a calm segment. (Removing gravity by subtracting its *magnitude* from the
-mean of $\|\mathbf a_m\|$ keeps $\bar N_a$ exact under any attitude without an
-orientation estimate; it slightly under-reads when specific force is
-near-orthogonal to gravity, which the angular term and the IMU residual then cover.)
 
-The mapping is monotone and piecewise-constant with hysteresis: $\bar N_\omega$ is
-compared against the rising thresholds `ncp.omega_thresh[]` (rad/s) and $\bar N_a$
-against `ncp.accel_thresh[]` (m/s²), each band adding one control point up to
-`ncp.n_cp_max`; a transition down a band requires the statistic to fall **below**
-the band edge by `ncp.hysteresis` (default 0.15, fractional) so density does not
-chatter at a threshold. A segment whose samples have not yet arrived **holds the
-previous finalized gear** and is provisional: the next sweep's ingest truncates the
-provisional tail segments (`reknot`) and re-lays them at the gear their own data
-selects, so every segment's *final* gear is decided on its real samples. Knots are
-placed at uniform **real-time** steps within the segment and evaluated through the
-per-interval non-uniform basis (§1.2). A freshly laid dense tail is smoothed by an
-**IMU-only warm-start mini-solve** (`ncp.warmstart_iters` LM iterations over this
-sweep's IMU residuals + tail anchors, only the fresh tail knots free) before
-association — without it the raw IMU-propagated knot placement leaves a wiggly
-curve whose deskew corrupts association (the measured divergence in
-`docs/OPTIMIZE.md`). Net effect: more control points under aggressive motion, fewer
-when smooth — accuracy when needed, cheap when not. The default thresholds follow
-the released Coco-LIC mean-rate ladder (Appendix R.1) and the gating *quantity* is
-fixed normatively as the mean-of-norms form above.
+added to $H, b$ with weight $1/\beta$ where
 
-> **Window slide under adaptive density (the drain).** One sweep may advance the
-> window across several outer segments and each segment may carry several knots, so
-> the slide Schur-marginalizes **every resident knot whose 4-knot support has fully
-> left the window** in one build — never "one segment per sweep", which is correct
-> only for the uniform one-knot-per-sweep grid and otherwise grows the prior's kept
-> set, and hence the marginalization cost, without bound. Two additional drain
-> rules keep the carried prior coherent with the re-knot: (i) a free knot **past
-> the data front** (`knotTime > t_end`) is always marginalized, never kept — the
-> next ingest's re-knot pops exactly those knots, and a prior keeping one would
-> either dangle or block the re-knot forever (the cubic support always reaches two
-> knots past the sweep end); (ii) a blanket block whose storage does not persist
-> across sweeps (the per-sweep exposure scalar) is marginalized for the same
-> reason. Gauge pins are index-based under adaptive density (the first kept knot of
-> the departing boundary), constants are skipped — not refused — so multi-knot
-> groups drain cleanly, and the front-trim reserves enough resident knots that the
-> tail re-knot never hits the four-knot cubic floor.
+$$
+\beta = \texttt{min\_beta}\cdot\big(1 + \mathrm{Var}(\|f\|)\big),
+$$
 
-> **Adaptive density shipped (task #72), default-off pending the validation
-> campaign.** The blockers recorded against the earlier peak-geared design are
-> resolved: the slide drains whole knot groups and multi-segment advances (above),
-> the analytic Jacobians are non-uniform-correct (autodiff parity ~1e-10 on
-> mixed-density grids), and the dense-knot warm start is redesigned (tail re-knot +
-> mini-solve). `ncp.enabled: false` runs the uniform spline **bit-identically** to a
-> build without the feature — that equivalence is a merge gate (replay diff against
-> a pre-change capture).
+$\mathrm{Var}(\|f\|)$ the interval specific-force-magnitude variance (§4.2).
+Still platform ⇒ small variance ⇒ strong anchor; aggressive motion ⇒ weak
+anchor. The block is disabled when the interval held fewer than two samples
+(no variance information). The regularizer constrains only the rotation
+columns; translation degeneracy is the observability report's job (§8).
 
-> **Continuity across a knot-density transition.** With true non-uniform evaluation
-> (§1.2) the basis matrices are exact functions of the real knot times, so the
-> trajectory is $C^2$ in **real** time across density changes — real velocity,
-> acceleration, and body angular acceleration are all continuous at the seam, and a
-> constant-rate motion remains exactly representable across a transition. (Under
-> the retired virtual-time warp the seam was only $C^1$ in real time and the IMU
-> residual had to absorb the acceleration step; that caveat no longer applies.)
-> Derivative magnitudes still scale with the local knot spacing — a gear-`g`
-> segment's intervals span `knot_dt / g` — which is precisely the bandwidth the
-> density buys.
+**Solve.** $H\,\delta x = -b$ by LDLT; update $T \leftarrow
+\mathrm{Exp}(\delta x)\,T$; converged when $\|\delta x\| <$ `convergence_eps`,
+capped at `icp_max_iterations`. The result fails (`converged = false`) when
+association is lost entirely, the iteration cap is hit without convergence, or
+the final correspondence count is below `min_keypoints`.
 
-### 5.6 Cross-checking CT: direct ground-truth tracking (the iEKF oracle is removed)
+## 7. The covariance chain (rung 0)
 
-The former offline iEKF differential-test oracle is **removed** — not a
-milestone, not an accepted `frontend.kind`, not a class in the codebase. CT
-correctness is cross-checked **directly against ground truth**: the front-end is
-driven over synthetic trajectories and recorded bags with a reference trajectory,
-and its `live_state()` pose is asserted to track the ground-truth pose in
-position and orientation, with the visual stage independently confirmed to engage
-(converged photometric residuals). A direct absolute-error bound is stronger and
-more interpretable than a "two estimators agree" comparison.
+The packet covariance is a **Laplace approximation from the data term only** —
+deliberately rung 0 of the honesty ladder. The chart conversions are the
+classic silent-bug surface; each step below is the contract and each is
+unit-tested (including a Monte-Carlo test of the full chain against empirical
+scatter).
 
----
+1. **Per-scan information, left/world, translation-first.** Re-associate at the
+   solved pose; $H_\text{data} = \sum J_i^\top J_i$ — **unaveraged**, and
+   **without** the $\beta$-regularizer (a heuristic prior carries no
+   measurement information; including it would hide degeneracy the
+   observability report must expose). The isotropic noise scale is
+   $\hat\sigma^2 = \chi / (3N - 6)$ ($\chi$ = final sum of squared residuals,
+   $N$ = correspondences, 3 rows each, 6 pose DoF absorbed), guarded by
+   $N \ge$ `min_keypoints`. Then
+   $\Sigma_\text{left} = \hat\sigma^2 (H_\text{data} + 10^{-6} I)^{-1}$.
+2. **→ right/body** (the spec-01 canonical chart): from
+   $\mathrm{Exp}(\delta x_\text{left})\,T = T\,\mathrm{Exp}(\delta x_\text{right})$,
+   $\delta x_\text{right} = \mathrm{Ad}_{T^{-1}}\,\delta x_\text{left}$ to first
+   order, so
+   $\Sigma_\text{right} = \mathrm{Ad}_{T^{-1}}\, \Sigma_\text{left}\, \mathrm{Ad}_{T^{-1}}^\top$.
+3. **Relative accumulation between keyframes** (right-perturbation
+   composition): per registered sweep with step $\delta T$ from the previous
+   registered pose,
+   $\Sigma_\text{rel} \leftarrow \mathrm{Ad}_{\delta T^{-1}}\, \Sigma_\text{rel}\, \mathrm{Ad}_{\delta T^{-1}}^\top + \Sigma_\text{step}$,
+   reset to zero at every keyframe.
+4. **→ rotation-first, exactly once, at pack time**: the single rotation-first
+   block in the system is `KeyframePacket.constraint_cov`, produced by
+   `reorderTransRotToRotTrans()` when the packet is assembled (§9). No other
+   code path reorders.
 
-## 6. The `KeyframePacket` L2 emits
+**Honesty caveats (the rung-0 contract):** successive steps are treated as
+independent — the correlation through the shared map is ignored; the noise
+model is isotropic per correspondence; the regularizer is excluded. The
+covariance is therefore *shape-honest but scale-uncalibrated*. The follow-up is
+**NEES calibration against ground truth** (rung 1): measure the normalized
+estimation error squared of the emitted relative constraints over GT runs and
+introduce a calibrated scale before the back-end tuning leans on absolute
+covariance magnitudes.
 
-`KeyframePacket` is **canonically defined in spec 01 §6.1** and is the **one and
-only** value L2 hands L3 (spec 00 §6, spec 01 §6). This section specifies how **L2
-fills** it from the spline window — it does **not** redefine it.
+## 8. Per-axis observability
 
-### 6.1 The fields L2 must fill (quoting spec 01 §6.1)
+Point-to-point $J^\top J$ carries an isotropic translation block (each
+correspondence pins all three axes equally), so it cannot flag surface-sliding
+degeneracy. The `ObservabilityReport` therefore projects each correspondence
+onto the **local map surface normal** — the component re-association cannot
+cancel. For each matched keypoint, the map neighbourhood within
+`voxel_size_m` of the match (minimum 5 neighbours, non-collinear) yields a
+planar-patch normal $n$ by smallest-scatter eigenvector; the right/body-chart
+information row is
 
-```cpp
-struct KeyframePacket {                 // SPEC 01 §6.1 is authoritative
-  std::uint64_t  id;                     // monotonic, L2-assigned
-  Timestamp      stamp;                  // PTP ns; a real measurement instant
-  Frame          ref_frame;              // = Frame::Odom for a live front-end
-  Pose           T_ref_body;             // T_ref_Fe (Fe = ImuLink) = spline eval at stamp
-  bool           kinematics_included;    // false on the normal path (§6.4)
-  Eigen::Vector3d v_ref, b_g, b_a;       // seeds/telemetry; authoritative only iff included
-  enum class ConstraintKind { RelativeBetween, AbsolutePrior, ImuPreintegration }
-                 constraint_kind;        // picks the L3 factor (§6.4)
-  std::uint64_t  rel_to_id;              // previous KF id (RelativeBetween/ImuPreint)
-  Pose           T_relto_this;           // relative transform (RelativeBetween)
-  GaussianBlock<6> constraint_cov;       // 6x6 ROTATION-FIRST [rx,ry,rz,tx,ty,tz] block
-                                         // (GTSAM Pose3 boundary); meaning set by kind
-  ObservabilityReport observability;     // 6 per-axis scores + frame (§4)
-  std::shared_ptr<const std::vector<LidarPoint>> cloud_body;  // handle into store (§6.5)
-  std::shared_ptr<const CameraFrame>            image;         // nullable
-  Pose           T_body_cam;             // extrinsic snapshot used at this KF
-  std::optional<ImuPreintegrationSummary> imu_summary;        // iff ImuPreintegration
-  std::uint32_t  calib_version;          // CalibrationSet snapshot provenance
-  std::uint32_t  frontend_kind;          // 1 = CT; diagnostics only; L3 must NOT branch
-};
-```
+$$
+\big[\, n_b^\top \;\big|\; (p \times n_b)^\top \,\big],\qquad n_b = R^\top n,
+$$
 
-How each field is produced from the CT window:
+averaged over correspondences into a 6×6 $h$. The per-axis score is the
+saturating
 
-| Field | Source |
-|---|---|
-| `id`/`stamp` | monotonic id; `stamp` = the chosen keyframe instant (a real measurement time). |
-| `ref_frame`/`T_ref_body` | `Odom` + **spline evaluation** $T_{W\,F_e}(\text{stamp})$. |
-| `kinematics_included`,`v_ref`,`b_g`,`b_a` | **false** on the normal path; `v_ref=\dot p_{W\,F_e}(\text{stamp})$ and the local bias knots are filled as **seeds/telemetry** (L3 ignores them in `RelativeBetween`). `true` only on the `ImuPreintegration` restart (§6.4). |
-| `constraint_kind` | `RelativeBetween` default; `AbsolutePrior` on first KF / fresh GNSS anchor; `ImuPreintegration` on window-restart fallback (§6.4). |
-| `T_relto_this`,`constraint_cov` | $\hat T_{\text{prev}}^{-1}\hat T_{\text{cur}}$ (both spline-evaluated). Relative covariance = the **sum of the two consecutive absolute window-posterior pose marginals** — a conservative upper bound on the true relative marginal (it drops the cross-covariance term, which only subtracts). The marginals are recovered and chained FIFO on the keyframe finalizer (§7.2; LiDAR-only marginal as fallback when the posterior is rank-deficient), then reordered once into rotation-first `[rx,ry,rz,tx,ty,tz]` (the GTSAM-boundary exception, §1.5). Weak-axis inflation from `observability` happens in **L3** (§4.3). |
-| `observability` | $\Lambda_{\text{pose}}$ pose block (§4). |
-| `cloud_body` | per-point spline-deskewed scan in $F_{e,\text{stamp}}$, retained in `IKeyframeStore` (§6.5). |
-| `image`/`T_body_cam` | the camera frame at this KF + the `CalibrationSet` $T_{F_e\,C}$ snapshot used. |
-| `imu_summary` | filled only on `ImuPreintegration` restart (§6.4). |
-| `calib_version`/`frontend_kind` | snapshot version; `1` (CT). |
+$$
+s_i = \frac{h_{ii}}{h_{ii} + \kappa},\qquad \kappa = 0.01,
+$$
 
-Every field the boundary demands is pinned: timestamp; **SE(3) pose in a named
-frame**; **optional velocity+bias with an "included" flag**; **covariance block**
-(rotation-first `[rx,ry,rz,tx,ty,tz]`, the §1.5 exception; spec 01 §3.3/§6.4);
-**6 per-axis observability with reference frame**;
-**point-cloud handle**; **camera/RGB handle**.
+so an axis carrying ≥ ~1/10 of the normal energy scores > 0.9 and an axis with
+no normal support (sliding along a lone plane; yaw about its normal) scores
+near 0. Frame `Body`, translation-first, per spec 01 §3.4; the report rides
+every packet and feeds back-end noise inflation (spec 05).
 
-### 6.2 Keyframe-selection policy
+## 9. Keyframe cadence and KeyframePacket emission
 
-Emit on **any** trigger, measured from the last emitted keyframe (spec 00 config
-`frontend.keyframe`):
-* translation $> d_{\text{kf}}$ (0.5–1.0 m), **or**
-* rotation $> \theta_{\text{kf}}$ (10–15°), **or**
-* elapsed time $> \Delta t_{\text{kf}}$ (heartbeat 1–2 s, so a stationary platform
-  still produces graph nodes), **or**
-* **information-driven:** accumulated new visual/LiDAR information / observability
-  change (densifies keyframes in feature-rich / manoeuvring sections).
+**Cadence.** A registered sweep is a keyframe when, relative to the previous
+keyframe, any of:
 
-Never while the window is uninitialised (§2.3). The first post-init keyframe anchors
-the `odom` origin and uses `AbsolutePrior` (§6.4).
+* distance ≥ `keyframe.dist_m`,
+* rotation ≥ `keyframe.rot_deg`,
+* elapsed time ≥ `keyframe.time_s`,
 
-### 6.3 (reserved — kinematics across the boundary handled in §6.4)
+or unconditionally when the relative chain is broken (§10) and the sweep
+converged — the chain must be re-anchored at the first opportunity.
 
-### 6.4 The single clean constraint contract
+**Packet contents.** `T_ref_body` in `Frame::Odom` at the sweep-end stamp;
+`kinematics_included = false` always; the observability report of the solve;
+`cloud_body` = the deskewed sweep (body frame at the stamp); `image` = the most
+recent `group.image` seen (passthrough; may be null) with the `T_body_cam`
+extrinsic snapshot; `calib_version`; `frontend_kind = 2`.
 
-Encoded by `constraint_kind` (spec 01 §6.3, §6.4; resolved default):
+**Constraint kinds.** Exactly two are emitted:
 
-* **Default (steady state) — `RelativeBetween`.** L2 has fused IMU+LiDAR+visual
-  (+GNSS) internally and *summarised* it as a single relative transform
-  `T_relto_this` ($\hat T_{\text{prev,cur}}$) with marginal `constraint_cov`. L3
-  adds **one** `BetweenFactor(rel_to_id → id)` and nothing else. The absolute
-  `T_ref_body` is an **initialisation/visualisation guess only** — L3 does **not**
-  treat it as an independent absolute prior. **No IMU factor in this mode** — the
-  IMU information is already inside the relative covariance. `kinematics_included =
-  false`; velocity/biases ride as seeds/telemetry, and L3 does not create
-  velocity/bias nodes.
-
-* **Anchor — `AbsolutePrior`.** First keyframe (fixes the gauge) and fresh
-  GNSS-anchored poses. `constraint_cov` is the marginal cov of `T_ref_body` itself.
-  No companion relative factor for an anchor, so no double-count; the next keyframe
-  returns to `RelativeBetween`. (For GNSS-bearing keyframes L3 adds a *separate*
-  GNSS factor, not derived from this pose.)
-
-* **Restart fallback only (§10) — `ImuPreintegration`.** Across a window restart the
-  relative pose is unreliable; L2 ships the raw `imu_summary` ($\Delta R,\Delta
-  v,\Delta p$ + 9-DoF cov + bias Jacobians, spec 01 §6.5) and sets
-  `kinematics_included = true`. L3 builds a GTSAM **`CombinedImuFactor`** (+ the
-  velocity/bias nodes it needs) **instead of** a between. Because `constraint_kind`
-  is a single enum, `RelativeBetween` and `ImuPreintegration` are **mutually
-  exclusive by construction**. If even IMU integration is untrustworthy
-  (saturation), L2 emits an `AbsolutePrior` with wide cov to start a fresh segment
-  (loop closure / GNSS stitches segments later).
-
-This guarantees the L2 information is represented **exactly once** at the
-boundary; bias estimation stays in L2 and crosses it only on restart.
-
-### 6.5 Retained per-keyframe point-cloud store
-
-L2 is the **producer** side of the retained per-keyframe cloud store; the store is
-`IKeyframeStore` (spec 01 §7.5) owned by L4 (spec 06).
-
-* On each keyframe L2 stores the **per-point spline-deskewed cloud in the keyframe
-  estimation frame** $F_{e,\text{stamp}}$ (compact: body-frame points + the keyframe
-  pose, so a corrected pose re-places them without re-querying the spline), keyed by
-  `id`. `KeyframePacket.cloud_body` is a **Shared-immutable handle** into this store,
-  never a copy (spec 01 §6.3, §6.5).
-* This is the data structure loop-closure **map de-integration** needs. Because
-  clouds are retained body-frame + pose, L4 does **clear-and-rebuild** of an
-  affected region's nvblox voxels/TSDF from retained clouds at *corrected* poses
-  after a loop closure (spec 06; `IMapLayer::apply_graph_update`, matching nvblox
-  running-average semantics) rather than fragile per-voxel subtraction. L5 GICP and
-  the final mesh read the same store (spec 01 §6.5).
-* Retention is bounded by the store's ring-buffer / on-disk spill policy (spec 06);
-  consumers re-fetch by `id` and never cache raw pointers across an eviction.
-
----
-
-## 7. `IFrontEnd`, threading, and back-end feedback
-
-### 7.1 The interface (spec 01 §7.3 is authoritative; quoted)
-
-```cpp
-class IFrontEnd {                                         // SPEC 01 §7.3
-public:
-  virtual ~IFrontEnd() = default;
-  virtual void set_calibration(std::shared_ptr<const CalibrationSet>) = 0; // + on L3 refine
-  virtual void ingest(const PreprocessedGroup&) = 0;      // PRIMARY: one sweep bundle, triggers the window solve
-  virtual void ingest_imu_live(const ImuSample&) = 0;     // live-state propagation only, never a solve
-  virtual void apply_correction(const GraphUpdate&) = 0;  // L3 feedback at safe points (§7.3)
-  virtual NavState live_state() const = 0;                // smooth odom-frame estimate (spline eval at now)
-  using KeyframeSink = std::function<void(KeyframePacket&&)>;
-  virtual void set_keyframe_sink(KeyframeSink) = 0;       // the ONE thing L2 gives L3 (§6)
-  virtual FrontEndDiagnostics diagnostics() const = 0;    // §8 (spec 01 canonical struct)
-};
-std::unique_ptr<IFrontEnd> makeFrontEnd(const FrontendConfig&,
-                                        std::shared_ptr<const CalibrationSet>,
-                                        TelemetrySink*);  // factory, spec 00 §5.1
-```
-
-The production class is **`CtFrontEnd`** (`frontend_kind = 1`), the only
-implementation the factory constructs; `FrontEndKind` is retained as the extension
-point for future estimators. The ROS 2 wrapper and L3 are written against
-`IFrontEnd` only.
-`live_state()` returns the spline evaluated at the latest valid time (a `NavState`,
-spec 01 §3.2) — for telemetry/control/L4 live integration, **not** the handoff.
-
-### 7.2 Threading & ownership
-
-L2 separates a **fast propagate/publish path** from the **window-solve path** so the
-operator-facing pose never inherits solver latency or jitter:
-
-* **Window-solve path.** `ingest(PreprocessedGroup)` runs the §5.1 outer loop on the
-  front-end thread (Meridian's priority stage, spec 00 §11): extend the spline,
-  associate, solve under the §5.2 deadline, marginalize, maybe emit a keyframe. On
-  completing a solve it publishes the new window result — the latest knots and the
-  bias/gravity estimate — into a **double-buffered last-solved snapshot** by an
-  atomic pointer swap (writer never blocks; readers always see one consistent,
-  complete window).
-* **Propagate/publish path.** `ingest_imu_live(ImuSample)` and `live_state()` do
-  **not** wait on or trigger a solve. `live_state()` produces the control-facing
-  `NavState` by evaluating the trajectory **off the last-solved snapshot**: it reads
-  the snapshot's spline up to its newest knot and, for time beyond that knot,
-  **re-propagates** by extending the spline's analytic motion under the snapshot's
-  most recent IMU samples (constant body rate / specific force over the short
-  extrapolation, the same closed-form evaluation used at cold start, §2.3). The
-  published live pose therefore advances smoothly at IMU rate and is decoupled from
-  the irregular cadence and step jitter of the window solve. The next solve replaces
-  the snapshot wholesale; there is no incremental write-back from the fast path into
-  the solver state.
-* **Why a snapshot, not a lock.** A reader taking `live_state()` mid-solve must never
-  see a half-updated window. The double buffer makes the read a single atomic load of
-  a consistent snapshot; the solver writes the *other* buffer and swaps. This is the
-  same lossless-to-the-solver, lossy-to-control discipline the rest of the system
-  uses for live state.
-* **Deferred keyframe finalization (`KeyframeFinalizer`).** Recovering the
-  window-posterior pose marginal for `constraint_cov` is a sparse
-  back-substitution over the whole window — the costliest post-solve step, with
-  next-keyframe (~1 s) slack rather than next-sweep (100 ms) slack — so on the
-  live path it runs **off the solve thread** on a single low-priority FIFO
-  worker. At keyframe emission the solve thread captures a cheap value-copy
-  snapshot of the final outer round's problem inputs (knot/bias/gravity/prior
-  clones + capped hits/IMU/patches) into a `KeyframeJob` together with the
-  otherwise-complete packet and a LiDAR-only fallback marginal; the worker
-  rebuilds a **bit-identical** Ceres problem from the clone, recovers the
-  marginal (falling back when the posterior is rank-deficient), chains it into
-  the relative-edge covariance (§6.1 — the worker owns the chain state; FIFO
-  order makes each job's predecessor the immediate one), packs `constraint_cov`,
-  and forwards the finished packet to the sink. The queue is small (depth 4);
-  a **full queue blocks the submitter** rather than dropping, so the chain has
-  no holes and the worst case is one inline-finalize cost — never worse than the
-  fully-synchronous path. `stop()` drains every in-flight job. The
-  **deterministic/replay path finalizes inline** on the solve thread (same
-  routine), keeping replay bit-exact. `constraint_cov` is therefore ready by the
-  next keyframe; the GNSS gate reads the last finalized marginal stale-tolerant
-  (§3.4).
-* `set_keyframe_sink`'s callback **enqueues** the `KeyframePacket` (Moved) onto a
-  lossless thread-safe queue to the back-end thread (spec 00 §11; spec 01 §6.3);
-  it fires on the finalizer worker (live path) or the front-end thread
-  (deterministic path). After the move L2 no longer owns it.
-* `cloud_body`/`image` are Shared-immutable; their lifetime is reference-counted
-  across {graph node, nvblox map store, loop detector} (spec 01 §6.3).
-
-The split is invisible at the `IFrontEnd` boundary: `live_state()` and the
-`KeyframePacket` stream are unchanged in type, meaning, and order; only the
-internal timing of the live pose and of packet finalization is decoupled from the
-solve.
-
-### 7.3 Back-end feedback
-
-L3 corrections arrive via the wrapper calling `set_calibration` (refined extrinsics
-as a versioned `CalibrationSet` snapshot, spec 01 §5.3) and a `GraphUpdate` path
-(spec 00 §11.2, applied at safe points). On a `GraphUpdate`, L2 re-anchors the
-odom frame and **shifts the spline control poses** by the correction (and updates
-the cached `odom→map`/datum); it does **not** restart. On a new `CalibrationSet`
-snapshot, L2 re-seeds its online extrinsic/exposure estimates and bumps
-`calib_version` for provenance on subsequent packets.
-
----
-
-## 8. Debug, introspection, timing
-
-Spec 00 §10 mandates a first-class telemetry subsystem: the **core writes to a
-ROS-agnostic `TelemetrySink`** and the wrapper maps it to topics. The canonical
-synchronous return is `FrontEndDiagnostics` (spec 01 §… — `scan_time_ms`,
-`solve_time_ms`, `deskew_time_ms`, `effective_points`, `mean_residual`,
-`final_residual`, `observability`, `iterations`, `restarted`). L2 emits the
-following, all gated by `debug.*` (counters/WARN default on; heavy clouds opt-in).
-
-### 8.1 Telemetry keys → ROS 2 topics (wrapper-bound, spec 00 §10.2)
-
-* `cloud("body/scan")`, `cloud("map/registered")` — spline-deskewed / world cloud
-  (the FAST-LIO `/cloud_registered{,_body}` analogue).
-* `cloud("frontend/effective")` + `scalar("frontend/n_effective")` +
-  `scalar("frontend/res_mean")` — the inlier set that constrained the solve, plus
-  count and mean residual (degeneracy made plottable).
-* `cloud("frontend/visual_points")` — projected visual map points;
-  `scalar("frontend/visual/map_points")` — active visual-map point count, and
-  `scalar("frontend/visual/n_candidates")` — per-frame visual candidates evaluated
-  (the visual funnel: candidates in vs map points retained).
-* `pose("odom/body")` + `vec("frontend/cov_diag")` — live odometry + typed 6×6 cov
-  (not smuggled into a pose message's covariance field as FAST-LIO does).
-* `vec("frontend/observability", obs[6])` — the 6 scores driving L3 noise; rendered
-  as the **observability hexagon** marker (spec 00 §10.4), degenerate axes red.
-* `pose("calib/T_imu_lidar")`, `pose("calib/T_imu_cam")` — online extrinsic
-  estimates over time; `scalar("frontend/exposure")` — inverse exposure $\tau$.
-* `vec("frontend/bias_acc"|"bias_gyr")`, `scalar("frontend/grav_norm")` — biases /
-  $|g|$ from the active knots.
-* `marker("spline/control_poses")` — the active control points + knot times, so the
-  adaptive-knot density (§5.5) is visible.
-* `timing(stage,ms)` per stage (extend/associate/solve/marginalize/map-update,
-  plus the keyframe-cov path `frontend.ct.{covsnapshot,covsubmit,posecov}`, §7.2)
-  → `StageTiming`.
-* `scalar("frontend/deadline_hit")` + `scalar("frontend/solve_ms")` +
-  `scalar("frontend/outer_iters")` — the deadline-bounded-solve signal (§5.2; the
-  ratio of solves cut off at `solver.time_limit_ms`), the wall-clock solve time, and
-  the §5.1.1 re-association pass count, so a sustained deadline-hit rate (the
-  over-budget warning) and association churn are plottable. (`frontend/deadline_hit`
-  and `frontend/solve_ms` are spec 09 §5.1's canonical keys; `frontend/outer_iters`
-  is a new L2 signal spec 09 should register alongside `frontend/iter_count`.)
-* `scalar("frontend/gnss/innovation_m")` + `scalar("frontend/gnss/accept_rate")` —
-  per-fix innovation (§3.4) and the rolling accept rate (spec 09 §5.1's canonical
-  `frontend/gnss/*` keys); reject reasons are logged.
-* `event(WARN,"frontend/window_restart",reason)` — restart recovery made visible
-  (spec 00 §10.2).
-* `marker("keyframe_links")` — emitted keyframes + links coloured
-  green=RelativeBetween, yellow=ImuPreintegration, red=AbsolutePrior/new-segment.
-
-### 8.2 Structured logging
-
-Per-outer-step one-line structured `INFO` (id, eff points, visual patches,
-outer/inner iters, mean residual, solve ms, deadline-hit, min eigenvalue, n_cp,
-KF?); `WARN` on no-effective-points / restart / extrinsic-or-exposure freeze /
-sustained deadline-hit / GNSS re-acquisition; `ERROR` on IMU saturation / total
-tracking loss. Heavy per-point dumps at `TRACE`. Via `meridian::log` (spec 00 §10.3); the core
-never calls `RCLCPP_*`.
-
----
-
-## 9. Parameters
-
-Keys are `meridian.frontend.*` unless noted; defaults are the code defaults
-(`config.hpp`). **Deployed tunes and their measured trade-offs live in
-`docs/OPTIMIZE.md` (the tuning ledger) and the per-dataset YAMLs** — a value
-retuned there does not amend this table's semantics.
-
-| Param | Default | Meaning / spec section |
+| situation | kind | covariance (before the pack-time reorder) |
 |---|---|---|
-| `kind` | `ct_livo` | the only accepted value (the `iekf_oracle` value was removed, §5.6) |
-| `init_time_s` | 0.1 | static-init window; **~1.0 s recommended and deployed** — a longer static start materially tightens gravity/bias init (§2.3) |
-| `sensors.imu.cov_gyr` $\sigma_g^2$ | 0.1 | **squared** continuous-time noise density (variance, $(\text{rad/s})^2$); `calibration_from_config` takes $\sqrt{\cdot}$ on load. App. R.4 |
-| `sensors.imu.cov_acc` $\sigma_a^2$ | 0.1 | **squared** density (variance, $(\text{m/s}^2)^2$); sqrt-on-load |
-| `sensors.imu.b_gyr_cov` $\sigma_{bg}^2$ | 1e-4 | **squared** gyro-bias random-walk density; sqrt-on-load |
-| `sensors.imu.b_acc_cov` $\sigma_{ba}^2$ | 1e-4 | **squared** accel-bias random-walk density; sqrt-on-load |
-| `spline.order` | `cubic` ($k=4$, $C^2$) | §1.2; App. R.1 |
-| `spline.knot_dt_ms` | 25 (code); 100 deployed | outer cadence; deployed ≈ 0.1 s = one segment per 10 Hz sweep, §5.1 |
-| `spline.window_knots` | 8 | fixed-lag window length in knots (≈ 0.8 s at 100 ms), §5.3 |
-| `spline.time_offset_estimate` | false | per-sensor $t_d$ hook (§2.2) |
-| `ncp.enabled` | false | adaptive knot density master gate (§5.5); false = uniform spline, bit-identical to a build without the feature |
-| `ncp.n_cp_max` | 1 (code); 3 deployed | per-segment control-point cap ("gear"), §5.5 |
-| `ncp.omega_thresh[]` | [0.5, 1.0, 5.0] rad/s | mean-rate $\bar N_\omega$ band edges (§5.5) |
-| `ncp.accel_thresh[]` | [0.5, 1.0, 5.0] m/s² | mean-deviation $\bar N_a$ band edges (§5.5) |
-| `ncp.hysteresis` | 0.15 (frac) | band-down hysteresis (§5.5) |
-| `ncp.warmstart_iters` | 4 | IMU-only warm-start mini-solve iterations over fresh dense tails (§5.5); 0 disables |
-| `motion_reg.enable` | true | gated jerk / ang-accel regularizer (§3.3) |
-| `motion_reg.weight` | 1e-3 (rel.) | regularizer weight vs accel weight (§3.3) |
-| `motion_reg.excitation_floor` | tune | engage-below excitation level (§3.3) |
-| `marg_prior_scale` | 1.0 | prior-forgetting multiplier in (0, 1] (§5.4); 1.0 = no forgetting |
-| `lidar.voxel_map_m` | 0.5 m | map voxel pitch (App. R.2) |
-| `lidar.num_match_points` | 5 | plane-fit kNN (§3.1) |
-| `lidar.max_match_dist_sq` | 5.0 m² | association gate (§3.1) |
-| `lidar.plane_thresh` | 0.1 m | planarity gate (§3.1) |
-| `lidar.point_cov` $\sigma_0^2$ | 1e-3 | LiDAR point variance (§3.1) |
-| `lidar.max_lidar_factors` | 1500 | bounded factor count (§3.1) |
-| `lidar.min_factors_per_normal` | 50 | per-stratum floor (§3.1) |
-| `lidar.normal_strata` | 7 (6 axes + oblique) | stratified subsample bins (§3.1) |
-| `lidar.local_map_cube_m` | 500 m | local-map cube side; map points beyond half this from the body are box-deleted (≤0 disables trimming) |
-| `solver.max_iterations` | 5 | inner LM cap (§5.2) |
-| `solver.min_iterations` | 2 | deadline lower bracket (§5.2) |
-| `solver.epsi` | 1e-3 | per-DoF tolerance (§5.2) |
-| `solver.time_limit_ms` | 90 | deadline-bounded solve, wall-clock path (§5.2) |
-| `bias.gyr_max` | 0.5 rad/s | gyro bias box bound on every bias-timeline knot (§1.4, §5.2) |
-| `bias.acc_max` | 5.0 m/s² | accel bias box bound on every bias-timeline knot (§1.4, §5.2) |
-| `bias.knot_dt_ms` | 500 | sliding bias-timeline knot cadence (§1.4) |
-| tail anchors *(code consts `kTailSigmaVel`/`kTailSigmaRate`, ct_frontend.cpp — not config-exposed)* | 0.2 m/s / 0.1 rad/s, stride `window_dt/4` | §1.3.1 |
-| `max_outer_iters` | 4 (3–5) | re-association passes (§5.1.1) |
-| `reassoc_steps` | 2 | inner LM steps per pass (§5.1.1) |
-| `assoc_shift_thresh_m` / `assoc_shift_thresh_deg` | 0.02 m / 0.2° | re-association early-stop (§5.1.1) |
-| `visual.enable` | true | master gate; off (or invalid intrinsics) ⇒ clean LIO, visual path skipped entirely |
-| `visual.patch` | 8 | patch size (§3.2; App. R.3) |
-| `visual.levels` | 3 | pyramid levels (§3.2) |
-| `visual.img_point_cov` | 100 | photometric residual weight (§3.2) |
-| `visual.outlier_threshold` | 1000 | SSD gate (§3.2) |
-| `visual.ncc_thre` | 0 (gate off) | NCC gate (§3.2 gate 4); enable per platform |
-| `visual.exposure_estimate_en` | true (gated) | §1.4, §3.6 |
-| `visual.inv_expo_cov` $\sigma_\tau^2$ | 1e-2 /s | exposure random-walk (§1.4) |
-| `visual.inv_expo_min` | 1e-3 | $\tau>0$ clamp (§1.4) |
-| `visual.grid_cell_px` | 32 px | one-best-per-cell grid (§3.2) |
-| `visual.warp_det_min`/`_max` | 0.1 / 10.0 | degenerate-warp guard (§3.2) |
-| `visual.warp_cond_max` | 50 | degenerate-warp guard (§3.2) |
-| `visual.active_box_m` | 20 m | visual-point eviction box half-extent (§3.2.1) |
-| ref-patch lifecycle *(`VisualMapConfig`, visual_map.hpp — not yet config-exposed)* | `ref_obs_cap` 30, `ref_add_angle_deg` 10°, `ref_add_score` 0.05, `ref_score_w` 0.7, `ref_converged_obs` 8 / 30°, `depth_continuity_m` 0.5 | §3.2.1 |
-| `visual.rolling_shutter_en` / `row_time_s` | false / datasheet | per-row spline eval — designed, **deferred, not yet in config** (§3.2.2) |
-| `keyframe.dist_m` | 1.0 m | keyframe trigger (§6.2) |
-| `keyframe.rot_deg` | 10° | keyframe trigger (§6.2) |
-| `keyframe.time_s` | 1.0 s | heartbeat trigger (§6.2) |
-| `degeneracy_thresh` $\kappa_{\text{deg}}$ | 10.0 | eigenvalue floor (§4.2); must be > 0 or every axis scores 1 and the gate never fires |
-| online extrinsic refinement (§3.6) | on by default (gated) | L2 key **not yet exposed** — extrinsics are currently held fixed from the `CalibrationSet` snapshot; authoritative refinement is L3's (`backend.extrinsic_refine`, spec 01 §5.3) |
-| `gnss.use` | true | master gate; off ⇒ bit-identical to a build without GNSS (§3.4) |
-| `gnss.floor_{fixed,float,dgps,spp}_{h,v}` | see §3.4 table | per-fix-type covariance floors (§3.4) |
-| `gnss.innovation_k` | 3.0 | Mahalanobis innovation gate (§3.4) |
-| `gnss.reacquire_count` | 5 | consecutive in-gate fixes to re-admit (§3.4) |
+| run's first keyframe (bootstrap sweep) | `AbsolutePrior` | $10^{-8} I$ — the pose *defines* the odom origin, tight by construction |
+| first keyframe after a chain break | `AbsolutePrior` | first converged per-scan $\Sigma_\text{right}$ × `reseed_cov_inflation` (fallback: $10^{-8} \cdot \texttt{reseed\_cov\_inflation} \cdot I$ if no converged solve preceded the emission) |
+| steady state | `RelativeBetween` | the accumulated $\Sigma_\text{rel}$ (§7, step 3), with `rel_to_id` / `T_relto_this` against the previous keyframe |
 
-(Covariance/weight values $\Sigma_L,\Sigma_I,\Sigma_C$ are not given numerically in
-the CT papers — tune empirically; Appendix R.1.)
+> **Contract change.** The retired front-end's restart fallback emitted
+> `ConstraintKind::ImuPreintegration` with an IMU summary. **This front-end
+> never emits `ImuPreintegration`** — a broken chain re-anchors with a
+> mid-stream `AbsolutePrior`, which spec 05 explicitly supports. The enum value
+> remains in spec 01 for the type's stability; L3 must not expect it from
+> `frontend_kind = 2`.
 
----
+## 10. Failure and reseed semantics
 
-## 10. Failure modes & mitigations
+No exception crosses `IFrontEnd` — `ingest()` wraps its body and converts any
+throw into a `frontend/lio/error` event while holding the last good state.
+The structured paths, in escalation order:
 
-| Failure | Detection | Response |
+1. **Sparse sweep** (keypoints < `min_keypoints`): the sweep is skipped
+   (`frontend/lio/reject`); the dead-reckoned guess becomes the registered
+   state so time advances; the map is kept. During bootstrap a sparse sweep
+   merely defers bootstrap.
+2. **Registration failure** in steady state (non-convergence or final
+   correspondences below the floor): same as (1) — drop the sweep, keep the
+   map, try the next sweep. `diagnostics().restarted` flags it.
+3. **Sensor gap** (`t_begin − prev_t_end > max_gap_s`): the state bridges the
+   hole on **constant velocity** (dead reckoning must not integrate one giant
+   dt), the tracker is rebased onto the bridged state, and a **reseed is
+   armed** (`frontend/lio/gap`). The map is kept; the next registration
+   outcome decides:
+   * **success** → the bridge held; disarm, continue normally.
+   * **failure** → the bridged prediction and the map disagree beyond
+     recovery: **clear the map**, zero $\Sigma_\text{rel}$, mark the keyframe
+     chain broken, and re-anchor the map on the failing sweep at the
+     dead-reckoned pose (`frontend/lio/reseed`). If that sweep is itself
+     unusable, fall back to the bootstrap path on the next usable sweep.
+4. **Chain repair**: after a reseed, the first converged covariance — inflated
+   by `reseed_cov_inflation` — prices the `AbsolutePrior` that re-roots the
+   keyframe chain (§9).
+
+`apply_correction` (loop-closure feedback) applies the rigid world-frame shift
+implied by the most recent moved keyframe to the registered, propagated, and
+live states. The map stays in the pre-correction frame: a small correction
+keeps registering against it; a large one fails the next solve, which path (3)
+absorbs.
+
+## 11. Determinism guarantees
+
+Two runs over identical input are **bit-identical**, live or replay — there is
+no asynchronous work, no wall-clock-dependent branch, and no thread count in
+the estimation path. The `deterministic` factory flag is accepted for interface
+compatibility and is a documented no-op. The guarantee rests on rules encoded
+in the unit tests:
+
+1. The voxel map is **never iterated to generate estimation data** —
+   association walks the time-ordered keypoint vector and probes the 27-cell
+   neighbourhood in fixed order; in-cell scans are insertion-ordered.
+2. Map iteration occurs only for **order-independent erasure** (the range
+   clip, a pure per-cell predicate).
+3. GN accumulation is **sequential** in keypoint order; no OpenMP/TBB anywhere
+   under `src/lio/` (CI grep gate, spec 11).
+4. Voxel hashing casts each index to `uint64` **before** arithmetic (defined
+   wraparound); cell indices use `std::floor`. Cell identity is decided by key
+   equality, never by the hash.
+5. Downsample survivors are appended in input scan order, never by walking a
+   set.
+
+Consequence: a deterministic-replay A/B that differs at all differs because the
+input differed. There is no rerun-once caveat.
+
+## 12. Threading
+
+The front-end is **synchronous and thread-confined**: `ingest`,
+`ingest_imu_live`, and `apply_correction` all execute on the pipeline's
+front-end stage thread (spec 00 §11), which feeds them serially from `Q_meas`.
+The keyframe sink fires inline on that thread and must only enqueue.
+`live_state()`/`diagnostics()` follow the `IFrontEnd` confinement contract
+(spec 01 §7.3). The full deskew + solve + map update runs to completion inside
+`ingest()`; the real-time budget is therefore visible as one stage timer
+(`frontend.lio.ingest`) with the deskew/solve split in `FrontEndDiagnostics`.
+
+Bounded internal buffers: the pre-init group hold (64 groups ≈ 6 s) and the
+live-IMU deque (4096 samples ≈ 20 s); both drop oldest-first when exceeded.
+
+## 13. Telemetry surface
+
+Per-sweep scalars (always-on unless grouped; groups are key-prefix wildcards,
+spec 09):
+
+| key | group | meaning |
 |---|---|---|
-| **Cold start, no trajectory** | spline spans < first valid knots | IMU-only deskew/seed (§2.3); build window from first data; no keyframe until window converged (spec 00 §7.2). |
-| **No effective LiDAR points** | effective correspondence count < 1 | mark step degraded; lean on IMU + visual residuals (the spline stays constrained by §3.3); bump counter; if persistent → window restart. |
-| **Knot spacing too coarse** for the motion | systematic IMU/LiDAR residual the solver cannot null | adaptive `n_cp` raises control-point density (§5.5). |
-| **Control points under-constrained** between sparse measurements | ill-conditioning / jitter; weak §4 axis at low `n_cp` | dense IMU residuals regularise; cap `n_cp`; marginalization prior anchors the boundary; engage the optional low-weight jerk / angular-acceleration regularizer (§3.3) on the under-excited span. |
-| **Geometric degeneracy** (corridor, tunnel, open field) | small eigenvalue(s) of $\Lambda_{\text{pose}}<\kappa_{\text{deg}}$ (§4) | ship low `observability` scores so L3 inflates the noise model on weak axes (§4.3); optionally clamp the update along weak dirs (solution remapping, designed option §4.3); lean on IMU/GNSS/visual; **freeze extrinsic/gravity refinement** (§3.6). |
-| **Photometric failure** (low light, blur, over/under-exposure) | high photo residual / NCC fail / depth-continuity fail / `outlier_threshold` hit | drop visual residuals this step (LIO only); freeze exposure $\tau$; WARN. Degrade gracefully. |
-| **IMU saturation / dropout** | accel/gyro at FSR or gap > `imu_gap_max` | mark; if integration untrustworthy emit `AbsolutePrior` wide-cov new segment; ERROR. |
-| **Sweep gap (bridged)** | sweep opens > ½ span past `last_solved_t_`, but group IMU reaches `last_solved_t_` within 2 IMU periods | the seed integrates across the hole; **solve normally**; log `frontend/sweep_gap_bridged` (§2.2). |
-| **Sweep gap (unbridgeable)** | the group IMU itself starts after `last_solved_t_` (a true data hole) | **`reseedAfterGap`**: predict the anchor across the hole on **constant velocity**, **rebuild** the window + bias timeline, insert the reseed sweep into the map **without solving**; the next continuous-IMU sweep solves against the rebuilt window (§2.2). |
-| **Unknown clock offset $t_d$** | systematic, motion-correlated residual | nominally prevented by PTP (spec 02); enable `ct.time_offset_estimate` hook (§2.2). |
-| **Marginalization linearization staleness / prior overconfidence** | prior inconsistent after a large correction; prior residual RMS growing over the mission with a weakly-observable state pinned | re-linearize prior on `GraphUpdate`; bound window so the prior is never far from the current estimate; per-slide prior forgetting via `marg_prior_scale` (§5.4). |
-| **Discrete-knot coverage by time-sampling** (the clamp-snapshot bug class) | a knot set covered by sampling the curve at times instead of enumerating deque indices skips or double-counts knots near a boundary / density change → partial coverage poisons the solve | **enumerate knot indices, never sample by time** (§5.4 invariant); the original snapshot path is gone with the clamp, but marginalization (§5.4) and tail-knot pinning (§1.3.1) must obey it. |
-| **GNSS spoof/jump/multipath** | innovation $k\cdot\sigma$ gate fail (§3.4); `fix` type; jump vs odom | reject the fix (counted); fix-type covariance floor caps trust; re-admit only after `gnss.reacquire_count` consecutive in-gate fixes; robust kernel; one bad fix never snaps the window. Authoritative robustness (PCM) in L3. |
-| **Bias runaway** (outlier burst drives a bias knot to an absurd value) | a bias-timeline knot pins at its box bound | **bias box bounds** (§5.2), applied to every $b_g$/$b_a$ knot of the sliding timeline (§1.4), absorb it in-window — no restart; if a bias stays pinned across the step it escalates to the divergence row below. (There is no step clamp; the tail null space it once guarded is removed structurally by tail-knot pinning, §1.3.1.) |
-| **Divergence** (residual blow-up, all-axis obs collapse) | residual norm > thresh **with a bias knot pinned at a bound** (§5.2); min eigenvalue ≈ 0 across axes | **window restart** (last resort, only after the §5.2 bias-bounds guard fails): discard the window, re-bootstrap from IMU-only deskew, emit `ImuPreintegration` (or wide `AbsolutePrior`) so L3 stitches the gap; prior keyframes preserved (§6.4). |
-| **Visual-map / ref-patch unbounded growth** (long mission) | active visual-point count or observation-list size rising without bound | observation cap + min-score eviction + converged latch on ref patches; spatial box-delete of out-of-box visual points mirroring the LiDAR map (§3.2.1); active set is RAII-owned, store is the durable record. |
-| **Degenerate / NaN photometric warp** (pure rotation, grazing, uninitialised normal) | $|\det A|$ / condition out of bounds, or no fitted normal (§3.2) | drop the point for that frame (never warp an unwarped or guessed patch); reconsider next frame once a normal exists. |
-| **Stale cloud handle after loop closure** | store eviction | consumers re-fetch from `IKeyframeStore` by `id`, never cache raw pointers (§6.5). |
+| `frontend/assoc/n_attempted`, `n_matched` | `assoc` | keypoints offered / correspondences found at the solved pose |
+| `frontend/solver/gn_iters`, `dx_norm`, `chi` | `solver` | iterations, last update norm, final squared-residual sum |
+| `frontend/lio/beta` | `lio` | gravity-regularizer weight actually used (−1 = block off) |
+| `frontend/lio/accel_var` | `lio` | interval specific-force-magnitude variance (the β driver) |
+| `frontend/lio/n_corr`, `deskew_span_t_ms` | `lio` | correspondence count; sweep time span |
+| `frontend/map/voxels`, `points` | `map_health` | map occupancy counters |
+| `frontend/state/vel_norm`, `bias_gyr_norm`, `bias_acc_norm` | — | live kinematic sanity |
+| `frontend/obs` (vec6), `frontend/obs_min` | — | per-axis observability + its minimum |
 
----
+Events (group `lio`): `init_backlog`, `init_done`, `gap`, `reject`, `reseed`;
+plus the ungrouped `frontend/lio/error`. Heavy payloads: `body/scan` (the
+deskewed sweep, `/meridian/cloud_body`) and `frontend/path_sample` (the
+odometry pose stream sampled at `debug_path_sample_hz`, aggregated by the
+wrapper into `/meridian/path`). All stamps are measurement time.
 
-## 11. Library choices and what was rejected
+## 14. Parameters
 
-One choice per job; alternatives are named here only to record that they were
-considered and rejected (library canon, system direction).
+`frontend.lio.*` (defaults from `config.hpp`; `validate()` enforces the stated
+ranges; every change gets a `docs/OPTIMIZE.md` row):
 
-| Job | Chosen | One-line justification | Rejected (why) |
-|---|---|---|---|
-| CT spline kernel | **basalt-headers (vendored)** | canonical, battle-tested $O(k)$ analytic derivatives **and** Jacobians w.r.t. control points — removes the single biggest implementation risk (App. R.1). | hand-rolled spline (months of subtle Jacobian bugs); full-SE(3) (non-split) spline (screw coupling, slower; App. R.1). |
-| Window solver / marginalization | **Ceres** (LM + Schur) | what all three CT references use; manifold SO(3), built-in Schur (App. R.1). | GTSAM here (reserved for the L3 iSAM2 global graph). |
-| NN for plane fitting | **ikd-Tree (vendored) or adaptive voxel-hash** | incremental, box-delete, lock-safe rebuild for the recent-point query (App. R.2). | brute-force kNN. |
-| Map (TSDF + colour + mesh) | **nvblox (GPU)** | GPU TSDF + colour + Marching Cubes on the Orin, the single map backend (spec 06). **No CPU fallback, no VDBFusion, no OpenVDB/NanoVDB.** | CPU TSDF / VDBFusion (Orin always has CUDA — a second path is dead weight). |
-| Robust kernels / IMU factor (L3 side) | **GTSAM** `noiseModel::Robust`+Huber, `CombinedImuFactor`, `GncOptimizer` | the restart factor and global graph (spec 05). | per-interval preintegration on the normal path (the relative cov already carries it; §6.4). |
-| Linear algebra / Lie | **Eigen 3.4 + Sophus** | basalt/Ceres substrate. | — |
-
-**The iEKF (rejected, removed).** A FAST-LIO2-style sequential ESIKF — the
-well-known fast alternative — handles intra-scan motion by approximate
-backward-propagation, fuses an asynchronous camera awkwardly, and cannot
-represent the sub-scan trajectory the colourised-mesh goal needs (Appendix R.1).
-The former offline oracle build is removed; cross-check is direct GT tracking (§5.6).
-
----
-
-## 12. Consistency checklist
-
-* **Spec 00 (architecture):** L2 behind `IFrontEnd`; **one** production front-end
-  (`CtFrontEnd`), and now the only one (the iEKF oracle was removed, §5.6); deskew via injected
-  `IDeskewProvider` backed by the spline (§2, spec 00 §7); telemetry through
-  `TelemetrySink` keys (§8, spec 00 §10); L2 the priority stage, `KeyframePacket`
-  moved on a lossless queue (§7, spec 00 §11). Honoured.
-* **Spec 01 (interfaces/types):** `KeyframePacket`, `NavState`,
-  `ObservabilityReport`, `LidarScan/LidarPoint`, `CameraFrame`, `ImuSample`,
-  `GnssFix`, `CalibrationSet`, `FrontEndDiagnostics`, `IFrontEnd` used **verbatim**;
-  tangent order `[ρ;φ]` and obs order `[tx,ty,tz,rx,ry,rz]`; extrinsics **not** in
-  the trajectory state (in `CalibrationSet`); `cloud_body` is a handle. **Spec 01 is
-  canonical; §6/§7 here restate, never redefine.** If they diverge, fix this file.
-* **Spec 02 (L0 time):** all stamps PTP ns; per-point `t_offset_ns` consumed at true
-  time (§3.1); the known-timing caveat (§2.2) relies on PTP.
-* **Spec 03 (L1):** consumes undeskewed `LidarScan`, pyramided `CameraFrame`, raw
-  IMU, gated `GnssFix`; deskew is L2-owned (intrinsic to the spline; `IDeskewProvider`
-  feedback at cold start), not L1 (§2).
-* **Spec 05 (L3):** receives exactly one `KeyframePacket` stream; **one factor per
-  keyframe** via `constraint_kind` — single relative `BetweenFactor` (front-end
-  marginal cov) on the normal path, `CombinedImuFactor` only on restart
-  (mutually exclusive), `AbsolutePrior` for anchors/GNSS; `kinematics_included =
-  false` except on restart; bias estimation in L2 (§6.4). Feeds back refined
-  `CalibrationSet` / `GraphUpdate` (§7.3). GNSS binding: `nearest_kf_id` is a
-  graph-attachment hint only; residual geometry binds to the spline pose at fix
-  time on both sides (§3.4).
-* **Spec 06 (L4 / nvblox / store):** L2 fills the retained per-keyframe body-frame
-  cloud enabling nvblox clear-and-rebuild de-integration; handles only; nvblox is
-  the sole GPU map backend (§6.5, §11).
-* **Spec 07 (L5):** GICP/place-recognition reads the same retained store.
-
----
-
-## Appendix R — SOTA reference grounding (non-normative)
-
-This appendix is evidence, not contract: curated digests of the reference systems
-this spec's design was validated against. Nothing here binds Meridian's behavior —
-the normative sections above own the design. Each block names the reference checkout
-it was verified against; the clones live in `/home/user/slam-reference`.
-
-### R.1 Continuous-time B-spline trajectory (CLINS / Coco-LIC / basalt)
-
-*Verified against `Coco-LIC@4ead7e4`, `clins@6ceb011` (both vendor basalt-style
-spline headers). basalt-headers itself is **not present** in
-`/home/user/slam-reference`; its `RdSpline`/`So3Spline`/`Se3Spline` API is
-described from the live Coco-LIC/clins copies.*
-
-Split cubic ($k=4$, $C^2$) cumulative B-spline: a `So3Spline<4>` for rotation + an
-`RdSpline<3,4>` for translation. The cumulative blending matrix
-$\tilde M^{(4)}=\tfrac16[[6,5,1,0],[0,3,3,0],[0,-3,3,0],[0,1,-2,1]]$ ($\lambda_0\equiv1$).
-Value/derivatives are the $O(k)$ Sommer recurrence; non-uniform (adaptive `n_cp`) is
-realised via virtual-time remapping over the uniform kernels (NURBS variants).
-
-| Concept | Coco-LIC `file:symbol` |
-|---|---|
-| cumulative blending matrix `M̃` | `src/spline/spline_common.h::computeBlendingMatrix<N,_,Cumulative=true>` (line 73) |
-| SO(3) value / gyro `ω` / accel | `src/spline/so3_spline.h::evaluate` (237), `velocityBody` (311), `accelerationBody` (370) |
-| non-uniform (virtual-time) variants | `so3_spline.h::evaluateNURBS` (283), `velocityBodyNURBS` (340) |
-| IMU residual (gyro+accel on spline) | `src/odom/factor/analytic_diff/trajectory_value_factor.h::IMUFactor` (128) |
-| bias random-walk residual | same file, `BiasFactor` (63); gravity `GravityFactor` (31) |
-| LiDAR point-to-plane on spline | `src/odom/factor/analytic_diff/lidar_feature_factor.h::LoamFeatureFactor` (30); NURBS form `LoamFeatureFactorNURBS` (175) — residual `pᵀ·n + d` at line 93 |
-| visual frame-to-map reprojection (LiDAR-depth) | `lidar_feature_factor.h` / `image_feature_factor.h` |
-| Schur marginalization prior | `src/odom/factor/analytic_diff/marginalization_factor.h::MarginalizationInfo` (106), `MarginalizationFactor` (161) |
-| adaptive knot insertion | `src/odom/trajectory_manager.cpp` (`non_uniform` extend path) |
-
-**CT vs iEKF contrast (the conclusion driving the §1 choice; the iEKF is no longer built, §5.6/§11).**
-
-| Dimension | CT B-spline (Coco-LIC/CLINS) | iEKF (FAST-LIO2 / Point-LIO) |
+| key | default | role |
 |---|---|---|
-| intra-scan motion | absorbed natively — deskew *is* the trajectory | backward-prop deskew (FAST-LIO2) / per-point update (Point-LIO) |
-| sensor asynchrony | native — each sensor at its own `t` | per-sensor handling; async camera awkward |
-| IMU handling | direct residual on spline 2nd-deriv + `ω` | propagation (FAST-LIO2) / augmented-state measurement (Point-LIO) |
-| sub-scan trajectory for colour | queryable at any rate | not represented |
-| compute | heavier NLLS window (Ceres) | lighter filter |
-| maturity | newer | very mature |
+| `voxel_size_m` | 1.0 | map voxel edge [m]; also the observability neighbourhood radius (> 0) |
+| `max_points_per_voxel` | 20 | per-cell point cap; sets the min-spacing rule `v/sqrt(cap)` (≥ 1) |
+| `max_range_m` | 100.0 | deskew range crop + map clip radius [m] (> 0; per-dataset, match L1 `det_range`) |
+| `keypoint_voxel_factor` | 1.5 | keypoint downsample voxel = factor × `voxel_size_m` (> 0) |
+| `min_keypoints` | 30 | sweep-usability floor and final-correspondence gate (≥ 1) |
+| `icp_max_iterations` | 100 | GN iteration cap (≥ 1) |
+| `convergence_eps` | 1e-5 | `‖δx‖` convergence threshold (> 0) |
+| `max_corr_dist_m` | 0.5 | nearest-neighbour correspondence gate [m] (> 0) |
+| `min_beta` | 200.0 | floor of the gravity-regularizer weight (> 0) |
+| `max_expected_jerk` | 3.0 | uniform-jerk bound of the accel-magnitude filter [m/s³] (> 0) |
+| `init_stationary_s` | 1.0 | standstill window for static init [s]; 0 = start immediately (≥ 0) |
+| `max_gap_s` | 0.5 | sensor gap that arms a reseed [s] (> 0) |
+| `reseed_cov_inflation` | 100.0 | covariance inflation on the post-reseed `AbsolutePrior` (≥ 1) |
 
-**Sharp edges.** (i) A CT spline absorbs *known* timing only — an unknown
-inter-sensor offset $t_d$ is silently baked in unless added as an optimised
-parameter (`T(t+t_d)`, differentiable). (ii) Coco-LIC's published $(N_g,N_a)\to n_{cp}$ adaptive
-thresholds are graphical in the paper — tune against the released code. (Meridian's
-*normative* gating statistic is the mean-of-per-sample-norms $\bar N_\omega,\bar N_a$
-form of §5.5 — each sample's magnitude taken individually before averaging, never a
-summed-then-normed vector aggregate, which cancels under fast rotation.)
-(iii) Covariance weights $\Sigma_L,\Sigma_I,\Sigma_C$ are not numerically given in
-the CT papers — tune empirically. (iv) Under a virtual-time warp (Coco-LIC's
-engineering pattern) the real-time trajectory is only $C^1$ across a knot-density
-change; Meridian therefore evaluates the true non-uniform basis per interval (§1.2),
-which restores $C^2$ in real time at the seam.
+`frontend.keyframe.*`: `dist_m` 1.0, `rot_deg` 10.0, `time_s` 1.0 — the §9
+cadence. `frontend.debug_path_sample_hz` (copied from `debug.path_sample_hz` at
+pipeline construction, default 30): sampling cadence of `frontend/path_sample`;
+debug-only, gates no estimator computation.
 
-### R.2 ikd-Tree incremental map internals (the registration-oracle contract)
+## 15. Failure modes
 
-*Verified against `FAST_LIO@7cc4175`. The `ikd-Tree` itself is a git submodule
-(`hku-mars/ikd-Tree`, pinned `e2e3f4e`) that is **not checked out** in this clone —
-`include/ikd-Tree/` is empty. The contract below is the digest the spec's NN query
-relies on; re-confirm body line numbers against an initialized submodule before
-quoting them.*
-
-The front-end's plane-fit NN query (`ikdtree.Nearest_Search`, 5-NN) sits on an
-incremental k-d tree with these load-bearing properties:
-
-| Property | Contract |
-|---|---|
-| node bookkeeping | per-node subtree AABB (`node_range_{x,y,z}`), `TreeSize`, `invalid_point_num`, `down_del_num`, recorded `alpha_bal`/`alpha_del` |
-| kNN search | bounded max-heap, box-distance pruning on the per-node AABB (not single-axis), skips lazy-deleted nodes/subtrees; result sorted nearest-first |
-| lazy delete | a deleted point/subtree is flagged (`point_deleted`/`tree_deleted`), not removed; re-insertion flips the flag back |
-| box-wise delete | `Delete_Point_Boxes(BoxPointType[])` — subtree fully inside box → O(1) `tree_deleted`; disjoint → prune; partial → recurse. Used by the sliding-map eviction |
-| scapegoat re-balance | rebuild subtree at $T$ when $\alpha_{bal}=\max(\#L,\#R)/(\text{TreeSize}-1)>0.7$ **or** $\alpha_{del}=\text{invalid}/\text{TreeSize}>0.5$; never if `TreeSize < 10` |
-| parallel rebuild | subtree > 1500 pts rebuilds on a worker thread; concurrent ops are logged to a ring buffer and **replayed** onto the new balanced subtree before swap; `size()`/`validnum()` use `trylock` + cached fallback so search/odometry never stall |
-| on-insert downsample | `Add_Points(.., downsample=true)` keeps one point per voxel (nearest the voxel centre), lazy-deletes the rest |
-
-Constants (from the dossier's header read; **unverified against the live empty
-submodule**): `Minimal_Unbalanced_Tree_Size=10`, `Multi_Thread_Rebuild_Point_Num=1500`,
-`delete_criterion_param=0.5`, `balance_criterion_param=0.7`, `downsample_size` set to
-`filter_size_map_min` (0.5 m). Meridian may instead use an adaptive voxel-hash with
-the same box-delete / lock-safe-rebuild contract.
-
-### R.3 Sparse-direct photometric residual (FAST-LIVO2)
-
-*Verified against `FAST-LIVO2@0d2c034`. Exact line numbers within `updateState`
-drifted from the dossier's earlier read; the anchor functions below were
-re-confirmed in this checkout.* Note: FAST-LIVO2 keeps a **custom 19-DoF
-`StatesGroup`** (`include/common_lib.h:30`, manual `operator+/-`), **not** the
-FAST-LIO IKFoM `state_ikfom`; the LiDAR and visual updates share that one covariance
-sequentially (LiDAR, then photometric, no re-propagation).
-
-| Element | `src/vio.cpp` symbol |
-|---|---|
-| per-frame pipeline | `processFrame` (1786): retrieve → `computeJacobianAndUpdateEKF` (784) → generate/update visual points → refine ref patch |
-| association (depth from LiDAR scan, in-FOV gather, raycast, depth-continuity gate, warp+NCC gate) | `retrieveFromVisualSparseMap` (352) |
-| photometric residual $r=\tau_{cur}I_{cur}(\mathbf u+\Delta)-\tau_{ref}P^{warp}[\Delta]$ | inside `updateState` (1520) |
-| projection Jacobian $J_\pi$ (2×3) | `computeProjectionJacobian` (189) |
-| affine warp via LiDAR-plane homography | `getWarpMatrixAffineHomography` (252); pyramid pick `getBestSearchLevel` (320) |
-| NCC gate | `calculateNCC` (333) |
-| sequential ESIKF update $K=(H^\top R^{-1}H+P^{-1})^{-1}\dots$ | `updateState` (1520) |
-
-Map points double as LiDAR points in a shared **0.5 m voxel hash** (`feat_map`,
-`vio.h:126`); depth always from LiDAR → no VIO init/triangulation. Parameters:
-`patch_size=8`, `patch_pyrimid_level=3`, `IMG_POINT_COV=100`, `outlier_threshold=1000`,
-`ncc_thre`, `exposure_estimate_en` (`vio.h:100,109`). Gates: depth-continuity Δ>0.5 m,
-NCC, oblique-view (>60°). Sharp edge to improve on: heavy raw-pointer ownership
-(`new`/`delete` of `VisualPoint`/`Feature`) — Meridian uses RAII/smart pointers.
-
-### R.4 IMU model, init, propagation, backward-deskew (FAST-LIO)
-
-*Verified against `FAST_LIO@7cc4175`.*
-
-| Quantity | Equation | `file:symbol` |
+| symptom | mechanism | response / instrument |
 |---|---|---|
-| de-biased gyro | $\omega = \omega_m - b_g$ | `use-ikfom.hpp::get_f` (47) |
-| world accel | $a = R(a_m-b_a)+g$ | `use-ikfom.hpp::get_f` (47) |
-| state ODE | $\dot p=v,\ \dot R=R[\omega]_\times,\ \dot v=R(a_m-b_a)+g$ | `get_f` |
-| mean propagation | $x_{k+1}=x_k\boxplus(f\,\Delta t)$ | `esekfom.hpp::predict` |
-| cov propagation | $P=F_xPF_x^\top+(\Delta t F_w)Q(\Delta t F_w)^\top$ | `esekfom.hpp::predict` |
-| init gravity (on $S^2$) | $g_0=-(\overline{a_m}/\|\overline{a_m}\|)\cdot 9.81$ | `IMU_Processing.hpp::IMU_init` |
-| init gyro bias | $b_{g0}=\overline{\omega_m}$ | `IMU_init` |
-| per-point rotation | $R_i=R_h\,\mathrm{Exp}(\omega\,\Delta t)$ | `IMU_Processing.hpp::UndistortPcl` |
-| per-point world disp. | $T_{ei}=p_h+v_h\Delta t+\tfrac12 a_h\Delta t^2-p_e$ | `UndistortPcl` |
-| deskew transform | $\hat P=R_{LI}^\top[R_e^\top(R_i(R_{LI}P_i+t_{LI})+T_{ei})-t_{LI}]$ | `UndistortPcl` |
+| estimate frozen while platform moves | sweeps skipped (sparse/failed registration) | `frontend/lio/reject` events; `frontend/assoc/n_matched` collapse |
+| jump after a data hole | constant-velocity bridge landed off | `frontend/lio/gap` then either recovery or `reseed`; expect an `AbsolutePrior` packet |
+| slow drift over long missions | frozen biases (no online estimation) | `frontend/state/bias_*_norm` constant by construction; see §16.1 |
+| confident-but-wrong covariance in degenerate scenes | rung-0 data-term-only Σ | `frontend/obs_min` low while `chi` small — observability, not Σ, is the degeneracy signal |
+| init never completes | platform not still for `init_stationary_s` | `frontend/lio/init_backlog` warning; held groups dropping |
+| tilt error from a moving start | `init_stationary_s = 0` identity-attitude fallback | gravity regularizer fights the wrong anchor; do not use 0 in the field |
 
-Defaults (`config/avia.yaml`): $\sigma_g^2=\sigma_a^2=0.1$, $\sigma_{bg}^2=\sigma_{ba}^2=10^{-4}$,
-`INIT_TIME=0.1 s`. Deskew is a **backward pass over the prior (propagated) trajectory**
-with constant-$\omega$/constant-accel intra-interval (the code's `// not accurate!`
-ceiling) — the discrete approximation Meridian's CT spline replaces.
+## 16. Known limitations
 
-**Two claims often gotten wrong, verified against the live clones:** (i)
-`f_w_final` **is** fully assigned in FAST-LIO's `esekfom.hpp::predict` (SO(3)/$S^2$
-blocks at lines 300/328/369, used in the covariance update at 381); (ii) FAST-LIVO2
-does **not** reuse FAST-LIO's IKFoM state or deskew — it carries a custom 19-DoF
-`StatesGroup` (R.3) and its deskew uses precomputed `extR_Ri`/`exrR_extT` extrinsic
-composites (`IMU_Processing.cpp:526`). The two systems share the *idea* of
-backward-propagation deskew, not the state or the code.
-
-### R.5 State manifold + iterated ESIKF (FAST-LIO IKFoM) — historical reference
-
-*Verified against `FAST_LIO@7cc4175`.* This grounded the now-removed offline iEKF
-oracle (§5.6). It is retained as a reference digest of FAST-LIO's sign conventions
-and the $\Lambda_{pose}=H^\top R^{-1}H$ pose block (which the CT solver still forms
-for observability, §4.1), but no Meridian component implements it any longer.
-
-State `state_ikfom` (DOF=23 tangent, DIM=24 ambient): $(p,R,R_{LI},t_{LI},v,b_g,b_a,g)$,
-$g\in S^2$ (fixed $|g|$, 2-DoF). `use-ikfom.hpp:12` (build), `:8` ($S^2$ type), `get_f` (47),
-`df_dx` 24×23 (61), `df_dw` 24×12 (80).
-
-| Element | Equation / `file:symbol` |
-|---|---|
-| right-perturbation chart | $R\boxplus\delta=R\,\mathrm{Exp}(\delta)$, Euclidean for vects, $S^2$ retraction for $g$ |
-| point-to-plane row $H_j$ (1×23, 12 nonzero) | $[\,n^\top,\ -n^\top R[q]_\times,\ -n^\top R R_{LI}[p^L]_\times,\ n^\top R R_{LI},\ 0\dots]$ — `laserMapping.cpp::h_share_model` (638) |
-| residual | $z_j=n^\top p^W_j+d$ stored as $-z_j$ |
-| information-form gain | $K=(H^\top R^{-1}H+P^{-1})^{-1}H^\top R^{-1}$ — inverts 23×23 not $m\times m$ |
-| iterated update + prior pull-back | $\delta=Kz+(KH-I)\,J\,(x\boxminus x_{prop})$; `update_iterated_dyn_share_modified` |
-| chart transport $J$ | SO(3): $A(\delta\phi)^\top$; $S^2$: $N_xM_x$ |
-| LiDAR meas. noise | scalar `LASER_POINT_COV=0.001`; convergence per-DoF `epsi=0.001`, `maximum_iter=4` |
-
-Plane fit: 5-point QR of $A\mathbf u=-\mathbf 1$ then unit-normalise (`common_lib.h::esti_plane`,
-226), 0.1 m planarity gate, range-scaled acceptance $s=1-0.9|r|/\sqrt{\|p^L\|}$ (keep
-$s>0.9$). Robustness is **gating, not per-point weighting**. `extrinsic_est_en=true`
-default fills cols 6–11 of $H$. The removed Meridian oracle used a decoupled
-`[p|R|v|b_g|b_a|g]` chart (so position columns stay $n^\top$), a first-order
-tangent-plane $S^2$ scheme, and identity chart-transport — deliberate
-simplifications that were acceptable for an offline cross-check.
+1. **No online bias estimation.** Biases are fixed at static-init values;
+   the at-rest accel bias is only observable along gravity. Long-mission gyro
+   drift accumulates as heading error. Benchmark first; an online bias state is
+   the designed extension point (it would ride the tracker, not the packet).
+2. **Rung-0 covariance** (§7 caveats): map correlation ignored, data term only,
+   isotropic $\hat\sigma^2$. NEES calibration against GT is the follow-up.
+3. **Interval-mean screw deskew** assumes the rate is constant across the
+   sweep; intra-sweep oscillation faster than the sweep period aliases into
+   the cloud. This is measured per dataset, not assumed away.
+4. **IMU lever arm ignored** in the sample rotation to $F_e$ (§2) — valid for
+   centimeter-scale offsets only.
+5. **`apply_correction` shifts the state, not the map.** Large corrections
+   force a reseed by design; revisit when loop closure ships.
+6. **Camera/GNSS are dormant**: images pass through for downstream
+   colourisation; GNSS gate verdicts are produced by L1 and consumed by no one.
+7. **Observability neighbourhood is one voxel deep** — `neighborsWithin` radii
+   beyond `voxel_size_m` silently truncate to the 27-cell envelope; the normal
+   estimate is local by construction.
