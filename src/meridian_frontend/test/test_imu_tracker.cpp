@@ -1,14 +1,14 @@
-#include "lio/imu_tracker.hpp"
+#include <gtest/gtest.h>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
-#include <gtest/gtest.h>
 #include <cmath>
 #include <numbers>
 #include <random>
 #include <sophus/so3.hpp>
 #include <vector>
 
+#include "lio/imu_tracker.hpp"
 #include "meridian/config/config.hpp"
 
 using meridian::FrontendLio;
@@ -41,8 +41,7 @@ ImuSample makeSample(Timestamp stamp, const Eigen::Vector3d& acc, const Eigen::V
 }
 
 void expectBitEqual(const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
-  EXPECT_TRUE((a.array() == b.array()).all())
-      << a.transpose() << " vs " << b.transpose();
+  EXPECT_TRUE((a.array() == b.array()).all()) << a.transpose() << " vs " << b.transpose();
 }
 
 // The integrator compensates each sample with the attitude *before* the update, so a
@@ -101,8 +100,7 @@ TEST(ImuTracker, GyroOnlyConstantRateMatchesClosedForm) {
 
   const NavState st = tracker.propagated_state();
   const double total_s = (kN - 1) * kStepS;
-  const Eigen::Quaterniond q_expected =
-      Sophus::SO3d::exp(omega * total_s).unit_quaternion();
+  const Eigen::Quaterniond q_expected = Sophus::SO3d::exp(omega * total_s).unit_quaternion();
   EXPECT_LT(st.T_world_body.q.angularDistance(q_expected), 1e-9);
   EXPECT_LT(st.v_world.norm(), 1e-9);
   EXPECT_LT(st.T_world_body.t.norm(), 1e-9);
@@ -338,9 +336,8 @@ TEST(ImuTracker, RebaseResetsKinematicsKeepsBiases) {
 
   NavState solved;
   solved.stamp = kT0 + 5 * kStepNs;
-  solved.T_world_body =
-      Pose{Eigen::Quaterniond(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitZ())),
-           Eigen::Vector3d(1.0, 2.0, 3.0)};
+  solved.T_world_body = Pose{Eigen::Quaterniond(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitZ())),
+                             Eigen::Vector3d(1.0, 2.0, 3.0)};
   solved.v_world = Eigen::Vector3d(0.5, -0.1, 0.2);
   solved.b_g = Eigen::Vector3d(9, 9, 9);  // must NOT be adopted
   solved.b_a = Eigen::Vector3d(8, 8, 8);
@@ -348,8 +345,7 @@ TEST(ImuTracker, RebaseResetsKinematicsKeepsBiases) {
 
   const NavState st = tracker.propagated_state();
   EXPECT_EQ(st.stamp, solved.stamp);
-  EXPECT_TRUE(
-      (st.T_world_body.q.coeffs().array() == solved.T_world_body.q.coeffs().array()).all());
+  EXPECT_TRUE((st.T_world_body.q.coeffs().array() == solved.T_world_body.q.coeffs().array()).all());
   expectBitEqual(st.T_world_body.t, solved.T_world_body.t);
   expectBitEqual(st.v_world, solved.v_world);
   EXPECT_TRUE(tracker.bias_gyro().isZero());
@@ -361,8 +357,7 @@ TEST(ImuTracker, RebaseResetsKinematicsKeepsBiases) {
       makeSample(t_next, gravityReaction(solved.T_world_body.q), Eigen::Vector3d::Zero()));
   const NavState after = tracker.propagated_state();
   EXPECT_EQ(after.stamp, t_next);
-  EXPECT_LT((after.T_world_body.t - (solved.T_world_body.t + solved.v_world * 0.01)).norm(),
-            1e-12);
+  EXPECT_LT((after.T_world_body.t - (solved.T_world_body.t + solved.v_world * 0.01)).norm(), 1e-12);
   EXPECT_LT((after.v_world - solved.v_world).norm(), 1e-12);
   EXPECT_LT(after.T_world_body.q.angularDistance(solved.T_world_body.q), 1e-15);
 }

@@ -1,14 +1,13 @@
 #include "lio/lio_frontend.hpp"
 
+#include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <cmath>
 #include <exception>
 #include <numbers>
+#include <sophus/so3.hpp>
 #include <span>
 #include <utility>
-
-#include <Eigen/Eigenvalues>
-#include <sophus/so3.hpp>
 
 #include "lio/relative_cov.hpp"
 #include "meridian/common/cov_reorder.hpp"
@@ -120,8 +119,7 @@ void LioFrontEnd::ingest(const PreprocessedGroup& group) {
       }
       if (telemetry_ != nullptr && telemetry_->enabled("frontend/lio/init_done")) {
         telemetry_->event(Level::Info, "frontend/lio/init_done",
-                          "static init complete: gravity aligned, at-rest biases fixed",
-                          g.t_end);
+                          "static init complete: gravity aligned, at-rest biases fixed", g.t_end);
       }
       // Drain in arrival order. Every held sample is already inside the tracker, so the
       // re-feed in processGroup dedups to a no-op; the propagated guess for the older
@@ -314,8 +312,7 @@ void LioFrontEnd::processGroup(const MeasureGroup& g) {
 }
 
 void LioFrontEnd::handleFailure(const MeasureGroup& g, const NavState& guess,
-                                const std::vector<Eigen::Vector3d>& deskewed,
-                                bool scan_usable) {
+                                const std::vector<Eigen::Vector3d>& deskewed, bool scan_usable) {
   restart_pending_ = true;
   diag_.restarted = true;
   // Time must advance regardless; the dead-reckoned pose is the best available.
@@ -347,8 +344,7 @@ void LioFrontEnd::handleFailure(const MeasureGroup& g, const NavState& guess,
   }
   if (telemetry_ != nullptr && telemetry_->enabled("frontend/lio/reseed")) {
     telemetry_->event(Level::Warn, "frontend/lio/reseed",
-                      "map cleared and re-anchored after post-gap registration failure",
-                      g.t_end);
+                      "map cleared and re-anchored after post-gap registration failure", g.t_end);
   }
 }
 
@@ -549,13 +545,16 @@ NavState LioFrontEnd::live_state() const {
   return tracker_.initialized() ? tracker_.propagated_state() : NavState{};
 }
 
-void LioFrontEnd::set_keyframe_sink(KeyframeSink sink) { keyframe_sink_ = std::move(sink); }
+void LioFrontEnd::set_keyframe_sink(KeyframeSink sink) {
+  keyframe_sink_ = std::move(sink);
+}
 
-FrontEndDiagnostics LioFrontEnd::diagnostics() const { return diag_; }
+FrontEndDiagnostics LioFrontEnd::diagnostics() const {
+  return diag_;
+}
 
 void LioFrontEnd::publishSweepTelemetry(const MeasureGroup& g, const MotionPrior& prior,
-                                        const RegistrationResult& res,
-                                        std::size_t n_keypoints) {
+                                        const RegistrationResult& res, std::size_t n_keypoints) {
   if (telemetry_ == nullptr) {
     return;
   }

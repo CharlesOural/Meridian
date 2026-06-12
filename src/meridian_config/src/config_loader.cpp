@@ -453,11 +453,10 @@ bool Config::validate(std::string* error_out) const {
   }
 
   // --- debug groups & path aggregation ---
-  for (const auto& [name, g] :
-       {std::pair<const char*, const DebugGroup*>{"assoc", &debug.assoc},
-        {"solver", &debug.solver},
-        {"lio", &debug.lio},
-        {"map_health", &debug.map_health}}) {
+  for (const auto& [name, g] : {std::pair<const char*, const DebugGroup*>{"assoc", &debug.assoc},
+                                {"solver", &debug.solver},
+                                {"lio", &debug.lio},
+                                {"map_health", &debug.map_health}}) {
     if (g->max_hz < 0.0) {
       return fail(std::string("debug.") + name + ".max_hz must be >= 0");
     }

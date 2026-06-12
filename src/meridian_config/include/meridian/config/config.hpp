@@ -239,7 +239,7 @@ struct PreprocessConfig {
 
 // ---- frontend (L2) ----
 struct FrontendLio {
-  double voxel_size_m = 1.0;           // map voxel edge [m]
+  double voxel_size_m = 1.0;  // map voxel edge [m]
   int max_points_per_voxel = 20;
   double max_range_m = 100.0;          // crop + map clip radius [m]
   double keypoint_voxel_factor = 1.5;  // keypoint downsample voxel = factor * voxel_size_m
@@ -247,11 +247,11 @@ struct FrontendLio {
   int icp_max_iterations = 100;
   double convergence_eps = 1e-5;
   double max_corr_dist_m = 0.5;
-  double min_beta = 200.0;             // floor on the gravity-regularizer weight
-  double max_expected_jerk = 3.0;      // [m/s^3]
-  double init_stationary_s = 1.0;      // standstill window for static init; 0 = start immediately
-  double max_gap_s = 0.5;              // sensor gap beyond this triggers a reseed
-  double reseed_cov_inflation = 100.0; // constraint-cov inflation on the reseeded keyframe
+  double min_beta = 200.0;              // floor on the gravity-regularizer weight
+  double max_expected_jerk = 3.0;       // [m/s^3]
+  double init_stationary_s = 1.0;       // standstill window for static init; 0 = start immediately
+  double max_gap_s = 0.5;               // sensor gap beyond this triggers a reseed
+  double reseed_cov_inflation = 100.0;  // constraint-cov inflation on the reseeded keyframe
 };
 struct FrontendKeyframe {
   double dist_m = 1.0;
@@ -413,9 +413,9 @@ struct DebugConfig {
   // Front-end debug groups (key prefix each one gates). All emission under a group is
   // hoisted behind one enabled() check per sweep, so an off group costs one hash
   // lookup; the always-on basics (counts, residual means, biases, ...) stay ungrouped.
-  DebugGroup assoc{};       // frontend/assoc/*  — association-quality detail + outlier cloud
-  DebugGroup solver{};      // frontend/solver/* — per-iteration trace + cost shares
-  DebugGroup lio{};         // frontend/lio/*    — internal-deskew / IMU-tracker / init / reseed detail
+  DebugGroup assoc{};   // frontend/assoc/*  — association-quality detail + outlier cloud
+  DebugGroup solver{};  // frontend/solver/* — per-iteration trace + cost shares
+  DebugGroup lio{};  // frontend/lio/*    — internal-deskew / IMU-tracker / init / reseed detail
   DebugGroup map_health{/*enable=*/true, 0.0};  // frontend/map/* — size/insert counters (cheap)
   // /meridian/path: the odometry pose stream sampled at path_sample_hz and aggregated
   // by the wrapper into one nav_msgs/Path, republished at most path_publish_hz and

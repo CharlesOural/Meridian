@@ -22,7 +22,7 @@ class TelemetrySink;
 // thread and must only enqueue. Ingested samples are borrowed (the front-end
 // copies what it keeps); emitted packets are moved.
 class IFrontEnd {
- public:
+public:
   virtual ~IFrontEnd() = default;
 
   // Calibration snapshot: once at start, and again whenever a refined snapshot is

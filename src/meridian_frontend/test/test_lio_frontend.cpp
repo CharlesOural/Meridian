@@ -54,7 +54,9 @@ std::shared_ptr<const CalibrationSet> makeCalib() {
   return c;
 }
 
-Sophus::SE3d toSE3(const Pose& p) { return Sophus::SE3d{p.q, p.t}; }
+Sophus::SE3d toSE3(const Pose& p) {
+  return Sophus::SE3d{p.q, p.t};
+}
 
 // Odom -> world alignment fixed by the run's first keyframe: the estimator's origin is
 // its init pose, so all ground-truth comparisons go through this constant transform.
@@ -71,8 +73,7 @@ RunResult runStream(const std::vector<PreprocessedGroup>& stream,
                     const std::vector<std::vector<ImuSample>>& live_per_group = {}) {
   RunResult out;
   auto fe = meridian::makeFrontEnd(FrontendConfig{}, makeCalib(), nullptr, true);
-  fe->set_keyframe_sink(
-      [&out](KeyframePacket&& kf) { out.packets.push_back(std::move(kf)); });
+  fe->set_keyframe_sink([&out](KeyframePacket&& kf) { out.packets.push_back(std::move(kf)); });
   for (std::size_t i = 0; i < stream.size(); ++i) {
     fe->ingest(stream[i]);
     if (i < live_per_group.size()) {

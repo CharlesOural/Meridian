@@ -5,7 +5,9 @@
 
 namespace meridian::lio {
 namespace {
-constexpr double square(double x) { return x * x; }
+constexpr double square(double x) {
+  return x * x;
+}
 }  // namespace
 
 ImuTracker::ImuTracker(const FrontendLio& cfg) : cfg_(cfg) {}
@@ -32,7 +34,9 @@ void ImuTracker::add_sample(const ImuSample& s) {
   propagateAndAccumulate(s);
 }
 
-bool ImuTracker::initialized() const { return initialized_; }
+bool ImuTracker::initialized() const {
+  return initialized_;
+}
 
 void ImuTracker::accumulateInit(const ImuSample& s) {
   if (init_count_ == 0) {
@@ -86,8 +90,7 @@ void ImuTracker::propagateAndAccumulate(const ImuSample& s) {
     const Eigen::Vector3d accel_world = q * accel_body;
     state_.T_world_body.t += state_.v_world * dt + 0.5 * dt * dt * accel_world;
     state_.v_world += accel_world * dt;
-    state_.T_world_body.q =
-        (q * Sophus::SO3d::exp(omega * dt).unit_quaternion()).normalized();
+    state_.T_world_body.q = (q * Sophus::SO3d::exp(omega * dt).unit_quaternion()).normalized();
     state_.stamp = s.stamp;
   }
 
@@ -153,14 +156,24 @@ void ImuTracker::rebase(const NavState& solved) {
   state_.v_world = solved.v_world;
 }
 
-NavState ImuTracker::propagated_state() const { return state_; }
+NavState ImuTracker::propagated_state() const {
+  return state_;
+}
 
-Eigen::Vector3d ImuTracker::bias_gyro() const { return state_.b_g; }
+Eigen::Vector3d ImuTracker::bias_gyro() const {
+  return state_.b_g;
+}
 
-Eigen::Vector3d ImuTracker::bias_accel() const { return state_.b_a; }
+Eigen::Vector3d ImuTracker::bias_accel() const {
+  return state_.b_a;
+}
 
-double ImuTracker::filtered_accel_magnitude() const { return accel_kf_mean_; }
+double ImuTracker::filtered_accel_magnitude() const {
+  return accel_kf_mean_;
+}
 
-double ImuTracker::filtered_accel_variance() const { return accel_kf_var_; }
+double ImuTracker::filtered_accel_variance() const {
+  return accel_kf_var_;
+}
 
 }  // namespace meridian::lio

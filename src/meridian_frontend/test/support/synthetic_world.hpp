@@ -133,9 +133,8 @@ public:
       const Pose T = poseAt(t_begin + offset);
       const double azim = 2.0 * std::numbers::pi * j / cfg_.n_azimuth;
       for (int k = 0; k < cfg_.n_rings; ++k) {
-        const double elev_deg =
-            cfg_.fov_down_deg +
-            (cfg_.fov_up_deg - cfg_.fov_down_deg) * k / std::max(cfg_.n_rings - 1, 1);
+        const double elev_deg = cfg_.fov_down_deg + (cfg_.fov_up_deg - cfg_.fov_down_deg) * k /
+                                                        std::max(cfg_.n_rings - 1, 1);
         const double elev = elev_deg * std::numbers::pi / 180.0;
         const Eigen::Vector3d d_sensor(std::cos(elev) * std::cos(azim),
                                        std::cos(elev) * std::sin(azim), std::sin(elev));
@@ -143,8 +142,7 @@ public:
         if (!(range > 0.0) || range > cfg_.max_range_m) {
           continue;
         }
-        const double noisy =
-            cfg_.range_noise_std > 0.0 ? range + range_noise_(rng_) : range;
+        const double noisy = cfg_.range_noise_std > 0.0 ? range + range_noise_(rng_) : range;
         LidarPoint pt;
         pt.xyz = (noisy * d_sensor).cast<float>();
         pt.t_offset_ns = static_cast<std::int32_t>(offset);

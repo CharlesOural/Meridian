@@ -1,7 +1,7 @@
+#include <gtest/gtest.h>
+
 #include <fstream>
 #include <string>
-
-#include <gtest/gtest.h>
 
 #include "meridian/config/config.hpp"
 #include "meridian/config/config_loader.hpp"
@@ -208,8 +208,7 @@ TEST(Config, ZeroQueueCapacityFails) {
 // ---- camera distortion keys ----
 
 TEST(ConfigLoader, LoadsCameraDistortionKeys) {
-  const std::string path =
-      std::string(::testing::TempDir()) + "/meridian_cam_distortion.yaml";
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_cam_distortion.yaml";
   {
     std::ofstream f(path);
     f << "meridian:\n"
@@ -246,8 +245,7 @@ TEST(ConfigLoader, ShortDistortionCoeffsZeroFill) {
 }
 
 TEST(ConfigLoader, TooManyDistortionCoeffsThrows) {
-  const std::string path =
-      std::string(::testing::TempDir()) + "/meridian_cam_distortion_long.yaml";
+  const std::string path = std::string(::testing::TempDir()) + "/meridian_cam_distortion_long.yaml";
   {
     std::ofstream f(path);
     f << "meridian:\n"

@@ -1,11 +1,10 @@
 #pragma once
 
+#include <Eigen/Core>
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <vector>
-
-#include <Eigen/Core>
 
 #include "lio/imu_tracker.hpp"
 #include "lio/scan_registration.hpp"

@@ -1,10 +1,9 @@
 #pragma once
 
+#include <Eigen/Core>
 #include <cstdint>
 #include <memory>
 #include <optional>
-
-#include <Eigen/Core>
 
 #include "meridian/common/cloud.hpp"
 #include "meridian/common/frame.hpp"

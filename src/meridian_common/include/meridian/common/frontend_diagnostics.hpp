@@ -14,18 +14,13 @@ struct FrontEndDiagnostics {
   double mean_residual = 0.0;   // mean absolute residual over effective points
   double final_residual = 0.0;  // cost at convergence
   ObservabilityReport observability;
-  int iterations = 0;     // solver iterations used by the last solve
-  int outer_iters = 0;    // re-association passes run by the last solve
+  int iterations = 0;      // solver iterations used by the last solve
+  int outer_iters = 0;     // re-association passes run by the last solve
   bool restarted = false;  // true once after a window restart, until the next solve
   // True when the wall-clock-bounded solve was cut off at the deadline before
   // convergence (best-iterate-so-far returned). Always false on the deterministic
   // replay path, which ignores the time limit.
   bool deadline_hit = false;
-  // Running count of control-point knots Schur-marginalized into the sliding-window
-  // prior since construction, and the row dimension of the current prior residual
-  // (0 while no prior exists). Together they confirm the prior chain has engaged.
-  int knots_marginalized = 0;
-  int prior_residual_dim = 0;
 };
 
 }  // namespace meridian

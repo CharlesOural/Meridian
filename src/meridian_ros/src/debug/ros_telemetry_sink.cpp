@@ -1,9 +1,8 @@
 #include "debug/ros_telemetry_sink.hpp"
 
 #include <algorithm>
-#include <string_view>
-
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <string_view>
 
 #include "conversions/core2ros.hpp"
 
@@ -18,15 +17,22 @@ bool is_wildcard(const std::string& key) {
   return key.size() >= 2 && key.compare(key.size() - 2, 2, "/*") == 0;
 }
 
-std::uint8_t to_u8(Level level) { return static_cast<std::uint8_t>(level); }
+std::uint8_t to_u8(Level level) {
+  return static_cast<std::uint8_t>(level);
+}
 
 Level from_log_level(LogLevel level) {
   switch (level) {
-    case LogLevel::Trace: return Level::Trace;
-    case LogLevel::Debug: return Level::Debug;
-    case LogLevel::Info: return Level::Info;
-    case LogLevel::Warn: return Level::Warn;
-    case LogLevel::Error: return Level::Error;
+    case LogLevel::Trace:
+      return Level::Trace;
+    case LogLevel::Debug:
+      return Level::Debug;
+    case LogLevel::Info:
+      return Level::Info;
+    case LogLevel::Warn:
+      return Level::Warn;
+    case LogLevel::Error:
+      return Level::Error;
   }
   return Level::Info;
 }
@@ -76,8 +82,8 @@ RosTelemetrySink::RosTelemetrySink(rclcpp::Node* node, const DebugConfig& cfg)
   path_state.max_hz = -1.0;  // negative = explicitly unlimited (pass() treats <=0 as no limit)
   keys_["frontend/path_sample"] = path_state;
   if (cfg.publish_path) {
-    pub_path_ = node_->create_publisher<nav_msgs::msg::Path>("/meridian/path",
-                                                             rclcpp::QoS(1).reliable());
+    pub_path_ =
+        node_->create_publisher<nav_msgs::msg::Path>("/meridian/path", rclcpp::QoS(1).reliable());
     path_.header.frame_id = frame_name(Frame::Odom);
   }
 }
@@ -123,8 +129,7 @@ bool RosTelemetrySink::pass(const std::string& key, bool heavy) {
   }
   const auto now = Clock::now();
   const auto min_interval = std::chrono::duration<double>(1.0 / st.max_hz);
-  if (st.last.time_since_epoch().count() != 0 && (now - st.last) < min_interval)
-    return false;
+  if (st.last.time_since_epoch().count() != 0 && (now - st.last) < min_interval) return false;
   st.last = now;
   return true;
 }
@@ -144,8 +149,8 @@ void RosTelemetrySink::scalar(const char* key, double v, Timestamp t) {
   pub_telemetry_->publish(m);
 }
 
-void RosTelemetrySink::vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v,
-                           Timestamp t, const char* axis_order) {
+void RosTelemetrySink::vec(const char* key, const Eigen::Ref<const Eigen::VectorXd>& v, Timestamp t,
+                           const char* axis_order) {
   if (!pass(key, /*heavy=*/false)) return;
   meridian_msgs::msg::Telemetry m;
   m.stamp = to_ros(t);
@@ -156,16 +161,15 @@ void RosTelemetrySink::vec(const char* key, const Eigen::Ref<const Eigen::Vector
   pub_telemetry_->publish(m);
 }
 
-void RosTelemetrySink::cloud(const char* key, const PointCloudView& view, Frame f,
-                             Timestamp t) {
+void RosTelemetrySink::cloud(const char* key, const PointCloudView& view, Frame f, Timestamp t) {
   if (!pass(key, /*heavy=*/true)) return;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub;
   {
     std::lock_guard<std::mutex> lock(m_);
     auto& slot = cloud_pubs_[key];
     if (!slot) {
-      slot = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-          cloud_topic(key), rclcpp::QoS(5).best_effort());
+      slot = node_->create_publisher<sensor_msgs::msg::PointCloud2>(cloud_topic(key),
+                                                                    rclcpp::QoS(5).best_effort());
     }
     pub = slot;
   }
@@ -216,16 +220,14 @@ void RosTelemetrySink::append_path(const Pose& p, Timestamp t) {
     // memory and per-publish serialisation on a long mission.
     const auto cap = static_cast<std::size_t>(std::max(cfg_.path_max_poses, 1));
     if (path_.poses.size() > cap) {
-      path_.poses.erase(path_.poses.begin(),
-                        path_.poses.begin() +
-                            static_cast<std::ptrdiff_t>(path_.poses.size() - cap));
+      path_.poses.erase(path_.poses.begin(), path_.poses.begin() + static_cast<std::ptrdiff_t>(
+                                                                       path_.poses.size() - cap));
     }
     path_.header.stamp = ps.header.stamp;
     const auto now = Clock::now();
     const auto min_interval =
         std::chrono::duration<double>(1.0 / std::max(cfg_.path_publish_hz, 1e-3));
-    if (path_last_pub_.time_since_epoch().count() == 0 ||
-        (now - path_last_pub_) >= min_interval) {
+    if (path_last_pub_.time_since_epoch().count() == 0 || (now - path_last_pub_) >= min_interval) {
       path_last_pub_ = now;
       snapshot = path_;  // copy under the lock; publish outside it
       publish_now = true;
@@ -278,8 +280,7 @@ void RosTelemetrySink::timing(const char* stage, double ms, Timestamp t) {
   pub_timing_->publish(m);
 }
 
-void RosTelemetrySink::event(Level level, const char* tag, std::string_view msg,
-                             Timestamp t) {
+void RosTelemetrySink::event(Level level, const char* tag, std::string_view msg, Timestamp t) {
   meridian_msgs::msg::Event m;
   m.stamp = to_ros(t);
   m.level = to_u8(level);
@@ -416,25 +417,20 @@ std::string RosTelemetrySink::image_topic(const std::string& key) const {
 RclcppLogSink::RclcppLogSink(rclcpp::Logger logger, LogLevel min_level)
     : logger_(std::move(logger)), default_level_(from_log_level(min_level)) {}
 
-void RclcppLogSink::log(Level level, const char* module, std::string_view kvline,
-                        Timestamp /*t*/) {
+void RclcppLogSink::log(Level level, const char* module, std::string_view kvline, Timestamp /*t*/) {
   switch (level) {
     case Level::Trace:
     case Level::Debug:
-      RCLCPP_DEBUG(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()),
-                   kvline.data());
+      RCLCPP_DEBUG(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()), kvline.data());
       break;
     case Level::Info:
-      RCLCPP_INFO(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()),
-                  kvline.data());
+      RCLCPP_INFO(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()), kvline.data());
       break;
     case Level::Warn:
-      RCLCPP_WARN(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()),
-                  kvline.data());
+      RCLCPP_WARN(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()), kvline.data());
       break;
     case Level::Error:
-      RCLCPP_ERROR(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()),
-                   kvline.data());
+      RCLCPP_ERROR(logger_, "[%s] %.*s", module, static_cast<int>(kvline.size()), kvline.data());
       break;
   }
 }

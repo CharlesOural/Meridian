@@ -2,20 +2,18 @@
 
 #include <chrono>
 #include <map>
-#include <mutex>
-#include <string>
-#include <unordered_map>
-#include <vector>
-
-#include <rclcpp/rclcpp.hpp>
-
 #include <meridian_msgs/msg/event.hpp>
 #include <meridian_msgs/msg/stage_timing.hpp>
 #include <meridian_msgs/msg/telemetry.hpp>
+#include <mutex>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "meridian/config/config.hpp"
@@ -33,7 +31,7 @@ namespace meridian {
 //
 // Thread-safe: called from source (wrapper) threads and the stage thread concurrently.
 class RosTelemetrySink final : public TelemetrySink {
- public:
+public:
   RosTelemetrySink(rclcpp::Node* node, const DebugConfig& cfg);
 
   bool enabled(const char* key) const override;
@@ -54,7 +52,7 @@ class RosTelemetrySink final : public TelemetrySink {
   void set_default_rate(double hz);
   void reset_timing();
 
- private:
+private:
   using Clock = std::chrono::steady_clock;
 
   struct KeyState {
@@ -108,8 +106,7 @@ class RosTelemetrySink final : public TelemetrySink {
 
   std::unordered_map<std::string, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr>
       cloud_pubs_;
-  std::unordered_map<std::string, rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr>
-      pose_pubs_;
+  std::unordered_map<std::string, rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr> pose_pubs_;
   std::unordered_map<std::string, rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr>
       image_pubs_;
 };
@@ -117,7 +114,7 @@ class RosTelemetrySink final : public TelemetrySink {
 // Bridges core logging onto the node's rclcpp logger, with a runtime-settable
 // per-module minimum level.
 class RclcppLogSink final : public LogSink {
- public:
+public:
   RclcppLogSink(rclcpp::Logger logger, LogLevel min_level);
 
   void log(Level level, const char* module, std::string_view kvline, Timestamp t) override;
@@ -126,7 +123,7 @@ class RclcppLogSink final : public LogSink {
   // "" sets the default level for every module without an explicit override.
   void set_level(const std::string& module, Level level);
 
- private:
+private:
   rclcpp::Logger logger_;
   mutable std::mutex m_;
   Level default_level_;
