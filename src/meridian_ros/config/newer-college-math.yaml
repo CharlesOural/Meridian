@@ -102,7 +102,7 @@ meridian:
       keypoint_voxel_factor: 1.5  # keypoint downsample voxel = factor * voxel_size_m
       min_keypoints: 30           # below this the sweep is rejected for registration
       icp_max_iterations: 100
-      convergence_eps: 1.0e-5
+      convergence_eps: 1.0e-3
       max_corr_dist_m: 0.5
       min_beta: 200.0             # floor on the gravity-regularizer weight
       max_expected_jerk: 3.0      # [m/s^3]

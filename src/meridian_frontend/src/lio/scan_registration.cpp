@@ -2,6 +2,7 @@
 
 #include <Eigen/Cholesky>
 #include <Eigen/LU>
+#include <chrono>
 #include <sophus/se3.hpp>
 
 namespace meridian::lio {
@@ -10,6 +11,11 @@ namespace {
 using Mat6 = Eigen::Matrix<double, 6, 6>;
 using Vec6 = Eigen::Matrix<double, 6, 1>;
 using Mat36 = Eigen::Matrix<double, 3, 6>;
+
+using SteadyClock = std::chrono::steady_clock;
+double ms_since(SteadyClock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(SteadyClock::now() - t0).count();
+}
 
 // World up-gravity vector [m/s^2]; static initialization aligns the world z-axis
 // with the measured up direction.
@@ -106,7 +112,9 @@ RegistrationResult ScanRegistration::registerScan(
   const Eigen::Vector3d g_anchor = T.so3().inverse() * kGravityUpWorld;
 
   for (int iter = 0; iter < cfg_.icp_max_iterations; ++iter) {
+    const auto t_assoc0 = SteadyClock::now();
     const NormalEq eq = accumulateData(keypoints_body, nearest, T);
+    out.assoc_ms += ms_since(t_assoc0);
     out.gn_iters = iter + 1;
     if (eq.n == 0) {
       break;  // association lost; report the failure from the current pose
@@ -125,7 +133,9 @@ RegistrationResult ScanRegistration::registerScan(
       H.noalias() += J_ori.transpose() * J_ori / beta;
       b.noalias() += J_ori.transpose() * r_ori / beta;
     }
+    const auto t_ldlt0 = SteadyClock::now();
     const Vec6 dx = H.ldlt().solve(-b);
+    out.ldlt_ms += ms_since(t_ldlt0);
     T = Sophus::SE3d::exp(dx) * T;
     out.dx_norm = dx.norm();
     if (out.dx_norm < cfg_.convergence_eps) {
@@ -136,6 +146,7 @@ RegistrationResult ScanRegistration::registerScan(
 
   out.pose = Pose{T.unit_quaternion(), T.translation()};
 
+  const auto t_cov0 = SteadyClock::now();
   // Re-associate at the solved pose: the unaveraged data-term normal equations are the
   // Laplace information. The heuristic gravity prior carries no measurement
   // information, so it is excluded and unobserved axes stay reported as unobserved.
@@ -161,6 +172,7 @@ RegistrationResult ScanRegistration::registerScan(
   } else {
     out.converged = false;
   }
+  out.cov_ms = ms_since(t_cov0);
   return out;
 }
 

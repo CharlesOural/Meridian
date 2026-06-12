@@ -21,9 +21,9 @@ constexpr std::array kAll{
     frontend::AssocNAttempted, frontend::AssocNMatched, frontend::SolverGnIters,
     frontend::SolverDxNorm, frontend::SolverChi, frontend::MapVoxels, frontend::MapPoints,
     frontend::MapSize, frontend::LidarInliers, frontend::LioBeta, frontend::LioAccelVar,
-    frontend::LioNCorr, frontend::LioDeskewSpanTMs, frontend::PathSample, frontend::Keyframe,
-    frontend::LioInitBacklog, frontend::LioInitDone, frontend::LioError, frontend::LioGap,
-    frontend::LioReject, frontend::LioReseed,
+    frontend::LioNCorr, frontend::LioDeskewSpanTMs, frontend::LioScanMs, frontend::PathSample,
+    frontend::Keyframe, frontend::LioInitBacklog, frontend::LioInitDone, frontend::LioError,
+    frontend::LioGap, frontend::LioReject, frontend::LioReseed,
     // backend
     backend::Chi2, backend::NFactors, backend::NLoops, backend::NGnss, backend::UpdateMs,
     backend::RelinCount, backend::QueueDepth, backend::OptimizeLag, backend::FallbackCount,
@@ -56,6 +56,9 @@ constexpr std::array kAll{
     // timing stages
     stage::Preprocess, stage::PreprocessDeskew, stage::PreprocessCamera,
     stage::PreprocessLidarValidity, stage::BackendOptimize, stage::LioIngest,
+    stage::LioDeskew, stage::LioDownsample, stage::LioRegister, stage::LioRegAssoc,
+    stage::LioRegSolve, stage::LioRegCov, stage::LioMapUpdate, stage::LioObservability,
+    stage::LioKeyframe,
 };
 
 const char* to_str(Unit u) {
