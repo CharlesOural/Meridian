@@ -180,8 +180,10 @@ void LioFrontEnd::processGroup(const MeasureGroup& g) {
       registration_.deskew(g.scan, T_body_lidar_, prior.omega_body, vel_body, g.t_end);
   const double deskew_ms = ms_since(t_deskew0);
 
+  const auto t_ds0 = Clock::now();
   const std::vector<Eigen::Vector3d> keypoints =
       voxelDownsample(deskewed, cfg_.lio.keypoint_voxel_factor * cfg_.lio.voxel_size_m);
+  const double downsample_ms = ms_since(t_ds0);
   const bool scan_usable = static_cast<int>(keypoints.size()) >= cfg_.lio.min_keypoints;
 
   if (!bootstrapped_) {
@@ -270,8 +272,10 @@ void LioFrontEnd::processGroup(const MeasureGroup& g) {
   solved.b_a = tracker_.bias_accel();
   tracker_.rebase(solved);
 
+  const auto t_map0 = Clock::now();
   insertWorld(deskewed, res.pose);
   map_.clipFarFrom(res.pose.t);
+  const double map_ms = ms_since(t_map0);
   cov_rel_ = composeRelativeCov(cov_rel_, delta, res.cov_right);
   if (chain_broken_ && !have_reseed_cov_) {
     // The first converged covariance after a reseed, inflated, prices the absolute
@@ -280,7 +284,9 @@ void LioFrontEnd::processGroup(const MeasureGroup& g) {
     have_reseed_cov_ = true;
   }
   reseed_armed_ = false;
+  const auto t_obs0 = Clock::now();
   last_obs_ = observabilityAt(keypoints, res.pose);
+  const double obs_ms = ms_since(t_obs0);
   last_state_ = solved;
   rebaseLive(solved);
 
@@ -300,6 +306,7 @@ void LioFrontEnd::processGroup(const MeasureGroup& g) {
   diag_.deadline_hit = false;
   diag_.scan_time_ms = ms_since(t_ingest0);
 
+  const auto t_kf0 = Clock::now();
   PointCloudPtr cloud;
   publishBodyScan(deskewed, g.t_end, &cloud);
   if (chain_broken_ || keyframeDue(res.pose, g.t_end)) {
@@ -308,8 +315,27 @@ void LioFrontEnd::processGroup(const MeasureGroup& g) {
     }
     emitKeyframe(solved, std::move(cloud));
   }
+  const double kf_ms = ms_since(t_kf0);
   publishSweepTelemetry(g, prior, res, keypoints.size());
   publishPathSample(res.pose, g.t_end);
+
+  // Per-phase timing of this ingest. timing() is never group-gated, so the breakdown is
+  // always recorded; assoc/ldlt/cov come from the solve's own measurement.
+  if (telemetry_ != nullptr) {
+    const Timestamp t = g.t_end;
+    telemetry_->timing(keys::stage::LioDeskew, deskew_ms, t);
+    telemetry_->timing(keys::stage::LioDownsample, downsample_ms, t);
+    telemetry_->timing(keys::stage::LioRegister, solve_ms, t);
+    telemetry_->timing(keys::stage::LioRegAssoc, res.assoc_ms, t);
+    telemetry_->timing(keys::stage::LioRegSolve, res.ldlt_ms, t);
+    telemetry_->timing(keys::stage::LioRegCov, res.cov_ms, t);
+    telemetry_->timing(keys::stage::LioMapUpdate, map_ms, t);
+    telemetry_->timing(keys::stage::LioObservability, obs_ms, t);
+    telemetry_->timing(keys::stage::LioKeyframe, kf_ms, t);
+    if (telemetry_->enabled(keys::frontend::LioScanMs)) {
+      telemetry_->scalar(keys::frontend::LioScanMs, ms_since(t_ingest0), t);
+    }
+  }
 }
 
 void LioFrontEnd::handleFailure(const MeasureGroup& g, const NavState& guess,

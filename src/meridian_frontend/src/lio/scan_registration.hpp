@@ -28,6 +28,12 @@ struct RegistrationResult {
   double dx_norm = 0.0;
   double chi = 0.0;
   bool converged = false;
+  // Wall-clock breakdown of this solve [ms]: association is the per-iteration
+  // nearest-map probe over all keypoints, ldlt the linear solve, cov the final
+  // covariance re-association. assoc dominates and scales with gn_iters.
+  double assoc_ms = 0.0;
+  double ldlt_ms = 0.0;
+  double cov_ms = 0.0;
 };
 
 // Nearest-map-point lookup: writes the closest stored point to `query_world` and

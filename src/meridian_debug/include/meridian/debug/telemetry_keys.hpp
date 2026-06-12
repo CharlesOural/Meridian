@@ -109,6 +109,9 @@ inline constexpr Key LioBeta{"frontend/lio/beta"};
 inline constexpr Key LioAccelVar{"frontend/lio/accel_var"};
 inline constexpr Key LioNCorr{"frontend/lio/n_corr", Unit::Count};
 inline constexpr Key LioDeskewSpanTMs{"frontend/lio/deskew_span_t_ms", Unit::Ms};
+// Per-sweep wall-clock total of the frontend ingest, emitted as a scalar (the stage
+// timer aggregates to avg/max; this keeps the per-sweep series for cold/steady split).
+inline constexpr Key LioScanMs{"frontend/lio/scan_ms", Unit::Ms};
 // odometry path sample (pose)
 inline constexpr Key PathSample{"frontend/path_sample"};
 // event tags
@@ -243,6 +246,18 @@ inline constexpr Key PreprocessCamera{"preprocess.camera"};
 inline constexpr Key PreprocessLidarValidity{"preprocess.lidar.validity"};
 inline constexpr Key BackendOptimize{"backend.optimize"};
 inline constexpr Key LioIngest{"frontend.lio.ingest", Unit::Ms};
+// LIO sub-phases of one ingest, mirroring the call tree. register splits further into
+// the association (nearest-map probe over keypoints, repeated per GN iteration), the
+// linear solve (LDLT), and the final covariance re-association.
+inline constexpr Key LioDeskew{"frontend.lio.deskew", Unit::Ms};
+inline constexpr Key LioDownsample{"frontend.lio.downsample", Unit::Ms};
+inline constexpr Key LioRegister{"frontend.lio.register", Unit::Ms};
+inline constexpr Key LioRegAssoc{"frontend.lio.register.assoc", Unit::Ms};
+inline constexpr Key LioRegSolve{"frontend.lio.register.solve", Unit::Ms};
+inline constexpr Key LioRegCov{"frontend.lio.register.cov", Unit::Ms};
+inline constexpr Key LioMapUpdate{"frontend.lio.map_update", Unit::Ms};
+inline constexpr Key LioObservability{"frontend.lio.observability", Unit::Ms};
+inline constexpr Key LioKeyframe{"frontend.lio.keyframe", Unit::Ms};
 }  // namespace stage
 
 // The whole catalog as a flat range, for tooling: the unit table, the no-duplicate-id
