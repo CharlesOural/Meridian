@@ -39,7 +39,7 @@ constexpr std::size_t kMeasQueueCapacity = 8 * 24;
 // Assembled map-cloud cadence and resolution. The cloud is rebuilt from all stored
 // keyframes once every kMapCloudFoldPeriod folds (or immediately on a loop fold), then
 // collapsed to a single voxel grid at kMapCloudVoxel metres so its size stays bounded.
-constexpr std::uint64_t kMapCloudFoldPeriod = 10;
+constexpr std::uint64_t kMapCloudFoldPeriod = 5;
 constexpr float kMapCloudVoxel = 0.3f;
 
 SensorInfo make_info(std::uint8_t id, Modality modality, Frame frame, const std::string& model,
