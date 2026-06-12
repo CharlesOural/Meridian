@@ -26,11 +26,11 @@
 > (per-point time is first-class, a per-sensor handler, a time-unit scale) and
 > fix what it got wrong (no health signal, no offset estimation, time smuggled
 > through `curvature`, sync done by a single `time_sync_en` boolean). The
-> system Meridian builds — a **continuous-time (CT), tightly-coupled
-> LiDAR-Inertial-Visual-GNSS** estimator (arch §0) — places harder demands on L0
-> than any LiDAR-only reference: it queries the trajectory `T(t)` at *each
-> point's true sample time*, at *mid-exposure* for the sparse-direct photometric
-> residual, and at *every IMU instant* for the derivative residual. All three
+> system Meridian builds — a **discrete, tightly-coupled
+> LiDAR-Inertial** estimator (arch §0) — depends on the timeline everywhere: it
+> warps *each point at its true sample time*, integrates *every IMU instant*
+> into propagation and the motion prior, and stamps the camera at
+> *mid-exposure* for the passthrough image. All three
 > demands are demands on the **single timeline** L0 produces.
 >
 > **Scope of L0.** L0 owns: per-sensor acquisition (`ISensorSource`), conversion
@@ -83,10 +83,9 @@
 
 A tightly-coupled multi-sensor estimator is, mathematically, a function of a set
 of measurements $\{z_i\}$ each indexed by the **true instant** $t_i$ at which the
-physical quantity was sampled. Every downstream guarantee — registration of each
-LiDAR point against the continuous trajectory `T(t_i)` evaluated at that point's
-true sample time (arch §7.5), IMU-derivative residuals along the spline,
-photometric reprojection at mid-exposure, B-spline knot placement — depends on
+physical quantity was sampled. Every downstream guarantee — the per-point deskew
+warp at each point's true sample time (arch §7.1), IMU propagation and the
+interval-averaged motion prior, the camera's mid-exposure stamp — depends on
 $t_i$ being **correct on a single timeline to a known tolerance**. If two sensors
 disagree about "now" by $\delta t$, a tightly-coupled fuse of them injects an
 error proportional to the platform velocity times $\delta t$: at 5 m/s, a 10 ms
@@ -141,7 +140,7 @@ L0's contract is a set of *obligations* on the fields it fills:
 | Type | Stamp field semantics (what the instant means) | L0 must guarantee |
 |---|---|---|
 | `ImuSample` (01 §4.1) | `stamp` = instant the IMU integrated the reported $\Delta v,\Delta\theta$ over its sample interval, reported as the **interval end** (the convention preintegration assumes). | Monotonic non-decreasing per `sensor_id`; on Meridian timeline; **raw** acc/gyro (no de-bias, no orientation). |
-| `LidarScan` + `LidarPoint` (01 §4.2) | `stamp_start` = true instant of the **first** point; `LidarPoint::t_offset_ns` = signed ns of *this* point relative to `stamp_start`. | Per-point time present and correct (reject scan otherwise, §11); `sweep_duration` = last−first; `points` Shared-immutable. |
+| `LidarScan` + `LidarPoint` (01 §4.2) | `stamp_start` = true instant of the **first** point; `LidarPoint::t_offset_ns` = signed ns of *this* point relative to `stamp_start`. | Per-point time present and correct (reject scan otherwise, §11); `sweep_duration` = **max** `t_offset_ns` over the cloud (the sweep-end offset, since offsets are not guaranteed column-ordered) — so `t_end = stamp_start + sweep_duration` is the instant of the last point, not the surviving span after filtering; `points` Shared-immutable. |
 | `CameraFrame` (01 §4.3) | `stamp` = **mid-exposure** instant. | Mid-exposure, not arrival; carry `exposure_s`,`gain`; `data` Shared-immutable. |
 | `GnssFix` (01 §4.4) | `stamp` = the **PPS edge** the fix is referenced to. | PPS-disciplined; raw geodetic + ENU covariance + `fix` type. |
 
@@ -231,7 +230,7 @@ L0 obligations on **every** implementation:
 * **B2 — monotonic per sensor.** Stamps are non-decreasing within one
   `sensor_id`. A regression (clock step backwards, §11) is *clamped and
   reported*, never silently emitted, because a non-monotonic stamp corrupts
-  preintegration and B-spline knot ordering.
+  IMU integration and the time-sorted deskew order.
 * **B3 — no blocking in the callback's caller.** The source thread must not block
   on the consumer. The consumer (L1 stage T1) is fed through the bounded
   `Q_sensors` queue (arch §11.1); the source pushes non-blocking and the queue's
@@ -241,6 +240,14 @@ L0 obligations on **every** implementation:
   record for its id (§9).
 * **B5 — clean stop.** After `stop()` returns, no further callbacks fire; the
   acquisition thread is joined.
+* **B6 — validate before callback.** Every sample passes the standing
+  `InputValidator` (§9.4) before it reaches `cb`: the validator owns B2's
+  monotonicity clamp, the dropout/skew checks, and the per-point-time / NaN-Inf /
+  emptiness rejects. A `Reject` verdict means the sample never reaches `cb` (nor
+  `Q_sensors`); a `Clamped` verdict means the stamp was repaired to hold B2 and the
+  repair was reported on the health channel. The validator is always on (not a
+  debug option), because a bad stamp corrupts the deskew warp and the IMU
+  integration interval rather than adding one noisy measurement.
 
 ### 3.2 `SensorInfo` (static descriptor)
 
@@ -250,7 +257,7 @@ struct SensorInfo {
   std::uint8_t id          = 0;          // unique within the rig
   Modality     modality    = Modality::Imu;     // Imu|Lidar|Camera|Gnss
   Frame        sensor_frame = Frame::Unknown;   // os_sensor0 / cam_link / imu_link / gnss_link
-  std::string  model        = "";        // "ouster_os1_128", "vn100", ...
+  std::string  model        = "";        // "ouster_os0_128", "bmi085", ...
   double       nominal_rate_hz = 0.0;    // expected sample/scan rate (for dropout detection)
   StampSource  configured_stamp_source = StampSource::ArrivalOnly; // best mechanism this sensor is wired for
 };
@@ -258,12 +265,26 @@ struct SensorInfo {
 
 `nominal_rate_hz` is the analogue of FAST-LIO's `SCAN_RATE` (`preprocess.h:103`,
 used to *reconstruct* point time from yaw when the LiDAR gives none,
-`preprocess.cpp:297`); we use it instead for **dropout detection** (§9): if
-inter-sample gap exceeds $k/\text{nominal\_rate}$ the source flags a dropout.
+`preprocess.cpp:297`); we use it instead for **dropout detection** (§9) and as the
+band centre for rate health. The two checks use different signals on purpose:
+
+- **Dropout** keys on the **raw** inter-sample gap: a single gap exceeding
+  $k/\text{nominal\_rate}$ ($k = 2.5$ nominal periods) raises `Dropout` immediately,
+  because a real hole must not be smoothed away. When `nominal_rate_hz` is unset the
+  threshold falls back to `failed_timeout_ms`.
+- **Rate band** (`RateLow`/`RateHigh`) keys on a **smoothed** rate estimate — an
+  EWMA of the instantaneous $1/\text{gap}$ (factor $0.1$) — compared against
+  `nominal_rate_hz · (1 ± rate_tolerance_frac)`. Smoothing keeps transport jitter on
+  one gap from flipping the rate codes; the instantaneous rate is never the band
+  signal.
+
+All health transitions are **edge-throttled**: a code is raised once on entry and
+cleared once on exit (the active-code bitset is checked first), so a sustained
+condition produces a single event, not one per sample.
 
 ### 3.3 Shared base: `SourceBase`
 
-To avoid re-implementing B1–B5 in each source, L0 provides a non-virtual
+To avoid re-implementing B1–B6 in each source, L0 provides a non-virtual
 mix-in (not a base class in the inheritance chain crossing the interface — the
 interface stays clean per arch R1):
 
@@ -277,16 +298,16 @@ protected:
   // applying the ClockModel correction (§5.3) and recording provenance.
   Timestamp stamp_from(Timestamp vendor_ns, ClockId clock, StampSource src);
 
-  // Enforce monotonicity per sensor; clamp+report regressions (B2).
-  Timestamp enforce_monotonic(Timestamp t);
-
-  // Dropout / rate / step bookkeeping → health (B4).
-  void note_sample(Timestamp t, StampSource src);
+  // Monotonicity clamp + dropout/skew/step bookkeeping → health. Both delegate to
+  // the standing InputValidator (§9.4), which owns last_stamp_ and the active-code
+  // bitset; these are the thin per-source entry points (B2, B4, B6).
+  Timestamp enforce_monotonic(Timestamp t);          // = validator_.on_stamp(...).stamp
+  void      note_sample(Timestamp t, StampSource src);
 
   const SensorInfo info_;
   ClockModel*      clock_;     // borrowed; lives in meridian_time, owned by pipeline
   HealthSink*      health_;    // borrowed; §9
-  Timestamp        last_stamp_ = std::numeric_limits<Timestamp>::min();
+  InputValidator   validator_; // §9.4 — owns last_stamp_, edge-throttled health codes
 };
 ```
 
@@ -341,10 +362,13 @@ PTP-disciplined clock) and the host arrival time.
   *milliseconds* inside `curvature` (`preprocess.cpp:226`, with
   `time_unit_scale` chosen from the `TIME_UNIT` enum `preprocess.h:18`,
   `preprocess.cpp:52–68`); we keep native ns and never round-trip through a
-  float. Per-point time is exactly what the CT front-end needs: it registers each
-  point against `T(stamp_start + t_offset_ns)` directly (arch §7.5), so the
+  float. Per-point time is exactly what the front-end needs: it warps each
+  point by its own offset within the constant-screw model (arch §7.1), so the
   fidelity of this field is the fidelity of deskew.
-* `sweep_duration = t_offset_ns(last) − t_offset_ns(first)` (≈100 ms at 10 Hz).
+* `sweep_duration = max t_offset_ns` over the cloud (≈100 ms at 10 Hz). Offsets
+  are relative to `stamp_start` and are **not** guaranteed ordered by column time,
+  so the sweep end is the largest offset anywhere in the cloud, not the offset of
+  the last-iterated point.
 
 **Per-point validity is NOT applied here** (no blind-radius cull, no
 `point_filter_num` decimation). FAST-LIO does those in `oust64_handler`
@@ -380,6 +404,7 @@ void OusterLidarSource::ingest_raw(const RawLidarFrame& f) {
                          stamp_from(f.device_ns_first_column, ClockId::Lidar, src));
   auto pts = std::make_shared<std::vector<LidarPoint>>();
   pts->reserve(f.pts.size());
+  std::int32_t max_t_offset = 0;
   for (const RawPoint& p : f.pts) {
     LidarPoint lp;
     lp.xyz         = {p.x, p.y, p.z};
@@ -388,14 +413,16 @@ void OusterLidarSource::ingest_raw(const RawLidarFrame& f) {
     lp.ring        = p.ring;
     lp.ambient     = p.ambient;
     lp.range       = p.range_m;
+    max_t_offset   = std::max(max_t_offset, lp.t_offset_ns);
     pts->push_back(lp);
   }
-  scan.sweep_duration = pts->empty() ? 0
-      : (Duration)pts->back().t_offset_ns - (Duration)pts->front().t_offset_ns;
+  // Offsets are not guaranteed column-ordered, so the sweep ends at the largest
+  // offset anywhere in the cloud, not at the last-iterated point.
+  scan.sweep_duration = static_cast<Duration>(max_t_offset);
   scan.points = std::move(pts);                         // Shared-immutable hereafter
 
   note_sample(scan.stamp_start, src);                   // health/dropout (§9)
-  validate_or_flag(scan);                               // §11: per-point-time presence, NaN ratio
+  if (validator_.on_lidar(scan) == Reject) return;      // §9.4: per-point-time, NaN/Inf, empty
   cb_(std::move(scan));                                 // push to Q_sensors (non-blocking)
 }
 ```
@@ -408,7 +435,7 @@ the LiDAR's built-in IMU is a wiring/config choice; either way it is a single
 `ImuSource`.
 
 **Wire → POD.** `RawImuFrame { Timestamp device_ns; bool has_device_ns;
-Vec3 acc; Vec3 gyro; Timestamp host_arrival; }`. **No orientation** is carried
+Eigen::Vector3d acc; Eigen::Vector3d gyro; Timestamp host_arrival; }`. **No orientation** is carried
 across, even if the device provides an AHRS quaternion — spec 01 §4.1 forbids
 trusting vendor fusion; the estimator owns orientation.
 
@@ -426,10 +453,9 @@ trusting vendor fusion; the estimator owns orientation.
 **Interval-end convention.** The `stamp` denotes the **end** of the integration
 interval the sample summarises. If a device documents mid-interval or
 start-of-interval semantics, the source shifts by ±half the nominal period so the
-contract (spec 01 §4.1, "interval end") holds. This matters because the CT
-front-end places the IMU-derivative residual at `stamp` along the spline (and the
-restart-fallback preintegration integrates over $[\text{stamp}_{k-1},
-\text{stamp}_k]$, arch §6.3); getting the convention wrong biases every IMU
+contract (spec 01 §4.1, "interval end") holds. This matters because the
+front-end integrates each sample over $[\text{stamp}_{k-1},
+\text{stamp}_k]$; getting the convention wrong biases every IMU
 contribution by one sample.
 
 ```cpp
@@ -456,17 +482,58 @@ void ImuSource::ingest_raw(const RawImuFrame& f) {
 ### 4.3 `CameraSource`
 
 **Modality:** camera. The rig has **one** global-shutter camera feeding the
-FAST-LIVO2-style sparse-direct photometric residual (arch §7.5). (Rolling
-shutter is a config flag that switches L2's reprojection, not L0.)
+FAST-LIVO2-style sparse-direct photometric residual (arch §7.5).
 
-**The instant that matters is mid-exposure.** Stamping on arrival is wrong by the
-transport delay; stamping on the trigger edge is wrong by half the exposure time.
-The correct instant is **trigger_edge + exposure/2** (global shutter). L0
-computes it:
+> **Rolling shutter (designed, deferred).** A global-shutter sensor has one
+> exposure interval for the whole frame, so a single mid-exposure stamp is
+> well-defined. A rolling-shutter sensor exposes each row at a different time, so
+> the correct treatment mirrors the LiDAR per-point-time model: L0 would carry a
+> per-row time offset (a `row_t_offset_ns` analogous to `LidarPoint::t_offset_ns`)
+> and the front-end would query `T(t)` per row, exactly as it does per LiDAR point.
+> That capability is **not built now** — the rig is global-shutter and
+> `sensors.camera.shutter: global` (§10) is the committed configuration. The
+> rolling-shutter path is a config flag (`shutter: rolling`) that, when added,
+> switches L0 to stamp per row and L2 to reproject per row; until then a frame
+> declared `rolling` is rejected at start (`Config::validate`) rather than
+> silently stamped as if global.
+
+**The canonical camera instant is mid-exposure.** For a global-shutter sensor the
+whole frame integrates light over a single interval `[trigger_edge, trigger_edge +
+exposure_s]`; the instant whose pose best represents the photons that formed the
+image is the **centre** of that interval. Stamping on arrival is wrong by the
+transport delay; stamping on the trigger edge (or the frame-header time) is wrong
+by half the exposure — a fixed bias that scales with shutter speed and platform
+velocity (a 16 ms exposure at 5 m/s is a 4 cm phantom translation on every
+photometric constraint). L0 therefore pins the stamp to **trigger_edge +
+exposure_s/2** and ships exactly that one instant; the photometric residual queries
+`T(t)` at it (arch §7.5):
 
 ```
 stamp_mid = stamp(trigger_edge) + round(exposure_s / 2 * 1e9)   // ns
 ```
+
+This is a **single, fixed convention**, not a configurable choice. It differs from
+the FAST-LIVO2 lineage, which carries the frame's raw header/sync stamp into the
+VIO residual with no half-exposure correction; that omission is acceptable for
+short exposures on a slow platform and a silent bias otherwise. Meridian pins
+mid-exposure once, at L0, so every downstream consumer (the front-end residual, the
+`MeasureGroup` interval test in §8, keyframe selection) sees the same instant and no
+module re-derives it. The `CameraFrame::stamp` contract (spec 01 §4.3 and the §2
+obligation table) means mid-exposure everywhere the field is read.
+
+> **Residual camera↔body-IMU time offset.** The mid-exposure convention corrects
+> the *intra-frame* exposure bias; it does not correct a residual *inter-sensor*
+> offset between the camera shutter timeline and the body-IMU timeline. An
+> uncompensated offset is a systematic reprojection bias on every photometric
+> constraint (10 ms at 1 m/s ≈ 1 cm of phantom translation), so it must be
+> folded into the stamp, not absorbed by robust weighting. The committed
+> correction today is the constant `sensors.camera.time_offset_ms` shift applied
+> once at ingest (§5 note), loaded from calibration and trusted only after an
+> empirical A/B on the actual recording — a calibration-session timeshift is not
+> automatically valid for a recording (§5, spec 08 §7.2). The §7 estimator path
+> (estimate `ClockId::Cam` against the body-IMU reference and apply it through
+> `to_meridian`, the same way the IMU↔LiDAR offset is handled) is the intended
+> replacement for the constant; it is specified but not yet wired (§7.1).
 
 **Stamping paths (priority):**
 
@@ -491,6 +558,14 @@ applied, and L2 falls back to robust photometric weighting).
 **Encoding.** L0 passes the raw encoding through (`Mono8`/`Bayer_RGGB8`/`RGB8`);
 debayering and pyramid construction are **L1** (spec 01 §7.2 note). L0 must not
 allocate a pyramid.
+
+**Compressed streams.** When `sensors.camera.compressed: true`, the wire payload
+is a JPEG/PNG `CompressedImage`; the transport wrapper decodes it straight to a
+tightly-packed `Mono8` frame at ingest (the photometric stage consumes intensity
+only, and the JPEG luma plane already exists at the decode). A payload that does
+not decode to an 8-bit image is dropped with a throttled warning, never forwarded
+malformed. This is how the Alphasense cameras (compressed-only mono8 JPEG in the
+Newer College bags) enter the same intake as a raw stream.
 
 ### 4.4 `GnssSource`
 
@@ -517,7 +592,7 @@ the back-end's job (spec 01 §4.4, GNC kernels spec 05 §8). L0 only reports `fi
 
 **Modality:** any (one `BagReplaySource<SampleT>` per recorded stream). This is
 the offline path that makes "the same core runs on a bag and on the robot" true
-(arch §1, §9.3; `DATASET.md`: FusionPortable primary, M2DGR co-primary).
+(arch §1, §9.3; `DATASET.md`: Newer College primary).
 
 * It reads recorded **typed samples** (or POD frames) and replays them through
   the *same* `Callback`, preserving their recorded stamps with
@@ -532,6 +607,18 @@ the offline path that makes "the same core runs on a bag and on the robot" true
 ---
 
 ## 5. The time model (`meridian_time`)
+
+> **Constant per-sensor stamp correction (`time_offset_ms`).**
+> `sensors.lidar.time_offset_ms` and `sensors.camera.time_offset_ms` apply a
+> constant shift onto the body-IMU timeline (t_corrected = t_sensor + offset) once,
+> in the pipeline `ingest()` overloads — BEFORE the validator and the aggregator,
+> so every stamp-driven decision (monotonicity clamps, rate estimation, group
+> assembly, image–sweep matching) operates on corrected time, identically live and
+> in replay. LiDAR per-point offsets are relative to the sweep reference and ride
+> along unchanged. Default 0 = bit-identical to the uncorrected path. A
+> calibration-session timeshift is NOT evidence for a recording (hardware sync
+> paths differ per sensor and per session — spec 08 §7.2): set the key only after
+> an empirical A/B on the actual data.
 
 ### 5.1 Three timelines and the one we estimate
 
@@ -749,6 +836,15 @@ arbitrary-but-consistent reference):
   time-jitter measurement-noise inflation (a sensor we can only time to ±2 ms
   should contribute weaker constraints than one timed to ±50 µs).
 
+> **Camera offset is the unwired case.** The estimator is specified for every
+> `ClockId`, but the **camera** offset is not yet estimated live: the stamp the
+> front-end consumes carries only the constant `sensors.camera.time_offset_ms`
+> shift loaded from calibration (§5 note; §4.3, *Residual camera↔body-IMU time
+> offset*). The intended end state lives here — estimate `ClockId::Cam`'s offset
+> against the body-IMU reference and apply it through `to_meridian`, exactly as
+> the IMU↔LiDAR offset is — rather than as a constant from a calibration
+> session that must be re-verified per recording.
+
 ### 7.2 The estimator: cross-correlation of motion signals + recursive filter
 
 Two complementary mechanisms:
@@ -842,7 +938,8 @@ struct MeasureGroup {
   Timestamp                  t_begin = 0;   // sweep start on t_H (= scan.stamp_start)
   Timestamp                  t_end   = 0;   // sweep end   on t_H (= stamp_start + sweep_duration)
   LidarScan                  scan;          // the LiDAR sweep (Shared-immutable points)
-  std::vector<ImuSample>     imu;           // ALL imu with t_begin' <= stamp <= t_end (see policy)
+  std::vector<ImuSample>     imu;           // samples in (lower, t_end], lower = min(prev_t_end, t_begin),
+                                            // plus the straddler at/before t_begin (see §8.2 policy)
   std::optional<CameraFrame> image;         // image whose mid-exposure falls in [t_begin, t_end], if any
   std::vector<GnssFix>       gnss;          // fixes in the interval (usually 0 or 1)
 };
@@ -875,14 +972,29 @@ Rules:
   1.5 sweep periods) after which we emit with whatever IMU arrived and flag
   `HealthCode::ImuLate`. This is FAST-LIO's "wait for IMU to cover the LiDAR end"
   condition made explicit and bounded.
-* **IMU interval convention.** Include IMU with `stamp ∈ (prev_t_end, t_end]`
-  plus the **one** sample straddling `t_begin` (needed for the CT window /
-  preintegration to start exactly at the sweep boundary). The front-end
-  interpolates the boundary; L0 just guarantees coverage.
+* **IMU interval convention.** Include IMU with `stamp ∈ (lower, t_end]` where
+  `lower = min(prev_t_end, t_begin)`, plus the **one** sample straddling `t_begin`
+  (the newest IMU at or before `t_begin`, needed for the CT window / preintegration
+  to start exactly at the sweep boundary). The straddler is emitted once, ahead of
+  the in-interval set, even when it sits at or before `lower`. Clamping the lower
+  edge to `t_begin` (rather than taking `prev_t_end` unconditionally) matters when
+  header-stamp jitter against a fixed sweep period makes a sweep *begin before the
+  previous one ended* (`t_begin < prev_t_end`): both overlapping groups then carry
+  the IMU in their **common** window, so each sweep's IMU set spans its own
+  `[t_begin, t_end]` with no hole at the seam. The front-end interpolates the
+  boundary; L0 just guarantees coverage.
 * **Reordering window.** Samples can arrive slightly out of order across sources
   (different transport latencies). The Aggregator keeps a small bounded reorder
   buffer per modality (`agg.reorder_ms`, default 20) and emits in stamp order;
-  anything later than the window is dropped with `HealthCode::LateDrop`.
+  anything later than the window — `stamp < watermark − reorder_ms`, the watermark
+  being the highest stamp accepted for that modality — is dropped with
+  `HealthCode::LateDrop`.
+* **IMU retention across the seam.** Emitting a group does **not** drain the IMU
+  deque up to `t_end`. The Aggregator keeps every sample back to the newest one at
+  or before `t_begin − reorder_ms`, because the next sweep can begin anywhere past
+  that bound (stamp jitter, §8.2) and its straddling sample — and the IMU shared in
+  an overlapping window — must survive this group's emission. Only IMU strictly
+  older than that retained sample is dropped.
 * **Lossy under overload.** If T2 (front-end) falls behind and `Q_meas`
   back-pressures, the Aggregator drops the **oldest** complete group (arch §11.2:
   `Q_meas` is lossy) and emits a telemetry `event` — never blocks the sensor
@@ -890,12 +1002,11 @@ Rules:
 
 ### 8.3 Bootstrap interaction (MUST-FIX #2)
 
-The Aggregator does not deskew (that is L1/L2). But it *labels* the first group(s)
-with `is_cold_start = true` until the front-end reports init complete (arch §7.2),
-so L1 knows to use IMU-only deskew before a CT window exists. This label is
-carried as a transient flag the pipeline sets, not a permanent field of
-`MeasureGroup`; once the CT front-end has initialised its first control points and
-takes over per-point registration (arch §7.2, §7.5) the flag clears.
+The Aggregator does not deskew and carries no bootstrap state (deskew and
+initialization are L2-internal, arch §7.1–§7.2). Groups are forwarded
+immediately and identically from the first one; the front-end holds them itself
+until its static initialization completes. There is no cold-start label, flag,
+or staging anywhere in L0/L1.
 
 ---
 
@@ -929,7 +1040,7 @@ struct SensorHealth {
   HealthCode    code       = HealthCode::None;   // dominant active code
   std::uint32_t code_bits  = 0;                  // bitset of all active codes
   StampSource   stamp_src  = StampSource::ArrivalOnly;  // current stamping mechanism
-  double        rate_hz    = 0.0;                // measured
+  double        rate_hz    = 0.0;                // measured (EWMA of 1/gap; feeds the rate band)
   double        offset_ns  = 0.0;                // ClockModel offset (0 if disciplined)
   double        offset_std_ns = 0.0;            // timing uncertainty (→ L2 noise)
   Timestamp     last_sample = 0;
@@ -973,6 +1084,69 @@ inflates the time-jitter component of a sensor's measurement noise in L2, and a
 L0's self-assessment and the fuse — the architectural reason health lives in the
 core and not only in the wrapper.
 
+### 9.4 The standing `InputValidator` (live stamp-integrity gate)
+
+The health codes above are *raised by* a single standing component every sample of
+every stream passes through before it is handed to the callback: the
+`InputValidator`. It is the engine behind `SourceBase::enforce_monotonic` and
+`note_sample` and the per-modality content check (`on_lidar`/`on_imu`, §3.3, §4.1),
+pulled out as one named gate so the checks are identical across all four modalities
+and so the *one* place that decides "this stamp is trustworthy" is testable in
+isolation. It runs **always-on, live** — not a
+debug-build option — because a single out-of-order or skewed stamp does not merely
+add one noisy measurement: it corrupts the deskew warp for every point in the
+sweep and the integration interval of every IMU sample that brackets it.
+Validating stamp
+integrity at the source is therefore a correctness obligation, not instrumentation.
+
+```cpp
+// meridian_sensors/src/input_validator.hpp  (private; one instance per sensor_id)
+class InputValidator {
+public:
+  InputValidator(SensorInfo, const ValidatorCfg&, HealthSink*);
+  // Called by SourceBase for every sample, before the callback. Returns the
+  // (possibly clamped) stamp and an accept/clamp/reject verdict; updates health.
+  struct Verdict { Timestamp stamp; enum { Accept, Clamped, Reject } kind; };
+  Verdict on_stamp(Timestamp proposed, StampSource src);
+  // Content checks for the typed sample (per-point time, NaN/Inf ratio, emptiness).
+  void    on_lidar(const LidarScan&);   // sets reject on F6/F11 conditions
+  void    on_imu(const ImuSample&);     // NaN/Inf on acc/gyro
+};
+```
+
+The validator runs **six standing checks**; each maps to a `HealthCode` (§9.1) and
+is **edge-throttled** ("dup-filtered"): the *first* sample entering a fault state
+emits one `event` and sets the code bit; subsequent samples in the same state are
+counted into a `<code>_count` scalar but emit **no** further events, and exit emits
+one clearing event (§3.2 edge-throttle policy). This is what stops a sustained
+fault — a mis-wired clock, a sensor stuck off-rate — from drowning the event stream
+in one message per sample while still surfacing the condition immediately and
+keeping an exact occurrence count for forensics.
+
+| Check | What it catches | Signal | Action | Code |
+|---|---|---|---|---|
+| **Rewind** | stamp not strictly non-decreasing per `sensor_id` (clock step back, replay seam, driver re-order) | `proposed <= last_stamp` | clamp to `last_stamp` (`Clamped`), re-anchor `ClockModel.t_ref` on a large jump; never emit a regressing stamp (B2) | `ClockStepDetected` |
+| **Gap** | a hole in the stream (dropout) | raw inter-sample gap `> k/nominal_rate` (`k = gap_periods`, default 2.5), or `> failed_timeout_ms` when `nominal_rate_hz` unset | accept the post-gap sample; raise `Dropout`, escalate to `Failed` past `failed_timeout` | `Dropout` |
+| **Skew** | crystal drift beyond the model's validity (a fault, not normal ppm) | `|ClockModel.skew_ppm|` over `skew_warn_ppm` (default 200) or a per-update offset implying `> offset.reject_jump_ms` | flag; the implied-jump correspondence is rejected as an outlier (§7.4) rather than absorbed | `SkewOutOfRange` |
+| **Per-point time** | a LiDAR scan that cannot be deskewed | all `t_offset_ns == 0` / field absent | **reject** the scan (`Reject`); do not reconstruct (§6.1, F6) | `LidarNoPointTime` |
+| **NaN/Inf** | corrupt sample content | `!isfinite` on any LiDAR `xyz` (ratio over `nan_ratio_warn`, default 0.05) or any IMU `acc`/`gyro` component | drop the offending points / reject an all-NaN scan / reject the IMU sample | `LidarHighNanRatio` / `EmptyScan` |
+| **Empty** | a scan with no points | `points` empty (raw, or after the NaN drop) | reject (`Reject`) | `EmptyScan` |
+
+The validator **does not** apply geometric or quality filtering — blind radius,
+decimation, intensity gating are all L1 (spec 03). Its remit is exactly *stamp
+integrity and sample well-formedness*: the minimum a sample must satisfy to be a
+legal input to the single timeline. A `Reject` verdict means the sample never
+reaches the callback (and never reaches `Q_sensors`); a `Clamped` verdict means the
+stamp was repaired to preserve monotonicity and the repair was reported. The
+content checks (`on_lidar`/`on_imu`) are the live, always-on counterparts of the
+camera under/over-exposure and IMU saturation checks L1 adds downstream — L0 owns
+only the timing- and finiteness-level guarantees here.
+
+`ValidatorCfg` lives under `meridian.time.validator` (§10). The validator holds no
+state beyond `last_stamp` and the active-code bitset per sensor, so it is cheap and
+thread-confined to its source's acquisition thread (the bitset is read by the
+health rollup under the same lightweight lock the `ClockModel` table uses, §13).
+
 ---
 
 ## 10. Configuration schema
@@ -1002,14 +1176,18 @@ meridian:
     health:
       failed_timeout_ms: 1000
       rate_tolerance_frac: 0.20
+    validator:               # §9.4 — standing live stamp-integrity gate, always on
+      gap_periods: 2.5       # dropout when raw gap > gap_periods / nominal_rate_hz
+      skew_warn_ppm: 200     # |ClockModel.skew_ppm| above this raises SkewOutOfRange
+      nan_ratio_warn: 0.05   # LiDAR scan NaN/Inf fraction above this raises LidarHighNanRatio
   sensors:
-    lidar:   { id: 0, name: main, frame: os_sensor0, model: ouster_os1_128,
+    lidar:   { id: 0, name: main, frame: os_sensor0, model: ouster_os0_128,
                topic: /os/points, nominal_rate_hz: 10,
                ptp: true, timestamp_mode: TIME_FROM_PTP_1588 }
-    imu:     { id: 0, name: main, frame: imu_link, model: vn100,
+    imu:     { id: 0, name: main, frame: imu_link, model: bmi085,
                topic: /imu/data_raw, nominal_rate_hz: 200,
                has_device_clock: true, interval_end_shift_ns: 0 }
-    camera:  { id: 0, name: front, frame: cam_link, model: blackfly_s,
+    camera:  { id: 0, name: front, frame: cam_link, model: alphasense,
                topic: /cam/image_raw, nominal_rate_hz: 20,
                trigger: gpio, exposure_from_meta: true, shutter: global }
     gnss:    { id: 0, name: rover, frame: gnss_link, topic: /gnss/fix,
@@ -1022,7 +1200,9 @@ meridian:
 **Validation rules** (`Config::validate`, arch §8.3): every `lidar/imu/camera/
 gnss` `id` is set; if `time.source == ptp` then at least one sensor has
 `ptp: true`; `nominal_rate_hz > 0` for each sensor; `max_wait_ms >=
-1000/lidar.nominal_rate_hz`.
+1000/lidar.nominal_rate_hz`; `camera.shutter == global` (the rolling-shutter path
+is designed but not built — §4.3 — so `shutter: rolling` is rejected at load rather
+than stamped as if global).
 
 ---
 
@@ -1043,9 +1223,13 @@ gnss` `id` is set; if `time.source == ptp` then at least one sensor has
 | F11 | **Empty / all-NaN scan** | `points` empty or NaN ratio > thresh | drop scan | Degraded `EmptyScan`/`LidarHighNanRatio` |
 
 Recovery principle: **degrade, never crash; always tell L2 and the operator.**
-Every transition is a telemetry `event` (§12). Compare the reference, where the
-analogous conditions are a silent `continue` or a one-off `ROS_WARN` (arch §10.2
-notes this for the front-end; L0 had no such signals at all).
+Every transition is a telemetry `event` (§12). The stamp-integrity rows — F4
+(clock step / rewind), F5 (dropout / gap), F6 (no per-point time), F10 (late drop),
+F11 (empty / all-NaN) — are detected by the standing `InputValidator` (§9.4) on
+every sample of every stream; their events are edge-throttled there so a sustained
+fault emits one event plus a running count, never one per sample. Compare the
+reference, where the analogous conditions are a silent `continue` or a one-off
+`ROS_WARN` (arch §10.2 notes this for the front-end; L0 had no such signals at all).
 
 ---
 
@@ -1067,6 +1251,7 @@ data, the wrapper decides how to surface it. L0's contributions:
 | `sensors/health/<sensor>` | `event`/`vec` | `SensorHealth` snapshot | the health channel itself |
 | `sensors/group_latency` | `scalar` | `t_now − t_end` at emit [ms] | aggregation backlog |
 | `sensors/imu_in_group` | `scalar` | #IMU per `MeasureGroup` | sweep/IMU coverage sanity |
+| `sensors/validator/<sensor>/<code>_count` | `scalar` | occurrences of each validator fault while active | the dup-filtered count behind the edge-throttled event (§9.4) |
 | `time/xcorr_peak/<pair>` | `scalar` | cross-corr peak value | sw-offset estimator confidence |
 | `event time/sync_changed` | `event` | "lidar HwPtp→SwOffset (unlock)" | the §6.1/F1 transition, visible |
 | `event sensors/dropout` | `event` | "imu0 dropout 0.43 s" | F5 |
@@ -1091,6 +1276,11 @@ events and `stamp_source` changes are always on (cheap, forensically vital).
   come from two threads (OS-time shim + T1's estimator); it guards its
   `ClockState` table with a lightweight lock (updates are infrequent — Hz-rate
   PTP stats, per-correspondence offset updates — so contention is nil).
+* **`InputValidator`** (§9.4) is **owned per source** inside `SourceBase` and is
+  **thread-confined** to that source's acquisition thread: its `last_stamp_` and
+  active-code bitset are touched only on the stamping path. The health rollup reads
+  the bitset through `HealthSink` under the same lightweight lock; nothing on the
+  hot path blocks.
 * **Ownership of buffers.** `LidarScan::points`, `CameraFrame::data` are
   **Shared-immutable** (spec 01 §2.4) the instant the source finishes filling
   them; from then on they cross threads by `shared_ptr<const>` and are never
@@ -1132,8 +1322,8 @@ The system is initialised; PTP locked; GNSS has fix.
    `offset_std_ns=60000`; `RigHealth.timeline_absolute=true`. Telemetry publishes
    `time/offset/imu0=37000`, `sensors/imu_in_group=21`,
    `sensors/group_latency=2.0`.
-6. **Downstream.** L2's CT front-end registers each LiDAR point against
-   `T(stamp_start + t_offset_ns)` and the camera patch against `T(image.stamp)`;
+6. **Downstream.** L2's LIO front-end warps each LiDAR point by its
+   `t_offset_ns` within the sweep's screw model and solves at `t_end`;
    the IMU's 60 µs timing σ inflates its noise slightly. None of L0's stamps are
    ever revisited.
 
@@ -1152,8 +1342,14 @@ L0 is unusually testable because, per arch §1, it is pure C++ fed by POD frames
   assert emitted stamps equal the inverse-mapped values to the ns. Assert native
   `t_offset_ns` pass-through (no scale), the bug-class FAST-LIO's `time_unit_scale`
   invites.
-* **Unit: monotonicity (B2).** Inject a backward device step; assert clamp +
-  `ClockStepDetected`, never a regressing stamp.
+* **Unit: `InputValidator` (§9.4, B6).** Drive each of the six standing checks in
+  isolation: inject a backward device step (rewind → clamp + `ClockStepDetected`,
+  never a regressing stamp); a stream hole (gap → `Dropout`); skew past
+  `skew_warn_ppm` (`SkewOutOfRange`); an all-zero `t_offset_ns` scan
+  (`LidarNoPointTime` reject); a NaN-laced cloud and an all-NaN/empty scan
+  (`LidarHighNanRatio` / `EmptyScan`). Assert the **dup-filter**: a sustained fault
+  emits exactly one entry event and one exit event while `<code>_count` increments
+  every sample; assert a `Reject` verdict never reaches the callback.
 * **Unit: aggregation policy.** Synthetic interleaved streams; assert the IMU set
   spans `[t_begin,t_end]` incl. straddler, the timeout path
   (`ImuLate`) fires, and reorder/late-drop behave at the window edges.
@@ -1163,7 +1359,7 @@ L0 is unusually testable because, per arch §1, it is pure C++ fed by POD frames
   with a known injected lag; assert recovered $\hat\tau$ within `grid_ms` and the
   KF converges; assert verify-mode residual flags when the injected offset
   exceeds threshold.
-* **Integration: bag replay.** Run `BagReplaySource` on a FusionPortable/M2DGR
+* **Integration: bag replay.** Run `BagReplaySource` on a Newer College
   sequence (`DATASET.md`); assert deterministic single-thread ordering, and run
   the estimator in verify mode to *report* the dataset's residual sync as a
   sanity check on the data itself.
@@ -1188,7 +1384,9 @@ ClockId (enum), ClockState,        — per-device clock model                (§
 HealthLevel, HealthCode (enums),   — sensor-health channel                 (§9.1)
   SensorHealth, RigHealth (struct),
   HealthSink (interface)
-SourceBase (impl mix-in, private)  — shared B1–B5 machinery                (§3.3)
+InputValidator (class, private),   — standing live stamp-integrity gate    (§9.4)
+  ValidatorCfg (struct)
+SourceBase (impl mix-in, private)  — shared B1–B6 machinery                (§3.3)
 RawLidarFrame/RawImuFrame/…(POD)   — wire-free conversion boundary         (§4)
 ```
 (If any L0-internal type ever needs to cross a boundary, it must first be amended

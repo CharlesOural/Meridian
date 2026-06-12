@@ -10,6 +10,8 @@ cd "$(dirname "$0")"
 IMAGE="meridian:humble-gpu"
 BOX="meridian"
 
+export DBX_CONTAINER_MANAGER=docker
+
 echo "==> Building $IMAGE (Meridian dep canon + CUDA 12 toolkit) from docker/Dockerfile.gpu"
 echo "    (first build is slow: GTSAM/Ceres/Sophus/small_gicp compile from source)"
 docker build -t "$IMAGE" \
@@ -18,5 +20,10 @@ docker build -t "$IMAGE" \
   --build-arg USER_GID="$(id -g)" \
   docker/
 
+# A rootful (docker) container makes distrobox stage a first-shell password setup,
+# gated on /var/tmp/.<user>.passwd.initialize. Its passwd loops forever when the
+# host's password policy rejects a short password, so clear the sentinel on every
+# container start — the init hook runs after distrobox writes it, before login.
 echo "==> Creating distrobox '$BOX' (NVIDIA GPU + home dir + GUI auto-wired)"
-distrobox create --name "$BOX" --image "$IMAGE" --nvidia --yes
+distrobox create --name "$BOX" --image "$IMAGE" --nvidia --yes \
+  --init-hooks 'rm -f /var/tmp/.*.passwd.initialize'

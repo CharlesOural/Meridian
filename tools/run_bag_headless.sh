@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Headless Meridian bag run: odometry_node (no rviz) + bag play, recording the
+# trajectory (TUM), telemetry, and events for drift/divergence analysis.
+#
+# Hygiene: `ros2 run` wraps the real binary, so killing only its PID orphans the
+# node; every kill below targets the odometry_node binary itself and verifies
+# death. A pre-flight check refuses to run while any stale node is alive —
+# ghosts subscribe to the same topics and publish to the same outputs, silently
+# poisoning the recording AND starving the CPU (drops at best-effort QoS).
+source /opt/ros/humble/setup.bash
+cd ~/Meridian
+source install/setup.bash
+
+if pgrep -f 'lib/meridian_ros/odometry_node' > /dev/null; then
+  echo "FATAL: stale odometry_node process(es) alive:" >&2
+  pgrep -fa 'lib/meridian_ros/odometry_node' >&2
+  echo "kill them first: pkill -f lib/meridian_ros/odometry_node" >&2
+  exit 1
+fi
+
+OUT=${1:-/tmp/meridian_bagrun}
+mkdir -p "$OUT"
+
+# $2 (optional): seconds of the bag to play; empty = whole bag.
+PLAY_SECS=${2:-}
+BAG=${BAG:-bags/newer-college/quad-easy}
+CONFIG=${CONFIG:-src/meridian_ros/config/newer-college-quad.yaml}
+echo "bag: $BAG  config: $CONFIG  play_secs: ${PLAY_SECS:-all}" | tee "$OUT/run_info.txt"
+
+# Exec the binary directly (no ros2-run wrapper) so $NODE_PID is the node itself.
+"$HOME/Meridian/install/meridian_ros/lib/meridian_ros/odometry_node" --ros-args \
+  -p config_file:=$PWD/$CONFIG \
+  -p use_sim_time:=true \
+  > "$OUT/node.log" 2>&1 &
+NODE_PID=$!
+sleep 3
+
+python3 tools/record_tum.py "$OUT/traj_tum.txt" > "$OUT/record_tum.log" 2>&1 &
+TUM_PID=$!
+ros2 topic echo --qos-depth 2000 /meridian/events > "$OUT/events.yaml" 2>&1 &
+EV_PID=$!
+ros2 topic echo --qos-depth 2000 /meridian/stage_timing > "$OUT/timing.yaml" 2>&1 &
+TM_PID=$!
+ros2 topic echo --qos-depth 4000 /meridian/telemetry > "$OUT/telemetry.yaml" 2>&1 &
+TL_PID=$!
+
+# Cap playback with a wall-clock timeout (bag plays ~real-time under --clock); this
+# Humble build lacks --playback-duration. Empty PLAY_SECS plays the whole bag.
+#
+# The QoS override makes the player's LiDAR writer RELIABLE so the node's reliable
+# subscription (sensors.lidar.qos_reliable) gets retransmissions: best-effort loses
+# ~14% of the multi-MB scans in flight under pipeline load. Keep the two in sync.
+QOS_OVERRIDES="$(dirname "$0")/replay_qos_overrides.yaml"
+if [ -n "$PLAY_SECS" ]; then
+  timeout --signal=INT "$PLAY_SECS" ros2 bag play "$BAG" --clock \
+    --qos-profile-overrides-path "$QOS_OVERRIDES" > "$OUT/bagplay.log" 2>&1
+else
+  ros2 bag play "$BAG" --clock \
+    --qos-profile-overrides-path "$QOS_OVERRIDES" > "$OUT/bagplay.log" 2>&1
+fi
+sleep 3
+
+kill $TUM_PID $EV_PID $TM_PID $TL_PID 2>/dev/null
+sleep 1
+kill -INT $NODE_PID 2>/dev/null
+for i in $(seq 1 20); do
+  kill -0 $NODE_PID 2>/dev/null || break
+  sleep 0.5
+done
+kill -9 $NODE_PID 2>/dev/null
+wait 2>/dev/null
+
+if pgrep -f 'lib/meridian_ros/odometry_node' > /dev/null; then
+  echo "WARNING: an odometry_node survived shutdown — kill it before the next run" >&2
+fi
+
+echo "--- artifacts ---"
+wc -l "$OUT/traj_tum.txt" "$OUT/events.yaml" 2>/dev/null
+echo "done"

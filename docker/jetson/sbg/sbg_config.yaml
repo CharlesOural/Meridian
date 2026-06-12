@@ -1,0 +1,40 @@
+# SBG INS/IMU driver config. Serial port + baud were probed on this rig
+# (/dev/ttyUSB0 @ 921600, valid sbgECom framing). ros_standard publishes
+# sensor_msgs/Imu on /imu/data; use_enu follows the ROS REP-103 ENU convention.
+# GNSS logs are disabled (no fix wired here); re-enable if a GNSS antenna is added.
+sbg_device:
+  ros__parameters:
+    uartConf:
+      portName: "/dev/ttyUSB0"
+      baudRate: 921600
+      portID: 0
+    driver:
+      frequency: 400
+    output:
+      time_reference: "ros"
+      ros_standard: true
+      use_enu: true
+      frame_id: "sbg_imu"
+      log_status: 200
+      log_imu_data: 1
+      log_ekf_euler: 0
+      log_ekf_quat: 8
+      log_ekf_nav: 0
+      log_ekf_vel_body: 0
+      log_ekf_rot_accel_body: 0
+      log_ekf_rot_accel_ned: 0
+      log_ship_motion: 0
+      log_utc_time: 200
+      log_mag: 8
+      log_mag_calib: 0
+      log_gps1_vel: 0
+      log_gps1_pos: 0
+      log_gps1_hdt: 0
+      log_gps1_raw: 0
+      log_odo_vel: 0
+      log_event_a: 0
+      log_event_b: 0
+      log_event_c: 0
+      log_event_d: 0
+      log_air_data: 0
+      log_imu_short: 0

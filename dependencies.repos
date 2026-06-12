@@ -2,21 +2,19 @@
 #   vcs import src < dependencies.repos
 #
 # The math stack (Eigen, Sophus, Ceres, GTSAM, PCL, OpenCV, small_gicp) is baked
-# into the dev image (docker/install-deps.sh), so it is NOT listed here. Only the
-# two deps that must live in the workspace are:
+# into the dev image (docker/install-deps.sh), so it is NOT listed here. The only
+# dep that must live in the workspace is:
 #   - nvblox:      GPU-only (L4). Builds against the image's CUDA toolkit
 #                  (docker/Dockerfile.gpu). NOT pulled/built on CPU/Mac hosts.
-#   - ouster-ros:  ROS-side LiDAR driver; only meridian_ros / meridian_tools use it.
 #
-# The three vendored upstreams (basalt-headers, ikd-Tree, scancontext) are git
-# SUBMODULES under vendor/, not vcs repos — pull them with:
+# Sensor drivers are NOT built in this workspace: they run as standalone per-driver
+# containers (docker/jetson/*, compose.jetson.yaml) and reach Meridian over topics.
+#
+# The vendored upstream (scancontext) is a git SUBMODULE under vendor/, not a
+# vcs repo — pull it with:
 #   git submodule update --init --recursive
 repositories:
   nvblox:
     type: git
     url: https://github.com/nvidia-isaac/nvblox.git
     version: public        # TODO: pin to a Humble-line commit SHA (spec 11 §3)
-  ouster-ros:
-    type: git
-    url: https://github.com/ouster-lidar/ouster-ros.git
-    version: ros2          # TODO: pin commit
