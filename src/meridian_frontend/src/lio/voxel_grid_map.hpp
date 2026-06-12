@@ -51,6 +51,13 @@ public:
   // 27-cell neighborhood. Returns false (neighbor untouched) when none qualifies.
   bool nearest(const Eigen::Vector3d& query_world, Eigen::Vector3d* neighbor) const;
 
+  // Append every stored point within `radius` of `query_world` to `out` (cleared
+  // first), scanning the 27-cell neighborhood in the same fixed probe order as
+  // nearest(), so the output order is deterministic. The probe only reaches one cell
+  // out, so radii beyond cfg.voxel_size_m are silently truncated to that envelope.
+  void neighborsWithin(const Eigen::Vector3d& query_world, double radius,
+                       std::vector<Eigen::Vector3d>* out) const;
+
   // Drop every voxel whose cell center is farther than cfg.max_range_m from
   // `center_world`.
   void clipFarFrom(const Eigen::Vector3d& center_world);

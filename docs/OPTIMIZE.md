@@ -178,6 +178,9 @@ first-ever working runs 291→**~1.0 m**; park unblocked (moving-start init).
 
 | const (file) | value | role / retune note |
 |---|---|---|
+| `kObsKappa` (lio_frontend.cpp) | 0.01 | knee of the per-axis observability score s = h/(h+κ) on the per-correspondence average of the normal-projected information; 0.01 puts any axis carrying ≥ ~1/10 of the normal energy above 0.9 and an unsupported axis (plane sliding / yaw about a lone normal) near 0 (synthetic box room > 0.9 all axes, single floor plane < 0.3 on tx/ty/rz — test-pinned) |
+| `kAnchorPriorVar` (lio_frontend.cpp) | 1e-8 | per-axis variance of the run's first AbsolutePrior keyframe (the odom-origin anchor, σ = 1e-4 matching backend `anchor_sigma`); tighter buys nothing, looser lets the backend wander the origin |
+| `kMaxHeldGroups` / `kMaxLiveImu` (lio_frontend.cpp) | 64 / 4096 | pre-init group hold and live-IMU buffer bounds (~6 s scans / ~20 s IMU); memory caps only — past them the oldest data drops and init/live re-anchors later |
 | `kWeakAxisCos` (ct_frontend.cpp) | 0.966 (~15°) | normal-vs-weak-axis alignment for factor-cap exemption |
 | `kMinSupportWeight` (ct_frontend.cpp) | 0.02 | tail-knot pinning threshold (u³/6 basis support); below → pin the knot |
 | `kTailSigmaVel` / `kTailSigmaRate` (ct_frontend.cpp) | 0.2 m/s / 0.1 rad/s | tail-anchor strengths over the unmeasured span |

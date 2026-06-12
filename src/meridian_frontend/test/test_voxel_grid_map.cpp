@@ -255,3 +255,49 @@ TEST(VoxelGridMap, IdenticalSequencesProduceIdenticalResults) {
   }
   EXPECT_GT(hits, 0);
 }
+
+// neighborsWithin against brute force over the inserted points: same membership for
+// radii inside the one-cell probe envelope, and a deterministic output order.
+TEST(VoxelGridMap, NeighborsWithinMatchesBruteForceAndIsDeterministic) {
+  FrontendLio cfg;
+  cfg.voxel_size_m = 1.0;
+  cfg.max_points_per_voxel = 20;
+  VoxelGridMap map{cfg};
+
+  std::mt19937 rng(7);
+  const auto cloud = randomCloud(rng, 600, -4.0, 4.0);
+  map.insert(cloud);
+
+  // Replicate the insert filter to know exactly which points the map kept.
+  std::vector<Vector3d> kept;
+  {
+    VoxelGridMap shadow{cfg};
+    for (const Vector3d& p : cloud) {
+      const std::size_t before = shadow.size();
+      shadow.insert({p});
+      if (shadow.size() > before) {
+        kept.push_back(p);
+      }
+    }
+  }
+
+  const auto queries = randomCloud(rng, 50, -3.0, 3.0);
+  const double radius = 0.8;  // inside the 27-cell envelope for voxel 1.0
+  std::vector<Vector3d> nbrs;
+  std::vector<Vector3d> nbrs_again;
+  for (const Vector3d& q : queries) {
+    map.neighborsWithin(q, radius, &nbrs);
+    std::size_t brute = 0;
+    for (const Vector3d& p : kept) {
+      if ((p - q).squaredNorm() <= radius * radius) {
+        ++brute;
+      }
+    }
+    EXPECT_EQ(nbrs.size(), brute);
+    map.neighborsWithin(q, radius, &nbrs_again);
+    ASSERT_EQ(nbrs.size(), nbrs_again.size());
+    for (std::size_t i = 0; i < nbrs.size(); ++i) {
+      EXPECT_TRUE(exactlyEqual(nbrs[i], nbrs_again[i]));
+    }
+  }
+}

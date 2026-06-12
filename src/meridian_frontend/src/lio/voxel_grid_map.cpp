@@ -95,6 +95,28 @@ bool VoxelGridMap::nearest(const Eigen::Vector3d& query_world, Eigen::Vector3d* 
   return true;
 }
 
+void VoxelGridMap::neighborsWithin(const Eigen::Vector3d& query_world, double radius,
+                                   std::vector<Eigen::Vector3d>* out) const {
+  out->clear();
+  const double radius_sq = radius * radius;
+  const VoxelCell base = cellOf(query_world, cfg_.voxel_size_m);
+  for (std::int64_t dx = -1; dx <= 1; ++dx) {
+    for (std::int64_t dy = -1; dy <= 1; ++dy) {
+      for (std::int64_t dz = -1; dz <= 1; ++dz) {
+        const auto it = voxels_.find(VoxelCell{base.x + dx, base.y + dy, base.z + dz});
+        if (it == voxels_.end()) {
+          continue;
+        }
+        for (const Eigen::Vector3d& p : it->second) {
+          if ((p - query_world).squaredNorm() <= radius_sq) {
+            out->push_back(p);
+          }
+        }
+      }
+    }
+  }
+}
+
 void VoxelGridMap::clipFarFrom(const Eigen::Vector3d& center_world) {
   const double max_range_sq = cfg_.max_range_m * cfg_.max_range_m;
   const double v = cfg_.voxel_size_m;
