@@ -11,9 +11,10 @@
 >
 > **The rig is fixed and singular.** Meridian fuses **one LiDAR + one IMU + one
 > camera + GNSS** (arch §2, §3). This spec calibrates exactly that rig: four
-> sensor frames, one estimation frame. There is no multi-LiDAR merge, no
-> per-sensor residual-stream bookkeeping, no second map backend — those do not
-> exist in the system, so they do not exist here. (A second LiDAR, if ever added,
+> sensor frames, one estimation frame. There is no multi-LiDAR merge and no
+> per-sensor residual-stream bookkeeping — those do not exist in the system, so they
+> do not exist here. (The surface map's `nvblox`/`cpu` backends share one extrinsic
+> set; the backend choice does not touch calibration.) (A second LiDAR, if ever added,
 > would slot behind the same `Extrinsic` / `ICalibrationProvider` machinery with
 > no new concepts; that is a one-line future extension, not a design point.)
 >

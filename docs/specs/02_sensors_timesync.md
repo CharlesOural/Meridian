@@ -181,8 +181,9 @@ This is the **only new public type** this spec introduces; it is added to spec
 > **On the per-sensor stamping ladder vs. "no fallbacks."** The architecture
 > forbids *defensive dual code paths and "or alternatively" hedges* (arch §0:
 > pick the single best option per job and commit) — that mandate governs
-> structural choices like "one map backend, not a CPU fallback" and "one LiDAR,
-> not a merge-of-N." The `HwPtp → SwOffset → ArrivalOnly` ladder below is **not**
+> structural choices like "one LiDAR, not a merge-of-N" (the surface map's
+> `nvblox`/`cpu` backends are a deliberate, explicitly-selected portability seam,
+> not a defensive fallback — spec 06 §0). The `HwPtp → SwOffset → ArrivalOnly` ladder below is **not**
 > such a hedge: it is a single, fixed **health-degradation policy** for *one*
 > sensor whose hardware sync transiently fails. There is exactly one stamping
 > path per sensor; when its hardware mechanism drops, the sensor *degrades along

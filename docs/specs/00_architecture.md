@@ -4,7 +4,7 @@
 >
 > **What Meridian is, in one line.** A **tightly-coupled LiDAR-Inertial** SLAM system: a **discrete-time LIO** front-end — voxel-hash local map, Gauss-Newton point-to-point ICP seeded by an interval-averaged IMU screw prior with adaptive gravity regularization, deskew internal to the estimator — feeding an iSAM2 factor-graph back-end and a GPU **nvblox** TSDF+colour+mesh map. Camera and GNSS streams are ingested and carried through the pipeline (image passthrough on keyframes, GNSS quality gate) but are **not yet fused** by the estimator.
 >
-> **Deployment target.** **NVIDIA Jetson Orin.** A CUDA GPU is **always present** — the mapping stack is GPU-only (nvblox), with no CPU fallback path anywhere in the design.
+> **Deployment target.** **NVIDIA Jetson Orin.** A CUDA GPU is **always present**, so the deployed surface map runs the **nvblox GPU backend**. The surface tier sits behind the backend-pluggable `IMapLayer`/`ISurfaceMap` seam (`nvblox` GPU / `cpu` host / deferred `vulkan`); the backend is chosen explicitly and fail-fast — the robot never silently downgrades off nvblox (spec 06 §0).
 >
 > **Scope reminder.** First-pass scope ends at a **colourised triangle mesh** (nvblox Marching Cubes). ESDF/path-planning and semantics/object-detection are *designed-for* but *not built now*; the architecture must leave clean seams for them (§12).
 >
@@ -101,10 +101,11 @@ meridian_ws/
 │  │   src/frontend_factory.cpp
 │  │
 │  ├─ meridian_backend/           # L3: IBackEnd + GTSAM iSAM2 factor-graph impl
-│  ├─ meridian_map/               # L4: IMapLayer + IKeyframeStore
-│  │   include/meridian/map/      #   imaplayer.hpp, ikeyframe_store.hpp
-│  │   src/nvblox/             #   THE map backend: nvblox GPU TSDF + colour +
-│  │                           #     Marching-Cubes mesh. No CPU fallback, no second impl.
+│  ├─ meridian_map/               # L4: IMapLayer + ISurfaceMap + IKeyframeStore
+│  │   include/meridian/map/      #   imaplayer.hpp, isurface_map.hpp, ikeyframe_store.hpp
+│  │   src/nvblox/             #   surface backend: nvblox GPU TSDF+colour+MC mesh (production)
+│  │   src/cpu/               #   surface backend: host TSDF+colour+MC (dev/CI/non-CUDA)
+│  │                           #     (src/vulkan/ deferred — agnostic SPIR-V backend, §12)
 │  ├─ meridian_place/             # L5: IPlaceRecognizer + ScanContext++/STD/BTC/GICP/PCM
 │  │
 │  ├─ meridian_pipeline/          # orchestration: wires L0..L6 + threads + queues (NO ROS)
@@ -128,7 +129,7 @@ meridian_ws/
 - One public class ≈ one header + one `.cpp`. **No 1500-line translation units** (FAST-LIO's `laserMapping.cpp` is 1055 lines doing everything; Point-LIO's is comparable — we will not repeat that). A module growing past ~600 lines is a refactor signal.
 - Public headers under `include/meridian/<module>/`; private headers under `src/`. The `meridian/` prefix makes every include site self-documenting about which library it pulls.
 - Interfaces are `I*.hpp`, pure-virtual, with `using Ptr = std::unique_ptr<I*>;` and a factory free function. Implementations live in `src/` subdirectories and are **not** exported in public headers — only the interface is.
-- **`meridian_map` has exactly one map implementation: nvblox** (`src/nvblox/`). There is no second backend directory, no `src/cpu/`, no VDBFusion/OpenVDB/NanoVDB path. `IMapLayer` stays as a clean seam (so a deferred ESDF layer can register behind it, §12), but its one and only surface implementation is nvblox.
+- **`meridian_map`'s surface tier `ISurfaceMap` is the one backend-pluggable seam**: `src/nvblox/` (GPU, production), `src/cpu/` (host, dev/CI/non-CUDA), and a deferred `src/vulkan/` (§12). Exactly one backend is selected per build-and-run, by `map.backend`, explicitly and fail-fast (spec 06 §0, §8.1). There is **no VDBFusion/OpenVDB/NanoVDB path** and no second *tier* — the backends are interchangeable implementations of one interface, not a defensive dual map. The registration tier and `IKeyframeStore` have a single implementation each.
 
 ---
 
@@ -142,7 +143,7 @@ Each layer is summarized by **what it owns / consumes / produces**. Math is defe
 | **L1** preprocessing | `meridian_preprocess` | L0 measurements | downsampled, validity-flagged clouds (**undeskewed**, time-sorted); rectified images + pyramid; GNSS quality verdicts | downsample (voxel grid), validity (blind radius, NaN/intensity), image pyramid, GNSS gate — deskew is **not** done here (it lives inside L2, §7) |
 | **L2** front-end (odometry) | `meridian_frontend` | L1 output + IMU | high-rate `NavState` (live pose) **and** `KeyframePacket` on keyframe events | the **discrete tightly-coupled LIO** estimator (internal constant-screw deskew; voxel-hash map; GN point-to-point ICP with IMU screw prior + adaptive gravity regularization); per-axis observability scoring |
 | **L3** back-end | `meridian_backend` | `KeyframePacket` (L2) + loop constraints (L5) | optimized global trajectory; `GraphUpdate` broadcast to L4/L2 | GTSAM iSAM2 graph, online extrinsic variables, GNC robust kernels, PCM gate |
-| **L4** layered map | `meridian_map` | corrected poses + retained clouds + RGB | **nvblox** GPU TSDF+colour; Marching-Cubes mesh; **per-keyframe cloud store** | de-integration / region rebuild on loop correction (GPU) |
+| **L4** layered map | `meridian_map` | corrected poses + retained clouds + RGB | TSDF+colour + Marching-Cubes mesh behind the pluggable `ISurfaceMap` backend (**nvblox** GPU production / `cpu` host / deferred `vulkan`); **per-keyframe cloud store** | de-integration / region rebuild on loop correction |
 | **L5** place recognition | `meridian_place` | keyframe descriptors + retained clouds | verified loop constraints (with covariance) → L3 | ScanContext++ → STD/BTC candidate → GICP verify → PCM consistency |
 | **L6** operator surface | (`meridian_ros` + `meridian_map`) | mesh + per-vertex confidence | colour mesh, confidence overlay markers | the human-facing view |
 
@@ -246,7 +247,7 @@ The **factory free function** is the only place that names concrete implementati
 | `ISensorSource` | `meridian/sensors/isensor_source.hpp` | `onSample(cb)` | swap: live driver, ROS-bag replay, simulator (same code path for live & offline) |
 | `IFrontEnd` | `meridian/frontend/ifrontend.hpp` | `ingest(PreprocessedGroup)`, `ingest_imu_live`, `set_keyframe_sink`, `apply_correction` | **production: discrete LIO** (`src/lio/`), the only impl (the iEKF test oracle and the CT estimator are retired, §5.4) |
 | `IBackEnd` | `meridian/backend/ibackend.hpp` | `add_keyframe(KeyframePacket&&)`, `add_loop_constraint`, `add_absolute`, `optimize()→GraphUpdate`, `corrected_trajectory`, `refined_calibration`, `diagnostics`, `write_g2o` (canonical: 01 §7.4) | iSAM2 (production); batch LM available for offline debugging only |
-| `IMapLayer` | `meridian/map/imaplayer.hpp` | `integrate(kf)`, `deintegrateRegion(aabb)`, `query`, `extractMesh` | **one impl: nvblox** (GPU TSDF+colour+mesh). Seam left for a deferred ESDF layer (§12) |
+| `IMapLayer` | `meridian/map/imaplayer.hpp` | `integrate(kf)`, `deintegrateRegion(aabb)`, `query`, `extractMesh` | façade over Tier R + `ISurfaceMap` + store; surface backend pluggable (**nvblox** GPU / `cpu` host / deferred `vulkan`), one selected per run. Seam left for a deferred ESDF layer (§12) |
 | `IKeyframeStore` | `meridian/map/ikeyframe_store.hpp` | `put(id,cloud,rgb,pose)`, `get(id)`, `clouds(region)` | RAM store (production); mmap'd on-disk store is a future option behind the same seam |
 | `IPlaceRecognizer` | `meridian/place/iplace_recognizer.hpp` | `add(kf)`, `query()→candidates`, `verify()→LoopConstraint` | ScanContext++ → STD/BTC → GICP → PCM |
 | `TelemetrySink` | `meridian/debug/telemetry.hpp` | `timing/scalar/vec/cloud/pose/marker/event` | ros, recording (tests), null (off) |
@@ -404,7 +405,7 @@ meridian:
                 keyframe: { dist_m: 1.0, rot_deg: 10, time_s: 1.0 } }
   backend:    { kind: isam2, relinearize_thresh: 0.1, robust: huber }   # committed incremental loop kernel; GNC runs off-thread (spec 05 §8)
   map:        { backend: nvblox, tsdf_voxel_m: 0.05, mesh: marching_cubes,
-                colour: true }                              # GPU; no fallback key
+                colour: true }                              # nvblox|cpu|vulkan; explicit, fail-fast
   place:      { kind: scan_context_pp, pcm: true, gicp_fitness_max: 0.3 }
   debug:      { level: info, publish_clouds: true, publish_markers: true,
                 timing: true, telemetry_rate_hz: 10 }
@@ -413,7 +414,7 @@ meridian:
 ### 8.3 Rules
 
 - **Validated on load.** `Config::validate(std::string* error)` checks units, ranges, and cross-field consistency (e.g. `tsdf_voxel_m ≤ preprocess.voxel_surf_m`, `frontend.lio.voxel_size_m > 0`, every `pipeline.queue.*_capacity > 0` per §11.1.1), returning `false` with a precise message on the first violation; `load_config_yaml()` calls it and throws, so a bad config fails fast — no silent defaults masking a typo (a real FAST-LIO foot-gun: a mistyped `nh.param` key silently uses the default).
-- **`kind` strings select implementations** through the factories (§5.1). The production values are fixed (`lio`, `isam2`, `nvblox`); `frontend.kind` accepts only `lio` (the former `ct_livo` and `iekf_oracle` values are retired and rejected, §5.4). `map.backend` has exactly one valid value, `nvblox` — there is no CPU/VDB alternative to select.
+- **`kind` strings select implementations** through the factories (§5.1). `frontend.kind` accepts only `lio` (the former `ct_livo` and `iekf_oracle` values are retired and rejected, §5.4); `backend.kind` is `isam2`. `map.backend` selects the surface backend — `nvblox` (GPU, production), `cpu` (host, dev/CI/non-CUDA), or deferred `vulkan` — and must name a backend compiled into this build (spec 11 §7.6); an uncompiled or misspelled backend fails validation, and there is never a silent substitution between backends (spec 06 §0, §8.1).
 - **Immutable after start.** `Config` is `const` once the pipeline is built. Runtime-tunable knobs (only debug verbosity and publish toggles) go through a separate `DebugControl` service (§10.5), never by mutating `Config`.
 
 ---
@@ -467,17 +468,19 @@ CUDA is opt-in **per hot-loop library**: only `meridian_map` links CUDA/nvblox. 
 
 - **No-ROS gate:** a grep over `src/meridian_*` excluding `meridian_ros` for `rclcpp | ros/ros.h | sensor_msgs | rclcpp/clock` must return empty.
 - **Dependency lint:** a script asserts the §4 edge set and fails if any `meridian_<layer>/package.xml` lists `rclcpp`/`*_msgs`, or if a layer `#include`s a sibling's `src/`.
-- **Single-map-backend gate:** assert `meridian_map` contains exactly one map implementation directory (`src/nvblox/`) and that no source under `meridian_map` references VDBFusion/OpenVDB/NanoVDB — there is no CPU map path.
+- **Surface-backend gate:** assert every `ISurfaceMap` implementation under `meridian_map` lives in its own backend directory (`src/nvblox/`, `src/cpu/`, and a future `src/vulkan/`) and that no source under `meridian_map` references VDBFusion/OpenVDB/NanoVDB — the backends are interchangeable implementations of one interface, not a smuggled-in second mapping library.
 - **No-grounding-in-code gate:** assert no source under `src/meridian_*` contains a reference dossier pointer (regex `grounding[ /][0-9]`, catching both `grounding/NN` and `grounding NN`), enforcing the self-contained-comment rule. Regex owned by spec 11 §9.3.
 - **Sequential-front-end gate:** a grep over `meridian_frontend/src/lio/` for `omp|tbb|std::thread|std::async` must return empty — the estimator is single-threaded by contract (§11.2).
 - **clang-tidy / clang-format** on every TU; warnings-as-errors in core.
-- **Unit + replay tests** under `colcon test`, including the LIO synthetic-world suite (tracking bound, covariance-chain Monte-Carlo, packet-stream contract) and the bit-identical two-run replay check (spec 04, spec 10). Per-module testing detailed in `02..10`. CI builds both the full GPU configuration and the no-GPU configuration (`MERIDIAN_WITH_MAP=OFF`, §9.5) so the off-device dev-box build stays green.
+- **Unit + replay tests** under `colcon test`, including the LIO synthetic-world suite (tracking bound, covariance-chain Monte-Carlo, packet-stream contract) and the bit-identical two-run replay check (spec 04, spec 10). Per-module testing detailed in `02..10`. CI builds the full GPU configuration (nvblox backend) and the no-CUDA configuration (`MERIDIAN_MAP_NVBLOX=OFF`, which keeps the `cpu` backend so the dev-box build has a working map, §9.5), plus the map-excluded build (`MERIDIAN_WITH_MAP=OFF`); the surface-backend conformance suite (spec 06 §8.4) runs per compiled backend so the off-device path stays green.
 
-### 9.5 CUDA / nvblox is core, not wrapper
+### 9.5 CUDA / nvblox is core, not wrapper; the surface backend is selectable
 
-Meridian targets **Jetson Orin** and assumes a CUDA GPU is **always present**. nvblox (TSDF + colour + Marching-Cubes mesh) runs entirely on the GPU and lives in `meridian_map`, a *core* package — it is built and tested without any ROS. CUDA being a dependency of `meridian_map` (and of any GPU residual work in `meridian_frontend`) does **not** violate the no-ROS rule (§1.1): that rule is about *middleware*, not about the accelerator. There is **no CPU fallback** for mapping and the build does not provide one; a missing GPU at runtime is a hard, fail-fast configuration error, not a degraded mode.
+Meridian targets **Jetson Orin** and assumes a CUDA GPU is **always present** on the deployed device, where the surface map runs the **nvblox GPU backend**. nvblox (TSDF + colour + Marching-Cubes mesh) runs entirely on the GPU and lives in `meridian_map`, a *core* package — it is built and tested without any ROS. CUDA being a dependency of the nvblox backend (and of any GPU residual work in `meridian_frontend`) does **not** violate the no-ROS rule (§1.1): that rule is about *middleware*, not about the accelerator.
 
-**Building without a GPU is a compile-time exclusion, never a runtime alternative.** A no-CUDA developer box (no Jetson, no discrete GPU) can build everything *except* the map by setting the workspace switch `MERIDIAN_WITH_MAP=OFF` (default `ON`). With the map excluded, `meridian_map` and every package that links it (`meridian_pipeline`, `meridian_ros`) build without CUDA/nvblox, so a developer can compile and unit-test L0–L3, L5, and the front-end on a laptop. This is purely a **build-configuration** facility for development: it removes the map from the binary, it does **not** substitute a CPU map. There is no runtime branch, no `IMapLayer` CPU implementation, and no degraded-but-running mode — a build with `MERIDIAN_WITH_MAP=ON` (the only deployment configuration) still hard-fails on a missing GPU. The deployed system is always the full GPU map; `MERIDIAN_WITH_MAP=OFF` produces a binary that simply has no map at all, used only for off-device development and CI of the non-map layers. Spec 11 §7 owns the CMake mechanics of the guard.
+**The surface tier is one interface (`ISurfaceMap`) with selectable backends** (spec 06 §0, §8.1): `nvblox` (GPU, the production/on-device backend), `cpu` (a host TSDF+colour+mesh of the same contract, for the dev Mac / a non-NVIDIA box / CI / the cross-backend correctness oracle), and a deferred `vulkan` (agnostic SPIR-V). Backend choice is **explicit and fail-fast, never silent**: `map.backend` names it, it must be compiled into the build, and a `nvblox` deployment **still hard-fails on a missing GPU** — the system never downgrades itself from `nvblox` to `cpu`. The `cpu` backend is a *deliberately chosen* peer backend, not a runtime fallback, so a deployed robot can never quietly run a degraded map while believing it is on nvblox.
+
+**Build-time backend availability is governed by compile flags** (spec 11 §7.6): `MERIDIAN_WITH_MAP` (default `ON`) builds the map layer at all; within it `MERIDIAN_MAP_NVBLOX` (default `ON`, requires CUDA+nvblox) compiles the GPU backend, while the `cpu` backend always compiles when the map is built (no special toolchain). A no-CUDA developer box therefore builds with `MERIDIAN_MAP_NVBLOX=OFF` and gets a **working `cpu` map**, not an absent one — and can compile and unit-test L0–L6 end to end on a laptop. `MERIDIAN_WITH_MAP=OFF` remains available to drop the map entirely (a binary with no `IMapLayer` at all) for minimal non-map builds. Spec 11 §7 owns the CMake mechanics.
 
 ---
 
@@ -673,6 +676,7 @@ The propagate path holds its own IMU-propagated live state; after every solve it
 
 The architecture is built so the deferred work *slots onto the same substrate* without rework. The guiding rule: **deferred features attach as new interface implementations or new consumers of existing value types — never as edits to existing layer contracts.**
 
+- **Agnostic GPU surface backend (`vulkan`):** a SPIR-V compute implementation of `ISurfaceMap` (TSDF + colour fusion + Marching Cubes in Vulkan shaders) that runs the dense surface at GPU speed on Metal/AMD/Intel/NVIDIA alike — so the map is no longer CUDA-locked. It attaches as one more backend behind the existing `map.backend` selection and the §8.4 conformance suite; Tier R, the `KeyframeStore`, and the loop-rebuild path are untouched. First pass ships without it (spec 06 §10).
 - **ESDF / path planning:** an additional `IMapLayer` implementation consuming the **same nvblox TSDF** the surface layer maintains (nvblox already computes ESDF on the GPU). Because map layers sit behind `IMapLayer` and are fed by the same corrected keyframes + retained clouds, adding ESDF is "register one more layer," not "rebuild the map." No L0–L3 change.
 - **Semantics / object detection:** `KeyframePacket` already carries a shared-immutable `image`, and the keyframe store retains cloud + image. A semantics module becomes a consumer of the store plus an annotation channel in L4; the TSDF/colour voxel can carry an extra label channel. Boundary types do not change.
 - **Offline high-fidelity export:** the nvblox Marching-Cubes mesh **is** the deliverable mesh. An *optional* one-shot Screened-Poisson pass over the retained keyframe clouds may be offered as an export utility in `meridian_tools`, never as a core runtime path.
@@ -688,7 +692,7 @@ There is **one** system — the LIO estimator with nvblox mapping. The list belo
 1. **Cross-cutting + value types** (`meridian_common`, `meridian_time`, `meridian_config`, `meridian_debug`, `meridian_calib`) — the types every other module consumes; stand these up first so the contracts compile.
 2. **L0/L1** (`meridian_sensors`, `meridian_preprocess`) — get real measurements onto the monotonic timeline and through preprocessing; verify with the bag replay harness.
 3. **L2 LIO front-end** (`meridian_frontend/src/lio/`) — the voxel-hash map, the IMU tracker (static init + propagation + interval priors), then scan registration (screw deskew + GN ICP) and the orchestrating `LioFrontEnd`. (The earlier `src/iekf/` oracle and `src/ct/` estimator are retired, §5.4.)
-4. **L4 nvblox map** (`meridian_map/src/nvblox/`) — GPU TSDF+colour+mesh consuming keyframe clouds; the keyframe store.
+4. **L4 surface map** (`meridian_map`) — Tier R voxel-hash, the `KeyframeStore`, and the `ISurfaceMap` surface tier consuming keyframe clouds. Bring up the `cpu` backend (`src/cpu/`) first — it builds everywhere and anchors the conformance suite (spec 06 §8.4) — then the `nvblox` backend (`src/nvblox/`) on CUDA hardware behind the same interface.
 5. **L3 back-end** (`meridian_backend`) — iSAM2 graph consuming `KeyframePacket`s, broadcasting `GraphUpdate`.
 6. **L5 place recognition** (`meridian_place`) — ScanContext++ → STD/BTC → GICP → PCM feeding loop constraints to L3, closing the map-correction loop into L4.
 7. **L6 + wrapper polish** — operator surface, full debug-bus binding, launch/config/rviz.
@@ -702,7 +706,7 @@ This ordering is a convenience for integration; the **design** is the complete s
 1. **No ROS below `meridian_ros`.** Core is plain C++ (and CUDA); time is int64 ns; logging/telemetry are sinks bound by the wrapper. CUDA/nvblox is core, not middleware. (§1, §6.2, §9.5, §10)
 2. **`KeyframePacket` is the only L2→L3 value.** Concretely defined; one geometric constraint per interval (`RelativeBetween` default; `AbsolutePrior` only on the first keyframe and the post-reseed re-anchor, mutually exclusive); velocity/bias ride as seeds, not graph variables, by default; bias estimation lives in L2. (§6)
 3. **The front-end is the discrete LIO estimator** (same packet contract as its predecessors). A voxel-hash map + GN point-to-point ICP with an interval-averaged IMU screw prior, deskewing internally; camera and GNSS ride through unfused. The iEKF oracle and the continuous-time estimator are both retired. (§5.4, §7)
-4. **The map is nvblox, GPU-only.** One backend, no CPU fallback, no VDB path. nvblox does TSDF + colour + Marching-Cubes mesh; loop correction = clear-and-rebuild of the affected region from retained clouds at corrected poses. (§2, §9.5, §6.5, and `06_mapping.md`)
+4. **The surface map is TSDF + colour + Marching-Cubes mesh behind the pluggable `ISurfaceMap` backend** — `nvblox` (GPU, production), `cpu` (host, dev/CI/non-CUDA), or deferred `vulkan` — one selected per run, explicitly and fail-fast, never a silent downgrade off nvblox. No VDBFusion/OpenVDB archive. Loop correction = clear-and-rebuild of the affected region from retained clouds at corrected poses, identical across backends. (§2, §9.5, and `06_mapping.md`)
 5. **One LiDAR + one IMU + one camera + GNSS.** No multi-LiDAR merge logic in the design. (§2, §3, §8.2)
 6. **Deskew is internal to L2** — a constant-screw warp at each point's sample time; L1 hands up undeskewed, time-sorted scans, and no feedback edge exists. (§7)
 7. **Layers depend downward + cross-cutting only;** siblings talk through interfaces + `meridian_common` value types; `meridian_pipeline` is the only wirer. (§4, §5)
@@ -768,7 +772,7 @@ ISensorSource    : onSample(cb)                                              —
 IFrontEnd        : ingest(PreprocessedGroup); ingest_imu_live; set_keyframe_sink;
                    live_state; apply_correction; diagnostics                — L2,  prod: lio, only impl (iekf + ct retired)
 IBackEnd         : addKeyframe(KeyframePacket); addLoop; optimize; onResult  — L3,  isam2 (batch LM = offline debug)
-IMapLayer        : integrate(kf); deintegrateRegion(aabb); query; extractMesh— L4,  one impl: nvblox (GPU); seam for deferred ESDF
+IMapLayer        : integrate(kf); deintegrateRegion(aabb); query; extractMesh— L4,  ISurfaceMap backend: nvblox(GPU)|cpu(host)|vulkan(deferred); seam for ESDF
 IKeyframeStore   : put(id,cloud,rgb,pose); get(id); clouds(region)          — L4,  ram (mmap = future)
 IPlaceRecognizer : add(kf); query()->candidates; verify()->LoopConstraint   — L5,  sc++ -> std/btc -> gicp -> pcm
 TelemetrySink    : timing/scalar/vec/cloud/pose/marker/event                — X-cut, swap: ros/recording/null

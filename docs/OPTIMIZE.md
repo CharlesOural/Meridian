@@ -113,3 +113,12 @@ ledger: it gates no estimator computation (debug stream sampling only).
 | key | value | trade/effect |
 |---|---|---|
 | `preprocess.camera.rectify_balance` (newer-college-quad.yaml) | 0.0 | fisheye→pinhole undistort framing. 0 crops the rectified image to the all-valid region (no black border, drops peripheral field of view) → cleanest input for direct photometric matching; 1 keeps the full field of view (black corners, heavier edge stretch). Feeds OpenCV's new-camera-matrix estimate (`balance` for equidistant, `alpha` for radtan), which sets the rectified focal length. |
+
+## L4 map (map.* — cpu surface backend; newer-college-quad.yaml)
+
+| key | value | trade/effect |
+|---|---|---|
+| `map.tsdf_voxel_m` | 0.35 | surface voxel edge. Smaller = finer mesh but cubic growth in voxel/triangle count and per-publish transport (0.25 gave ~370k triangles after 45 keyframes; 0.35 ~halves that). Raise toward 0.5 for a lighter mesh over a constrained operator link; lower on a Jetson/GPU run. Must stay ≤ `reg_voxel_m` and ≤ `preprocess.voxel_surf_m`. |
+| `map.tsdf_trunc_voxels` | 2 | truncation band in voxels; also the fusion shell radius. 2 → a 5-voxel-thick band so Marching Cubes finds complete cubes from sparse LiDAR returns. 1 is thinner/cheaper but risks holes; 3+ thickens the surface and multiplies fusion cost (cost ∝ (2r+1)³ per occupied input voxel). |
+| `map.reg_voxel_m` | 0.5 | Tier-R registration voxel edge. Coarser than the surface voxel; trades plane-cache locality for memory. |
+| `kMeshFoldPeriod` (meridian_pipeline.cpp) | 10 | folds between L4 surface-mesh re-extract+publish. The mesh is re-extracted whole and is large, so this throttles the O(voxels) extract and the marker transport; forced on a loop fold. Lower = fresher mesh, higher operator-link load. |

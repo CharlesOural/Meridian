@@ -36,8 +36,12 @@ single source of truth never drifts. When in doubt, follow the spec, not this fi
 The toolchain lives in a container — never install on the host. `docker/install-deps.sh`
 is the single source of truth for the dependency stack (ROS 2 Humble, C++20,
 Eigen/Sophus/Ceres 2.1/GTSAM 4.2/PCL/OpenCV/small_gicp, clang tooling); both
-Dockerfiles run it. CUDA/nvblox is Linux-GPU only, so Apple Silicon builds
-everything except `meridian_map` and the packages that link it.
+Dockerfiles run it. The surface map (`meridian_map`) is backend-pluggable behind
+`ISurfaceMap` (spec 06 §0): the `nvblox` GPU backend is Linux+CUDA only, so on
+Apple Silicon `meridian_map` builds with the portable `cpu` backend instead
+(`-DMERIDIAN_MAP_NVBLOX=OFF`, auto-default when no CUDA compiler is found) —
+`map.backend: cpu` gives a real (lower-res) TSDF map the dev box can run.
+`-DMERIDIAN_WITH_MAP=OFF` still drops the map entirely for non-map work.
 
 **`docs/DEVELOPMENT.md` is the runbook** — container setup (distrobox / Docker), the
 one-time workspace bring-up (`git submodule update`, `vcs import src < dependencies.repos`),

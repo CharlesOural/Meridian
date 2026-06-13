@@ -26,11 +26,14 @@ small_gicp, yaml-cpp, linuxptp, evo, and the Foxglove bridge. The GPU image adds
 the **CUDA 12 toolkit**; **nvblox** is built in the workspace from
 `dependencies.repos`.
 
-> **The one platform caveat — CUDA.** `meridian_map` (L4, the nvblox GPU
-> TSDF+colour+mesh) is **CUDA-only with no CPU fallback** (spec 11 §7). It builds
-> and runs only on the Linux/GPU image. **Apple Silicon has no CUDA**, so on the
-> Mac you build everything *except* L4 (and the packages that link it). This is a
-> hardware limit, the same category as RViz being Linux-only — not a bug.
+> **The one platform caveat — CUDA.** L4's `nvblox` surface backend is GPU/CUDA
+> only and builds/runs only on the Linux/GPU image. **Apple Silicon has no CUDA**,
+> so on the Mac `meridian_map` builds with the portable **`cpu`** backend instead
+> (`-DMERIDIAN_MAP_NVBLOX=OFF`, the auto-default when no CUDA compiler is found,
+> spec 11 §7.6): `map.backend: cpu` gives a real (lower-res, slower) TSDF+colour+mesh
+> the Mac can run and visualise — you no longer lose L4 entirely. The nvblox
+> *backend* is the hardware-limited part, the same category as RViz being
+> Linux-only. `-DMERIDIAN_WITH_MAP=OFF` still drops the map altogether for non-map work.
 
 ---
 

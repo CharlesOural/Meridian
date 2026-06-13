@@ -1020,9 +1020,10 @@ nvblox TSDF voxels are **running weighted averages** with no exact inverse —
 per-measurement "subtraction" would require storing every contribution per voxel
 (huge) and is numerically unstable. The principled operation matching
 running-average semantics is to **discard affected voxels and re-integrate the
-retained clouds at corrected poses** (GPU, `00` §9.5 — nvblox is the only map
-backend and there is no CPU path). Because clouds are immutable + body-frame, this
-is mechanical. L5 must therefore *not* attempt its own incremental map edit — that
+retained clouds at corrected poses** (`00` §9.5; the same logic runs on whichever
+`ISurfaceMap` backend is selected — nvblox GPU or cpu host). Because clouds are
+immutable + body-frame, this is mechanical. L5 must therefore *not* attempt its own
+incremental map edit — that
 would duplicate and contradict L4.
 
 ### 10.4 Burst coalescing (advisory)
