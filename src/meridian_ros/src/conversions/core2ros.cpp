@@ -173,6 +173,9 @@ visualization_msgs::msg::Marker to_marker(const Marker& m, Timestamp t) {
     case Marker::Type::Text:
       msg.type = RosMarker::TEXT_VIEW_FACING;
       break;
+    case Marker::Type::Triangles:
+      msg.type = RosMarker::TRIANGLE_LIST;
+      break;
   }
   msg.scale.x = m.scale;
   msg.scale.y = m.scale;

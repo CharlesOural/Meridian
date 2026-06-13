@@ -54,6 +54,8 @@ RosTelemetrySink::RosTelemetrySink(rclcpp::Node* node, const DebugConfig& cfg)
                                                                    rclcpp::QoS(50).reliable());
   pub_markers_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
       "/meridian/markers", rclcpp::QoS(5).reliable());
+  pub_map_mesh_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/meridian/map_mesh", rclcpp::QoS(1).reliable().transient_local());
 
   // The known-hot per-sweep cloud is created here so the stage thread never hits the
   // lazy create_publisher path on its first publish.
@@ -254,6 +256,11 @@ void RosTelemetrySink::marker(const Marker& m, Timestamp t) {
   if (!pass("markers/" + m.ns, /*heavy=*/true)) return;
   visualization_msgs::msg::MarkerArray arr;
   arr.markers.push_back(to_marker(m, t));
+  // The L4 surface mesh goes to its own latched topic so it survives the run.
+  if (m.ns == "map/mesh") {
+    pub_map_mesh_->publish(arr);
+    return;
+  }
   pub_markers_->publish(arr);
 }
 

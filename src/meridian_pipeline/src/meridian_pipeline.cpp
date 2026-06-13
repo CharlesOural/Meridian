@@ -41,6 +41,9 @@ constexpr std::size_t kMeasQueueCapacity = 8 * 24;
 // collapsed to a single voxel grid at kMapCloudVoxel metres so its size stays bounded.
 constexpr std::uint64_t kMapCloudFoldPeriod = 5;
 constexpr float kMapCloudVoxel = 0.3f;
+// The L4 surface mesh is large (re-extracted whole each time), so it publishes less often
+// than the map cloud to keep the per-publish transport cost off the operator link.
+constexpr std::uint64_t kMeshFoldPeriod = 10;
 
 SensorInfo make_info(std::uint8_t id, Modality modality, Frame frame, const std::string& model,
                      double rate_hz, StampSource src) {
@@ -170,6 +173,13 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
       };
       loop_detector_ = makeLoopDetector(cfg_.place, store_, pose_source_,
                                         /*deterministic=*/sync_mode_, sink_.get());
+    }
+    // L4 layered map (Tier R + the selected ISurfaceMap backend), sharing the canonical
+    // store. It integrates keyframes at corrected back-end poses and re-integrates on a
+    // loop correction; the surface mesh is published to the operator.
+    if (cfg_.map.enable) {
+      if (!store_) store_ = std::make_shared<KeyframeStore>();
+      map_ = makeMapLayer(cfg_.map, calib, store_, sink_.get());
     }
   }
 }
@@ -514,7 +524,55 @@ void MeridianPipeline::publish_graph_update(const GraphUpdate& gu) {
   if (store_ && last_kf_id_) {
     publish_map_cloud(ts, /*force=*/gu.loop_closed);
   }
+  if (map_) update_l4_map(gu, ts, /*force=*/gu.loop_closed);
   if (graph_update_sink_) graph_update_sink_(gu);
+}
+
+void MeridianPipeline::update_l4_map(const GraphUpdate& gu, Timestamp ts, bool force) {
+  // Correct already-integrated keyframes first (clear-and-rebuild of the moved region).
+  if (!gu.moved.empty()) map_->apply_graph_update(gu);
+  // Integrate any newly-placed keyframes at their corrected back-end poses. A keyframe is
+  // mapped exactly once; subsequent moves arrive through apply_graph_update above.
+  for (const std::uint64_t id : store_->ids()) {
+    if (mapped_ids_.count(id) != 0) continue;
+    const std::optional<Pose> p = backend_->pose_of(id);
+    if (!p) continue;  // not yet placed in the graph; integrate on a later fold
+    const PointCloudPtr cloud = store_->cloud(id);
+    if (!cloud) continue;
+    KeyframePacket kf;
+    kf.id = id;
+    kf.cloud_body = cloud;
+    kf.image = store_->image(id);
+    kf.T_body_cam = store_->body_cam(id).value_or(Pose{});
+    map_->integrate(kf, *p);
+    mapped_ids_.insert(id);
+  }
+  // The surface mesh is O(voxels) to extract and large to transport, so throttle it
+  // (forced on a loop fold, where the whole point is to show the corrected surface).
+  if (!force && ++folds_since_mesh_ < kMeshFoldPeriod) return;
+  folds_since_mesh_ = 0;
+  publish_map_mesh(ts);
+}
+
+void MeridianPipeline::publish_map_mesh(Timestamp ts) {
+  if (!map_ || !sink_->wants_clouds()) return;
+  const ColorMesh& mesh = map_->extract_mesh();
+  if (mesh.vertices.empty()) return;
+  // Triangle-list marker: vertices are already in 3-per-triangle order with per-vertex
+  // turbo colours, so a viewer renders the coloured surface with no setup.
+  Marker mk;
+  mk.type = Marker::Type::Triangles;
+  mk.frame = Frame::Map;
+  mk.ns = "map/mesh";
+  mk.id = 0;
+  mk.scale = 1.0f;
+  mk.points = mesh.vertices;
+  mk.colors.resize(mesh.colors.size());
+  for (std::size_t i = 0; i < mesh.colors.size(); ++i) {
+    mk.colors[i] = {mesh.colors[i][0] / 255.f, mesh.colors[i][1] / 255.f,
+                    mesh.colors[i][2] / 255.f, 1.f};
+  }
+  sink_->marker(mk, ts);
 }
 
 std::vector<LoopConstraint> MeridianPipeline::detect_loops() {

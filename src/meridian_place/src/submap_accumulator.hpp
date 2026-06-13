@@ -10,7 +10,7 @@
 
 #include "meridian/common/cloud.hpp"
 #include "meridian/common/pose.hpp"
-#include "meridian/place/keyframe_store.hpp"
+#include "meridian/map/keyframe_store.hpp"
 
 namespace meridian {
 

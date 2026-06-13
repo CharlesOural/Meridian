@@ -25,6 +25,20 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 option(MERIDIAN_WERROR "Treat warnings as errors in core packages" ON)
 
+# L4 map build switches. MERIDIAN_WITH_MAP gates the whole map layer; MERIDIAN_MAP_NVBLOX
+# gates the CUDA/nvblox surface backend within it. The cpu surface backend always builds
+# when the map layer does (no special toolchain), so a non-CUDA box still gets a working
+# map. Default the nvblox backend ON only when a CUDA compiler is present, so a non-CUDA
+# dev box configures cleanly without manual flags.
+option(MERIDIAN_WITH_MAP "Build the L4 map layer (meridian_map)" ON)
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+  option(MERIDIAN_MAP_NVBLOX "Compile the nvblox (CUDA/GPU) surface backend" ON)
+else()
+  option(MERIDIAN_MAP_NVBLOX "Compile the nvblox (CUDA/GPU) surface backend" OFF)
+endif()
+
 # Apply the house warning set to a target. The CXX generator guard keeps the
 # host-only flags off CUDA device compilation, which nvcc would reject.
 function(meridian_apply_warnings _target)

@@ -335,17 +335,40 @@ void load_backend(const YAML::Node& root, BackendConfig& c) {
 void load_map(const YAML::Node& root, MapConfig& c) {
   const YAML::Node n = root["map"];
   if (!n) return;
+  get(n, "enable", c.enable);
   if (n["backend"]) {
-    c.backend =
-        parse_enum<MapBackend>(n["backend"], "map.backend", {{"nvblox", MapBackend::Nvblox}});
+    c.backend = parse_enum<MapBackend>(n["backend"], "map.backend",
+                                       {{"nvblox", MapBackend::Nvblox},
+                                        {"cpu", MapBackend::Cpu},
+                                        {"vulkan", MapBackend::Vulkan}});
   }
-  get(n, "tsdf_voxel_m", c.tsdf_voxel_m);
   get(n, "reg_voxel_m", c.reg_voxel_m);
+  get(n, "reg_max_pts", c.reg_max_pts);
+  get(n, "reg_seed", c.reg_seed);
+  get(n, "reg_max_level", c.reg_max_level);
+  get(n, "reg_planarity", c.reg_planarity);
+  get(n, "reg_min_plane_pts", c.reg_min_plane_pts);
+  get(n, "reg_neighbor_ring", c.reg_neighbor_ring);
+  get(n, "reg_hot_radius_m", c.reg_hot_radius_m);
+  get(n, "tsdf_voxel_m", c.tsdf_voxel_m);
+  get(n, "tsdf_trunc_voxels", c.tsdf_trunc_voxels);
+  get(n, "tsdf_w_max", c.tsdf_w_max);
+  get(n, "tsdf_max_integration_dist_m", c.tsdf_max_integration_dist_m);
+  get(n, "colour", c.colour);
+  get(n, "color_ewma_alpha", c.color_ewma_alpha);
+  get(n, "color_occlusion_check", c.color_occlusion_check);
+  get(n, "invalid_depth_decay", c.invalid_depth_decay);
   if (n["mesh"]) {
     c.mesh =
         parse_enum<MeshKind>(n["mesh"], "map.mesh", {{"marching_cubes", MeshKind::MarchingCubes}});
   }
-  get(n, "colour", c.colour);
+  get(n, "mesh_max_rate_hz", c.mesh_max_rate_hz);
+  get(n, "mesh_conf_w", c.mesh_conf_w);
+  if (n["store"] && n["store"]["backend"]) {
+    c.store.backend = parse_enum<StoreBackend>(n["store"]["backend"], "map.store.backend",
+                                               {{"ram", StoreBackend::Ram},
+                                                {"mmap", StoreBackend::Mmap}});
+  }
 }
 
 void load_place(const YAML::Node& root, PlaceConfig& c) {

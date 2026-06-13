@@ -15,7 +15,7 @@
 #include "meridian/common/pose.hpp"
 #include "meridian/common/time.hpp"
 #include "meridian/config/config.hpp"
-#include "meridian/place/keyframe_store.hpp"
+#include "meridian/map/keyframe_store.hpp"
 
 namespace meridian {
 

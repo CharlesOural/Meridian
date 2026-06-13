@@ -1,11 +1,12 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>meridian_place</name>
+  <name>meridian_map</name>
   <version>0.0.0</version>
-  <description>L5 place recognition / loop closure: the ILoopDetector hierarchical
-    cascade (Scan Context retrieval, GICP verification, single-loop consistency) and
-    the retained KeyframeStore it reads geometry from. Emits LoopConstraint to L3. No ROS.</description>
+  <description>L4 layered map: the canonical KeyframeStore, the Tier-R registration
+    voxel-hash, and the backend-pluggable ISurfaceMap surface tier (cpu host backend;
+    nvblox GPU backend under MERIDIAN_MAP_NVBLOX). Loop correction is clear-and-rebuild
+    from retained clouds at corrected poses. No ROS.</description>
   <maintainer email="william@gcp.callistodata.com">William Profit</maintainer>
   <license>Proprietary</license>
 
@@ -16,7 +17,7 @@
   <depend>meridian_common</depend>
   <depend>meridian_config</depend>
   <depend>meridian_debug</depend>
-  <depend>meridian_map</depend>
+  <depend>meridian_calib</depend>
   <!-- Sophus is provided by the dev image and found via find_package(Sophus); it has no
        standard rosdep key, so it is not listed here. -->
 
