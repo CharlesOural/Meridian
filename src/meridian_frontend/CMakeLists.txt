@@ -10,6 +10,7 @@ find_package(meridian_common REQUIRED)
 find_package(meridian_config REQUIRED)
 find_package(meridian_debug REQUIRED)
 find_package(meridian_calib REQUIRED)
+find_package(OpenMP)
 
 add_library(meridian_frontend SHARED
   src/frontend_factory.cpp
@@ -36,6 +37,11 @@ target_link_libraries(meridian_frontend PUBLIC
   Eigen3::Eigen
   Sophus::Sophus
 )
+
+# Parallel processing
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(meridian_frontend PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 ament_export_targets(meridian_frontendTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(

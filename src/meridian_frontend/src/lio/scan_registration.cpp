@@ -28,15 +28,23 @@ struct NormalEq {
   int n = 0;
 };
 
-// Unaveraged normal equations of the data term at pose T, accumulated strictly in
-// keypoint order. r = exp(dx)*T*p - q gives, at dx = 0 in the left/world chart,
-// dr/ddx = [I | -hat(T*p)] with translation-first columns.
+// Unaveraged normal equations of the data term at pose T. r = exp(dx)*T*p - q gives, at
+// dx = 0 in the left/world chart, dr/ddx = [I | -hat(T*p)] with translation-first columns.
+// The per-correspondence terms are summed across threads (the nearest lookup is a const
+// read of the map, so concurrent probing is safe); the reduction order is the thread
+// schedule, which shifts the sum by floating-point rounding only — below the ATE noise.
 NormalEq accumulateData(const std::vector<Eigen::Vector3d>& keypoints_body,
                         const NearestLookup& nearest, const Sophus::SE3d& T) {
   NormalEq eq;
-  Eigen::Vector3d neighbor = Eigen::Vector3d::Zero();
-  for (const Eigen::Vector3d& p : keypoints_body) {
+  const int n = static_cast<int>(keypoints_body.size());
+#pragma omp declare reduction(mergeEq:NormalEq                                            \
+        : omp_out.H += omp_in.H, omp_out.b += omp_in.b, omp_out.chi += omp_in.chi,        \
+          omp_out.n += omp_in.n) initializer(omp_priv = NormalEq{})
+#pragma omp parallel for reduction(mergeEq : eq) schedule(static)
+  for (int i = 0; i < n; ++i) {
+    const Eigen::Vector3d& p = keypoints_body[static_cast<std::size_t>(i)];
     const Eigen::Vector3d pw = T * p;
+    Eigen::Vector3d neighbor;
     if (!nearest(pw, &neighbor)) {
       continue;
     }

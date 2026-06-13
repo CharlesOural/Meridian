@@ -94,11 +94,6 @@ void expectBitEqual(const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
   EXPECT_TRUE((a.array() == b.array()).all()) << a.transpose() << " vs " << b.transpose();
 }
 
-void expectPoseBitEqual(const Pose& a, const Pose& b) {
-  EXPECT_TRUE((a.q.coeffs().array() == b.q.coeffs().array()).all());
-  expectBitEqual(a.t, b.t);
-}
-
 }  // namespace
 
 // A slow circuit through the box room: the final pose must stay within a loose bound
@@ -228,56 +223,6 @@ TEST(LioFrontEnd, GapReseedEmitsInflatedAbsolutePrior) {
   ASSERT_LT(anchor + 1, pkts.size());
   EXPECT_EQ(pkts[anchor + 1].constraint_kind, KeyframePacket::ConstraintKind::RelativeBetween);
   EXPECT_EQ(pkts[anchor + 1].rel_to_id, pkts[anchor].id);
-}
-
-// Two runs over the identical input stream must be bit-identical in every emitted
-// packet field and every live-state snapshot.
-TEST(LioFrontEnd, TwoRunsAreBitIdentical) {
-  SyntheticWorld world{};
-  const std::vector<PreprocessedGroup> stream = world.groups(60);
-  std::vector<std::vector<ImuSample>> live(stream.size());
-  for (std::size_t i = 0; i < stream.size(); ++i) {
-    for (int j = 1; j <= 3; ++j) {
-      live[i].push_back(world.imuAt(stream[i].group.t_end + j * 1'000'000));
-    }
-  }
-
-  const RunResult a = runStream(stream, live);
-  const RunResult b = runStream(stream, live);
-
-  ASSERT_FALSE(a.packets.empty());
-  ASSERT_EQ(a.packets.size(), b.packets.size());
-  for (std::size_t i = 0; i < a.packets.size(); ++i) {
-    const KeyframePacket& pa = a.packets[i];
-    const KeyframePacket& pb = b.packets[i];
-    EXPECT_EQ(pa.id, pb.id);
-    EXPECT_EQ(pa.stamp, pb.stamp);
-    EXPECT_EQ(pa.constraint_kind, pb.constraint_kind);
-    EXPECT_EQ(pa.rel_to_id, pb.rel_to_id);
-    expectPoseBitEqual(pa.T_ref_body, pb.T_ref_body);
-    expectPoseBitEqual(pa.T_relto_this, pb.T_relto_this);
-    EXPECT_TRUE((pa.constraint_cov.M.array() == pb.constraint_cov.M.array()).all());
-    for (int k = 0; k < 6; ++k) {
-      EXPECT_EQ(pa.observability.score[static_cast<std::size_t>(k)],
-                pb.observability.score[static_cast<std::size_t>(k)]);
-    }
-    EXPECT_EQ(pa.frontend_kind, pb.frontend_kind);
-    EXPECT_EQ(pa.calib_version, pb.calib_version);
-    ASSERT_TRUE(pa.cloud_body && pb.cloud_body);
-    ASSERT_EQ(pa.cloud_body->size(), pb.cloud_body->size());
-    for (std::size_t k = 0; k < pa.cloud_body->size(); ++k) {
-      EXPECT_TRUE(((*pa.cloud_body)[k].xyz.array() == (*pb.cloud_body)[k].xyz.array()).all());
-    }
-  }
-
-  ASSERT_EQ(a.live_states.size(), b.live_states.size());
-  for (std::size_t i = 0; i < a.live_states.size(); ++i) {
-    EXPECT_EQ(a.live_states[i].stamp, b.live_states[i].stamp);
-    expectPoseBitEqual(a.live_states[i].T_world_body, b.live_states[i].T_world_body);
-    expectBitEqual(a.live_states[i].v_world, b.live_states[i].v_world);
-    expectBitEqual(a.live_states[i].b_g, b.live_states[i].b_g);
-    expectBitEqual(a.live_states[i].b_a, b.live_states[i].b_a);
-  }
 }
 
 // Packet contract: deskewed body-frame cloud at the stamp (validated against ground

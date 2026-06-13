@@ -3,7 +3,6 @@
 #include <Eigen/Core>
 #include <cstddef>
 #include <cstdint>
-#include <unordered_map>
 #include <vector>
 
 #include "meridian/config/config.hpp"
@@ -40,6 +39,12 @@ std::vector<Eigen::Vector3d> voxelDownsample(const std::vector<Eigen::Vector3d>&
 // cell holding at most cfg.max_points_per_voxel points. Nearest-neighbor queries probe
 // the query's cell and its 26 face/edge/corner neighbors in a fixed order, so lookups
 // never depend on hash-map iteration order.
+//
+// The cell index is an open-addressing (linear-probe) table rather than a node-based
+// std::unordered_map: the 27-cell probe then walks a contiguous slot array with no
+// per-bucket allocation or pointer chase on the miss path, which dominates the frontend
+// cost. The stored points and their order are unchanged, so nearest()/neighborsWithin()
+// return identical results to a node-based map.
 class VoxelGridMap {
 public:
   explicit VoxelGridMap(const FrontendLio& cfg);
@@ -69,9 +74,27 @@ public:
   std::size_t voxel_count() const;
 
 private:
+  // One open-addressing slot. `used` distinguishes a live cell from an empty slot; the
+  // points keep their insertion order, exactly as the previous per-voxel vector did.
+  struct Slot {
+    VoxelCell key;
+    std::vector<Eigen::Vector3d> pts;
+    bool used = false;
+  };
+
+  // Live points of `cell`, or nullptr when the cell is absent. The lookup is a linear
+  // probe from the cell's hash slot until the key matches or an empty slot is hit.
+  const std::vector<Eigen::Vector3d>* cellPoints(const VoxelCell& cell) const;
+  // The slot a key occupies or should occupy (its insertion point on a miss).
+  std::size_t probe(const VoxelCell& cell) const;
+  // Grow and re-probe all live slots when the load factor crosses the threshold.
+  void growIfNeeded();
+
   FrontendLio cfg_;
-  std::size_t size_ = 0;
-  std::unordered_map<VoxelCell, std::vector<Eigen::Vector3d>, VoxelCellHash> voxels_;
+  std::vector<Slot> table_;  // size is a power of two; mask_ = size - 1
+  std::size_t mask_ = 0;
+  std::size_t used_ = 0;   // occupied slots (for the load factor)
+  std::size_t size_ = 0;   // total stored points
 };
 
 }  // namespace meridian::lio
