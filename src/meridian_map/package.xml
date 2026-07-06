@@ -14,6 +14,11 @@
   <buildtool_depend>meridian_cmake</buildtool_depend>
 
   <depend>eigen</depend>
+  <!-- Workspace-built plain-CMake package (dependencies.repos); orders the colcon graph
+       and chains its install prefix so find_package(nvblox) resolves when the GPU
+       backend is compiled. Not a rosdep key: pass "skip-keys nvblox" to rosdep install.
+       Ignored for ordering on CPU-only hosts where src/nvblox is not imported. -->
+  <depend>nvblox</depend>
   <depend>meridian_common</depend>
   <depend>meridian_config</depend>
   <depend>meridian_debug</depend>

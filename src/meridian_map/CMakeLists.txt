@@ -47,14 +47,33 @@ target_link_libraries(meridian_map PUBLIC
 if(MERIDIAN_MAP_NVBLOX)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  # nvblox's installed config references its vendored deps' imported targets without
+  # finding them; they ship their own configs in the same prefix, so find them first.
+  find_package(glog REQUIRED)
+  find_package(gflags REQUIRED)
+  find_package(stdgpu REQUIRED)
   find_package(nvblox REQUIRED)
+  # nvblox's exported stdgpu wrapper puts <prefix>/include/stdgpu itself on the include
+  # path, whose limits.h/memory.h shadow the libc headers in every consumer TU. The
+  # stdgpu headers are reached as <stdgpu/...> from the plain include root, so drop the
+  # poisonous entry.
+  get_filename_component(_nvblox_prefix "${nvblox_DIR}/../../.." ABSOLUTE)
+  set_target_properties(nvblox::nvblox_stdgpu PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+    "${_nvblox_prefix}/include;${_nvblox_prefix}/include/nvblox")
   target_sources(meridian_map PRIVATE
     src/nvblox/nvblox_surface_map.cpp
     src/nvblox/nvblox_integrate.cu)
+  # CUDA_ARCHITECTURES is deliberately NOT set here: the target inherits
+  # CMAKE_CUDA_ARCHITECTURES (toolchain default 87, overridable per build host).
+  # Separable compilation stays OFF: the single .cu shares no device symbols, and a
+  # static library with relocatable device code would force every non-CUDA consumer
+  # of meridian_map to run a device-link step it cannot perform.
   set_target_properties(meridian_map PROPERTIES
-    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
-    CUDA_SEPARABLE_COMPILATION ON CUDA_ARCHITECTURES 87)
-  target_link_libraries(meridian_map PUBLIC nvblox::nvblox CUDA::cudart)
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  # The stdgpu device hash calls constexpr host functions from device code.
+  target_compile_options(meridian_map PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  target_link_libraries(meridian_map PUBLIC nvblox::nvblox_lib CUDA::cudart)
   target_compile_definitions(meridian_map PUBLIC MERIDIAN_MAP_HAS_NVBLOX)
 endif()
 
@@ -80,6 +99,14 @@ if(BUILD_TESTING)
   # Façade + factory + loop-rebuild conformance (public interface only).
   meridian_add_gtest(test_layered_map test/test_layered_map.cpp)
   target_link_libraries(test_layered_map meridian_map)
+  if(MERIDIAN_MAP_NVBLOX)
+    # GPU-backend conformance; needs a CUDA device at run time.
+    meridian_add_gtest(test_nvblox_surface_map test/test_nvblox_surface_map.cpp)
+    target_include_directories(test_nvblox_surface_map PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_nvblox_surface_map meridian_map)
+  endif()
 endif()
 
-ament_package()
+# The extras re-find nvblox + its vendored deps for dependents (static-lib link
+# interface); a no-op when the backend is compiled out.
+ament_package(CONFIG_EXTRAS cmake/nvblox_deps.cmake.in)

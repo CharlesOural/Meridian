@@ -49,11 +49,18 @@ Then, one-time workspace bring-up from the repo root:
 ```bash
 git submodule update --init          # vendor/ (scancontext)
 vcs import src < dependencies.repos              # nvblox (GPU)
-rosdep install --from-paths src --ignore-src -y
+rosdep install --from-paths src --ignore-src -y --skip-keys nvblox
 CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install \
     --parallel-workers 1 \
     --cmake-args -DCMAKE_CUDA_ARCHITECTURES="86;87"
 ```
+
+> **`--skip-keys nvblox`**: nvblox is a workspace-built plain-CMake package
+> (meridian_map's package.xml depends on it for build ordering), not a rosdep key.
+>
+> **CUDA arch list**: match the actual device(s) — Orin `87`, Ampere `86`,
+> Turing `75`, Pascal `61` (e.g. `"61;75"` on a GTX 1080 + RTX 2080 box). nvblox
+> and meridian_map must be built with the same list.
 
 > **Build parallelism.** `CMAKE_BUILD_PARALLEL_LEVEL` caps the compile threads
 > (default **6** here); `--parallel-workers 1` builds one package at a time, so

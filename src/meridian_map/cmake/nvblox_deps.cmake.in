@@ -1,0 +1,19 @@
+# Runs on find_package(meridian_map) so dependents of the static library can resolve
+# its nvblox link interface. nvblox's installed config neither finds its vendored
+# deps (their configs ship in the same prefix) nor keeps <prefix>/include/stdgpu off
+# the include path (its limits.h/memory.h shadow the libc headers), so both are
+# handled here exactly as in the meridian_map build itself.
+set(_meridian_map_has_nvblox @MERIDIAN_MAP_NVBLOX@)
+if(_meridian_map_has_nvblox)
+  include(CMakeFindDependencyMacro)
+  find_dependency(CUDAToolkit)
+  find_dependency(glog)
+  find_dependency(gflags)
+  find_dependency(stdgpu)
+  find_dependency(nvblox)
+  get_filename_component(_meridian_map_nvblox_prefix "${nvblox_DIR}/../../.." ABSOLUTE)
+  set_target_properties(nvblox::nvblox_stdgpu PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+    "${_meridian_map_nvblox_prefix}/include;${_meridian_map_nvblox_prefix}/include/nvblox")
+  unset(_meridian_map_nvblox_prefix)
+endif()
+unset(_meridian_map_has_nvblox)
