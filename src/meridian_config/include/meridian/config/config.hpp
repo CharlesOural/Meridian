@@ -397,6 +397,7 @@ struct MapConfig {
   bool color_occlusion_check = true;             // sphere-trace before colouring a voxel
   bool invalid_depth_decay = false;              // optional reproducible far-outlier prune (post-MVP)
   MeshKind mesh = MeshKind::MarchingCubes;
+  bool mesh_incremental = true;  // re-mesh only changed blocks; false = full re-extract per call
   double mesh_max_rate_hz = 2.0;
   double mesh_conf_w = 8.0;                       // W_conf for per-vertex confidence (= tsdf_w_max)
   MapStore store{};

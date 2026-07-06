@@ -362,6 +362,7 @@ void load_map(const YAML::Node& root, MapConfig& c) {
     c.mesh =
         parse_enum<MeshKind>(n["mesh"], "map.mesh", {{"marching_cubes", MeshKind::MarchingCubes}});
   }
+  get(n, "mesh_incremental", c.mesh_incremental);
   get(n, "mesh_max_rate_hz", c.mesh_max_rate_hz);
   get(n, "mesh_conf_w", c.mesh_conf_w);
   if (n["store"] && n["store"]["backend"]) {

@@ -122,3 +122,15 @@ ledger: it gates no estimator computation (debug stream sampling only).
 | `map.tsdf_trunc_voxels` | 2 | truncation band in voxels; also the fusion shell radius. 2 → a 5-voxel-thick band so Marching Cubes finds complete cubes from sparse LiDAR returns. 1 is thinner/cheaper but risks holes; 3+ thickens the surface and multiplies fusion cost (cost ∝ (2r+1)³ per occupied input voxel). |
 | `map.reg_voxel_m` | 0.5 | Tier-R registration voxel edge. Coarser than the surface voxel; trades plane-cache locality for memory. |
 | `kMeshFoldPeriod` (meridian_pipeline.cpp) | 10 | folds between L4 surface-mesh re-extract+publish. The mesh is re-extracted whole and is large, so this throttles the O(voxels) extract and the marker transport; forced on a loop fold. Lower = fresher mesh, higher operator-link load. |
+
+## L4 map — nvblox GPU surface backend (map.* — newer-college-quad-nvblox.yaml; constants in nvblox_surface_map.cpp)
+
+| key | value | trade/effect |
+|---|---|---|
+| `map.tsdf_voxel_m` (nvblox yaml) | 0.15 | GPU surface voxel edge. Block count (VRAM + mesh size) grows cubically as it shrinks. 0.1 @ 40 m cutoff OOM'd an 8 GB card mid-quad-easy (nvblox allocates blocks along the FULL ray for free-space carving, so one open-courtyard view touches ~10⁵ blocks); 0.15 @ 30 m runs the sequence. 0.05 (spec default) needs a bigger-VRAM deployment or a tighter cutoff. |
+| `map.tsdf_trunc_voxels` (nvblox yaml) | 4 | truncation band = 0.6 m. The projective integrator needs no cpu-style shell thickening; 4 keeps Marching Cubes cubes complete at 0.15 m voxels. |
+| `map.tsdf_max_integration_dist_m` (nvblox yaml) | 30.0 | surface-fusion depth cutoff and the other half of the VRAM budget: free-space carving makes open-scene block count grow ~cubically with it. 40 m contributed to the 8 GB OOM above; 30 m fits with headroom while still spanning the quad courtyard. |
+| `map.mesh_incremental` | true | mesh extraction scope per `extract_mesh()` call. true re-meshes only blocks whose TSDF/colour changed since the last call and patches a host-side block cache (cost ∝ changed surface); false clears and re-extracts the whole layer every call (cost ∝ map size — oracle/debug path, also what the cpu backend does). Output is identical; flip to false when chasing suspected incremental-bookkeeping bugs. |
+| `kAzimuthDivisions` (nvblox_surface_map.cpp) | 1024 | azimuth bins of the per-keyframe range image the cloud is rasterized into (rows come from the sensor ring count). Fewer bins = coarser angular quantisation (surface blur at range); more = sparser bins that defeat the integrator's interpolation gates unless the cloud is dense. 1024 matches the OS0's native horizontal resolution. |
+| `kDefaultRows` (nvblox_surface_map.cpp) | 64 | elevation rows when the cloud carries no ring ids (synthetic/test clouds). Real sweeps use max_ring+1. |
+| `kMinRange` (nvblox_surface_map.cpp) | 0.1 m | returns closer than this are dropped before rasterization (self-hits, degenerate ranges). Matches the lidar model's minimum valid range. |
