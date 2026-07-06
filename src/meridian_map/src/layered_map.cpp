@@ -35,16 +35,30 @@ void LayeredMap::apply_graph_update(const GraphUpdate& update) {
   if (update.moved.empty()) return;
 
   // The region to rebuild spans the moved keyframes' OLD and NEW footprints: the old
-  // location's voxels must be cleared, the new location's rebuilt.
+  // location's voxels must be cleared, the new location's rebuilt. The old footprint is
+  // the surface tier's own provenance, not the cloud bounds — fusion spills past the
+  // returns by the truncation band and the storage granularity, and every keyframe that
+  // co-fused a cleared voxel must be re-integrated or it leaves a hole.
   Aabb region;
+  std::vector<std::uint64_t> moved_ids;
+  moved_ids.reserve(update.moved.size());
   for (const auto& m : update.moved) {
-    if (auto b = store_->bounds(m.id)) region.expand(*b);  // old footprint
+    moved_ids.push_back(m.id);
+    if (auto b = store_->bounds(m.id)) region.expand(*b);  // old footprint (Tier R)
   }
+  region.expand(surf_->dirty_bounds(moved_ids));  // old footprint (Tier S provenance)
   for (const auto& m : update.moved) {
     store_->update_pose(m.id, m.new_T_map_body);
     if (auto b = store_->bounds(m.id)) region.expand(*b);  // new footprint
   }
   if (region.empty()) return;
+  // Cloud bounds are compared against the region for membership, but a keyframe can
+  // contribute to a voxel up to the truncation band beyond its returns; widen so those
+  // contributors are always selected for rebuild.
+  const float margin =
+      static_cast<float>(cfg_.tsdf_voxel_m) * static_cast<float>(cfg_.tsdf_trunc_voxels + 8);
+  region.min -= Eigen::Vector3f::Constant(margin);
+  region.max += Eigen::Vector3f::Constant(margin);
 
   // Every keyframe overlapping the region is cleared and rebuilt, so each affected voxel
   // is re-fused from exactly its contributors (no double counting), at corrected poses.
@@ -63,7 +77,9 @@ std::optional<PlaneHit> LayeredMap::query_plane(const Eigen::Vector3f& p_map) co
   return reg_->query_plane(p_map);
 }
 
-const ColorMesh& LayeredMap::extract_mesh() { return surf_->extract_mesh(); }
+const ColorMesh& LayeredMap::extract_mesh() {
+  return surf_->extract_mesh();
+}
 
 MapDiagnostics LayeredMap::diagnostics() const {
   MapDiagnostics d = reg_->diagnostics();

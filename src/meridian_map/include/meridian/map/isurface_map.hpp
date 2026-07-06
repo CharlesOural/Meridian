@@ -16,7 +16,7 @@ namespace meridian {
 // NvbloxSurfaceMap (GPU, deferred build), VulkanSurfaceMap (deferred). The fusion
 // semantics are identical across backends; only performance and platform differ.
 class ISurfaceMap {
- public:
+public:
   virtual ~ISurfaceMap() = default;
 
   // Lay this keyframe's TSDF geometry then its colour at the given map pose.
@@ -27,6 +27,12 @@ class ISurfaceMap {
   // Clear everything the given keyframes contributed (geometry + colour + mesh together),
   // so a loop region can be rebuilt from corrected poses.
   virtual void clear_keyframes(const std::vector<std::uint64_t>& ids) = 0;
+
+  // Map-frame bounds of the surface volume these keyframes fused (their provenance),
+  // which can spill past the retained clouds' own bounds by the truncation band and
+  // storage granularity. The rebuild region derives from this, so clearing never
+  // outruns the set of keyframes selected for re-integration.
+  virtual Aabb dirty_bounds(const std::vector<std::uint64_t>& ids) const = 0;
 
   // Update and return the standing host mesh (extraction is incremental over changed
   // geometry; the returned reference is valid until the next call).
