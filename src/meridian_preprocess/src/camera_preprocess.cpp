@@ -1,7 +1,6 @@
 #include "meridian/preprocess/camera_preprocess.hpp"
 
 #include <algorithm>
-
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -15,8 +14,7 @@ namespace {
 constexpr const char* kLogModule = "preprocess.camera";
 }
 
-CameraPreprocessor::CameraPreprocessor(const PreprocCamera& cfg,
-                                       const IntrinsicsCamera& intrinsics,
+CameraPreprocessor::CameraPreprocessor(const PreprocCamera& cfg, const IntrinsicsCamera& intrinsics,
                                        TelemetrySink* telemetry)
     : cfg_(cfg), intrinsics_(intrinsics), telemetry_(telemetry) {
   buildRectifyMap();
@@ -33,8 +31,8 @@ void CameraPreprocessor::buildRectifyMap() {
     return;
   }
 
-  const cv::Matx33d K(intrinsics_.fx, 0.0, intrinsics_.cx, 0.0, intrinsics_.fy,
-                      intrinsics_.cy, 0.0, 0.0, 1.0);
+  const cv::Matx33d K(intrinsics_.fx, 0.0, intrinsics_.cx, 0.0, intrinsics_.fy, intrinsics_.cy, 0.0,
+                      0.0, 1.0);
   const cv::Size sz(w, h);
   const double balance = std::clamp(cfg_.rectify_balance, 0.0, 1.0);
   cv::Mat new_K;
@@ -42,10 +40,10 @@ void CameraPreprocessor::buildRectifyMap() {
   if (intrinsics_.model == IntrinsicsCamera::Distortion::Equidistant) {
     const cv::Vec4d D(intrinsics_.coeffs[0], intrinsics_.coeffs[1], intrinsics_.coeffs[2],
                       intrinsics_.coeffs[3]);
-    cv::fisheye::estimateNewCameraMatrixForUndistortRectify(K, D, sz, cv::Matx33d::eye(),
-                                                            new_K, balance, sz);
-    cv::fisheye::initUndistortRectifyMap(K, D, cv::Matx33d::eye(), new_K, sz, CV_16SC2,
-                                         map1_, map2_);
+    cv::fisheye::estimateNewCameraMatrixForUndistortRectify(K, D, sz, cv::Matx33d::eye(), new_K,
+                                                            balance, sz);
+    cv::fisheye::initUndistortRectifyMap(K, D, cv::Matx33d::eye(), new_K, sz, CV_16SC2, map1_,
+                                         map2_);
   } else {
     // RadTan / plumb-bob: alpha plays the same crop-vs-keep role balance does for fisheye.
     const cv::Mat D = (cv::Mat_<double>(1, 5) << intrinsics_.coeffs[0], intrinsics_.coeffs[1],
@@ -100,14 +98,13 @@ void CameraPreprocessor::decode(const CameraFrame& frame, cv::Mat* intensity,
   }
 }
 
-void CameraPreprocessor::photometric(const CameraFrame& frame, cv::Mat* intensity,
-                                     bool* applied, bool* exposure_known) const {
+void CameraPreprocessor::photometric(const CameraFrame& frame, cv::Mat* intensity, bool* applied,
+                                     bool* exposure_known) const {
   *applied = false;
   *exposure_known = frame.exposure_s > 0.f;
 
   if (!cfg_.photometric_calib) {
-    MERIDIAN_WARN(kLogModule, "event", "camera/no_photometric_calib", "stamp",
-                  frame.stamp);
+    MERIDIAN_WARN(kLogModule, "event", "camera/no_photometric_calib", "stamp", frame.stamp);
     return;
   }
 
@@ -129,6 +126,26 @@ cv::Mat CameraPreprocessor::rectify(const cv::Mat& img) const {
   if (img.cols != map1_.cols || img.rows != map1_.rows) return img;
   cv::Mat out;
   cv::remap(img, out, map1_, map2_, cv::INTER_LINEAR);
+  return out;
+}
+
+std::shared_ptr<const CameraFrame> CameraPreprocessor::rectify_frame(
+    const std::shared_ptr<const CameraFrame>& frame) const {
+  if (!frame || !rectify_valid_) return frame;
+  cv::Mat intensity, colour;
+  decode(*frame, &intensity, &colour);
+  const cv::Mat& src = colour.empty() ? intensity : colour;
+  if (src.empty()) return frame;
+  cv::Mat rect = rectify(src);
+  if (rect.data == src.data) return frame;  // size mismatch: stayed distorted
+  if (!rect.isContinuous()) rect = rect.clone();
+
+  auto out = std::make_shared<CameraFrame>(*frame);
+  out->width = rect.cols;
+  out->height = rect.rows;
+  out->encoding = rect.channels() == 3 ? CameraFrame::Encoding::RGB8 : CameraFrame::Encoding::Mono8;
+  out->data = std::make_shared<const std::vector<std::uint8_t>>(
+      rect.data, rect.data + rect.total() * static_cast<std::size_t>(rect.channels()));
   return out;
 }
 
