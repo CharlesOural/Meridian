@@ -1706,17 +1706,10 @@ thread, no queue, no timer** — `add_keyframe` / `add_loop_constraint` /
 - `optimize_interval_ms`, the force-on-loop rule, and the queue/back-pressure
   machinery (FM-8/FM-9) do not apply; nothing on the replay path reads a wall clock.
 
-With the cadence fixed and the factor insertion order fixed, the whole solve is
-deterministic: GTSAM is pinned TBB-off (spec 11), elimination ordering (COLAMD) is a
-pure function of the graph, and iSAM2 relinearisation decisions depend only on
-deltas. **Two replays of the same bag + config must produce byte-identical
-corrected trajectories**; an A/B difference is attributable to the config alone.
-Live remains timer-batched, so live and replay reach the same factors through
-different batch boundaries (hence different intermediate linearisation points);
-live==replay agreement is therefore statistical, evaluated per spec 10, while
-replay==replay is exact. Replay is the evaluation path; live is integration and
-viz. The nondeterminism class this kills — wall-clock batching flipping pass/fail
-between runs — is the same one the L2 replay harness exists to kill.
+With the cadence fixed and the factor insertion order fixed, the back-end solve
+itself is order-independent: GTSAM is pinned TBB-off (spec 11), elimination ordering
+(COLAMD) is a pure function of the graph, and iSAM2 relinearisation decisions depend
+only on deltas. Replay is the evaluation path; live is integration and viz.
 
 ---
 

@@ -154,7 +154,7 @@ analogue for (observability, solver convergence, recovery events):
   publishing, telemetry rate, and log level live (spec 00 §8.3, §10.5).
 - **G8 — Replay == live.** The exact same telemetry is produced whether driven by
   a live `ISensorSource` or a bag-replay one, so a forensic session on a recorded
-  bag is bit-for-bit the same debug view as the field run (§13).
+  bag is the same debug view as the field run (§13).
 
 ---
 
@@ -243,7 +243,7 @@ non-negotiable constraints that keep it from becoming a backdoor:
   thread and never deferred. The consumer runs to completion before the producer
   proceeds, so the `const&` is valid for exactly the hook's duration and no locking of
   estimator state is introduced. A consumer that blocks blocks that one stage; in the
-  single-threaded determinism/replay mode (spec 00 §11.2) used by tests this is simply
+  single-threaded replay mode (spec 00 §11.2) used by tests this is simply
   in-line execution. The hook is therefore **forbidden in production postures by
   policy** — it exists for the deterministic test/replay path, and `NullHooks` is the
   only binding a live node ever uses.
@@ -260,8 +260,7 @@ lives in `meridian_debug` and names only core/GTSAM types, never a ROS message.
 ### 2.5 The `ParquetTelemetrySink` — the harness recording sink and its schema
 
 The evaluation harness (spec 10) records every telemetry call to disk as columnar
-Parquet, one file per domain, and then computes metrics and the determinism hash over
-those files. That sink is `ParquetTelemetrySink`, defined here because it is a
+Parquet, one file per domain, and then computes metrics over those files. That sink is `ParquetTelemetrySink`, defined here because it is a
 `meridian_debug`/`meridian_tools` `TelemetrySink` implementation (it owns no ROS) and
 because the harness depends on a *fixed* schema it can read without coordinating with
 the producer. It is the recording peer of `CsvTelemetrySink` — same input (the bus),
@@ -291,18 +290,16 @@ columns are:
 | `level` | `uint8` | for `kind=event`: the `Level`; else `0` |
 | `tag` | `string` (dictionary) | for `kind=event`: the event tag; else `""` |
 | `message` | `string` | for `kind=event`: the `key=value` detail line; else `""` |
-| `seq` | `uint64` | monotone per-(file) write counter, the deterministic tie-break for equal `(stamp_ns,key)` (§13.4) |
+| `seq` | `uint64` | monotone per-(file) write counter, the tie-break for equal `(stamp_ns,key)` |
 
 The schema is **append-only and versioned** by a `schema_version` Parquet
 file-metadata key; a reader keys off it so adding a column never breaks an archived
 run (spec 10 §7.3 re-runs old baselines). Dictionary-encoding the low-cardinality
 string columns keeps the files small and fast to scan in pandas/duckdb (spec 10 §10).
 
-**Determinism contract.** The hash the harness pins (§13.4, spec 10 §7.4) is computed
-over these records under a canonical ordering, and `ParquetTelemetrySink` is the
-single producer of that record set. The sink is only used on the single-threaded
-replay/determinism path; it is not a live-node sink (the live node uses
-`RosTelemetrySink` plus an optional black-box `CsvTelemetrySink`, §11.1).
+**Sink usage.** The sink is only used on the single-threaded replay path; it is not a
+live-node sink (the live node uses `RosTelemetrySink` plus an optional black-box
+`CsvTelemetrySink`, §11.1).
 
 ---
 
@@ -1171,8 +1168,8 @@ rich when on.** Mechanisms:
 ## 13. Replay / bag path equivalence
 
 This is the property that makes the whole debug subsystem trustworthy: **a bag
-replay produces byte-identical telemetry to the live run that recorded it**, so a
-field issue is reproduced and debugged at a desk.
+replay reproduces the live call path that recorded it**, so a field issue is
+reproduced and debugged at a desk.
 
 ### 13.1 Why it holds (structural)
 
@@ -1194,11 +1191,9 @@ vs `BagReplaySource`, spec 01 §7.1) and the bound sink. Therefore:
 
 - Loads the **same `Config` YAML** the live node used (spec 00 §8.1) — the YAML and
   ROS-param loaders fill the *same* struct, so there is no drift.
-- Drives the pipeline in **`--single-thread` deterministic mode** (spec 00 §11.2);
-  the front-end is sequential in every mode and nvblox GPU
-  reductions run in their deterministic variant, so the solve is
-  order-deterministic and the run is **bit-reproducible** (a test-only guarantee,
-  spec 00 §11.2).
+- Drives the pipeline in **`--single-thread` replay mode** (spec 00 §11.2);
+  the front-end runs on one stage thread in every mode and nvblox GPU
+  reductions run in their deterministic variant.
 - Feeds measurements **in recorded timestamp order** at either wall-clock-scaled
   or as-fast-as-possible rate; telemetry stamps are the *measurement* times, not
   wall times, so plots align across runs.
@@ -1215,38 +1210,6 @@ event, final `backend/chi2` within tolerance of golden, ATE from
 `corrected_trajectory()` under threshold. **This is debugging-as-testing** — the
 same signals an operator watches are the signals CI gates on. FAST-LIO cannot do
 this (its signals are globals + CSV).
-
-### 13.4 The pinned determinism hash
-
-The determinism guarantee — two replays of the same `(bag, config, calib, git SHA)`
-produce byte-identical artefacts (spec 10 §1.1, §7.4) — is enforced by a single
-content hash over the recorded telemetry. To make that hash well-defined and stable
-it is pinned, not left to the order rows happened to be written:
-
-- **Canonical record set and ordering.** The hash is computed over the
-  `ParquetTelemetrySink` record set (§2.5) **sorted by `(stamp_ns, key, seq)`** — the
-  measurement timestamp first, the channel key second, and the monotone per-write
-  `seq` counter as the final, total tie-break for records that share a stamp and key.
-  This canonical sort removes any dependence on the order calls reached the sink, so
-  the hash is invariant to write interleaving and to harmless reorderings; only a real
-  change in *what was computed* moves it.
-- **Hashed fields.** Each record contributes its `(stamp_ns, key, kind, values,
-  axis_order, unit, level, tag, message)` to a streaming SHA-256 in the canonical
-  order; `seq` orders but is **not** itself hashed (it is a within-run artefact, not a
-  property of the computation). Floating-point `values` are hashed by their exact IEEE
-  bit pattern — the determinism mode is bit-reproducible (spec 00 §11.2), so this is
-  an equality, not a tolerance.
-- **Single-thread replay only.** The hash is a property of the
-  **single-threaded determinism/replay path** alone (spec 00 §11.2). The production
-  pipeline is multi-threaded and makes no bit-reproducibility claim; the hash is never
-  computed on, nor asserted against, a live multi-threaded run. The harness writes the
-  digest as `determinism.trajectory_hash` (spec 10 §4.5) and CI runs the replay twice
-  on the smoke clip and asserts equality (spec 10 §7.4, the M0 gate).
-
-This is what makes the regression baselines (spec 10 §7) meaningful: a hash change at
-a fixed SHA/config/calib is, by construction, a nondeterminism bug — a stray thread, a
-wall-clock read, an unordered-container iteration, or a non-deterministic GPU reduction
-not run in its deterministic variant.
 
 ---
 
@@ -1393,8 +1356,8 @@ NullSink             default; empty bodies; enabled()→false                 (m
 RecordingSink        captures all calls into the always-on bounded ring     (meridian_debug; tests + forensics, §9.5/§11.2)
 MultiSink            fan-out to ordered children, short-circuits             (meridian_debug)
 CsvTelemetrySink     per-key CSV append                                      (meridian_tools)
-ParquetTelemetrySink columnar, fixed schema, per-domain file; determinism    (meridian_tools; harness, §2.5)
-                       record set, single-thread replay only
+ParquetTelemetrySink columnar, fixed schema, per-domain file                     (meridian_tools; harness, §2.5)
+                       single-thread replay only
 RosTelemetrySink     →topics/TF/markers/images; owns the one to_ros          (meridian_ros)
 NullHooks            default IntrospectionHooks; subscribed()→false          (meridian_debug; live + replay-without-test)
 ```

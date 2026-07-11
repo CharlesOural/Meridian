@@ -6,9 +6,9 @@ this is triage.
 ## Tooling (run this before interpreting anything)
 
 ```bash
-# Deterministic offline replay — THE way to evaluate accuracy / run A/Bs.
+# Offline replay — THE way to evaluate accuracy / run A/Bs.
 # Reads the bag directly (no ROS transport), pipeline in Replay mode: lossless,
-# byte-identical output across runs, parallel-safe.
+# parallel-safe.
 install/meridian_ros/lib/meridian_ros/replay_runner \
     <cfg.yaml> <bag_dir> out.tum [max_content_secs]
 
@@ -55,14 +55,6 @@ drift/explosion; it's actually starvation. Fix the budget, not the estimator.
   regimes; A/B back-to-back.
 - No `TRANSPORT LOSS` warning in the wrapper log (the standing gate, below). If
   it fired, fix transport before reading anything else.
-- Determinism: the estimator itself is synchronous and **bit-identical for
-  identical input** in both modes (no async work, no thread count in the
-  solve). `replay_runner` feeds it identical input, so replay A/Bs are
-  bit-reproducible — a run-to-run change on the same bag means nondeterminism
-  leaked in; treat it as a bug, there is no rerun-once caveat. LIVE bag replay
-  through the node is NOT run-to-run identical (transport timing decides what
-  arrives and what Q_meas evicts); compare live runs statistically, never
-  bit-wise.
 - Runner defaults to `bags/newer-college/quad-easy` (override with `BAG=`).
 
 ## Triage (first 5 minutes)
@@ -137,7 +129,7 @@ ros2 service call /meridian/set_debug_key meridian_msgs/SetDebugKey \
 
 `src/meridian_ros/config/newer-college-quad.yaml` ships all groups ON (it is the
 accuracy-hunt exemplar); every other config keeps the default-off posture. The
-deterministic replay (`replay_runner`) honours the same `debug:` groups from the
+offline replay (`replay_runner`) honours the same `debug:` groups from the
 same YAML — a replay records exactly what the live posture would (no rate limit:
 every sample lands in `*_telemetry.txt`).
 
@@ -237,7 +229,7 @@ The back-end has its own offline loop, decoupled from the front-end replay, via
 # on the back-end alone at ~thousands of folds/second (no front-end, no ROS):
 backend_dev.sh dump  <cfg> <bag_dir> bags/run            # -> bags/run.packets.bin (+ .index.txt)
 backend_dev.sh run   <cfg> bags/run.packets.bin out.tum  # [--inject-loops L.yaml] [--g2o g.g2o]
-backend_dev.sh check <cfg> bags/run.packets.bin          # byte-determinism + identity property
+backend_dev.sh check <cfg> bags/run.packets.bin
 backend_dev.sh loops bags/run.packets.bin.index.txt L.yaml --gt GT.tum   # truth-anchored loops
 ```
 

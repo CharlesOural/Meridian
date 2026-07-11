@@ -652,7 +652,7 @@ Every ~100 ms (default, spec 05 §9.2), the back-end:
 
 For evaluation (spec 10), the **replay harness** runs the back-end off a fixed sequence of measurement files, with **no wall-clock timers** and **no threads**. The cadence is deterministic: optimize after every keyframe, folding in all loops/GNSS staged since the previous keyframe (spec 05 §17.1).
 
-Two replays of the same bag + config produce **byte-identical** corrected trajectories. This reproducibility is essential for debugging, A/B testing configs, and evaluation.
+Given a fixed packet stream the back-end solve is order-independent (GTSAM TBB-off, COLAMD a pure function of the graph).
 
 ---
 

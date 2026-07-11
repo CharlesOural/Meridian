@@ -598,7 +598,7 @@ the offline path that makes "the same core runs on a bag and on the robot" true
   the *same* `Callback`, preserving their recorded stamps with
   `StampSource::Replay` (trusted as-is — a bag's timeline is already fixed).
 * It supports **deterministic ordering** by stamp (merge across streams) for the
-  single-thread determinism mode (arch §11.2), and a `--rate` knob (1×, faster,
+  single-thread replay mode (arch §11.2), and a `--rate` knob (1×, faster,
   step) for debugging.
 * It **bypasses the `ClockModel`** (no live discipline offline) but *can*
   optionally re-run software offset estimation (§7) against the recorded streams
@@ -615,7 +615,7 @@ the offline path that makes "the same core runs on a bag and on the robot" true
 > so every stamp-driven decision (monotonicity clamps, rate estimation, group
 > assembly, image–sweep matching) operates on corrected time, identically live and
 > in replay. LiDAR per-point offsets are relative to the sweep reference and ride
-> along unchanged. Default 0 = bit-identical to the uncorrected path. A
+> along unchanged. Default 0 = identical to the uncorrected path. A
 > calibration-session timeshift is NOT evidence for a recording (hardware sync
 > paths differ per sensor and per session — spec 08 §7.2): set the key only after
 > an empirical A/B on the actual data.

@@ -12,8 +12,8 @@ this log means *aggressive, high-frequency motion over unstructured, often veget
 terrain* — the regime that distinguishes our design choices from benchmark-leaderboard
 ones tuned on smooth indoor/urban data.
 
-Evaluation harness for every number below: deterministic offline replay (`replay_runner`,
-synchronous, lossless), ATE via Umeyama-aligned RMSE against `gt/tum_asimu`, on the Newer
+Evaluation harness for every number below: offline replay (`replay_runner`),
+ATE via Umeyama-aligned RMSE against `gt/tum_asimu`, on the Newer
 College Dataset (2021). Standins for the target regime: **math-medium** (a 2.6 Hz handheld
 yaw sway = the aggressive-motion stressor) and **park** (parkland/vegetation, 571 s = the
 offroad/unstructured + long-trajectory-drift stressor). quad-easy/quad-hard bracket gentle

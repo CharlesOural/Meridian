@@ -66,7 +66,7 @@ takes exactly one option.
 | Linear algebra (vectors, matrices, dense solves) | **Eigen 3.4** | The de-facto C++ numerical core; every other library here (Sophus, GTSAM, PCL, OpenCV) already speaks `Eigen::`, so it is the lingua franca with zero glue. | Blaze, Armadillo |
 | Lie groups (SO(3)/SE(3) exp/log, manifolds) | **Sophus** | Header-only `SO3`/`SE3` on Eigen, matching the box-plus/box-minus and right-perturbation convention spec 01 §3.1 mandates. | hand-rolled so3_math, manif |
 | Back-end optimiser (incremental factor graph) | **GTSAM 4.2** | Ships `ISAM2` (the incremental Bayes-tree smoother spec 05 needs), `CombinedImuFactor`, `noiseModel::Robust`+`Huber`, and `GncOptimizer` — the exact factor/robustness set spec 05 specifies, in one BSD library. | g2o, Ceres-only back-end, SE-Sync |
-| Per-sweep registration solver | **Meridian GN (in `meridian_frontend/src/lio/`)** | The front-end's solve is a 6-DoF Gauss-Newton point-to-point ICP whose normal equations are a closed-form 6×6 LDLT — small enough that a library solver buys nothing and costs determinism. (Ceres remains installed in the container but is **unlinked**: its consumer, the removed CT window solver, no longer exists.) | Ceres, GTSAM for the per-sweep solve |
+| Per-sweep registration solver | **Meridian GN (in `meridian_frontend/src/lio/`)** | The front-end's solve is a 6-DoF Gauss-Newton point-to-point ICP whose normal equations are a closed-form 6×6 LDLT — small enough that a library solver buys nothing at this problem size. (Ceres remains installed in the container but is **unlinked**: its consumer, the removed CT window solver, no longer exists.) | Ceres, GTSAM for the per-sweep solve |
 | Dense mapping: TSDF + colour + mesh | **nvblox (isaac_ros_nvblox)** | GPU TSDF + GPU colour fusion + GPU Marching Cubes in one CUDA library with a maintained ROS 2 wrapper; on the guaranteed-CUDA Jetson Orin it is the only map backend (spec 06 Appendix R). **No CPU fallback.** | VDBFusion, Voxblox, OpenVDB/NanoVDB |
 | Nearest-neighbour map for registration | **voxel-hash maps (Meridian)** | The front-end's local map (`meridian_frontend/src/lio/`) and the L4 registration map (spec 06 §3) are both `std::unordered_map`-based voxel hashes with fixed-order neighbour probes — deterministic by construction and validated against brute-force references in unit tests, with no external NN library. | nanoflann, PCL KdTree, reference k-d trees |
 | Fine registration (loop-closure GICP verify) | **small_gicp** | Header-light, multi-threaded GICP/VGICP that takes Eigen point buffers directly — the L5 verify step (spec 07) wants a fast, dependency-thin GICP, not full PCL registration. | PCL GICP, libpointmatcher |
@@ -297,8 +297,8 @@ target_link_libraries(meridian_frontend PUBLIC
   meridian_calib::meridian_calib
   Eigen3::Eigen
   Sophus::Sophus)
-# NO rclcpp, NO *_msgs — CI no-ROS gate (spec 00 §9.4); no Ceres/OpenCV/PCL/TBB/
-# OpenMP/Threads — the estimator is Eigen+Sophus only and strictly sequential.
+# NO rclcpp, NO *_msgs — CI no-ROS gate (spec 00 §9.4); no Ceres/OpenCV/PCL/TBB.
+# The estimator is Eigen+Sophus; its scan-to-map association is parallelised with OpenMP.
 
 ament_export_targets(meridian_frontendTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(
@@ -700,21 +700,17 @@ the LSP. On the x86 dev box, swap `--mixin orin` for `--mixin release` (and set
    `#include`s a sibling's `src/`.
 3. **No-CUDA-outside-map gate.** Only `meridian_map` may declare the `CUDA`
    language; any other package enabling CUDA fails (keeps GPU fenced).
-4. **Sequential-front-end gate.** Grep `meridian_frontend/src/lio/` for
-   `omp|tbb|std::thread|std::async` → must be empty; the estimator is
-   single-threaded by contract (spec 00 §11.2) so two identical replays stay
-   bit-identical.
-5. **No-grounding-in-code gate.** Grep `src/meridian_*` source (`*.hpp`/`*.cpp`/`*.cu`,
+4. **No-grounding-in-code gate.** Grep `src/meridian_*` source (`*.hpp`/`*.cpp`/`*.cu`,
    comments included) for the regex `grounding[ /][0-9]` → must be empty. Code comments
    must read self-contained, with no pointer into the reference dossiers; the character
    class `[ /]` catches both the slash form (`grounding/07`) and the space-separated
    form (`grounding 07`) — the earlier slash-only pattern missed the latter.
-6. **clang-tidy / clang-format** on every core TU; `-Werror` in core.
-7. **Build + unit + replay tests** under `colcon test` (GoogleTest); the replay
+5. **clang-tidy / clang-format** on every core TU; `-Werror` in core.
+6. **Build + unit + replay tests** under `colcon test` (GoogleTest); the replay
    test drives `meridian_pipeline` from a bag via `meridian_tools` with no ROS spinning
    (proves the off-ROS path). The non-map build (`MERIDIAN_WITH_MAP=OFF`, §7.6) runs
    the non-map unit/replay tests so the no-GPU dev-box path stays green.
-8. **Reproducible, dual base images.** CI runs in **two** tagged Docker images that
+7. **Reproducible, dual base images.** CI runs in **two** tagged Docker images that
    snapshot the §3 apt versions so apt deps never float: an **Orin/JetPack** image
    (`nvcr.io/nvidia/l4t-jetpack`-based, CUDA 12.x, `CMAKE_CUDA_ARCHITECTURES=87`,
    builds `MERIDIAN_WITH_MAP=ON`) and an **x86 dev** image (`ros:humble`-based, builds
@@ -789,12 +785,11 @@ choices, here is the one-line reason the alternative lost. This section is the
 | **Dense mapping** | **Voxblox (CPU)** | Ageing CPU codebase; nvblox supersedes it on GPU with the same block-hash semantics. Kept only as the ESDF *algorithm* reference (spec 06 Appendix R), never linked. |
 | Back-end optimiser | **g2o** | GTSAM ships `ISAM2` (true incremental Bayes tree), `GncOptimizer`, and `CombinedImuFactor` out of the box (spec 05 Appendix R); g2o would mean re-implementing incremental smoothing and GNC. |
 | Back-end optimiser | **Ceres as the global back-end** | Ceres is batch; the global graph needs *incremental* iSAM2. |
-| Per-sweep solver | **Ceres / GTSAM for the registration solve** | The GN normal equations are a closed-form 6×6 LDLT; a general NLLS framework adds link weight, allocation churn, and (with internal threading) nondeterminism for zero benefit at this problem size. |
-| NN / registration | **nanoflann / PCL KdTree as primary** | The maps need incremental insert + range-clip near the robot; a static k-d tree forces rebuilds. The voxel-hash gives incremental behaviour, O(1) insert, and a fixed-order neighbour probe that keeps the solve deterministic. |
+| Per-sweep solver | **Ceres / GTSAM for the registration solve** | The GN normal equations are a closed-form 6×6 LDLT; a general NLLS framework adds link weight and allocation churn for zero benefit at this problem size. |
+| NN / registration | **nanoflann / PCL KdTree as primary** | The maps need incremental insert + range-clip near the robot; a static k-d tree forces rebuilds. The voxel-hash gives incremental behaviour, O(1) insert, and a fixed-order neighbour probe that keeps lookups order-independent. |
 | GICP | **PCL GICP** | Drags the full PCL registration stack; small_gicp is faster, multi-threaded, and takes Eigen buffers directly — matching the L5 verify need without the PCL weight in the hot path. |
 | Lie groups | **manif / hand-rolled** | Sophus is the convention the codebase and the references share; using anything else adds a conversion seam at every boundary. |
 | ROS distro | **Iron / Jazzy** | Not the Jetson/JetPack-aligned LTS; Humble is the supported on-device distro. |
-| Front-end parallelism | **OpenMP/TBB in the estimator** | Parallel reductions sum in nondeterministic order, breaking the bit-identical replay guarantee; the per-sweep GN fits the budget single-threaded, so the estimator stays strictly sequential (CI-enforced, §9.3). |
 | Single vs multi-LiDAR | **multi-LiDAR / dome-Ouster merge** | The system is single LiDAR + single IMU + single camera + GNSS; multi-LiDAR is at most a future extension behind the same `ISensorSource`/`IFrontEnd` interfaces, not designed or built now. |
 
 ---

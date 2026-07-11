@@ -1269,8 +1269,8 @@ loop-level degeneracy is *visible*, mirroring L2's observability reporting (`00`
 
 Per `00_architecture.md` §9.4, against the Newer College benchmark set
 (`DATASET.md`). The L5 acceptance criterion: ATE drops after loop closure; no
-false-loop corruption. Runs under `colcon test` with the deterministic
-single-thread mode (`00` §11.2) for reproducibility.
+false-loop corruption. Runs under `colcon test` with the single-thread replay
+mode (`00` §11.2).
 
 1. **Unit — Scan Context invariance.** Synthetic cloud rotated by a known yaw ⇒
    recovered `Δψ` within one sector; translated within tolerance ⇒ SC distance

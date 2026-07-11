@@ -1368,8 +1368,6 @@ If §5.1 said association dominates the budget, this is the lever that tames it.
 
 On the reference workload the measured effect is roughly **21 ms serial → 7 ms parallel**, a ~14 ms saving on a 100 ms budget — the difference between comfortably making the deadline and dropping sweeps. Nothing else in the pipeline buys that much.
 
-The catch is **determinism.** A parallel reduction that accumulates in thread-completion order gives bitwise-different results run to run, which breaks the replay==live guarantee. Meridian preserves determinism **by construction**: each thread writes its hits into a per-thread buffer, and the buffers are merged back **in fixed index order**, not completion order. The arithmetic is identical regardless of how the threads were scheduled. You get the 14 ms and keep reproducibility — you do not trade one for the other.
-
 ### 5.7 Standing real-time gates: what the operator watches
 
 A handful of telemetry signals are the standing health gates (spec 09 §5, and `docs/REALTIME_DEBUGGING.md`). An operator watches these, not the raw trajectory, to judge health:
@@ -1399,7 +1397,6 @@ Three failure modes cover almost everything, each with a distinct signature and 
 
 | Knob | Trades | Impact |
 |---|---|---|
-| parallel association | determinism (preserved by design) for ~14 ms | largest |
 | `max_lidar_factors` | accuracy on weak axes for solve+assoc time | large |
 | `voxel_surf_m` (map voxel) | map density / kNN cost for resolution | large |
 | window length / knot count | solve time for trajectory fidelity | moderate |
@@ -1420,7 +1417,7 @@ Put it together with a realistic session. The trajectory on the dashboard looks 
 
 That last point is the lesson of the chapter: **the trajectory shape is a symptom, the telemetry is the diagnosis.** Read the gates in order — overload before divergence — and the fix follows directly.
 
-**Chapter summary.** Real time is a scheduling problem, and in this front-end the schedule is dominated by *association*, not arithmetic — so the biggest levers are bounding the factor count and parallelizing correspondence (deterministically, by construction). The single most important diagnostic discipline is separating **overload** (work arrives late; `q_meas_dropped > 0`) from **divergence** (work is wrong; observability collapses), because they demand opposite fixes. Deskew is free in continuous time — the spline is its own deskew provider in steady state, with an IMU dead-reckoner only at cold start — and observability is a first-class per-axis output that the backend trusts to down-weight degenerate stretches. When it fails, the recovery is dictated by which of three signatures you see, and the telemetry gates, read in order, tell you which.
+**Chapter summary.** Real time is a scheduling problem, and in this front-end the schedule is dominated by *association*, not arithmetic — so the biggest levers are bounding the factor count and parallelizing correspondence. The single most important diagnostic discipline is separating **overload** (work arrives late; `q_meas_dropped > 0`) from **divergence** (work is wrong; observability collapses), because they demand opposite fixes. Deskew is free in continuous time — the spline is its own deskew provider in steady state, with an IMU dead-reckoner only at cold start — and observability is a first-class per-axis output that the backend trusts to down-weight degenerate stretches. When it fails, the recovery is dictated by which of three signatures you see, and the telemetry gates, read in order, tell you which.
 
 ---
 

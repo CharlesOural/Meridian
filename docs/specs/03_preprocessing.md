@@ -325,11 +325,10 @@ per-voxel point cap, and its eviction policy are L4/Tier R, owned by `06_mapping
 
 **The representative is chosen deterministically — never newest-wins.** The obvious
 implementation (keep the last point that lands in a cell, overwrite as you iterate)
-makes the surviving set a function of *iteration order*, which violates the
-single-thread determinism mode (`00_*` §11.2): two runs over the same scan, or a
-reordered decode, can keep different points and produce a different cloud, breaking
-bit-reproducibility and the regression harness. L1 instead selects per cell by a
-**fixed, order-independent rule**:
+makes the surviving set a function of *iteration order*: two runs over the same scan,
+or a reordered decode, can keep different points and produce a different cloud — an
+order-dependent swing in behaviour that the regression harness cannot tolerate. L1
+instead selects per cell by a **fixed, order-independent rule**:
 
 - **`surf_max_pts == 1` (default):** keep the point **nearest the voxel centre**,
   ties broken by ascending `t_offset_ns` then by the point's decode index. This is
@@ -339,12 +338,9 @@ bit-reproducibility and the regression harness. L1 instead selects per cell by a
 - **`surf_max_pts > 1`:** when a cell receives more than the cap, retain a bounded
   sample by **reservoir sampling with a per-process seeded RNG** (`surf_seed`,
   default 0): the draw is uniform over the cell's points, unbiased toward early or
-  late returns, and — because the RNG is seeded — identical across replays of the
-  same input on one thread. This mirrors the registration store's deterministic
-  reservoir eviction (`06_mapping.md` §3.2a) so both density-reduction points in the
-  pipeline share one determinism discipline rather than two ad-hoc policies. The
-  reservoir draw is the only randomness in L1 and is confined to the eviction
-  decision; it never touches a point's coordinates or time.
+  late returns. This mirrors the registration store's seeded reservoir eviction
+  (`06_mapping.md` §3.2a). The reservoir draw is the only randomness in L1 and is
+  confined to the eviction decision; it never touches a point's coordinates or time.
 
 The downsample runs after the validity gate (so dead points never occupy a cell)
 and keeps the gate's already-floored `sweep_duration` (§3.5a): thinning only removes
@@ -834,9 +830,8 @@ no clock, no middleware (`00_*` §1, the whole point of the split). Tests run un
   `surf_max_pts == 1` keeps the point nearest the voxel centre (with the documented
   tie-break) and that the result is invariant under a **shuffle of the input order**
   — the determinism property newest-wins fails. With `surf_max_pts > 1`, assert the
-  reservoir keeps exactly the cap, that two runs with the same `surf_seed` keep an
-  identical set, and that the survivors are re-sorted by `t_offset_ns`. Assert
-  `n_voxel_out` matches the survivor count.
+  reservoir keeps exactly the cap and that the survivors are re-sorted by
+  `t_offset_ns`. Assert `n_voxel_out` matches the survivor count.
 - **`sweep_duration` floor (§3.5a):** filter a scan down to a handful of
   early-column survivors; assert the recomputed `sweep_duration` is raised to
   `sweep_floor_frac / nominal_rate_hz`, that it never exceeds the original
@@ -855,8 +850,8 @@ no clock, no middleware (`00_*` §1, the whole point of the split). Tests run un
 - **GNSS (§7):** quality gate truth table; spoof test feeding GNSS velocity that
   diverges from a scripted IMU velocity, asserting `spoof_suspected` after
   `spoof_persist` windows and not before; LLA→ENU against a known reference point.
-- **Determinism (`00_*` §11.2):** in single-thread mode, the whole L1 pipeline on
-  a fixed input is bit-reproducible.
+- **Order-independence (`00_*` §11.2):** in single-thread mode, the whole L1
+  pipeline on a fixed input is order-independent (L1 carries no parallel reduction).
 
 ---
 

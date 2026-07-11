@@ -38,12 +38,11 @@
 8. [Per-axis observability](#8-per-axis-observability)
 9. [Keyframe cadence and KeyframePacket emission](#9-keyframe-cadence-and-keyframepacket-emission)
 10. [Failure and reseed semantics](#10-failure-and-reseed-semantics)
-11. [Determinism guarantees](#11-determinism-guarantees)
-12. [Threading](#12-threading)
-13. [Telemetry surface](#13-telemetry-surface)
-14. [Parameters](#14-parameters)
-15. [Failure modes](#15-failure-modes)
-16. [Known limitations](#16-known-limitations)
+11. [Threading](#11-threading)
+12. [Telemetry surface](#12-telemetry-surface)
+13. [Parameters](#13-parameters)
+14. [Failure modes](#14-failure-modes)
+15. [Known limitations](#15-known-limitations)
 
 ---
 
@@ -88,7 +87,7 @@ construction (§4.1). L2 owns `odom`; L3 owns `map` and the `odom→map` relatio
 | propagated state | IMU rate | `ImuTracker` | dead-reckoning between sweeps; the registration initial guess; rebased onto each solved pose |
 | live state | IMU rate | `LioFrontEnd` | `live_state()` output, advanced by `ingest_imu_live` and rebased after every solve; never read by estimation |
 
-Biases are fixed at their static-init values for the whole run (§16.1); gravity
+Biases are fixed at their static-init values for the whole run (§15.1); gravity
 is fixed at magnitude 9.81 m/s² along world $-z$ after init.
 
 **Tangent conventions.** All internal 6-DoF tangents are **translation-first**
@@ -148,7 +147,7 @@ insertion, `body/scan` telemetry, and `KeyframePacket.cloud_body`.
 
 The keypoint set fed to registration is a voxel downsample of the deskewed
 sweep at edge `keypoint_voxel_factor × voxel_size_m`, keeping the **first**
-point per occupied cell in input order (deterministic, §11).
+point per occupied cell in input order (deterministic).
 
 ## 4. The IMU tracker
 
@@ -219,7 +218,7 @@ points.
   length. `clear()` exists only for the reseed path (§10).
 
 The map is estimation state, not a product: nothing outside the front-end reads
-it, and `apply_correction` deliberately does not move it (§16.5).
+it, and `apply_correction` deliberately does not move it (§15.5).
 
 ## 6. Registration: Gauss-Newton + adaptive gravity regularizer
 
@@ -404,31 +403,7 @@ live states. The map stays in the pre-correction frame: a small correction
 keeps registering against it; a large one fails the next solve, which path (3)
 absorbs.
 
-## 11. Determinism guarantees
-
-Two runs over identical input are **bit-identical**, live or replay — there is
-no asynchronous work, no wall-clock-dependent branch, and no thread count in
-the estimation path. The `deterministic` factory flag is accepted for interface
-compatibility and is a documented no-op. The guarantee rests on rules encoded
-in the unit tests:
-
-1. The voxel map is **never iterated to generate estimation data** —
-   association walks the time-ordered keypoint vector and probes the 27-cell
-   neighbourhood in fixed order; in-cell scans are insertion-ordered.
-2. Map iteration occurs only for **order-independent erasure** (the range
-   clip, a pure per-cell predicate).
-3. GN accumulation is **sequential** in keypoint order; no OpenMP/TBB anywhere
-   under `src/lio/` (CI grep gate, spec 11).
-4. Voxel hashing casts each index to `uint64` **before** arithmetic (defined
-   wraparound); cell indices use `std::floor`. Cell identity is decided by key
-   equality, never by the hash.
-5. Downsample survivors are appended in input scan order, never by walking a
-   set.
-
-Consequence: a deterministic-replay A/B that differs at all differs because the
-input differed. There is no rerun-once caveat.
-
-## 12. Threading
+## 11. Threading
 
 The front-end is **synchronous and thread-confined**: `ingest`,
 `ingest_imu_live`, and `apply_correction` all execute on the pipeline's
@@ -442,7 +417,7 @@ The keyframe sink fires inline on that thread and must only enqueue.
 Bounded internal buffers: the pre-init group hold (64 groups ≈ 6 s) and the
 live-IMU deque (4096 samples ≈ 20 s); both drop oldest-first when exceeded.
 
-## 13. Telemetry surface
+## 12. Telemetry surface
 
 Per-sweep scalars (always-on unless grouped; groups are key-prefix wildcards,
 spec 09):
@@ -464,7 +439,7 @@ deskewed sweep, `/meridian/cloud_body`) and `frontend/path_sample` (the
 odometry pose stream sampled at `debug_path_sample_hz`, aggregated by the
 wrapper into `/meridian/path`). All stamps are measurement time.
 
-## 14. Parameters
+## 13. Parameters
 
 `frontend.lio.*` (defaults from `config.hpp`; `validate()` enforces the stated
 ranges; every change gets a `docs/OPTIMIZE.md` row):
@@ -490,18 +465,18 @@ cadence. `frontend.debug_path_sample_hz` (copied from `debug.path_sample_hz` at
 pipeline construction, default 30): sampling cadence of `frontend/path_sample`;
 debug-only, gates no estimator computation.
 
-## 15. Failure modes
+## 14. Failure modes
 
 | symptom | mechanism | response / instrument |
 |---|---|---|
 | estimate frozen while platform moves | sweeps skipped (sparse/failed registration) | `frontend/lio/reject` events; `frontend/assoc/n_matched` collapse |
 | jump after a data hole | constant-velocity bridge landed off | `frontend/lio/gap` then either recovery or `reseed`; expect an `AbsolutePrior` packet |
-| slow drift over long missions | frozen biases (no online estimation) | `frontend/state/bias_*_norm` constant by construction; see §16.1 |
+| slow drift over long missions | frozen biases (no online estimation) | `frontend/state/bias_*_norm` constant by construction; see §15.1 |
 | confident-but-wrong covariance in degenerate scenes | rung-0 data-term-only Σ | `frontend/obs_min` low while `chi` small — observability, not Σ, is the degeneracy signal |
 | init never completes | platform not still for `init_stationary_s` | `frontend/lio/init_backlog` warning; held groups dropping |
 | tilt error from a moving start | `init_stationary_s = 0` identity-attitude fallback | gravity regularizer fights the wrong anchor; do not use 0 in the field |
 
-## 16. Known limitations
+## 15. Known limitations
 
 1. **No online bias estimation.** Biases are fixed at static-init values;
    the at-rest accel bias is only observable along gravity. Long-mission gyro

@@ -16,10 +16,9 @@ eval pass and then the Jetson port will fill these in.
 
 Budget: one sweep must finish in **~100 ms** (10 Hz). Validate only on **full
 sequences** (a short clip never fills Q_meas, so it hides drops), with the
-deterministic replay harness (`replay_runner`) for accuracy numbers — the LIO
-front-end is bit-identical run-to-run, so a single replay per point is valid.
+offline replay harness (`replay_runner`) for accuracy numbers.
 
-## `frontend.lio.*` (config keys; spec 04 §14 owns the semantics)
+## `frontend.lio.*` (config keys; spec 04 §13 owns the semantics)
 
 | key | value | trades | measured effect |
 |---|---|---|---|
@@ -103,7 +102,7 @@ ledger: it gates no estimator computation (debug stream sampling only).
 
 | key | value | trade/effect |
 |---|---|---|
-| `place.enable` (newer-college-quad.yaml) | true | master switch; ON by default now that the discrete LIO front-end carries no async map rebuild, so sync replay is byte-identical with the detector enabled (verified: two loop-closure replays md5-identical). On quad-easy it auto-detects 9 revisit loops; ATE 0.088 m with or without (low-drift, ~neutral — the loop path runs but the LIO odometry barely drifts here). |
+| `place.enable` (newer-college-quad.yaml) | true | master switch; ON by default now that the discrete LIO front-end carries no async map rebuild. On quad-easy it auto-detects 9 revisit loops; ATE 0.088 m with or without (low-drift, ~neutral — the loop path runs but the LIO odometry barely drifts here). |
 | `place.sc_dist_thresh` (Scan Context accept) | 0.13 | retrieval precision. 0.5 (loose) admits co-visible-but-not-co-located pairs → GICP aligns them on the rigid scene → 45 loops → ATE 6.6 m (corrupted). 0.13 → 7 high-confidence loops, ATE stable. SC is high-recall/low-precision; this is the main precision gate alongside GICP fitness. |
 | `place.gicp_fitness_min` / `gicp_overlap_min` | 0.8 / 0.6 | accept gate on the GICP inlier ratio (fitness == overlap). Together with sc_dist_thresh keeps only excellent geometric matches; lowering them re-admits the corrupting loops. |
 | GICP fitness = inlier ratio (gicp_verify.cpp) | overlap = num_inliers / **own-downsampled** source size | the inlier-ratio denominator MUST be the cloud actually registered. Dividing by the full keyframe cloud (small_gicp downsamples internally) made overlap ~100× too small → fitness capped at 0.14 → zero loops admitted. Own the downsample → correct ratio. The spec's rmse-weighted fitness term is deferred (small_gicp reports a Mahalanobis cost, not metric rmse). |

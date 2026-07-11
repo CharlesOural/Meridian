@@ -298,16 +298,16 @@ cell). `kNShards` keeps the front-end's read lock contention low (§3.6).
 Once a voxel holds `kMaxPtsPerVoxel` points, a further insert must drop one. A
 **newest-wins** policy (overwrite the oldest slot) makes the surviving point set —
 and therefore the cached plane — depend on the *order* points were offered, which
-the multi-threaded live path (§3.4) does not fix; the same bag would yield a
-different plane cache run to run, breaking the determinism mode (§9). Eviction is
+the multi-threaded live path (§3.4) does not fix; the same input would yield a
+different plane cache run to run, an order-dependence we avoid. Eviction is
 therefore **reservoir sampling** with a per-process **seeded** RNG: the voxel keeps
 a `seen` counter, and the $k$-th offered point ($k>$`kMaxPtsPerVoxel`) replaces a
 uniformly-chosen existing slot with probability `kMaxPtsPerVoxel`$/k$, else is
 dropped. This keeps a uniform sample of all points ever offered to the voxel
 (unbiased toward early *or* late returns) and, because the RNG is seeded from a
 fixed config seed (`map.reg_seed`, default 0) and advanced in keyframe-insert order
-on T4, the retained set is **reproducible** across runs of the same bag in
-single-thread replay. The reservoir draw is the only randomness in Tier R and is
+on T4, the retained set is a stable function of the keyframe-insert order (no
+wall-clock or newest-wins dependence). The reservoir draw is the only randomness in Tier R and is
 confined to the eviction decision, never to the query path.
 
 ### 3.3 Adaptive resolution & the plane cache
@@ -582,9 +582,9 @@ post-MVP**, and neither runs in the first pass.
   projects **inside** a later keyframe's depth image but with **no return at or
   beyond its range** (i.e. the ray passed through where the voxel claims surface)
   has its weight decremented by a fixed step each such observation, and is freed
-  when $W$ reaches zero. This is a **reproducible** prune: the decrement is driven
-  only by the keyframe stream, applied in keyframe order, so a `--single-thread`
-  replay produces the identical pruned set (the determinism requirement of §9). It
+  when $W$ reaches zero. This is a **stable** prune: the decrement is driven
+  only by the keyframe stream, applied in keyframe order, so a given keyframe stream
+  yields the same pruned set regardless of thread interleaving. It
   prunes the far-range outlier class — geometry that free-space evidence
   contradicts — without touching well-observed surface. It is **never** a substitute
   for clear-and-rebuild on a loop correction (§7); it is a maintenance prune that
@@ -854,8 +854,8 @@ apply_graph_update(update, store):
   dominate. The geometry pass therefore rebuilds the whole region's TSDF first; the
   colour pass then replays oldest→newest over the completed surface, so occlusion is
   tested against final geometry and the freshest accepted view wins the EWMA. The
-  stamp-ascending order makes the rebuilt colour deterministic (the determinism
-  requirement of §9).
+  stamp-ascending order makes the rebuilt colour order-independent (it does not
+  depend on thread interleaving).
 
 ### 7.3a Clear granularity: nvblox clears whole 8³ blocks, not voxels
 
@@ -1065,13 +1065,10 @@ fallback/`cpu:` key anywhere in the map schema.
 | Projective-integrator silhouette artefact | spurious surface at depth discontinuity (Appendix R.1) | accepted for the online mesh; the offline Poisson export (§10) is the clean archival path |
 | NaN/inf in fused distance | non-finite `distance` after fuse | nvblox rejects the measurement; `event(WARN,"map/nonfinite_sdf")` from the host wrapper |
 
-**Determinism mode** (arch §11.2): in `--single-thread` replay, integrate / mesh
-/ rebuild run inline on the replay thread in the same order; nvblox kernels are run
-in their deterministic variant where available, so the map (and mesh) is
-reproducible across runs of the same bag to the extent the GPU reductions allow
-(arch §11.2 notes bit-reproducibility is a test-only guarantee). The two
-order-sensitive CPU/host decisions are pinned to be reproducible: Tier R voxel
-eviction is seeded reservoir sampling (`reg_seed`, §3.2a), and the rebuild colour
+**Single-thread replay** (arch §11.2): integrate / mesh / rebuild run inline on the
+replay thread in the same order; nvblox kernels are run in their deterministic variant
+where available. The two order-sensitive CPU/host decisions are order-independent: Tier R
+voxel eviction is seeded reservoir sampling (`reg_seed`, §3.2a), and the rebuild colour
 pass replays keyframes in stamp-ascending order (§7.2), so neither the retained
 point set nor the rebuilt surface colour depends on thread interleaving.
 

@@ -37,7 +37,7 @@ One LiDAR + one IMU (plus a camera and GNSS carried through unfused) feed a **di
 | 07  | [`07_loop_closure.md`](specs/07_loop_closure.md)                           | L5 — Scan Context++ → STD/BTC → small_gicp → PCM                                                              |
 | 08  | [`08_calibration.md`](specs/08_calibration.md)                             | Calibration: offline prior + online extrinsic refinement                                                      |
 | 09  | [`09_debug_introspection.md`](specs/09_debug_introspection.md)             | Debug topics, rviz markers, per-module timing — "see what the estimator is doing"                             |
-| 10  | [`10_evaluation_harness.md`](specs/10_evaluation_harness.md)               | Replay==live harness; evo ATE/RPE; per-dataset acceptance                                                     |
+| 10  | [`10_evaluation_harness.md`](specs/10_evaluation_harness.md)               | Replay harness; evo ATE/RPE; per-dataset acceptance                                                           |
 | 11  | [`11_build_system_libraries.md`](specs/11_build_system_libraries.md)       | Library choice per job (justified); colcon workspace; CUDA/nvblox on Orin; version pins                       |
 
 ## Reference grounding — each spec's Appendix R
