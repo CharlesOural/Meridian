@@ -1,4 +1,0 @@
-string module             # e.g. "frontend"; "" = all modules
-uint8 level               # 0 Trace .. 4 Error
----
-bool ok

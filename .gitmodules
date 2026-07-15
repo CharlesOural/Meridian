@@ -1,3 +1,0 @@
-[submodule "vendor/scancontext"]
-	path = vendor/scancontext
-	url = https://github.com/gisbi-kim/scancontext_tro.git

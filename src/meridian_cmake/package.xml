@@ -3,10 +3,8 @@
 <package format="3">
   <name>meridian_cmake</name>
   <version>0.0.0</version>
-  <description>Shared CMake toolchain, dependency finders, vendored-target helpers and
-    test macros for the Meridian workspace. Every other package find_package()es this
-    and include()s its modules, so the C++20/CUDA flags, warning policy and
-    find_package invocations are written exactly once.</description>
+  <description>Shared C++/CUDA toolchain and test helpers for Meridian packages.
+    Dependencies are discovered explicitly by the package that owns them.</description>
   <maintainer email="charles@cfglobal.fr">Charles Farhat</maintainer>
   <license>Proprietary</license>
 

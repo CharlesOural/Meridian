@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 #
 # Meridian dev image — LINUX + NVIDIA GPU. The cross-platform CPU base (same
-# shared install-deps.sh) PLUS the CUDA 12 toolkit, so meridian_map (L4, nvblox)
-# can build.
+# shared install-deps.sh) plus the CUDA 12 toolkit for registration benchmarks
+# and the future nvblox dense candidate.
 #
 # CUDA arch is NOT baked: it is passed at build time via CMAKE_CUDA_ARCHITECTURES
 # nvblox is built in the colcon workspace from dependencies.repos.

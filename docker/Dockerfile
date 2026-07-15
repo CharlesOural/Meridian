@@ -6,15 +6,13 @@
 # dependency stack is the shared install-deps.sh; the GPU image (Dockerfile.gpu)
 # runs the same script on a CUDA-capable base.
 #
-# Base is the `perception` variant (ros_base + PCL/OpenCV/image pipeline), which
+# Base is the `perception` variant (ROS base + OpenCV/image tooling), which
 # publishes both amd64 and arm64. `desktop-full` is osrf-only and amd64-only, so
 # it cannot build native on arm64; rviz2 (a runtime-only dep) is absent here, and
 # viz goes through the Foxglove bridge instead.
 #
-# Covers every CPU layer of Meridian (L0–L3, L5: sensors, preprocessing, the CT
-# front-end, the iSAM2 back-end, place recognition) and the replay harness deps.
-# It does NOT include CUDA, so meridian_map (L4, nvblox) is NOT buildable here —
-# that needs the GPU image. (Apple Silicon has no CUDA at all, by hardware.)
+# Covers CPU contract, estimator, global-graph, ROS adapter, and replay work.
+# GPU registration and the future nvblox dense candidate require the GPU image.
 ARG ROS_DISTRO=humble
 FROM ros:${ROS_DISTRO}-perception
 
@@ -22,7 +20,7 @@ ARG ROS_DISTRO
 ENV ROS_DISTRO=${ROS_DISTRO}
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Meridian dependency canon (docs/specs/11) — one shared installer (§ see file).
+# Meridian dependency canon — one shared installer (see docs/DEVELOPMENT.md).
 # MERIDIAN_BUILD_JOBS caps parallel compile jobs; lower it if the build OOMs.
 ARG MERIDIAN_BUILD_JOBS=6
 COPY install-deps.sh /tmp/install-deps.sh

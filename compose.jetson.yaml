@@ -1,5 +1,5 @@
 # Jetson sensor-driver stack — one container per driver, all on host networking.
-# Each driver reaches its sensor directly (Ouster on end0; SBG and ZED to come)
+# Each driver reaches its sensor directly (Ouster on end0, SBG over serial, ZED over UVC)
 # and publishes to ROS 2; the containers share the DDS graph over host loopback.
 # The Mac previews everything through the `foxglove` service — nothing extra to run.
 #

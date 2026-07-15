@@ -1,20 +1,19 @@
 # vcs source dependencies built INSIDE the colcon workspace.
 #   vcs import src < dependencies.repos
 #
-# The math stack (Eigen, Sophus, Ceres, GTSAM, PCL, OpenCV, small_gicp) is baked
+# The math stack (Eigen, Sophus, GTSAM, OpenCV, small_gicp) is baked
 # into the dev image (docker/install-deps.sh), so it is NOT listed here. The only
-# dep that must live in the workspace is:
-#   - nvblox:      GPU-only (L4). Builds against the image's CUDA toolkit
-#                  (docker/Dockerfile.gpu). NOT pulled/built on CPU/Mac hosts.
+# dependency that must live in the workspace is:
+#   - nvblox: GPU-only future dense-map candidate. It is not needed for the
+#             current pre-dense implementation slices and is not imported on CPU hosts.
 #
 # Sensor drivers are NOT built in this workspace: they run as standalone per-driver
 # containers (docker/jetson/*, compose.jetson.yaml) and reach Meridian over topics.
 #
-# The vendored upstream (scancontext) is a git SUBMODULE under vendor/, not a
-# vcs repo — pull it with:
-#   git submodule update --init --recursive
 repositories:
   nvblox:
     type: git
     url: https://github.com/nvidia-isaac/nvblox.git
-    version: f426aacd7d6b3c2f185469da355430a7a9c85709  # v0.0.7 — Humble/isaac_ros-3.2 line (CUDA 11.0–12.6)
+    # Observed v0.0.10-line candidate. A clean Jetson build is required before
+    # meridian_dense may adopt it; the ignored working checkout is not evidence.
+    version: 62ff8b4f9d9c1dc4ea90c49e4a4e2a3f96cf6f64

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build the reproducible Meridian GPU image (docker/Dockerfile.gpu) and create a
+# Build the Meridian GPU image (docker/Dockerfile.gpu) and create a
 # Distrobox from it.
 #   ./setup-distrobox.sh
 #
@@ -13,7 +13,7 @@ BOX="meridian"
 export DBX_CONTAINER_MANAGER=docker
 
 echo "==> Building $IMAGE (Meridian dep canon + CUDA 12 toolkit) from docker/Dockerfile.gpu"
-echo "    (first build is slow: GTSAM/Ceres/Sophus/small_gicp compile from source)"
+echo "    (first build is slow: GTSAM/Sophus/small_gicp compile from source)"
 docker build -t "$IMAGE" \
   -f docker/Dockerfile.gpu \
   --build-arg USER_UID="$(id -u)" \

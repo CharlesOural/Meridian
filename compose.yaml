@@ -6,15 +6,14 @@
 #   docker compose down -v          # nuke container + volumes
 #
 # The whole repo is mounted at /workspace, so it IS the colcon workspace:
-#   colcon build      → builds src/* + vendored submodules
-#   src/, vendor/, dependencies.repos, docs/ all live on the host and survive `down -v`.
+#   colcon build      → builds active packages under src/
+#   src/, dependencies.repos, docs/ all live on the host and survive `down -v`.
 #
 # Visualization (both platforms): run the Foxglove bridge inside, then connect
 # the free Foxglove Studio app to  ws://localhost:8765
 #   (inside)  ros2 launch foxglove_bridge foxglove_bridge_launch.xml
 #
-# NOTE for Mac / any non-CUDA host: meridian_map (L4, nvblox) needs CUDA and is
-# NOT built here. See DEVELOPMENT.md for the `--packages-skip` build line.
+# nvblox is an optional future dense candidate and is not imported on this CPU image.
 services:
   meridian:
     build:

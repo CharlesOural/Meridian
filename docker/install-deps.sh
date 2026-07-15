@@ -4,25 +4,23 @@
 #
 # What it installs:
 #   - apt:    build tooling, ROS extras, and the apt-provided libs
-#             (Eigen 3.4, PCL 1.12, OpenCV 4, yaml-cpp, Boost, glog/gflags,
+#             (Eigen 3.4, OpenCV 4, yaml-cpp, Boost, glog/gflags,
 #              SuiteSparse, METIS, linuxptp)
-#   - source: Sophus, Ceres 2.1 (Manifold API), GTSAM 4.2, small_gicp
+#   - source: Sophus, GTSAM 4.2.1, small_gicp 1.0.0
 
 
 set -euo pipefail
 
-# --- pinned versions --------------------------
+# --- source-build defaults --------------------
 SOPHUS_TAG="${SOPHUS_TAG:-1.22.10}"
-CERES_TAG="${CERES_TAG:-2.1.0}"
-GTSAM_TAG="${GTSAM_TAG:-4.2.0}"
-# TODO: pin small_gicp to a commit SHA for full reproducibility.
-SMALL_GICP_REF="${SMALL_GICP_REF:-master}"
+GTSAM_TAG="${GTSAM_TAG:-4.2.1}"
+SMALL_GICP_REF="${SMALL_GICP_REF:-v1.0.0}"
 
 export DEBIAN_FRONTEND=noninteractive
 
 # --- build parallelism --------------------------------------------------------
 # Number of parallel compile jobs, as the first argument (or MERIDIAN_BUILD_JOBS,
-# or the default). Ninja otherwise fans out to every core; Ceres/GTSAM units are
+# or the default). Ninja otherwise fans out to every core; GTSAM units are
 # Eigen-template-heavy and each peak well over 1.5 GB, so on a low-RAM host the
 # default exhausts memory and swaps. Lower this if the build freezes the machine.
 JOBS="${1:-${MERIDIAN_BUILD_JOBS:-6}}"
@@ -40,7 +38,6 @@ apt-get install -y --no-install-recommends \
   "ros-${ROS_DISTRO}-rqt-tf-tree" \
   "ros-${ROS_DISTRO}-diagnostic-updater" \
   libeigen3-dev \
-  libpcl-dev \
   libopencv-dev \
   libyaml-cpp-dev \
   libboost-all-dev \
@@ -56,7 +53,7 @@ rm -rf /var/lib/apt/lists/*
 # --- evo (offline ATE/RPE eval — pip, offline tooling only ---------
 pip3 install --no-cache-dir evo
 
-# --- Sophus (Lie groups; SO3/SE3 the splines store as control points) --------
+# --- Sophus (core SO(3)/SE(3) representation) --------------------------------
 git clone https://github.com/strasdat/Sophus.git /tmp/Sophus
 git -C /tmp/Sophus checkout "${SOPHUS_TAG}"
 cmake -S /tmp/Sophus -B /tmp/Sophus/build -G Ninja \
@@ -66,16 +63,7 @@ cmake -S /tmp/Sophus -B /tmp/Sophus/build -G Ninja \
 cmake --build /tmp/Sophus/build --target install --parallel "${JOBS}"
 rm -rf /tmp/Sophus
 
-# --- Ceres 2.1 (CT-window NLLS solver; needs the Manifold API → ≥2.1) --------
-git clone https://github.com/ceres-solver/ceres-solver.git /tmp/ceres
-git -C /tmp/ceres checkout "${CERES_TAG}"
-cmake -S /tmp/ceres -B /tmp/ceres/build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF
-cmake --build /tmp/ceres/build --target install --parallel "${JOBS}"
-rm -rf /tmp/ceres
-
-# --- GTSAM 4.2 (iSAM2 back-end) ---------------------
+# --- GTSAM 4.2.1 (private local/global graph adapters) -----------------------
 # system Eigen (one Eigen for the whole tree), no -march=native (portable image),
 # TBB off
 git clone https://github.com/borglab/gtsam.git /tmp/gtsam
@@ -87,7 +75,7 @@ cmake -S /tmp/gtsam -B /tmp/gtsam/build -G Ninja \
   -DGTSAM_WITH_TBB=OFF \
   -DGTSAM_BUILD_TESTS=OFF \
   -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
-  -DGTSAM_BUILD_UNSTABLE=OFF
+  -DGTSAM_BUILD_UNSTABLE=ON
 cmake --build /tmp/gtsam/build --target install --parallel "${JOBS}"
 rm -rf /tmp/gtsam
 

@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """ATE evaluation of a TUM trajectory against ground truth.
 
-Associates poses by nearest timestamp (max 50 ms), aligns with Umeyama SE(3)
+Associates poses by nearest timestamp (default max 50 ms), aligns with Umeyama SE(3)
 (rotation+translation, no scale), reports RMSE/median/max ATE and the per-axis
-error envelope. Usage: eval_ate.py <gt_tum> <est_tum> [t_max_offset_s]
+error envelope. Usage: eval_ate.py <gt_tum> <est_tum> [--max-dt 0.05]
 """
+import argparse
 import sys
 import numpy as np
 
 
 def load_tum(path):
     rows = []
-    for line in open(path):
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        v = line.split()
-        if len(v) < 8:
-            continue
-        rows.append([float(x) for x in v[:8]])
+    with open(path, encoding="utf-8") as stream:
+        for line in stream:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            v = line.split()
+            if len(v) < 8:
+                continue
+            rows.append([float(x) for x in v[:8]])
+    if not rows:
+        raise ValueError(f"{path}: no valid TUM poses")
     a = np.array(rows)
     a = a[np.argsort(a[:, 0])]
     # drop duplicate stamps (recorder can echo a pose twice)
@@ -53,12 +57,22 @@ def umeyama(src, dst):
 
 
 def main():
-    gt_path, est_path = sys.argv[1], sys.argv[2]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("ground_truth")
+    parser.add_argument("estimate")
+    parser.add_argument("--max-dt", type=float, default=0.05,
+                        help="maximum association time difference in seconds")
+    args = parser.parse_args()
+
+    if args.max_dt < 0:
+        parser.error("--max-dt must be non-negative")
+
+    gt_path, est_path = args.ground_truth, args.estimate
     t_gt, p_gt, _ = load_tum(gt_path)
     t_est, p_est, _ = load_tum(est_path)
     print(f"gt: {len(t_gt)} poses [{t_gt[0]:.3f} .. {t_gt[-1]:.3f}]")
     print(f"est: {len(t_est)} poses [{t_est[0]:.3f} .. {t_est[-1]:.3f}]")
-    pairs = associate(t_gt, t_est)
+    pairs = associate(t_gt, t_est, args.max_dt)
     if len(pairs) < 3:
         print("FATAL: <3 associated pairs (timestamp overlap problem?)")
         sys.exit(1)
@@ -78,7 +92,7 @@ def main():
           f"y={np.percentile(abs(d[:,1]),95):.3f} z={np.percentile(abs(d[:,2]),95):.3f}")
     # error growth over time: print a sparse profile
     print("\n  t_rel[s]  err[m]")
-    for k in np.linspace(0, len(pairs) - 1, 12).astype(int):
+    for k in np.unique(np.linspace(0, len(pairs) - 1, min(12, len(pairs))).astype(int)):
         print(f"  {t_est[ei[k]] - t_est[ei[0]]:8.1f}  {err[k]:8.3f}")
 
 

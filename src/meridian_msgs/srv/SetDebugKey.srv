@@ -1,5 +1,0 @@
-string key                # telemetry key or wildcard, e.g. "frontend/visual/*"
-bool enable
-float64 max_hz            # 0 = use the default rate
----
-bool ok

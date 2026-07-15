@@ -1,3 +1,0 @@
-float64 seconds           # dump the last N seconds of recorded telemetry
----
-string path               # file the snapshot was written to ("" on failure)

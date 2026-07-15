@@ -1,148 +1,167 @@
-# Meridian — Development Environment
+# Developing Meridian
 
-ROS and the whole SLAM toolchain never touch your host OS. Everything lives in a
-container built from one reproducible spec (`docker/install-deps.sh`, wrapped by
-two Dockerfiles). Break it → delete → recreate.
+This is the operational development runbook. The authoritative design and implementation order are in [SYSTEM_SPECS.md](SYSTEM_SPECS.md). If this file and the specification disagree, the specification wins.
 
+Current repository state: the v1 implementation has been removed. Only shared workspace infrastructure remains while Slice 0 (contracts and replay harness) is built. Commands naming future packages are marked as such; do not mistake an empty workspace for a completed estimator.
+
+## 1. Development rules
+
+- Develop and test in the provided container; do not install persistent dependencies on the host.
+- Keep algorithm packages ROS-free. ROS messages, QoS, TF, lifecycle, and conversion stay in `meridian_ros`/`meridian_msgs`.
+- Keep GTSAM, CUDA, nvblox, OpenCV, and other implementation libraries out of public domain headers.
+- Add a package only when it contains a real target and tests. Do not create empty architecture placeholders.
+- All queues are bounded; all state has one writer; all cross-module records are immutable or move-only.
+- A new tunable or changed default requires an entry in [OPTIMIZE.md](OPTIMIZE.md).
+- A new runtime failure path requires a typed reason, a test, and an operator action in [REALTIME_DEBUGGING.md](REALTIME_DEBUGGING.md).
+- Live and replay must call the same core implementation.
+
+## 2. Repository layout
+
+```text
+Meridian/
+  docs/SYSTEM_SPECS.md       sole architecture/implementation specification
+  docs/DEVELOPMENT.md        this runbook
+  docs/OPTIMIZE.md           experiment and tunable ledger
+  docs/REALTIME_DEBUGGING.md operator/debug runbook
+  docs/TESTING.md            test and benchmark runbook
+  docker/                    CPU/GPU development images
+  docker/jetson/             sensor-driver deployment containers
+  src/                       active colcon packages only
+  tools/                     generic active tools only
+  bags/                      unversioned test data
+  ../slam-reference/         selected upstream research code/paper context
 ```
-Meridian/                       # this repo IS the colcon workspace (mounted at /workspace)
-├── docker/
-│   ├── install-deps.sh         # THE dependency canon (spec 11) — one source of truth
-│   ├── Dockerfile              # CPU base, cross-platform (Linux amd64 + Apple Silicon arm64)
-│   └── Dockerfile.gpu          # Linux: CPU base + CUDA 12 toolkit (for nvblox / L4)
-├── compose.yaml                # cross-platform base (CPU, no X11) — what the Mac runs
-├── compose.linux-gpu.yaml      # Linux override: NVIDIA GPU + X11/RViz + USB sensors
-├── setup-distrobox.sh          # Linux: build GPU image + create the Distrobox
-├── dependencies.repos          # vcs deps built in-workspace (nvblox GPU)
-├── src/                        # the colcon source space (meridian_* packages go here)
-└── bags/                       # benchmark bags + ground truth (see docs/DATASET.md)
-```
 
-**What the image contains** (the dependency canon from
-[`docs/specs/11_build_system_libraries.md`](specs/11_build_system_libraries.md)):
-ROS 2 Humble (perception variant), C++20 toolchain (GCC 11), colcon/rosdep/vcstool,
-Eigen 3.4, Sophus 1.22.10, **Ceres 2.1**, **GTSAM 4.2**, PCL 1.12, OpenCV 4,
-small_gicp, yaml-cpp, linuxptp, evo, and the Foxglove bridge. The GPU image adds
-the **CUDA 12 toolkit**; **nvblox** is built in the workspace from
-`dependencies.repos`.
+The intended package tree is specified in section 5 of `SYSTEM_SPECS.md`. Git commit `f5ca513158c95aaf88223486ec481c1d42730a21` is the v1 extraction baseline; retrieve a selected file with `git show`, then adapt it behind the v2 contract and tests. Do not restore a whole legacy package.
 
-> **The one platform caveat — CUDA.** L4's `nvblox` surface backend is GPU/CUDA
-> only and builds/runs only on the Linux/GPU image. **Apple Silicon has no CUDA**,
-> so on the Mac `meridian_map` builds with the portable **`cpu`** backend instead
-> (`-DMERIDIAN_MAP_NVBLOX=OFF`, the auto-default when no CUDA compiler is found,
-> spec 11 §7.6): `map.backend: cpu` gives a real (lower-res, slower) TSDF+colour+mesh
-> the Mac can run and visualise — you no longer lose L4 entirely. The nvblox
-> *backend* is the hardware-limited part, the same category as RViz being
-> Linux-only. `-DMERIDIAN_WITH_MAP=OFF` still drops the map altogether for non-map work.
+## 3. Entering the environment
 
----
-
-## Linux (NVidia), Distrobox
+Linux/Jetson-capable development:
 
 ```bash
-./setup-distrobox.sh            # builds meridian:humble-gpu, creates the box
+./setup-distrobox.sh
 distrobox enter meridian
 ```
 
-Then, one-time workspace bring-up from the repo root:
+Explicit Docker alternative:
 
 ```bash
-git submodule update --init          # vendor/ (scancontext)
-vcs import src < dependencies.repos              # nvblox (GPU)
-rosdep install --from-paths src --ignore-src -y --skip-keys nvblox
-CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install \
-    --parallel-workers 1 \
-    --cmake-args -DCMAKE_CUDA_ARCHITECTURES="86;87"
-```
-
-> **`--skip-keys nvblox`**: nvblox is a workspace-built plain-CMake package
-> (meridian_map's package.xml depends on it for build ordering), not a rosdep key.
->
-> **CUDA arch list**: match the actual device(s) — Orin `87`, Ampere `86`,
-> Turing `75`, Pascal `61` (e.g. `"61;75"` on a GTX 1080 + RTX 2080 box). nvblox
-> and meridian_map must be built with the same list.
-
-> **Build parallelism.** `CMAKE_BUILD_PARALLEL_LEVEL` caps the compile threads
-> (default **6** here); `--parallel-workers 1` builds one package at a time, so
-> total concurrent compiles stay ≈ 6. The bare `colcon build` instead fans out to
-> every core × every package, and nvblox's CUDA units peak at several GB each —
-> enough to swap-freeze a 16 GB host. Lower the number if the build OOMs; raise
-> it if you have RAM to spare. Same knob at image-build time:
-> `--build-arg MERIDIAN_BUILD_JOBS=<n>`.
-
-- RViz just works: `rviz2`
-- GPU visible inside: `nvidia-smi`
-- Nuke and recreate (~minutes): `distrobox rm -f meridian && ./setup-distrobox.sh`
-
-### Or the explicit Docker path (same image, full GPU + X11)
-
-```bash
-xhost +local:root               # once per login, lets the container open RViz
 docker compose -f compose.yaml -f compose.linux-gpu.yaml up -d
 docker compose -f compose.yaml -f compose.linux-gpu.yaml exec meridian bash
-# ...
-docker compose -f compose.yaml -f compose.linux-gpu.yaml down -v   # destroy
 ```
 
----
-
-## Mac (Apple Silicon) / any CPU-only host
-
-Distrobox is Linux-only, so on Mac use **plain Docker** + **Foxglove Studio** for
-viz. The CPU image's base is multi-arch, so it builds **native arm64** — no
-emulation. There is no NVIDIA/CUDA on Apple Silicon, so `meridian_map` (L4,
-nvblox) never builds here; it is not yet in `src/`, so today the whole workspace
-builds.
+CPU-only development:
 
 ```bash
-docker compose up -d                        # base file only (CPU, no GPU)
+docker compose up -d
 docker compose exec meridian bash
 ```
 
-One-time workspace bring-up:
+The workspace path is the repository root. Always source ROS before building:
 
 ```bash
-git submodule update --init                 # vendor/ (scancontext)
-# do NOT `vcs import` nvblox — it needs CUDA.
-CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install --parallel-workers 1
-colcon test --parallel-workers 1 && colcon test-result --verbose
+source /opt/ros/humble/setup.bash
+cd ~/Meridian
 ```
 
-This builds and unit-tests every **CPU algorithm layer** in isolation — L0
-sensors, L1 preprocessing, and **L2 the LIO front-end** (plus the cross-cutting
-packages). The skip list covers `meridian_map` (L4, CUDA-only) and the
-integration/ROS packages; integrated pipeline runs and bag replay happen on the
-Linux/GPU box. (colcon just warns about skip names not yet in the tree.)
+## 4. Dependency handling
 
-Visualization (both platforms — the shared viz tool):
+`docker/install-deps.sh` is the source-build/apt dependency canon. `dependencies.repos` is only for source dependencies that must live in the workspace. Every dependency must have:
+
+- upstream URL and license;
+- package/feature that owns it;
+- CPU/GPU and target-platform constraints;
+- a clean-build test.
+
+Dependency references are owned by their build or deployment definition. A benchmark or deployment manifest records what actually resolved for that run when the information is available. The research clones in `../slam-reference` are reading material, not build dependencies.
+
+nvblox is not required for the current pre-dense implementation slices. Import and build it only when working on the later dense candidate:
 
 ```bash
-ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+vcs import src < dependencies.repos
 ```
 
-Then open **Foxglove Studio** (free Mac app) → connect to `ws://localhost:8765`
-for the 3D / map / point-cloud view. Tear down: `docker compose down -v`.
+Do not initialize old vendor submodules; v2 has none.
 
----
+## 5. Build and test
 
-## Reproducibility
+During the pre-Slice-0 cleanup, the honest active Meridian build is:
 
-`docker/install-deps.sh` is the contract — the single place the dependency stack
-is defined; both Dockerfiles run it. Add a library by editing that script (or
-`dependencies.repos` for a workspace-built one) and rebuilding the image — never
-`apt install` permanently inside a running container, or you lose reproducibility.
-Version pins live in `install-deps.sh` (source builds) and follow spec 11 §3.
+```bash
+CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install \
+  --parallel-workers 1 --packages-select meridian_cmake
+colcon test --packages-select meridian_cmake
+colcon test-result --verbose
+```
 
-> **Pinning TODO.** A few refs are not yet locked to a SHA (`small_gicp` in
-> `install-deps.sh`; `nvblox` in `dependencies.repos`). Pin them per spec 11 §3
-> before any release/air-gapped build so nothing floats on a moving branch. (The
-> `vendor/` submodules are already SHA-pinned by gitlink.)
+As slices add packages, build the smallest affected closure:
 
----
+```bash
+colcon build --symlink-install --packages-up-to <package>
+colcon test --packages-select <package> --event-handlers console_cohesion+
+colcon test-result --verbose
+```
 
-## Testing with a dataset
+For a clean validation, remove generated `build/`, `install/`, `log/`, and the merged `compile_commands.json`, then rebuild. An old install overlay can make deleted dependencies appear available.
 
-The benchmark set is Newer College 2021 under `bags/newer-college/` (`quad-easy`
-is the routine sequence). `docs/DATASET.md` covers download, `rosbags-convert`,
-and the local layout; `docs/TESTING.md` covers running against it — the headless
-run + ATE loop, or driving the live node with `ros2 bag play --clock`.
+After a build:
+
+```bash
+source install/setup.bash
+python3 tools/merge_compile_commands.py
+```
+
+Never rebuild a package while a replay/live process is using its symlink-installed library.
+
+## 6. Required local gates
+
+Run gates in proportion to the change:
+
+1. format and warnings-as-errors;
+2. unit/property/Jacobian tests for the changed target;
+3. package dependency and public-header self-containment checks;
+4. ROS-free include/dependency scan for core/local/global/dense/store;
+5. deterministic component replay;
+6. relevant fault cases;
+7. full-sequence benchmark and target-Jetson timing for algorithm/default changes.
+
+CPU debug profiles should include ASan/UBSan and deterministic single-thread modes. GPU changes require a clean dependency import, target-architecture build, analytic CPU/reference comparison where meaningful, CUDA error checks, and target-device tests.
+
+## 7. Implementation workflow
+
+For each slice in `SYSTEM_SPECS.md`:
+
+1. freeze/review the public domain contracts;
+2. add the smallest real package target and unit tests;
+3. build a deterministic standalone component/replay harness;
+4. implement the provisional default and declared challengers behind one interface;
+5. run the decision benchmark with a registered manifest;
+6. record artifacts/results in `OPTIMIZE.md`;
+7. promote one default through code review;
+8. add ROS conversion/lifecycle wiring only after core behavior is green;
+9. update testing/debug runbooks with executable commands and expected reports.
+
+## 8. Reference-reading workflow
+
+Before implementing a research-derived seam:
+
+- read the primary paper and the exact relevant source files in `../slam-reference`;
+- record upstream coordinate/time/residual conventions;
+- identify state ownership and hidden runtime assumptions;
+- reproduce a minimal upstream behavior in an independent test;
+- write Meridian's own interface and analytic/property tests;
+- document adapted paths, license, upstream source, and intentional differences in the new package README.
+
+The main routing table is section 2 of `SYSTEM_SPECS.md`. Add a reference repository only when a named implementation or benchmark lane needs its source.
+
+## 9. Commit/review checklist
+
+- [ ] Change follows a reviewed `SYSTEM_SPECS.md` decision or updates the spec first.
+- [ ] No legacy compatibility API was restored.
+- [ ] Public records include units, frames, time, revisions, and ownership.
+- [ ] Failure/overflow behavior is typed and tested.
+- [ ] No raw matrix crosses a covariance/information boundary without semantics.
+- [ ] Deterministic replay remains green.
+- [ ] Tunables/results are in `OPTIMIZE.md`.
+- [ ] Operator-visible behavior is in `REALTIME_DEBUGGING.md`.
+- [ ] Test manifest and artifacts are reproducible.

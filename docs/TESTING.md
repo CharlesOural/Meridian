@@ -1,129 +1,180 @@
-# Testing Meridian against a Newer College bag
+# Meridian testing and benchmark runbook
 
-End-to-end check of the live system (L0 sensors → L1 preprocessing → L2 CT
-front-end), driven by a Newer College multi-cam sequence through the ROS node.
-Everything runs inside the dev container (see `DEVELOPMENT.md`). Dataset
-download, conversion, layout and per-collection calibration: `docs/DATASET.md`.
+This is the operational test skeleton for Meridian v2. It intentionally removes all v1 executables, configurations, topics, and reference numbers. The binding architecture, factors, failure behavior, and implementation slices are in [SYSTEM_SPECS.md](SYSTEM_SPECS.md).
 
-**Current scope: LIO only.** The visual stage is switched off in the configs
-(`frontend.visual.enable: false`): the Alphasense cameras suffer heavy
-vignetting, so the benchmark is LiDAR-inertial first; re-enabling visual on
-this dataset is a future task. The camera calibration stays in the configs so
-the flip is one line.
+Current status: pre-Slice-0. Only workspace infrastructure can be built; fill commands and acceptance thresholds as real v2 targets land.
 
-## Testing policy (mandatory)
+## 1. Test principles
 
-- **Routine validation runs ONE sequence: `quad-easy`.** Every day-to-day
-  change is judged on it alone.
-- **The 3-sequence pass (`quad-easy` + `math-medium` + `park`) runs ONLY
-  before committing large work** — not per-iteration.
-- **`quad-hard` is a HOLDOUT.** Never tune on it, never use it to pick between
-  candidates; it is reserved for milestone evaluations, and any run on it is
-  recorded as a validation result (see `docs/DATASET.md`).
+- Test contracts and failure semantics before end-to-end accuracy.
+- Compare analytic Jacobians against numerical derivatives.
+- Compare incremental/fixed-lag results against small batch or analytic oracles.
+- Use one domain implementation for live and replay.
+- Make ordering, random seeds, threads, and GPU reductions deterministic in replay mode.
+- Validate input counts/time/calibration before scoring trajectories.
+- Tune only on development data; preserve independent holdouts.
+- Use full sequences and fault/endurance campaigns for promotion.
+- A run must record capability/availability and catastrophic failures, not only ATE.
 
-| sequence | config (`src/meridian_ros/config/`) | role |
-|---|---|---|
-| quad-easy | `newer-college-quad.yaml` | routine validation |
-| math-medium | `newer-college-math.yaml` | pre-commit pass |
-| park | `newer-college-park.yaml` | pre-commit pass |
-| quad-hard | `newer-college-quad.yaml` | **HOLDOUT** — milestones only |
+## 2. Test pyramid
 
-The configs differ per collection (the rig was recalibrated between them);
-never run park with the quad config.
+### 2.1 Static/build gates
 
-## 0. Build + unit gates
+- format, warnings-as-errors, clang-tidy;
+- package dependency direction and cycle check;
+- no ROS includes/dependencies in core/local/global/dense/store;
+- no GTSAM/CUDA/nvblox type in public headers;
+- public-header self-containment;
+- CPU sanitizers and external-code license/source scan;
+- clean build without an old install overlay.
 
-```bash
-colcon build --symlink-install
-source install/setup.bash
-colcon test --packages-select meridian_frontend meridian_pipeline meridian_config \
-  && colcon test-result --verbose
+### 2.2 Unit/property tests
+
+- IDs, revisions, time intervals, source epochs, serialization compatibility;
+- SE(3), frame direction, perturbation/tangent conversion;
+- covariance/information PSD/rank/units/frame guards;
+- queues, manifests, duplicate and stale revision behavior;
+- IMU integration/bias/covariance and exact segment ownership;
+- camera/LiDAR/GNSS factor Jacobians;
+- submap seals, checksums, idempotency and half-open boundary ownership.
+
+### 2.3 Component tests
+
+- sensor wire conversions with malformed and golden messages;
+- IMU initialization/propagation/gaps;
+- visual tracking/recovery/triangulation/factors;
+- LiDAR deskew/registration/degeneracy;
+- local graph/marginalization/rebuild/rollback;
+- sparse submap finalization/condensation/outbox;
+- visual/LiDAR retrieval and verification;
+- PCM/GNC transactions and global revisions;
+- GNSS datum/alignment/factor/FSM/reacquisition;
+- lifecycle/QoS/TF/restart and missing-revision recovery;
+- later dense nvblox analytic GPU behavior.
+
+### 2.4 System tests
+
+- deterministic full-bag replay;
+- live-driver soak with intake reconciliation;
+- dropout/delay/reorder/duplicate/time-jump/corruption injection;
+- darkness/blur/repeated texture, corridor/floor/open field, vegetation/dynamics;
+- GNSS multipath/outage/return;
+- false-loop storms and mutually consistent false clusters;
+- local/global/store/dense process kill/restart;
+- CPU/GPU contention, thermal/power modes, storage backpressure;
+- 24-hour bounded memory and journal/checkpoint recovery.
+
+## 3. Benchmark manifest
+
+Every bag/dataset has a committed manifest; raw bags remain unversioned. A manifest contains:
+
+```text
+id and role: development | regression | holdout | adversarial
+source/license/citation
+bag/dataset checksums and time interval
+sensor models/rates/resolutions
+topic mapping and publisher QoS
+clock/stamp/per-point-time conventions
+calibration artifact + trust/provenance
+ground-truth source, frame, uncertainty and scoring transform
+known gaps/dynamics/environment labels
+fault-injection profile and seeds
+permitted decisions/tunables
 ```
 
-The front-end unit/integration tests (voxel map, IMU tracker, registration,
-covariance chain, end-to-end synthetic tracking) must be green before judging a
-bag run.
+### Dataset registry
 
-## 1. Preflight
+| Manifest | Sensors | Environment/failures | Ground truth | Role | Calibration trust | Status |
+|---|---|---|---|---|---|---|
+| pending | — | — | — | — | — | no v2 manifests committed |
 
-Follow the preflight in `docs/REALTIME_DEBUGGING.md` before trusting any
-number — in short: quiet box (load ≲ 1), no ghost `odometry_node`, and the
-`TRANSPORT LOSS` gate in the node log must stay silent for the whole run. The
-runner refuses to start while a stale node is alive, but it cannot see
-background load for you.
+Newer College and existing Barracuda recordings may be migrated into manifests after their topic/time/calibration facts are audited. Old configuration values and measured v1 outcomes are not v2 baselines.
 
-## 2. Headless run + ATE (the canonical loop)
+## 4. Run manifest and artifacts
 
-```bash
-tools/run_bag_headless.sh /tmp/nc_quad_easy          # defaults: quad-easy bag + quad config
-python3 tools/eval_ate.py \
-    bags/newer-college/gt/tum_asimu/gt-nc-quad-easy.csv /tmp/nc_quad_easy/traj_tum.txt
-```
+Every run records:
 
-The runner starts the node headless, plays the bag with the player-side QoS
-override (`tools/replay_qos_overrides.yaml` — reliable LiDAR writer, paired
-with `sensors.lidar.qos_reliable: true` in the configs), records the TUM
-trajectory plus `node.log` / `events.yaml` / `timing.yaml` / `telemetry.yaml`,
-and verifies the node died. Other sequences:
+- run ID, UTC start, repository/build/container IDs;
+- resolved config/calibration/model hashes and random seeds;
+- dataset manifest/checksum and scoring interval;
+- machine/Jetson/JetPack/CUDA, power mode, clocks, affinity, ambient/concurrent load;
+- source/QoS discovery and intake waterfall;
+- capability/FSM timeline and local/global revision history;
+- trajectory and covariance outputs;
+- typed reports/events/stage timing/resource trace;
+- loop/GNSS dispositions and forensic bundles;
+- scoring tool/version/alignment policy;
+- exit status and test result summary.
 
-```bash
-BAG=bags/newer-college/math-medium CONFIG=src/meridian_ros/config/newer-college-math.yaml \
-  tools/run_bag_headless.sh /tmp/nc_math_medium
-BAG=bags/newer-college/park CONFIG=src/meridian_ros/config/newer-college-park.yaml \
-  tools/run_bag_headless.sh /tmp/nc_park
-```
+Artifacts live under a run-ID directory and are immutable after scoring.
 
-**Ground truth:** always score against `gt/tum_asimu/*.csv` (GT re-expressed in
-the Alphasense-IMU estimation frame), never `gt/tum/`. The `tum_asimu` files
-are plain TUM (`stamp x y z qx qy qz qw`, whitespace-separated, no header) —
-`eval_ate.py` reads them directly, no conversion step.
+## 5. Standard execution skeleton
 
-Healthy quad-easy run, for calibration of expectations: all ~1991 scans reach
-the node (`wrapper/lidar/cb_n` ≈ published count, `lost_upstream_n` = 0), no
-`TRANSPORT LOSS` warning, no `frontend/lio/{gap,reject,reseed}` events,
-`pipeline/q_meas_dropped` absent
-or ~0, ATE in the 0.1–0.3 m band (reference: ~0.2 m rmse full bag).
-
-## 3. Interactive run (rviz)
-
-Terminal A — the node (+ rviz, fixed frame `odom`):
+Commands will be implemented in `meridian_tools`; this is the required shape:
 
 ```bash
-ros2 launch meridian_ros meridian.launch.py use_sim_time:=true rviz:=true
-# config_file:=$(pwd)/src/meridian_ros/config/<other>.yaml for non-quad sequences
+# Clean build of affected packages
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-up-to <package>
+colcon test --packages-select <package> --event-handlers console_cohesion+
+colcon test-result --verbose
+
+# Deterministic domain replay (future command)
+meridian_replay --manifest <manifest.yaml> --out <run_dir> --deterministic
+
+# Fault campaign (future command)
+meridian_replay --manifest <manifest.yaml> --faults <faults.yaml> --out <run_dir>
+
+# Scoring
+python3 tools/eval_ate.py <ground_truth.tum> <run_dir/local_or_global.tum>
 ```
 
-Terminal B — the bag, publishing the sim clock, with the same QoS override the
-runner uses (without it, best-effort delivery silently drops scans):
+The runner must fail if a stale node exists, manifests/hashes do not match, expected input loss is unexplained, outputs are incomplete, or child processes survive teardown.
 
-```bash
-ros2 bag play bags/newer-college/quad-easy --clock \
-    --qos-profile-overrides-path tools/replay_qos_overrides.yaml
-```
+## 6. Accuracy and consistency metrics
 
-What you should see:
+Record as applicable:
 
-- **World-stable geometry**: walls/ground in `/meridian/cloud_registered` stay
-  put as the rig moves — no smearing or swimming per sweep.
-- **Smooth odom track**: `/meridian/odom` traces a continuous path, no
-  teleports; the stationary start holds still.
-- **Events**: one `frontend/lio/init_done` (static init needs the ~10 s
-  still period at the sequence start), recurring `frontend/keyframe`, and
-  **no** `frontend/lio/{gap,reject,reseed}` events.
+- local and global ATE/RPE with explicit alignment and frame;
+- translational/rotational drift per time/distance;
+- pose/velocity/bias NEES and per-factor NIS/coverage;
+- availability by capability state and recovery latency;
+- deskew error and registration residual/rank calibration;
+- visual track survival/coverage/recovery and loop recall/precision;
+- GNSS innovation/alignment/reacquisition consistency;
+- false global commits—catastrophic count must be zero in the release adversarial suite;
+- map/submap consistency later.
 
-```bash
-ros2 topic hz /meridian/odom               # ≈10 Hz (sweep rate)
-ros2 topic echo /meridian/events           # init / health / drop events
-ros2 topic echo /meridian/stage_timing     # per-stage wall time (assoc/solve/marg/map)
-ros2 topic echo /meridian/telemetry        # rates, queue gauges, waterfall counters
-```
+Never rank systems on one aggregate number. Report sequence-level distributions and failures.
 
-## Troubleshooting
+## 7. Real-time/resource metrics
 
-| Symptom | Likely cause |
-|---|---|
-| `TRANSPORT LOSS` in the node log | QoS pairing broken — player override not passed, or `sensors.lidar.qos_reliable` edited; see `docs/REALTIME_DEBUGGING.md` |
-| `q_meas_dropped` / `frontend/lio/gap` events | overload — triage with the stage-timing budget in `docs/REALTIME_DEBUGGING.md` |
-| `dropping scan: missing ... per-point time field` | wrong LiDAR topic, or a bag prepared without the verification pass in `docs/DATASET.md` |
-| nothing at all | `use_sim_time:=true` on the node but the bag played without `--clock` (or vice versa) |
-| ATE meters-scale on a healthy log | wrong per-collection config for the sequence, or scored against `gt/tum/` instead of `gt/tum_asimu/` |
+On target hardware record p50/p95/p99/max for ingress age, visual, deskew, LiDAR match/factor, local solve/marginalize/commit, seal, retrieval, verification, global transaction, publication, and end-to-end output age. Also record deadline misses, queue count/bytes/age, CPU, GPU, RAM, VRAM, allocations/copies/synchronization, storage I/O, power, temperature, clocks, and throttling.
+
+Global/loop/GNSS/dense stress must run concurrently while checking that the local deadline remains valid.
+
+## 8. Decision benchmark fairness
+
+For residual/frontend comparisons:
+
+- share admitted raw IDs, calibration, deskew and preprocessing unless under test;
+- share knot/keyframe/submap schedule unless under test;
+- share target content and source-exclusion policy;
+- share initial guesses, robust gates, and scoring timestamps;
+- cap candidates by comparable compute/memory budgets;
+- run declared failure cases, not only nominal sequences.
+
+Record decisions D001–D017 and their artifacts in [OPTIMIZE.md](OPTIMIZE.md).
+
+## 9. Slice acceptance checklist
+
+- [ ] Clean build/static gates.
+- [ ] Unit/Jacobian/property suite.
+- [ ] Component deterministic replay and oracle comparison.
+- [ ] Relevant failure-injection suite.
+- [ ] No unexplained intake/drop/revision mismatch.
+- [ ] Accuracy and consistency thresholds reviewed.
+- [ ] Target p99/memory/power/thermal thresholds reviewed.
+- [ ] Forensic trigger and recovery paths tested.
+- [ ] Documentation and tuning ledger updated.
+- [ ] Holdout used only under its declared policy.

@@ -1,4 +1,3 @@
-_reference/
 *.pdf
 
 # colcon build artifacts (workspace == repo root)
@@ -15,9 +14,8 @@ _reference/
 /bags/*
 !/bags/.gitkeep
 
-# vcs-imported source deps land under src/ (nvblox, ouster-ros) — not versioned here
+# vcs-imported source dependencies are not versioned here
 /src/nvblox/
-/src/ouster-ros/
 
 # OS / python junk
 .DS_Store

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Record the Meridian odometry track to a TUM-format trajectory file.
 
-Subscribes /meridian/odom (nav_msgs/Odometry, the front-end's live pose on the
-"odom/body" telemetry key) and appends one TUM line per message:
+Subscribes to a configurable nav_msgs/Odometry topic and appends one TUM line
+per message:
 
     timestamp tx ty tz qx qy qz qw
 
@@ -11,7 +11,7 @@ use_sim_time). The file is flushed on every write and again on SIGINT, so a trac
 survives a Ctrl-C at the end of a bag.
 
 Usage (inside the dev container, after sourcing the workspace):
-    python3 tools/record_tum.py OUT.tum [--topic /meridian/odom]
+    python3 tools/record_tum.py OUT.tum [--topic /meridian/local/odometry]
 
 Then play the bag as usual; Ctrl-C this script when the bag finishes. Compare
 against the sequence's ground truth (see docs/TESTING.md):
@@ -31,10 +31,10 @@ class TumRecorder(Node):
         super().__init__("meridian_record_tum")
         self._file = open(out_path, "w")
         self._count = 0
-        # The pose publisher uses a reliable, keep-last QoS; match it so no sample
-        # is silently dropped by an incompatible profile.
-        qos = QoSProfile(depth=50)
-        qos.reliability = ReliabilityPolicy.RELIABLE
+        # A best-effort reader is compatible with either reliable or best-effort
+        # odometry publishers. Evaluation still audits received timestamps/counts.
+        qos = QoSProfile(depth=10)
+        qos.reliability = ReliabilityPolicy.BEST_EFFORT
         self._sub = self.create_subscription(Odometry, topic, self._on_odom, qos)
         self.get_logger().info(f"recording {topic} -> {out_path}")
 
@@ -58,7 +58,7 @@ class TumRecorder(Node):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", help="output TUM trajectory file")
-    parser.add_argument("--topic", default="/meridian/odom")
+    parser.add_argument("--topic", default="/meridian/local/odometry")
     args = parser.parse_args()
 
     rclpy.init()
