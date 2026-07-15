@@ -4,14 +4,28 @@
 # so the Foxglove app (on the Mac) can preview topics. Temporary viz aid — safe to
 # delete together with its compose service.
 ARG ROS_DISTRO=humble
+
+# The bridge sends each topic's schema to the client, so it must be able to resolve every
+# message type on the graph -- without sbg_driver's definitions the whole /sbg/* namespace
+# fails to load and is invisible in the app. Only the built messages are copied, not the
+# driver or its serial dependencies.
+FROM meridian-sbg:humble AS sbg
+
 FROM ros:${ROS_DISTRO}-ros-base
 
 ARG ROS_DISTRO
 ENV ROS_DISTRO=${ROS_DISTRO}
 ENV DEBIAN_FRONTEND=noninteractive
 
+# nmea_msgs/rtcm_msgs carry the NTRIP correction stream and the GGA sent back to the
+# caster; without their definitions those topics cannot be inspected to confirm RTK
+# corrections are actually arriving.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ros-${ROS_DISTRO}-foxglove-bridge \
+      ros-${ROS_DISTRO}-nmea-msgs \
+      ros-${ROS_DISTRO}-rtcm-msgs \
  && rm -rf /var/lib/apt/lists/*
 
-CMD ["bash", "-lc", "source /opt/ros/${ROS_DISTRO}/setup.bash && exec ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765"]
+COPY --from=sbg /opt/sbg_ws/install /opt/sbg_ws/install
+
+CMD ["bash", "-lc", "source /opt/ros/${ROS_DISTRO}/setup.bash && source /opt/sbg_ws/install/setup.bash && exec ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765"]
