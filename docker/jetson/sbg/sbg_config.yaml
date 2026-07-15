@@ -1,15 +1,128 @@
-# SBG INS/IMU driver config. Serial port + baud were probed on this rig
+# SBG Ellipse-D INS/IMU driver config. Serial port + baud were probed on this rig
 # (/dev/ttyUSB0 @ 921600, valid sbgECom framing). ros_standard publishes
 # sensor_msgs/Imu on /imu/data; use_enu follows the ROS REP-103 ENU convention.
-# GNSS logs are disabled (no fix wired here); re-enable if a GNSS antenna is added.
+#
+# WITH confWithRos: true THIS FILE IS A COMPLETE DEVICE IMAGE, NOT A PATCH.
+# Every key the driver knows is read with a compiled-in fallback, so a key omitted here
+# is not "left alone" -- it is written to the device's flash as the driver's default and
+# the unit reboots. Omitting `gnss.*` once already overwrote this device's GNSS model, and
+# the IMU lever arm below survived only because the firmware refuses that command. So:
+# before adding or removing a key, read the device with docker/jetson/sbg/probe/sbg_probe.c
+# and keep every value here equal to the device's, except the one you mean to change.
+#
+# Values below match the device as probed, so no write fires on startup.
 sbg_device:
   ros__parameters:
+    # Write the output config below to the device. Without this the driver only READS
+    # the device's stored config (25 Hz here) and ignores every log_* rate in this file.
+    confWithRos: true
     uartConf:
       portName: "/dev/ttyUSB0"
       baudRate: 921600
       portID: 0
     driver:
       frequency: 400
+
+    # Seeds the initial alignment only; the first GNSS fix supersedes it within seconds.
+    # These are the driver's own placeholder coordinates (Brittany) and are stated here
+    # explicitly so the value is deliberate rather than a silent default.
+    #
+    # `year` is deliberately ABSENT and must stay absent -- this is the one key where
+    # declaring it is worse than omitting it. The driver reads month and day from the
+    # "sensorParameters.year" key as well, then truncates to uint8, so setting year: 2018
+    # writes month = day = 2018 & 0xFF = 226 (an observed 2018-226-226 on this unit).
+    # Left undefined, year/month/day each take their own default and give a valid
+    # 2018-03-10. The init date is therefore not settable from this file at all.
+    sensorParameters:
+      initLat: 48.419727
+      initLong: -4.472119
+      initAlt: 100.0
+      motionProfile: 1              # GENERAL_PURPOSE. Tunes the on-device EKF only, and
+                                    # nothing downstream reads the EKF: Meridian consumes
+                                    # accel+gyro from /imu/data and drops the orientation,
+                                    # and gps_pos is the raw receiver, not the fusion.
+
+    # IMU orientation and offset in the vehicle frame, as surveyed on this rig. The lever
+    # arm is NOT zero -- do not "reset" it. Firmware 2.5 rejects this command ("not
+    # available for the connected device"), which is the only reason the survey survived
+    # the driver's default write; the values are kept correct so a firmware that accepts
+    # the command writes the truth. X forward / Y right -> Z down (NED); use_enu below
+    # converts the published topics to ENU.
+    imuAlignementLeverArm:
+      axisDirectionX: 0             # FORWARD
+      axisDirectionY: 3             # RIGHT
+      misRoll: 0.0
+      misPitch: 0.0
+      misYaw: 0.0
+      leverArmX: -0.573
+      leverArmY: 0.0
+      leverArmZ: 0.4895
+
+    # The GNSS receiver is internal on an Ellipse-D and its port is not reassignable, so
+    # the firmware rejects changes here. rtcmPort=PORT_A puts RTCM corrections on the same
+    # serial link the driver already speaks eCom over -- the driver writes RTCM bytes to
+    # that handle directly, so no second cable is needed.
+    aidingAssignment:
+      gnss1ModulePortAssignment: 5  # INTERNAL
+      gnss1ModuleSyncAssignment: 5  # SYNC_INTERNAL
+      rtcmPortAssignment: 0         # PORT_A
+      odometerPinAssignment: 0      # DISABLED
+
+    magnetometer:
+      magnetometerModel: 201        # INTERNAL_NORMAL
+      magnetometerRejectMode: 1     # AUTOMATIC
+
+    # No odometer is wired; these are the device's current values, restated so the block
+    # is explicit rather than defaulted.
+    odom:
+      gain: 4800.0
+      gain_error: 0
+      direction: false
+      leverArmX: 0.0
+      leverArmY: 0.0
+      leverArmZ: 0.0
+      rejectMode: 1                 # AUTOMATIC
+
+    gnss:
+      # 101 = INTERNAL, the correct model for an ELLIPSE-N/-D. The device currently holds
+      # 102 (NMEA, meant for an ELLIPSE-E with an external receiver) because that is the
+      # driver's default and an earlier run wrote it. This is the one intended change in
+      # this file. Note 107 -- which the driver's own ellipse_D example yaml suggests --
+      # is SBG_ECOM_GNSS_MODEL_RESERVED_02, "do not use".
+      gnss_model_id: 101
+      # Antenna phase centre in the IMU frame [m]. UNMEASURED -- tape-measure to ~2 cm and
+      # set both here and in meridian_ros barracuda.yaml sensors.gnss.extrinsic_T, or every
+      # GNSS residual carries this offset as a bias.
+      primaryLeverArmX: 0.0
+      primaryLeverArmY: 0.0
+      primaryLeverArmZ: 0.0
+      primaryLeverPrecise: true
+      # A second antenna is mounted but unsurveyed. The secondary lever arm IS the heading
+      # baseline, so DUAL_PRECISE with a zero vector is a zero baseline and yields no
+      # heading; SINGLE is the honest setting until it is measured. Switching to 4
+      # (DUAL_PRECISE) additionally needs log_gps1_hdt below and a consumer for
+      # sbg_driver/SbgGpsHdt, which Meridian does not have -- it recovers yaw itself.
+      secondaryLeverArmX: 0.0
+      secondaryLeverArmY: 0.0
+      secondaryLeverArmZ: 0.0
+      secondaryLeverMode: 1         # SINGLE
+      posRejectMode: 1              # AUTOMATIC
+      velRejectMode: 1              # AUTOMATIC
+      hdtRejectMode: 1              # AUTOMATIC
+
+    # RTCM corrections in, GGA out. The driver subscribes rtcm_msgs/Message and writes the
+    # payload straight to the serial handle; it publishes a 1 Hz GGA built from the current
+    # fix, which the NTRIP caster needs to pick the nearest base station. Both resolve to
+    # /ntrip_client/<topic_name>.
+    rtcm:
+      subscribe: true
+      topic_name: "rtcm"
+      namespace: "ntrip_client"
+    nmea:
+      publish: true
+      topic_name: "nmea"
+      namespace: "ntrip_client"
+
     output:
       time_reference: "ros"
       ros_standard: true
@@ -18,7 +131,11 @@ sbg_device:
       log_status: 200
       log_imu_data: 1
       log_ekf_euler: 0
-      log_ekf_quat: 8
+      # ros_standard /imu/data publishes at the slowest of its inputs; the quaternion
+      # gated it to 200/8 = 25 Hz. Match imu_data (200 Hz) so /imu/data streams at 200 Hz.
+      # The driver refuses to create the sensor_msgs/Imu publisher without this log, so it
+      # stays on even though the orientation it carries is unused.
+      log_ekf_quat: 1
       log_ekf_nav: 0
       log_ekf_vel_body: 0
       log_ekf_rot_accel_body: 0
@@ -27,9 +144,12 @@ sbg_device:
       log_utc_time: 200
       log_mag: 8
       log_mag_calib: 0
-      log_gps1_vel: 0
-      log_gps1_pos: 0
-      log_gps1_hdt: 0
+      # 10001 = emit on new data. The GNSS logs are asynchronous, not rate-divided: the
+      # receiver solves at 5 Hz and a divider cannot manufacture fixes it never computed.
+      # gps1_pos drives both /sbg/gps_pos and the standard /imu/nav_sat_fix.
+      log_gps1_vel: 10001
+      log_gps1_pos: 10001
+      log_gps1_hdt: 0               # single-antenna mode; see gnss.secondaryLeverMode
       log_gps1_raw: 0
       log_odo_vel: 0
       log_event_a: 0
