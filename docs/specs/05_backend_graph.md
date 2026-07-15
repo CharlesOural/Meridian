@@ -107,9 +107,10 @@
   L3 only *consumes* a verified `LoopConstraint` and decides accept/reject via PCM
   (§7) + GNC (§8).
 - TSDF / colour / mesh and the clear-and-rebuild **re-integration** itself — **L4**
-  (`IMapLayer::apply_graph_update`, `01 §7.5`; `06_mapping.md`). L4 is **nvblox on
-  the GPU** — the one and only map backend, no CPU path. L3 *triggers* a region
-  rebuild by emitting a `GraphUpdate`; it never touches voxels.
+  (`IMapLayer::apply_graph_update`, `01 §7.5`; `06_mapping.md`). L4's surface tier is
+  the pluggable `ISurfaceMap` backend (nvblox GPU in production, cpu host off-device);
+  L3 is backend-agnostic — it *triggers* a region rebuild by emitting a `GraphUpdate`
+  and never touches voxels.
 - Cloud storage — the `KeyframeStore` (`01 §7.5`). L3 forwards the packet's
   Shared-immutable `cloud_body` / `image` handles to the store and to L5; it does
   not copy or own clouds.

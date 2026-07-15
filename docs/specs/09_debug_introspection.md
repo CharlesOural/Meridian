@@ -671,10 +671,12 @@ per-sensor-name'd because there is exactly one of each.
 | `place/candidates` | `scalar` | `/meridian/telemetry` (`count`) | off | NEW. ScanContext++ candidate count per query. |
 | `place/gicp_fitness` | `scalar` | `/meridian/telemetry` (`m`) | off | NEW. Verification residual of the accepted loop. |
 
-### 5.5 Map (L4 — nvblox, GPU)
+### 5.5 Map (L4 — surface backend: nvblox GPU / cpu host)
 
-The map is **nvblox**, GPU-only: TSDF + colour + Marching-Cubes mesh, the single
-backend (spec 00 §9.5). These channels observe that one GPU map.
+The surface map is TSDF + colour + Marching-Cubes mesh behind the pluggable
+`ISurfaceMap` backend — `nvblox` on the GPU in production, the `cpu` host backend
+off-device (spec 00 §9.5, spec 06 §0). These channels observe whichever backend is
+selected; the telemetry keys are backend-independent.
 
 | key | call | topic / type | default | origin → improvement |
 |---|---|---|---|---|

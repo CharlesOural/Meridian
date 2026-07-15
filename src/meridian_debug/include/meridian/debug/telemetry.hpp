@@ -23,7 +23,7 @@ enum class Level { Trace, Debug, Info, Warn, Error };
 // on `type` (e.g. LineList = pairs of endpoints, Points = vertices). A marker is
 // keyed by (ns, id) so a re-published marker updates in place instead of stacking.
 struct Marker {
-  enum class Type { Points, LineList, LineStrip, Arrow, Cube, Sphere, Text, Hexagon };
+  enum class Type { Points, LineList, LineStrip, Arrow, Cube, Sphere, Text, Hexagon, Triangles };
   Type type = Type::LineList;
   Frame frame = Frame::Map;
   std::string ns;

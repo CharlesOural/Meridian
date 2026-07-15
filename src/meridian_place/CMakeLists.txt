@@ -10,9 +10,9 @@ include(MeridianDeps)            # Eigen3::Eigen, Sophus::Sophus, small_gicp::sm
 find_package(meridian_common REQUIRED)
 find_package(meridian_config REQUIRED)
 find_package(meridian_debug REQUIRED)
+find_package(meridian_map REQUIRED)  # the canonical KeyframeStore (L4) L5 reads from
 
 add_library(meridian_place
-  src/keyframe_store.cpp
   src/sc_descriptor.cpp
   src/submap_accumulator.cpp
   src/gicp_verify.cpp
@@ -32,6 +32,7 @@ target_link_libraries(meridian_place PUBLIC
   meridian_common::meridian_common
   meridian_config::meridian_config
   meridian_debug::meridian_debug
+  meridian_map::meridian_map
   Eigen3::Eigen Sophus::Sophus)
 # small_gicp is an implementation detail of the Stage-C verifier (private src/ header), so
 # it is not exported on the public interface.
@@ -44,12 +45,10 @@ install(TARGETS meridian_place EXPORT meridian_placeTargets
 ament_export_targets(meridian_placeTargets HAS_LIBRARY_TARGET)
 # small_gicp is a private link dependency, but a static library propagates it as a link
 # requirement, so downstream packages must be able to resolve the imported target.
-ament_export_dependencies(meridian_common meridian_config meridian_debug Eigen3 Sophus small_gicp)
+ament_export_dependencies(meridian_common meridian_config meridian_debug meridian_map Eigen3 Sophus small_gicp)
 
 if(BUILD_TESTING)
   include(MeridianTesting)
-  meridian_add_gtest(test_keyframe_store test/test_keyframe_store.cpp)
-  target_link_libraries(test_keyframe_store meridian_place)
   # The descriptor / submap engines are private (src/) headers; tests reach them directly.
   meridian_add_gtest(test_sc_descriptor test/test_sc_descriptor.cpp)
   target_include_directories(test_sc_descriptor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

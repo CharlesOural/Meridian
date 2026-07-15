@@ -2,9 +2,8 @@
 
 #include <cstdint>
 #include <memory>
-#include <vector>
-
 #include <opencv2/core.hpp>
+#include <vector>
 
 #include "meridian/calib/calibration_set.hpp"
 #include "meridian/common/sample.hpp"
@@ -18,12 +17,12 @@ class TelemetrySink;
 // Images are owned cv::Mat values; the pyramid is level 0 = full resolution, each
 // subsequent level halved.
 struct ProcessedCamera {
-  CameraFrame frame;                  // stamp / sensor metadata carried through
-  cv::Mat intensity;                  // single-channel, rectified + photometrically normalized
-  cv::Mat intensity_raw;              // single-channel, decoded only (pre-rectify, original feed)
-  cv::Mat colour;                     // RGB (empty for a mono source), rectified
-  std::vector<cv::Mat> pyramid;       // Gaussian pyramid of intensity, level 0 = full res
-  IntrinsicsCamera rectified;         // pinhole K of the rectified images (distortion None)
+  CameraFrame frame;                    // stamp / sensor metadata carried through
+  cv::Mat intensity;                    // single-channel, rectified + photometrically normalized
+  cv::Mat intensity_raw;                // single-channel, decoded only (pre-rectify, original feed)
+  cv::Mat colour;                       // RGB (empty for a mono source), rectified
+  std::vector<cv::Mat> pyramid;         // Gaussian pyramid of intensity, level 0 = full res
+  IntrinsicsCamera rectified;           // pinhole K of the rectified images (distortion None)
   bool photometric_calibrated = false;  // photometric normalization actually applied
   bool exposure_known = false;          // exposure_s was present (else exposure term skipped)
 };
@@ -35,7 +34,7 @@ struct ProcessedCamera {
 //
 // Thread-confined: driven from a single stage thread.
 class CameraPreprocessor {
- public:
+public:
   // intrinsics carries the rectified K / distortion (used once rectification is wired).
   // telemetry may be nullptr (no-op).
   CameraPreprocessor(const PreprocCamera& cfg, const IntrinsicsCamera& intrinsics,
@@ -44,7 +43,19 @@ class CameraPreprocessor {
   // Decodes the frame to an intensity (+ colour) image and builds the pyramid.
   ProcessedCamera process(const CameraFrame& frame) const;
 
- private:
+  // Decode + undistort only, packaged as a CameraFrame for consumers that colour from
+  // the image (no photometric work, no pyramid). RGB8 for a colour source, Mono8
+  // otherwise; the geometry matches rectified_intrinsics(). Returns the input handle
+  // unchanged when the frame cannot be decoded or no remap was built. Safe to call
+  // concurrently with process(): both only read the prebuilt remap.
+  std::shared_ptr<const CameraFrame> rectify_frame(
+      const std::shared_ptr<const CameraFrame>& frame) const;
+
+  // Pinhole K of rectified_frame() output (equals the source intrinsics, distortion and
+  // all, when no remap was built).
+  const IntrinsicsCamera& rectified_intrinsics() const { return rectified_; }
+
+private:
   // Decodes raw bytes to a single-channel intensity image and, for a colour source, the
   // RGB image. Mono passes through; Bayer is demosaiced.
   void decode(const CameraFrame& frame, cv::Mat* intensity, cv::Mat* colour) const;
@@ -64,9 +75,9 @@ class CameraPreprocessor {
   IntrinsicsCamera intrinsics_;
   TelemetrySink* telemetry_ = nullptr;
 
-  cv::Mat map1_, map2_;            // undistort-rectify remap (empty if no rectification)
-  bool rectify_valid_ = false;    // a usable remap was built
-  IntrinsicsCamera rectified_;    // pinhole K of the rectified output (== intrinsics_ if no map)
+  cv::Mat map1_, map2_;         // undistort-rectify remap (empty if no rectification)
+  bool rectify_valid_ = false;  // a usable remap was built
+  IntrinsicsCamera rectified_;  // pinhole K of the rectified output (== intrinsics_ if no map)
   mutable bool warned_size_mismatch_ = false;  // one-shot guard for the size-mismatch warning
 };
 

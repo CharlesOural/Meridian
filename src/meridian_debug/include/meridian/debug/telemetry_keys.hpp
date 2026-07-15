@@ -205,6 +205,7 @@ namespace map {
 inline constexpr Key Cloud{"map/cloud"};            // cloud
 inline constexpr Key Registered{"map/registered"};  // cloud
 inline constexpr Key Keyframe{"map/keyframe"};       // pose
+inline constexpr Key Mesh{"map/mesh"};               // marker (TRIANGLE_LIST, L4 surface)
 }  // namespace map
 
 namespace body {

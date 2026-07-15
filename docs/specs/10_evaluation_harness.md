@@ -4,7 +4,7 @@
 >
 > **What Meridian is, for the purposes of this spec.** A single, complete **discrete, tightly-coupled LiDAR-Inertial** estimator (Spec 00): one per-sweep LIO front-end (`lio` — internal constant-screw deskew, voxel-hash local map, Gauss-Newton ICP with an interval-averaged IMU prior); an iSAM2 factor-graph back-end; and a GPU **nvblox** TSDF+colour+Marching-Cubes map. Camera and GNSS streams ride through the pipeline unfused. There is **one** system to evaluate — not a sequence of shippable versions. The harness therefore measures one estimator against ground truth. (The FAST-LIO2-style iEKF oracle and the continuous-time estimator that previously sat behind the same `IFrontEnd` are **removed** — Spec 00 §5.4. The front-end cross-check is direct: the synthetic-world GT-tracking suite, Jacobian-vs-numeric parity, and the Monte-Carlo covariance-chain test; §8.)
 >
-> **Deployment target.** NVIDIA Jetson Orin; a CUDA GPU is **always present**. Mapping is nvblox, GPU-only — there is no CPU map path to evaluate and no CPU-fallback gate. **Single LiDAR + single IMU + single camera + GNSS** — there is no multi-LiDAR merge to test.
+> **Deployment target.** NVIDIA Jetson Orin; a CUDA GPU is **always present**, and the evaluated deployment runs the `nvblox` GPU surface backend. The surface tier is pluggable (`nvblox` / `cpu`, spec 06 §0); off-device the `cpu` backend is exercised for correctness, but the **production accuracy/latency profile is always the nvblox build**. **Single LiDAR + single IMU + single camera + GNSS** — there is no multi-LiDAR merge to test.
 
 ---
 
@@ -312,7 +312,7 @@ From `timing.parquet` (fed by `ScopedTimer`/`TimingRegistry`, Spec 09), measured
 
 - Per-stage latency percentiles (p50/p99): L1 preprocess, L2 per-sweep solve (`frontend.lio.ingest`, with the deskew/solve split in `FrontEndDiagnostics`), L3 `optimize`, L4 nvblox `integrate`, L5 detect, mesh extract (the stage keys are the Spec 00 §10.2 telemetry names).
 - **Real-time factor** `rt_factor` = total compute time / bag duration (must be < 1 for the front-end path to keep up; the back-end optimize, GPU map integration, and meshing run on separate threads, Spec 00 §11.1, with their own budgets and may lag behind the front-end).
-- Per-frame budget gate: the L2 front-end `step` p99 must be below the LiDAR period (100 ms at 10 Hz Ouster) for the production profile. Measured in `RealTime` mode (§2.5) and cross-checked against `AsFastAsPossible` ScopedTimer numbers (the two must agree to within scheduling noise). nvblox GPU integration and Marching-Cubes timing are measured the same way; there is no CPU map path to compare against.
+- Per-frame budget gate: the L2 front-end `step` p99 must be below the LiDAR period (100 ms at 10 Hz Ouster) for the production profile. Measured in `RealTime` mode (§2.5) and cross-checked against `AsFastAsPossible` ScopedTimer numbers (the two must agree to within scheduling noise). nvblox GPU integration and Marching-Cubes timing are measured the same way; the production timing profile is the nvblox backend (the `cpu` backend is for off-device correctness, not the latency budget).
 
 ### 5.6 The `Metric` interface (extensibility seam)
 

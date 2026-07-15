@@ -8,7 +8,7 @@
 #include "meridian/common/pose.hpp"
 #include "meridian/config/config.hpp"
 #include "meridian/place/iloop_detector.hpp"
-#include "meridian/place/keyframe_store.hpp"
+#include "meridian/map/keyframe_store.hpp"
 
 using meridian::KeyframePoseSource;
 using meridian::KeyframeStore;

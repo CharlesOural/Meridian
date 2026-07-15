@@ -148,6 +148,21 @@ meridian:
     # accurate odometry chain (a stiff loop adds cm-level noise). A large regulariser keeps
     # them soft here; on a drifting sequence the chained residual still accumulates correction.
     cov_lambda: 0.1
+  map:
+    # L4 dense surface map. On this Mac (no CUDA) the surface backend is the portable
+    # cpu TSDF+colour+Marching-Cubes; on a Jetson set backend: nvblox. The mesh is
+    # published as /meridian/markers (TRIANGLE_LIST, ns map/mesh) with baked turbo colour.
+    enable: true
+    backend: cpu
+    reg_voxel_m: 0.5            # Tier R registration voxel (>= tsdf_voxel_m)
+    tsdf_voxel_m: 0.35          # surface detail; coarser than a GPU run to stay CPU-cheap + bound mesh size
+    tsdf_trunc_voxels: 3        # truncation band = 1.05 m (fusion shell radius 3 voxels) — fills ring gaps
+    tsdf_w_max: 8.0
+    tsdf_max_integration_dist_m: 40.0
+    colour: true
+    color_ewma_alpha: 0.8
+    mesh_max_rate_hz: 2.0
+    mesh_conf_w: 8.0
   debug:
     level: info
     publish_clouds: true

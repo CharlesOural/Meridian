@@ -12,7 +12,7 @@ One LiDAR + one IMU (plus a camera and GNSS carried through unfused) feed a **di
 
 - One front-end: the discrete LIO estimator, validated directly against ground truth. (Two predecessors — an iEKF test oracle and a continuous-time estimator — are retired; camera/GNSS fusion are future stages on the same seams.)
 - Single LiDAR. (Multi-LiDAR is a future extension behind the same interfaces, not designed now.)
-- nvblox, GPU-only. No CPU fallback, no second map backend.
+- Surface map behind the pluggable `ISurfaceMap` backend: nvblox (GPU) in production, a portable `cpu` backend for dev/non-CUDA boxes, deferred `vulkan`. One selected per run, explicitly and fail-fast — never a silent downgrade.
 - ROS 2 **Humble**, C++20, colcon/ament_cmake. ROS-agnostic core C++ library + thin ROS 2 wrappers.
 
 ## How to read these docs

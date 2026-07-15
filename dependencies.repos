@@ -17,4 +17,4 @@ repositories:
   nvblox:
     type: git
     url: https://github.com/nvidia-isaac/nvblox.git
-    version: public        # TODO: pin to a Humble-line commit SHA (spec 11 §3)
+    version: f426aacd7d6b3c2f185469da355430a7a9c85709  # v0.0.7 — Humble/isaac_ros-3.2 line (CUDA 11.0–12.6)

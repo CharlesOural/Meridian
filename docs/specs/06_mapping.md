@@ -14,12 +14,39 @@
 >
 > **System framing (supersedes any earlier phased plan).** Meridian is **one
 > complete system** — a discrete, tightly-coupled LiDAR-Inertial estimator
-> feeding an iSAM2 back-end and a **GPU nvblox** map. There is no
+> feeding an iSAM2 back-end and a dense surface map. There is no
 > "ship a simpler map first" milestone and no v1/v2 split anywhere in L4. The
 > deployment target is an **NVIDIA Jetson Orin with a CUDA GPU always present**;
-> the surface map is **nvblox, GPU-only, with no CPU fallback path** (spec 00 §0,
-> §9.5). The bring-up order in `00_architecture.md §13` is module integration
-> order for this one system, not a feature roadmap.
+> the **canonical on-device surface backend is GPU nvblox**. The bring-up order in
+> `00_architecture.md §13` is module integration order for this one system, not a
+> feature roadmap.
+>
+> **Surface-backend model.** The surface tier `ISurfaceMap` (§4, §8.1) is a
+> **backend-pluggable seam** carrying **exactly one selected backend per
+> build-and-run**. Three backends are defined:
+> - **`nvblox`** — GPU CUDA TSDF + colour + Marching-Cubes. The **canonical
+>   production backend** and the only one targeted for Jetson Orin deployment.
+> - **`cpu`** — a host TSDF + colour + Marching-Cubes meeting the same contract,
+>   for **development, CI, the cross-backend correctness oracle, and non-CUDA
+>   platforms** (the dev Mac, an x86 box without an NVIDIA GPU). It is not a
+>   real-time on-device dense mapper — lower resolution / throughput is expected.
+> - **`vulkan`** — a SPIR-V compute backend for fully GPU-agnostic acceleration
+>   (Metal via MoltenVK, plus AMD/Intel/NVIDIA). Interface-only / deferred (§10);
+>   no first-pass implementation.
+>
+> **Backend selection is explicit and fail-fast, never silent.** `map.backend`
+> names the backend; a backend is *available* only if its toolchain was compiled
+> in (§8.3, spec 11 §7.6). Selecting an unavailable backend is a hard, fail-fast
+> startup error — **there is no automatic downgrade from `nvblox` to `cpu`.** A
+> deployed robot therefore never silently runs a degraded map believing it is
+> running nvblox: the Jetson configuration selects `nvblox` and hard-fails on a
+> missing GPU, and `cpu` is only ever an explicitly chosen backend. **The rest of
+> L4 is backend-independent** — Tier R (§3), the `KeyframeStore` (§6) and the
+> clear-and-rebuild orchestration (§7) are shared, so the backend split is
+> contained entirely within `ISurfaceMap`. Every backend implements the identical
+> contract and must pass the shared backend-conformance suite (§8.4); backends are
+> tolerance-equivalent, not bit-identical, to one another (different
+> Marching-Cubes variants, GPU-vs-CPU reductions).
 >
 > **Scope.** First-pass scope ends at a **colourised triangle mesh** (nvblox
 > Marching Cubes). The ESDF (path planning) and semantic/label channels are
@@ -51,7 +78,7 @@
 1. [What L4 is, and the two-tier mental model](#1-what-l4-is-and-the-two-tier-mental-model)
 2. [Inputs, outputs, threading, lifetime](#2-inputs-outputs-threading-lifetime)
 3. [Tier R — adaptive voxel-hash registration map](#3-tier-r--adaptive-voxel-hash-registration-map)
-4. [Tier S — nvblox GPU TSDF + RGB surface map](#4-tier-s--nvblox-gpu-tsdf--rgb-surface-map)
+4. [Tier S — TSDF + RGB surface map (pluggable backend)](#4-tier-s--tsdf--rgb-surface-map-pluggable-backend-nvblox--cpu--vulkan)
 5. [The mesh stage — nvblox Marching Cubes + colour](#5-the-mesh-stage--nvblox-marching-cubes--colour)
 6. [The retained per-keyframe cloud store (MUST-FIX #4)](#6-the-retained-per-keyframe-cloud-store-must-fix-4)
 7. [Loop-closure de-integration: clear-and-rebuild (MUST-FIX #4)](#7-loop-closure-de-integration-clear-and-rebuild-must-fix-4)
@@ -105,11 +132,14 @@ behind a single `IMapLayer` family of interfaces (§8):
   keep its incremental-insert / box-delete / k-NN *behaviour*, change its
   *layout*). It carries cached per-voxel planes so the front-end's per-point query
   is a hash lookup, not a 5-NN + PCA.
-* **Tier S — nvblox GPU TSDF+RGB surface** (§4): the dense signed-distance +
-  colour field, running-average fused on the GPU by nvblox, from which nvblox
-  extracts the mesh (§5). This is the **only** surface/map backend — there is no
-  CPU fallback, no VDBFusion, no OpenVDB/NanoVDB archive, no second `IMapLayer`
-  surface implementation (spec 00 §2.1, §9.5; spec 11 §7).
+* **Tier S — TSDF+RGB surface** (§4): the dense signed-distance + colour field,
+  running-average fused, from which Marching Cubes extracts the mesh (§5). It is
+  reached through the **backend-pluggable `ISurfaceMap` seam** (§4, §8.1): the
+  canonical production backend is **nvblox on the GPU**, with a `cpu` backend for
+  dev/CI/non-CUDA platforms and a deferred `vulkan` backend, selected explicitly
+  and fail-fast (never a silent fallback). There is no VDBFusion / OpenVDB /
+  NanoVDB archive and no *second tier* — multi-backend means one `ISurfaceMap`
+  interface with interchangeable implementations, not a defensive dual map path.
 * **`KeyframeStore`** (§6): the *canonical retained cloud store* — the data
   structure MUST-FIX #4 requires. Both tiers are *derived* and *rebuildable* from
   this store; the store is the single source of truth for re-integration after a
@@ -433,28 +463,39 @@ re-inserting everything in it.
 
 ---
 
-## 4. Tier S — nvblox GPU TSDF + RGB surface map
+## 4. Tier S — TSDF + RGB surface map (pluggable backend; nvblox / cpu / vulkan)
 
 ### 4.1 What it is
 
-Tier S is the **dense surface representation**, and it is **nvblox on the GPU,
-full stop** — the only surface/map backend in Meridian (spec 00 §2.1, §9.5; spec 11
-§7). nvblox maintains a sparse, block-allocated grid of
+Tier S is the **dense surface representation**: a sparse, block-allocated grid of
 **Truncated Signed Distance Function (TSDF)** voxels (signed distance + fusion
 weight) and a separate **colour** layer, fused with **running-average** semantics
-(§4.3), from which nvblox extracts the mesh (§5). Unlike Tier R (which
+(§4.3), from which Marching Cubes extracts the mesh (§5). Unlike Tier R (which
 stores points + cached planes for *registration*), Tier S models **free space and
-surface** so Marching Cubes can produce a watertight, colourised mesh.
+surface** so Marching Cubes can produce a colourised mesh.
 
-There is **no CPU fallback and no second implementation.** nvblox runs on the
-guaranteed-present Jetson Orin CUDA GPU; a missing GPU at runtime is a hard,
-fail-fast configuration error, not a degraded mode (spec 00 §9.5). VDBFusion,
-Voxblox, OpenVDB and NanoVDB were considered and rejected (spec 11 §11) — they do
-not appear in the build or this spec except as the named alternatives we declined.
+Tier S is reached through the **backend-pluggable `ISurfaceMap` seam** (§8.1). The
+**canonical production backend is `nvblox`** on the GPU
+(§4.2); a portable **`cpu`** backend implements the same TSDF/colour/MC contract on
+the host for development, CI, the cross-backend correctness oracle, and non-CUDA
+platforms; a **`vulkan`** SPIR-V backend is a deferred hook (§10). All backends are
+selected **explicitly and fail-fast** — a build/run carries exactly one, and there
+is no silent `nvblox`→`cpu` downgrade (§0, §8.3). The §4.3 fusion mathematics are
+the **backend-independent contract** every backend must reproduce (to tolerance);
+§4.2 describes how the `nvblox` backend in particular drives it.
 
-### 4.2 How Meridian drives nvblox
+There is still **no VDBFusion / Voxblox / OpenVDB / NanoVDB archive** — those were
+considered and rejected (spec 11 §11) and the `cpu` backend is a small bespoke
+projective TSDF + Marching Cubes (or a thin Open3D-tensor wrapper), not a second
+mapping library smuggled in. On the deployed Jetson the configured backend is
+`nvblox`, and a missing GPU there is a hard, fail-fast configuration error, not a
+degraded mode (spec 00 §9.5).
 
-`meridian_map` links the nvblox **C++ core library** directly (not the
+### 4.2 The `nvblox` backend: how Meridian drives nvblox
+
+This subsection describes the production GPU backend; the `cpu` backend (§8.1)
+implements the same §4.3 fusion contract on the host and the `vulkan` backend is
+deferred (§10). `meridian_map` links the nvblox **C++ core library** directly (not the
 `isaac_ros_nvblox` ROS node — the core is ROS-agnostic, spec 00 R1, spec 11 §7.2).
 The host-side wrapper class owns nvblox's mapper and its layers, and the only CUDA
 Meridian *writes* is the cloud→depth projection that feeds nvblox's integrators
@@ -933,9 +974,11 @@ T4 is busy rebuilding.
 
 `IMapLayer` (spec 01 §7.5) is realised as a small family so the registration and
 surface tiers stay independently testable (arch §5), all constructed by
-`meridian_pipeline` and wired together. **The surface tier has exactly one
-implementation — nvblox** (spec 00 §2.1, §9.5); there is no second `ISurfaceMap`
-impl and no CPU-fallback selector.
+`meridian_pipeline` and wired together. **The surface tier `ISurfaceMap` is the
+one backend-pluggable seam**: `makeMapLayer` constructs the backend named by
+`map.backend` (`nvblox` / `cpu` / `vulkan`, §0, §8.3) — exactly one per run, chosen
+explicitly and fail-fast. The registration tier and store have a single
+implementation each.
 
 ```cpp
 // meridian/map/iregistration_map.hpp  — Tier R (queried by L2, CPU)
@@ -952,7 +995,8 @@ public:
   virtual MapDiagnostics diagnostics() const = 0;
 };
 
-// meridian/map/isurface_map.hpp  — Tier S + mesh (consumed by L6). ONE impl: nvblox.
+// meridian/map/isurface_map.hpp  — Tier S + mesh (consumed by L6).
+// Backend-pluggable: NvbloxSurfaceMap (GPU) | CpuSurfaceMap (host) | VulkanSurfaceMap (deferred).
 class ISurfaceMap {
 public:
   virtual ~ISurfaceMap() = default;
@@ -972,10 +1016,11 @@ public:
   virtual const ColorMesh& extract_mesh() = 0;                                  // §5 (spec 01 §7.7 type)
   virtual MapDiagnostics diagnostics() const = 0;
 };
-// The only ISurfaceMap implementation: NvbloxSurfaceMap (meridian/map/src/nvblox/).
+// ISurfaceMap implementations: NvbloxSurfaceMap (meridian/map/src/nvblox/, GPU),
+// CpuSurfaceMap (meridian/map/src/cpu/, host), VulkanSurfaceMap (deferred, §10).
 
 // meridian/map/imap.hpp — the façade IMapLayer (spec 01 §7.5) the pipeline holds.
-// Owns IRegistrationMap (VoxelHashMap) + ISurfaceMap (NvbloxSurfaceMap) +
+// Owns IRegistrationMap (VoxelHashMap) + ISurfaceMap (the selected backend) +
 // KeyframeStore and implements integrate()/apply_graph_update()/query_plane()/
 // extract_mesh() by delegation, enforcing the "store first, derived tiers are
 // caches" discipline.
@@ -986,13 +1031,16 @@ IMapLayer::Ptr makeMapLayer(const MapConfig&, const CalibrationSet&);  // factor
 
 The façade `LayeredMap::integrate(kf, T_map_body)` does, in order: (1)
 `store.put` if first sight of the id; (2) `regMap.integrate_keyframe`; (3)
-`surfaceMap.integrate` (nvblox). `apply_graph_update` runs the §7.2 algorithm
-across both tiers. `query_plane` delegates to Tier R; `extract_mesh` to nvblox.
+`surfaceMap.integrate` (the selected backend). `apply_graph_update` runs the §7.2
+algorithm across both tiers. `query_plane` delegates to Tier R; `extract_mesh` to
+the surface backend.
 
-> **`makeMapLayer` does not select a backend.** There is no map backend choice:
-> `makeMapLayer` always constructs `VoxelHashMap` + `NvbloxSurfaceMap`. The
-> factory exists for dependency injection and test mocking, not to offer a
-> CPU/GPU menu (spec 00 §5, §8.3).
+> **`makeMapLayer` selects the surface backend.** It always constructs
+> `VoxelHashMap` (Tier R) + `KeyframeStore`, and for Tier S constructs the
+> `ISurfaceMap` named by `map.backend`. The choice is restricted to backends
+> compiled into this build (spec 11 §7.6); naming an uncompiled backend is a
+> fail-fast configuration error, never a silent substitution. The factory also
+> remains the dependency-injection / test-mock seam (spec 00 §5, §8.3).
 
 ### 8.2 Supporting value types declared here
 
@@ -1013,12 +1061,17 @@ alias for a span/vector of map-frame `Eigen::Vector3f`.
 
 The architecture schema has `map: { backend: nvblox, reg_voxel_m, tsdf_voxel_m,
 mesh, colour }`. L4 expands it (validated on load, arch §8.3; **must** keep
-`tsdf_voxel_m ≤ reg_voxel_m`). `backend` has exactly one valid value, `nvblox`;
-there is no CPU/VDB alternative to select (spec 00 §8.3):
+`tsdf_voxel_m ≤ reg_voxel_m`). `backend` selects the surface backend (§0, §8.1);
+its valid values are `nvblox` (GPU, production), `cpu` (host, dev/CI/non-CUDA), and
+`vulkan` (deferred). The value must name a backend compiled into this build (spec 11
+§7.6); an uncompiled backend fail-fasts on load (spec 00 §8.3). The `cpu` backend
+honours `tsdf_voxel_m` / `tsdf_w_max` / colour / mesh keys identically — it may cap
+resolution internally for throughput, reported via diagnostics, but the schema is
+shared:
 
 ```yaml
 map:
-  backend:           nvblox        # the ONLY valid value (GPU; no fallback)
+  backend:           nvblox        # nvblox (GPU) | cpu (host) | vulkan (deferred)
   reg_voxel_m:       0.2           # Tier R base voxel (== arch reg_voxel_m)
   reg_max_pts:       20            # kMaxPtsPerVoxel
   reg_seed:          0             # seed for deterministic reservoir voxel eviction (§3.2a)
@@ -1042,8 +1095,35 @@ map:
     backend:         ram           # ram | mmap (deferred)
 ```
 
-There is no `archive:` block (the NanoVDB out-of-core archive is removed) and no
-fallback/`cpu:` key anywhere in the map schema.
+There is no `archive:` block (the NanoVDB out-of-core archive is removed). The
+`cpu` backend is selected through `backend: cpu`, not a separate fallback key — it
+is a peer surface implementation, not a degraded mode bolted onto `nvblox`.
+
+### 8.4 Backend conformance
+
+Every `ISurfaceMap` backend implements the identical contract (§8.1) and the
+identical fusion semantics (§4.3, §5), so the choice of backend changes
+performance and platform, never meaning. A shared **backend-conformance test
+suite** (run per compiled backend under `colcon test`) pins this:
+
+* **Geometry oracle.** Integrate a known analytic surface (a plane, a sphere) at a
+  known pose; assert the extracted mesh's vertices lie within a voxel-scaled
+  tolerance of the true surface and the per-vertex normals point outward.
+* **Colour oracle.** Paint the surface from a synthetic camera; assert the fused
+  vertex colours match the projected image within tolerance, and that an occluder
+  is *not* bled onto the surface behind it (§4.3 occlusion test).
+* **Clear-and-rebuild equivalence.** Integrate keyframes, move one via
+  `apply_graph_update`, and assert the rebuilt region (§7) is tolerance-equal to
+  integrating the corrected poses from scratch — the §7.4 invariant, checked per
+  backend.
+* **Within-backend determinism.** Two single-thread replays of the same input
+  produce the same mesh for that backend (the §9 determinism requirement), to the
+  extent that backend's reductions allow (bit-identical on `cpu`; deterministic
+  variant on `nvblox`, arch §11.2).
+
+Backends are **tolerance-equivalent, not bit-identical, to one another** (different
+Marching-Cubes variants and GPU-vs-CPU reductions), so the suite compares each
+backend against the analytic oracle, not against another backend's bytes.
 
 ---
 
@@ -1056,8 +1136,9 @@ fallback/`cpu:` key anywhere in the map schema.
 | `GraphUpdate` references unknown id | `store.get(id)` empty | skip that id, `event(ERROR,"map/unknown_kf_in_update")`; rebuild the rest (degraded but safe) |
 | Rebuild set too large (global snap) | `|rebuildIds|` > `rebuild_chunk_max` | chunk across T4 cycles (§7.6); front-end runs on hot window meanwhile |
 | `Q_map` back-pressure (T4 behind) | queue near capacity | lossless: front-end keyframe creation slows (arch §11.2); **never drop** a keyframe cloud |
-| GPU out of memory (nvblox, unbounded extent) | nvblox allocation failure | `event(ERROR,"map/gpu_oom")`; operator remedy is to lower `tsdf_max_integration_dist_m` (the primary VRAM control, §4.3), coarsen `tsdf_voxel_m`, or tighten `reg_hot_radius_m`. Fail-fast, **not** a silent CPU fallback (spec 00 §9.5; VRAM-exhaustion sharp edge, Appendix R.4) |
-| CUDA GPU absent at startup | nvblox/CUDA init fails | hard fail-fast configuration error (spec 00 §9.5) — Meridian does not run mapping without a GPU |
+| GPU out of memory (`nvblox` backend, unbounded extent) | nvblox allocation failure | `event(ERROR,"map/gpu_oom")`; operator remedy is to lower `tsdf_max_integration_dist_m` (the primary VRAM control, §4.3), coarsen `tsdf_voxel_m`, or tighten `reg_hot_radius_m`. Fail-fast, **not** a silent backend swap (spec 00 §9.5; VRAM-exhaustion sharp edge, Appendix R.4) |
+| `backend: nvblox` but CUDA GPU absent at startup | nvblox/CUDA init fails | hard fail-fast configuration error (spec 00 §9.5) — the deployed Jetson config selects `nvblox` and does not run mapping without a GPU. A non-CUDA box must select `backend: cpu` *explicitly*; the system never downgrades on its own |
+| `map.backend` names a backend not compiled into this build | factory lookup misses on load | hard fail-fast configuration error (§8.1, spec 11 §7.6) — never a silent substitution to an available backend |
 | TSDF voxel saturated, can't correct | weight at `tsdf_w_max` yet pose moved | small `w_max` cap + clear-and-rebuild (§7) guarantees corrected re-fuse; saturation can't lock a wrong surface |
 | Dynamic object burned into surface | stale surface persists where scene changed | small `tsdf_w_max` (default 8) lets fresh free-space/geometry fade it within a few sweeps (§4.3); the optional `invalid_depth_decay` (§4.5) prunes the far-outlier class |
 | Foreground colour bled onto background | wrong tint at a depth discontinuity | `color_occlusion_check` sphere-traces before colouring; occluded voxels are not painted (§4.3) |
@@ -1140,10 +1221,21 @@ consumers of existing value types — never as edits to existing layer contracts
   the new code to a read-only consumer of the store. First pass ships without it
   (`map.ground_align.enable`, absent in first pass).
 
-The rule, restated: ESDF, semantics, Poisson, and ground-alignment are *new derived
-consumers / optional channels / an offline utility / a read-only store consumer*,
-riding the existing `integrate` / `apply_graph_update` / `KeyframeStore` machinery.
-The first-pass code must compile and run with all of them absent.
+* **`vulkan` surface backend (interface only).** A SPIR-V compute implementation
+  of `ISurfaceMap` (§8.1) — projective TSDF + colour fusion + Marching Cubes in
+  Vulkan compute shaders — would make the GPU surface path **fully agnostic**
+  (Metal via MoltenVK, plus AMD/Intel/NVIDIA), so the dense map runs on the dev
+  Mac and on non-CUDA hardware at GPU speed rather than the `cpu` backend's host
+  speed. It attaches as **one more `ISurfaceMap` backend** behind the existing
+  factory selection (§8.1) and the conformance suite (§8.4); nothing in Tier R, the
+  `KeyframeStore`, or the §7 rebuild changes. First pass ships without it
+  (`map.backend: vulkan` is reserved; not compiled in until the backend exists).
+
+The rule, restated: ESDF, semantics, Poisson, ground-alignment, and the `vulkan`
+backend are *new derived consumers / optional channels / an offline utility / a
+read-only store consumer / one more surface backend*, riding the existing
+`integrate` / `apply_graph_update` / `KeyframeStore` / `ISurfaceMap` machinery. The
+first-pass code must compile and run with all of them absent.
 
 ---
 
@@ -1175,7 +1267,7 @@ runtime without restart; `NullSink` makes them zero-cost when off (arch §10.6).
 
 | Param | Default | Meaning | Cross-ref |
 |---|---|---|---|
-| `map.backend` | nvblox | surface map backend (the only valid value) | §4, arch §8.2 |
+| `map.backend` | nvblox | surface backend: `nvblox` (GPU) / `cpu` (host) / `vulkan` (deferred); must be compiled in | §0, §4, §8.1 |
 | `map.reg_voxel_m` | 0.2 | Tier R base voxel edge [m] | §3.2, arch §8.2 |
 | `map.reg_max_pts` | 20 | points kept per voxel (downsample cap) | §3.2 (ikd-Tree `downsample_size` analogue) |
 | `map.reg_seed` | 0 | seed for deterministic reservoir voxel eviction | §3.2a |
@@ -1209,13 +1301,16 @@ runtime without restart; `NullSink` makes them zero-cost when off (arch §10.6).
 3. **Registration (Tier R) uses an adaptive voxel-hash on the CPU** with cached
    per-voxel planes, keeping ikd-Tree's incremental-insert/box-delete/k-NN
    *behaviour* (§3). The front-end's hot query never touches the GPU.
-4. **The surface map is nvblox, GPU-only** (TSDF + colour + Marching-Cubes mesh),
-   with a **small** fusion-weight cap (`tsdf_w_max` ≈ 8) for scene responsiveness —
-   correctability is owned by clear-and-rebuild, not the cap (§4.3). Colour is fused
-   by EWMA with a sphere-traced occlusion test (§4.3); the runtime mesh is streamed
-   as a per-cycle block delta, full extraction is offline-only (§5.4). No CPU
-   fallback, no VDBFusion/OpenVDB, one `ISurfaceMap` implementation (§4, §5;
-   spec 00 §9.5).
+4. **The surface map is TSDF + colour + Marching-Cubes mesh behind the
+   backend-pluggable `ISurfaceMap` seam** — `nvblox` (GPU, production), `cpu`
+   (host, dev/CI/non-CUDA), or deferred `vulkan`, selected explicitly and
+   fail-fast with no silent downgrade (§0, §8.1). A **small** fusion-weight cap
+   (`tsdf_w_max` ≈ 8) gives scene responsiveness — correctability is owned by
+   clear-and-rebuild, not the cap (§4.3). Colour is fused by EWMA with a
+   sphere-traced occlusion test (§4.3); the runtime mesh is streamed as a per-cycle
+   block delta, full extraction is offline-only (§5.4). No VDBFusion/OpenVDB
+   archive; every backend meets the one §4.3/§5 contract and passes the shared
+   conformance suite (§8.4).
 5. **Loop correction is clear-and-rebuild from retained clouds at corrected
    poses** — never per-voxel subtraction (MUST-FIX #4, §7); exact
    via per-keyframe provenance + region-overlap superset, cleared at nvblox's 8³

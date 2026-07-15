@@ -26,11 +26,14 @@ small_gicp, yaml-cpp, linuxptp, evo, and the Foxglove bridge. The GPU image adds
 the **CUDA 12 toolkit**; **nvblox** is built in the workspace from
 `dependencies.repos`.
 
-> **The one platform caveat — CUDA.** `meridian_map` (L4, the nvblox GPU
-> TSDF+colour+mesh) is **CUDA-only with no CPU fallback** (spec 11 §7). It builds
-> and runs only on the Linux/GPU image. **Apple Silicon has no CUDA**, so on the
-> Mac you build everything *except* L4 (and the packages that link it). This is a
-> hardware limit, the same category as RViz being Linux-only — not a bug.
+> **The one platform caveat — CUDA.** L4's `nvblox` surface backend is GPU/CUDA
+> only and builds/runs only on the Linux/GPU image. **Apple Silicon has no CUDA**,
+> so on the Mac `meridian_map` builds with the portable **`cpu`** backend instead
+> (`-DMERIDIAN_MAP_NVBLOX=OFF`, the auto-default when no CUDA compiler is found,
+> spec 11 §7.6): `map.backend: cpu` gives a real (lower-res, slower) TSDF+colour+mesh
+> the Mac can run and visualise — you no longer lose L4 entirely. The nvblox
+> *backend* is the hardware-limited part, the same category as RViz being
+> Linux-only. `-DMERIDIAN_WITH_MAP=OFF` still drops the map altogether for non-map work.
 
 ---
 
@@ -46,11 +49,18 @@ Then, one-time workspace bring-up from the repo root:
 ```bash
 git submodule update --init          # vendor/ (scancontext)
 vcs import src < dependencies.repos              # nvblox (GPU)
-rosdep install --from-paths src --ignore-src -y
+rosdep install --from-paths src --ignore-src -y --skip-keys nvblox
 CMAKE_BUILD_PARALLEL_LEVEL=6 colcon build --symlink-install \
     --parallel-workers 1 \
     --cmake-args -DCMAKE_CUDA_ARCHITECTURES="86;87"
 ```
+
+> **`--skip-keys nvblox`**: nvblox is a workspace-built plain-CMake package
+> (meridian_map's package.xml depends on it for build ordering), not a rosdep key.
+>
+> **CUDA arch list**: match the actual device(s) — Orin `87`, Ampere `86`,
+> Turing `75`, Pascal `61` (e.g. `"61;75"` on a GTX 1080 + RTX 2080 box). nvblox
+> and meridian_map must be built with the same list.
 
 > **Build parallelism.** `CMAKE_BUILD_PARALLEL_LEVEL` caps the compile threads
 > (default **6** here); `--parallel-workers 1` builds one package at a time, so

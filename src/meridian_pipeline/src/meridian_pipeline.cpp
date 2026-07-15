@@ -1,5 +1,6 @@
 #include "meridian/pipeline/meridian_pipeline.hpp"
 
+#include <Eigen/Geometry>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -9,8 +10,6 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-
-#include <Eigen/Geometry>
 
 #include "health_bridge.hpp"
 #include "meridian/calib/calibration_from_config.hpp"
@@ -41,6 +40,9 @@ constexpr std::size_t kMeasQueueCapacity = 8 * 24;
 // collapsed to a single voxel grid at kMapCloudVoxel metres so its size stays bounded.
 constexpr std::uint64_t kMapCloudFoldPeriod = 5;
 constexpr float kMapCloudVoxel = 0.3f;
+// The L4 surface mesh is large (re-extracted whole each time), so it publishes less often
+// than the map cloud to keep the per-publish transport cost off the operator link.
+constexpr std::uint64_t kMeshFoldPeriod = 10;
 
 SensorInfo make_info(std::uint8_t id, Modality modality, Frame frame, const std::string& model,
                      double rate_hz, StampSource src) {
@@ -118,8 +120,8 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
   const auto cam_it = calib->cam_intrinsics.find(static_cast<std::uint8_t>(s.camera.id));
   const IntrinsicsCamera cam_intr =
       cam_it != calib->cam_intrinsics.end() ? cam_it->second : IntrinsicsCamera{};
-  camera_preprocessor_ = std::make_unique<CameraPreprocessor>(
-      cfg_.preprocess.camera, cam_intr, sink_.get());
+  camera_preprocessor_ =
+      std::make_unique<CameraPreprocessor>(cfg_.preprocess.camera, cam_intr, sink_.get());
   aggregator_ =
       std::make_unique<Aggregator>(cfg_.aggregation, cfg_.sensors, health_.get(), sink_.get());
   aggregator_->set_sink([this](MeasureGroup&& g) { on_group(std::move(g)); });
@@ -170,6 +172,22 @@ MeridianPipeline::MeridianPipeline(const Config& cfg, std::unique_ptr<TelemetryS
       };
       loop_detector_ = makeLoopDetector(cfg_.place, store_, pose_source_,
                                         /*deterministic=*/sync_mode_, sink_.get());
+    }
+    // L4 layered map (Tier R + the selected ISurfaceMap backend), sharing the canonical
+    // store. It integrates keyframes at corrected back-end poses and re-integrates on a
+    // loop correction; the surface mesh is published to the operator.
+    if (cfg_.map.enable) {
+      if (!store_) store_ = std::make_shared<KeyframeStore>();
+      // The map colours from the store's rectified images, so its calibration snapshot
+      // carries the rectified pinhole K rather than the raw distorted intrinsics.
+      auto map_calib = calib;
+      if (camera_preprocessor_ && camera_preprocessor_->rectified_intrinsics().fx > 0.0) {
+        auto adjusted = std::make_shared<CalibrationSet>(*calib);
+        adjusted->cam_intrinsics[static_cast<std::uint8_t>(cfg_.sensors.camera.id)] =
+            camera_preprocessor_->rectified_intrinsics();
+        map_calib = std::shared_ptr<const CalibrationSet>(std::move(adjusted));
+      }
+      map_ = makeMapLayer(cfg_.map, map_calib, store_, sink_.get());
     }
   }
 }
@@ -247,7 +265,9 @@ void MeridianPipeline::set_keyframe_sink(KeyframeSink sink) {
   keyframe_sink_ = std::move(sink);
 }
 
-void MeridianPipeline::set_backend_tap(BackendTap tap) { backend_tap_ = std::move(tap); }
+void MeridianPipeline::set_backend_tap(BackendTap tap) {
+  backend_tap_ = std::move(tap);
+}
 
 void MeridianPipeline::set_graph_update_sink(GraphUpdateSink sink) {
   graph_update_sink_ = std::move(sink);
@@ -257,11 +277,17 @@ std::vector<StampedPose> MeridianPipeline::corrected_trajectory() const {
   return backend_ ? backend_->corrected_trajectory() : std::vector<StampedPose>{};
 }
 
-Pose MeridianPipeline::map_odom() const { return backend_ ? backend_->map_odom() : Pose{}; }
+Pose MeridianPipeline::map_odom() const {
+  return backend_ ? backend_->map_odom() : Pose{};
+}
 
-bool MeridianPipeline::backend_enabled() const { return backend_ != nullptr; }
+bool MeridianPipeline::backend_enabled() const {
+  return backend_ != nullptr;
+}
 
-NavState MeridianPipeline::live_state() const { return frontend_->live_state(); }
+NavState MeridianPipeline::live_state() const {
+  return frontend_->live_state();
+}
 
 TelemetrySink* MeridianPipeline::telemetry() {
   return sink_.get();
@@ -426,7 +452,14 @@ bool MeridianPipeline::stage_backend_item(BackendItem&& item) {
           if (store_) {
             // Retain the cloud and stamp before the packet is moved into the back-end;
             // the map cloud composes from here, and the detector reads the same store.
-            store_->put(v.id, v.cloud_body, v.image, v.T_ref_body);
+            // The retained image is rectified to the pinhole model the map's calibration
+            // snapshot carries (the packet keeps the raw frame for the back-end), and the
+            // camera extrinsic rides along so colour projects from the right pose.
+            auto image = v.image;
+            if (image && camera_preprocessor_) {
+              image = camera_preprocessor_->rectify_frame(image);
+            }
+            store_->put(v.id, v.cloud_body, std::move(image), v.T_ref_body, v.T_body_cam);
             kf_stamps_[v.id] = v.stamp;
           }
           if (loop_detector_) pending_kf_for_detector_.emplace_back(v.id, v.cloud_body);
@@ -443,8 +476,7 @@ bool MeridianPipeline::stage_backend_item(BackendItem&& item) {
 
 void MeridianPipeline::backend_loop() {
   using Clock = std::chrono::steady_clock;
-  const auto interval =
-      std::chrono::milliseconds(std::llround(cfg_.backend.optimize_interval_ms));
+  const auto interval = std::chrono::milliseconds(std::llround(cfg_.backend.optimize_interval_ms));
   auto last_opt = Clock::now();
   std::uint64_t staged = 0;
   bool force = false;
@@ -514,7 +546,57 @@ void MeridianPipeline::publish_graph_update(const GraphUpdate& gu) {
   if (store_ && last_kf_id_) {
     publish_map_cloud(ts, /*force=*/gu.loop_closed);
   }
+  if (map_) update_l4_map(gu, ts, /*force=*/gu.loop_closed);
   if (graph_update_sink_) graph_update_sink_(gu);
+}
+
+void MeridianPipeline::update_l4_map(const GraphUpdate& gu, Timestamp ts, bool force) {
+  // Correct already-integrated keyframes first (clear-and-rebuild of the moved region).
+  if (!gu.moved.empty()) map_->apply_graph_update(gu);
+  // Integrate any newly-placed keyframes at their corrected back-end poses. A keyframe is
+  // mapped exactly once; subsequent moves arrive through apply_graph_update above.
+  for (const std::uint64_t id : store_->ids()) {
+    if (mapped_ids_.count(id) != 0) continue;
+    const std::optional<Pose> p = backend_->pose_of(id);
+    if (!p) continue;  // not yet placed in the graph; integrate on a later fold
+    const PointCloudPtr cloud = store_->cloud(id);
+    if (!cloud) continue;
+    KeyframePacket kf;
+    kf.id = id;
+    kf.cloud_body = cloud;
+    kf.image = store_->image(id);
+    kf.T_body_cam = store_->body_cam(id).value_or(Pose{});
+    map_->integrate(kf, *p);
+    mapped_ids_.insert(id);
+  }
+  // The surface mesh is O(voxels) to extract and large to transport, so throttle it
+  // (forced on a loop fold, where the whole point is to show the corrected surface).
+  if (!force && ++folds_since_mesh_ < kMeshFoldPeriod) return;
+  folds_since_mesh_ = 0;
+  publish_map_mesh(ts);
+}
+
+void MeridianPipeline::publish_map_mesh(Timestamp ts) {
+  if (!map_ || !sink_->wants_clouds()) return;
+  const ColorMesh& mesh = map_->extract_mesh();
+  if (mesh.indices.empty()) return;
+  // Triangle-list marker: expand the indexed mesh into 3-vertices-per-triangle order
+  // (a backend may share welded vertices between triangles), colours carried per vertex.
+  Marker mk;
+  mk.type = Marker::Type::Triangles;
+  mk.frame = Frame::Map;
+  mk.ns = "map/mesh";
+  mk.id = 0;
+  mk.scale = 1.0f;
+  mk.points.resize(mesh.indices.size());
+  mk.colors.resize(mesh.indices.size());
+  for (std::size_t i = 0; i < mesh.indices.size(); ++i) {
+    const std::uint32_t v = mesh.indices[i];
+    mk.points[i] = mesh.vertices[v];
+    mk.colors[i] = {mesh.colors[v][0] / 255.f, mesh.colors[v][1] / 255.f, mesh.colors[v][2] / 255.f,
+                    1.f};
+  }
+  sink_->marker(mk, ts);
 }
 
 std::vector<LoopConstraint> MeridianPipeline::detect_loops() {

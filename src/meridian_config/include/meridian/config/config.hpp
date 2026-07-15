@@ -17,7 +17,7 @@ enum class PipelineMode { Live, Replay };
 enum class TimeSource { Ptp, Pps, Host };
 enum class FrontEndKind { Lio };
 enum class BackEndKind { Isam2 };
-enum class MapBackend { Nvblox };
+enum class MapBackend { Nvblox, Cpu, Vulkan };
 enum class MeshKind { MarchingCubes };
 enum class PlaceKind { ScanContextPp };
 enum class RobustKernel { Huber, Cauchy, Gm, Tls };
@@ -381,21 +381,32 @@ struct MapStore {
   StoreBackend backend = StoreBackend::Ram;
 };
 struct MapConfig {
+  bool enable = false;  // construct + run the L4 map stage in the pipeline
+  // Surface backend; must be one compiled into this build (cpu always; nvblox under
+  // MERIDIAN_MAP_NVBLOX). Selection is fail-fast, never a silent substitution.
   MapBackend backend = MapBackend::Nvblox;
+  // Tier R (CPU registration voxel-hash)
   double reg_voxel_m = 0.2;
   int reg_max_pts = 20;
+  int reg_seed = 0;  // deterministic reservoir voxel-eviction seed
   int reg_max_level = 3;
   double reg_planarity = 0.1;
   int reg_min_plane_pts = 5;
   int reg_neighbor_ring = 1;
   double reg_hot_radius_m = 100.0;
+  // Tier S (surface TSDF + colour + mesh)
   double tsdf_voxel_m = 0.05;  // must be <= reg_voxel_m and <= preprocess.voxel_surf_m
   int tsdf_trunc_voxels = 4;
-  double tsdf_w_max = 100.0;
+  double tsdf_w_max = 8.0;                       // small: keeps the surface responsive
+  double tsdf_max_integration_dist_m = 50.0;     // surface-fusion depth cutoff; primary VRAM control
   bool colour = true;
+  double color_ewma_alpha = 0.8;                 // colour blend toward newest in-band observation
+  bool color_occlusion_check = true;             // sphere-trace before colouring a voxel
+  bool invalid_depth_decay = false;              // optional reproducible far-outlier prune (post-MVP)
   MeshKind mesh = MeshKind::MarchingCubes;
+  bool mesh_incremental = true;  // re-mesh only changed blocks; false = full re-extract per call
   double mesh_max_rate_hz = 2.0;
-  double mesh_conf_w = 10.0;
+  double mesh_conf_w = 8.0;                       // W_conf for per-vertex confidence (= tsdf_w_max)
   MapStore store{};
 };
 

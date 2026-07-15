@@ -22,8 +22,10 @@
 > the `IFrontEnd` interface (spec 01 §7.3); camera and GNSS are carried through
 > the pipeline unfused. The estimator links **no solver, NN, or image library**
 > — Eigen + Sophus only. The deployment
-> target is an **NVIDIA Jetson Orin with CUDA always present**; mapping is
-> **nvblox, GPU-only, no CPU fallback**.
+> target is an **NVIDIA Jetson Orin with CUDA always present**, where mapping runs
+> the **nvblox GPU backend**. The surface tier is pluggable behind `ISurfaceMap`
+> (`nvblox` GPU / `cpu` host / deferred `vulkan`), one selected per build-and-run,
+> explicitly and fail-fast — never a silent downgrade off nvblox (§7.6).
 >
 > **Companion specs.** `00_architecture.md` (package layout §2, dependency rules
 > §4, build system §9 — this spec is the full expansion of §9), `01_interfaces_
@@ -55,11 +57,13 @@
 ## 1. Library canon — one chosen library per job
 
 The governing principle (spec 00, and the project owner's simplicity mandate):
-**pick the single best library per job and commit.** No dual code paths, no "or
-alternatively" hedges, no defensive CPU fallback. The table below is the whole
+**pick the single best library per job and commit.** No dual code paths and no "or
+alternatively" hedges. The one deliberate exception is the surface map: `ISurfaceMap`
+carries interchangeable backends (`nvblox` / `cpu` / `vulkan`) for platform reach,
+but the selection is **explicit and fail-fast, never an automatic fallback** (§7.6),
+so it does not reintroduce defensive dual paths. The table below is the whole
 build's bill of materials; every later section just wires these in. The
-"considered & rejected" column is a one-line pointer to §11 — the design itself
-takes exactly one option.
+"considered & rejected" column is a one-line pointer to §11.
 
 | Job | **Chosen library** | One-line justification | Rejected (→ §11) |
 |---|---|---|---|
@@ -67,7 +71,7 @@ takes exactly one option.
 | Lie groups (SO(3)/SE(3) exp/log, manifolds) | **Sophus** | Header-only `SO3`/`SE3` on Eigen, matching the box-plus/box-minus and right-perturbation convention spec 01 §3.1 mandates. | hand-rolled so3_math, manif |
 | Back-end optimiser (incremental factor graph) | **GTSAM 4.2** | Ships `ISAM2` (the incremental Bayes-tree smoother spec 05 needs), `CombinedImuFactor`, `noiseModel::Robust`+`Huber`, and `GncOptimizer` — the exact factor/robustness set spec 05 specifies, in one BSD library. | g2o, Ceres-only back-end, SE-Sync |
 | Per-sweep registration solver | **Meridian GN (in `meridian_frontend/src/lio/`)** | The front-end's solve is a 6-DoF Gauss-Newton point-to-point ICP whose normal equations are a closed-form 6×6 LDLT — small enough that a library solver buys nothing and costs determinism. (Ceres remains installed in the container but is **unlinked**: its consumer, the removed CT window solver, no longer exists.) | Ceres, GTSAM for the per-sweep solve |
-| Dense mapping: TSDF + colour + mesh | **nvblox (isaac_ros_nvblox)** | GPU TSDF + GPU colour fusion + GPU Marching Cubes in one CUDA library with a maintained ROS 2 wrapper; on the guaranteed-CUDA Jetson Orin it is the only map backend (spec 06 Appendix R). **No CPU fallback.** | VDBFusion, Voxblox, OpenVDB/NanoVDB |
+| Dense mapping: TSDF + colour + mesh | **nvblox (isaac_ros_nvblox)** — production backend | GPU TSDF + GPU colour fusion + GPU Marching Cubes in one CUDA library; the canonical `ISurfaceMap` backend on the guaranteed-CUDA Jetson Orin (spec 06 §0, Appendix R). A bespoke **`cpu`** backend (small projective TSDF + Marching Cubes, no extra mapping library) and a deferred **`vulkan`** backend implement the same interface for non-CUDA platforms; §7.6 governs which are compiled. | VDBFusion, Voxblox, OpenVDB/NanoVDB (as *libraries*) |
 | Nearest-neighbour map for registration | **voxel-hash maps (Meridian)** | The front-end's local map (`meridian_frontend/src/lio/`) and the L4 registration map (spec 06 §3) are both `std::unordered_map`-based voxel hashes with fixed-order neighbour probes — deterministic by construction and validated against brute-force references in unit tests, with no external NN library. | nanoflann, PCL KdTree, reference k-d trees |
 | Fine registration (loop-closure GICP verify) | **small_gicp** | Header-light, multi-threaded GICP/VGICP that takes Eigen point buffers directly — the L5 verify step (spec 07) wants a fast, dependency-thin GICP, not full PCL registration. | PCL GICP, libpointmatcher |
 | Point-cloud I/O & filters | **PCL** (io/filters only, sparingly) | Used *only* for bag/file I/O and a couple of filters at the edges; the hot path computes on `meridian::LidarPoint` buffers, never `pcl::PointCloud` (spec 01 §1 R1). PCL is a heavy dependency, so it is fenced to `meridian_preprocess`/`meridian_tools`. | PCL everywhere (rejected by R1) |
@@ -119,7 +123,7 @@ These are the exact versions the workspace is validated against. Pins live in
 | Sophus | **1.22.10** (the 2022 tagged release) | vcs source build *or* apt where available | Header-only; must be the Eigen-3.4-compatible tag. |
 | GTSAM | **4.2.0** | source build (CMake), `GTSAM_USE_SYSTEM_EIGEN=ON` | Build with `GTSAM_BUILD_WITH_MARCH_NATIVE=OFF` (reproducible Orin binary), `GTSAM_USE_SYSTEM_EIGEN=ON` (one Eigen, §8), `GTSAM_WITH_TBB=OFF` unless TBB is also pinned. Provides ISAM2 / CombinedImuFactor / Robust+Huber / GncOptimizer (spec 05 Appendix R). |
 | Ceres | **2.1.0** | apt `libceres-dev` (2.1 on jammy) | **Installed in the container but unlinked**: its consumer, the CT window solver, was removed with the CT front-end. The pin documents the container image (avoids an image rebuild), not a link dependency — no `meridian_*` package may link it. |
-| nvblox | **isaac_ros_nvblox, Humble release line** (pin the commit in `dependencies.repos`) | vcs source build (CUDA) | The only map backend; §7. Built against system CUDA 12.x. |
+| nvblox | **isaac_ros_nvblox, Humble release line** (pin the commit in `dependencies.repos`) | vcs source build (CUDA) | The production `ISurfaceMap` backend; §7. Built against system CUDA 12.x. Required only when `MERIDIAN_MAP_NVBLOX=ON`; the `cpu` backend needs no extra dependency. |
 | CUDA | **12.x** (JetPack 6 system CUDA) | JetPack / apt | `nvcc`, cuBLAS, Thrust — all nvblox needs. |
 | PCL | **1.12.x** (jammy) | apt `libpcl-dev` | io/filters only; fenced to `meridian_preprocess`/`meridian_tools`. |
 | OpenCV | **4.5.x** (jammy) | apt `libopencv-dev` | imgproc/video/calib3d for the visual track. On Orin, the JetPack OpenCV (CUDA-enabled) is acceptable but Meridian uses only CPU OpenCV calls — do not depend on CUDA-OpenCV. |
@@ -169,7 +173,7 @@ meridian_ws/
 │  │   src/frontend_factory.cpp
 │  │
 │  ├─ meridian_backend/           # L3: IBackEnd = GTSAM iSAM2            (GTSAM)
-│  ├─ meridian_map/               # L4: IMapLayer = nvblox + voxel-hash   (CUDA, nvblox, Eigen)
+│  ├─ meridian_map/               # L4: IMapLayer = ISurfaceMap(nvblox|cpu) + voxel-hash (Eigen; CUDA+nvblox for nvblox backend)
 │  │   include/meridian/map/
 │  ├─ meridian_place/             # L5: IPlaceRecognizer                  (Eigen, small_gicp,
 │  │                           #       vendored Scan Context++)
@@ -461,14 +465,19 @@ been removed; the front-end vendors nothing.)
 
 ---
 
-## 7. CUDA / nvblox build setup for Jetson Orin
+## 7. CUDA / nvblox build setup for Jetson Orin (and the `cpu` backend)
 
-nvblox is the **only** map backend and the **only** CUDA in the build. There is
-**no CPU fallback** — `meridian_map` requires CUDA to compile and the deployment
-target always has it (spec 06 Appendix R; the simplicity mandate). A no-GPU
-developer box does not get a CPU map; it simply omits the map from the build via
-the compile-time `MERIDIAN_WITH_MAP` guard (§7.6), which is a build exclusion, not
-a runtime alternative.
+nvblox is the **production** `ISurfaceMap` backend and the **only** CUDA in the
+build. The deployment target (Jetson Orin) always has CUDA, so deployed binaries
+build the nvblox backend and run it (spec 06 §0, Appendix R). A non-CUDA developer
+box (a plain x86 laptop, an Apple-Silicon dev machine) builds the **`cpu`**
+backend instead — a host TSDF+colour+Marching-Cubes implementation of the same
+`ISurfaceMap` contract — so it gets a *working* map, not an absent one. Two
+compile flags govern this (§7.6): `MERIDIAN_WITH_MAP` (build the map layer at all)
+and `MERIDIAN_MAP_NVBLOX` (compile the CUDA/nvblox backend). The `cpu` backend
+always compiles when the map layer is built; it needs no CUDA. Backend selection at
+runtime is `map.backend`, explicit and fail-fast — never an automatic downgrade
+(spec 00 §9.5).
 
 ### 7.1 Platform assumptions
 
@@ -481,66 +490,77 @@ a runtime alternative.
   talks to nvblox's C++ library directly (spec 00 R1: the core is ROS-agnostic,
   so the ROS nvblox node is not in our data path).
 
-### 7.2 `meridian_map/CMakeLists.txt` (the CUDA core package)
+### 7.2 `meridian_map/CMakeLists.txt` (CPU backend always; CUDA backend gated)
+
+The package builds the backend-independent core (Tier R, the store, the façade) and
+the **`cpu` backend** with no CUDA. The **`nvblox` backend** — its host wrapper, its
+one `.cu` file, and the `find_package(nvblox)` / `enable_language(CUDA)` it needs —
+is compiled only when `MERIDIAN_MAP_NVBLOX` is ON, behind `MERIDIAN_MAP_HAS_NVBLOX`.
 
 ```cmake
 cmake_minimum_required(VERSION 3.22)
-project(meridian_map NONE)                          # decide language after the guard
+project(meridian_map NONE)                          # decide languages after the guards
 
 find_package(ament_cmake REQUIRED)
 find_package(meridian_cmake REQUIRED)
 include(MeridianToolchain)                          # also sets CUDA std/arch (below)
 
-# Build minus map on a no-GPU dev box (spec 00 §9.5, §7.6). When OFF, this package
-# contributes nothing and never touches CUDA/nvblox — it is NOT a CPU map.
+# Drop the whole map layer on a minimal non-map build (spec 00 §9.5, §7.6).
 if(NOT MERIDIAN_WITH_MAP)
   ament_package()
   return()
 endif()
 
-enable_language(CXX CUDA)                            # CUDA is first-class only past the guard
+enable_language(CXX)                                 # the cpu backend + core are pure C++
 include(MeridianDeps)
 include(MeridianVendored)
-
-find_package(CUDAToolkit REQUIRED)               # modern FindCUDAToolkit (CMake ≥3.17)
-find_package(nvblox REQUIRED)                     # nvblox's exported CMake config
 find_package(meridian_common REQUIRED)
 find_package(meridian_debug  REQUIRED)
 find_package(meridian_calib  REQUIRED)
 
+# Backend-independent core + the always-available cpu backend.
 add_library(meridian_map
   src/voxel_hash_map.cpp           # Tier R registration (CPU)
   src/keyframe_store.cpp           # retained cloud store (CPU)
-  src/nvblox_surface_map.cpp       # Tier S: wraps nvblox TSDF+colour+mesh (host side)
-  src/nvblox_integrate.cu          # CUDA: cloud->depth projection feeding nvblox
-  src/map_factory.cpp)
+  src/cpu/cpu_surface_map.cpp      # ISurfaceMap backend: host TSDF+colour+Marching-Cubes
+  src/map_factory.cpp)             # makeMapLayer: dispatches on map.backend
 
-set_target_properties(meridian_map PROPERTIES
-  CUDA_STANDARD 17                 # nvblox kernels are C++17
-  CUDA_STANDARD_REQUIRED ON
-  CUDA_SEPARABLE_COMPILATION ON
-  CUDA_ARCHITECTURES 87)           # Orin SM 8.7 (single arch)
-
-target_compile_features(meridian_map PUBLIC cxx_std_20)   # host side is C++20
-
+target_compile_features(meridian_map PUBLIC cxx_std_20)
 target_include_directories(meridian_map PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-
 target_link_libraries(meridian_map PUBLIC
   meridian_common::meridian_common meridian_debug::meridian_debug meridian_calib::meridian_calib
-  Eigen3::Eigen
-  nvblox::nvblox                   # TSDF + colour + Marching Cubes (GPU)
-  CUDA::cudart)
+  Eigen3::Eigen)
+
+# nvblox (GPU) backend — compiled only where CUDA + nvblox are present.
+if(MERIDIAN_MAP_NVBLOX)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  find_package(nvblox REQUIRED)
+  target_sources(meridian_map PRIVATE
+    src/nvblox/nvblox_surface_map.cpp   # Tier S host wrapper (TSDF+colour+mesh)
+    src/nvblox/nvblox_integrate.cu)     # the one boundary .cu (cloud->depth projection)
+  set_target_properties(meridian_map PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_SEPARABLE_COMPILATION ON CUDA_ARCHITECTURES 87)   # Orin SM 8.7
+  target_link_libraries(meridian_map PUBLIC nvblox::nvblox CUDA::cudart)
+  target_compile_definitions(meridian_map PUBLIC MERIDIAN_MAP_HAS_NVBLOX)  # map_factory dispatch
+endif()
 # NO rclcpp — meridian_map is core.
 
 ament_export_targets(meridian_mapTargets HAS_LIBRARY_TARGET)
-ament_export_dependencies(meridian_common meridian_debug meridian_calib Eigen3 nvblox CUDAToolkit)
+ament_export_dependencies(meridian_common meridian_debug meridian_calib Eigen3)
 install(TARGETS meridian_map EXPORT meridian_mapTargets
         ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include)
 ament_package()
 ```
+
+`map_factory.cpp` constructs the backend named by `map.backend`: `cpu` always,
+`nvblox` only under `#ifdef MERIDIAN_MAP_HAS_NVBLOX`. A `map.backend` that names a
+backend not compiled into this build is a fail-fast configuration error (spec 06
+§8.1) — never a silent substitution.
 
 ### 7.3 What `MeridianToolchain.cmake` sets for CUDA
 
@@ -573,35 +593,49 @@ config, or (b) once into an install prefix that `CMAKE_PREFIX_PATH` then exposes
 to `find_package(nvblox)`. The core CMake build (cuBLAS/Thrust only, no ROS) is
 preferred so `meridian_map` links `nvblox::nvblox` without dragging the ROS wrapper.
 
-### 7.5 The one boundary `.cu` file
+### 7.5 The one boundary `.cu` file (nvblox backend)
 
-The only CUDA Meridian *writes* is `nvblox_integrate.cu`: it projects a retained
-`meridian::LidarPoint` cloud (body frame) at a corrected pose into the depth/colour
-representation nvblox's `ProjectiveTsdfIntegrator` / `ProjectiveColorIntegrator`
-consume, and drives `updateMesh()`. Everything else (TSDF fusion, ESDF if ever
-enabled, Marching Cubes) is nvblox's own kernels. We do not reimplement fusion;
-spec 06 fixes the runtime, this spec just compiles it.
+The only CUDA Meridian *writes* is `src/nvblox/nvblox_integrate.cu`: it projects a
+retained `meridian::LidarPoint` cloud (body frame) at a corrected pose into the
+depth/colour representation nvblox's `ProjectiveTsdfIntegrator` /
+`ProjectiveColorIntegrator` consume, and drives `updateMesh()`. Everything else
+(TSDF fusion, ESDF if ever enabled, Marching Cubes) is nvblox's own kernels. The
+`cpu` backend reimplements the same §4.3/§5 fusion math on the host (a small
+projective TSDF + Marching Cubes), validated against the analytic oracle in the
+conformance suite (spec 06 §8.4); spec 06 fixes the runtime, this spec just
+compiles it.
 
-> **No fallback, stated once.** There is no `#ifdef MERIDIAN_NO_CUDA`, no
-> VDBFusion/OpenVDB path, no `IMapLayer` second implementation. `meridian_map`
-> fails to configure without CUDA + nvblox, and that is correct for the Jetson
-> Orin target.
+> **No silent fallback.** Backend selection is `map.backend`, validated at startup
+> against the backends compiled in (§7.6); an `nvblox` deployment still hard-fails
+> on a missing GPU and never degrades itself to `cpu` (spec 00 §9.5). There is no
+> VDBFusion/OpenVDB *library* path — the `cpu` backend is Meridian's own host TSDF,
+> not a smuggled-in second mapping library.
 
-### 7.6 The `MERIDIAN_WITH_MAP` compile-time guard (build minus map, never a CPU map)
+### 7.6 The map compile-time guards (`MERIDIAN_WITH_MAP`, `MERIDIAN_MAP_NVBLOX`)
 
-A developer box without CUDA (a plain x86 laptop, an Apple-Silicon dev machine) must still be able to build and unit-test the non-map layers — the front-end, back-end, place recognition, sensors, and all cross-cutting libraries. This is a **build-configuration exclusion**, not a runtime fallback: the switch removes `meridian_map` from the build graph entirely; it never substitutes a CPU map.
+Two orthogonal switches decide what of L4 is built. `MERIDIAN_WITH_MAP` decides
+whether the map layer exists at all; `MERIDIAN_MAP_NVBLOX` decides whether the
+CUDA/nvblox backend is compiled into it. The `cpu` backend is built whenever the
+map layer is, so a non-CUDA box gets a **working map**, not an absent one.
 
 ```cmake
-# MeridianToolchain.cmake — workspace-wide switch, default ON (full GPU deployment build).
-option(MERIDIAN_WITH_MAP "Build the GPU map layer (meridian_map, nvblox/CUDA)" ON)
+# MeridianToolchain.cmake — workspace-wide switches.
+option(MERIDIAN_WITH_MAP   "Build the map layer (meridian_map)"            ON)
+# Default the nvblox backend to ON only when a CUDA compiler is available, so a
+# non-CUDA dev box configures cleanly with the cpu backend and no manual flags.
+include(CheckLanguage)
+check_language(CUDA)
+option(MERIDIAN_MAP_NVBLOX "Compile the nvblox (CUDA/GPU) surface backend"
+       $<IF:$<BOOL:${CMAKE_CUDA_COMPILER}>,ON,OFF>)
 ```
 
 Rules:
 
-- **`MERIDIAN_WITH_MAP=ON` (default, the only deployment configuration).** `meridian_map` is built exactly as §7.2 specifies; CUDA + nvblox are required and the build hard-fails without them. Every deployed binary is built this way.
-- **`MERIDIAN_WITH_MAP=OFF` (development / CI of non-map layers only).** `meridian_map` is skipped (its `CMakeLists.txt` early-returns before `enable_language(... CUDA)`, so no CUDA toolkit is required and `find_package(nvblox)` is never reached — see the guard at the top of the §7.2 sketch). `meridian_pipeline` and `meridian_ros`, which link the map, compile the map-facing wiring out behind the same guard: the pipeline constructs the map stage (T4/T5 in spec 00 §11) and the `Q_map` queue **only** when `MERIDIAN_WITH_MAP` is defined, and exposes no `IMapLayer` otherwise. The resulting binary has **no map at all** — it is not a degraded map, not a CPU map, not a runtime-selectable mode.
-- **No runtime branch and no second `IMapLayer`.** The guard is preprocessor/CMake only. There is never an `#ifdef`-selected CPU integrator, never a `map.backend` value other than `nvblox`, and never a path where a `MERIDIAN_WITH_MAP=ON` binary degrades to CPU on a missing GPU — it fail-fasts (spec 00 §9.5). The guard's sole purpose is letting a no-GPU box build the rest of the system; it preserves the "nvblox GPU-only, no CPU fallback" invariant rather than weakening it.
-- **CI coverage.** CI builds the workspace **both** ways: the on-device/x86-GPU image builds with `MERIDIAN_WITH_MAP=ON` (the full system, §9.3); a no-CUDA x86 image builds with `MERIDIAN_WITH_MAP=OFF` and runs the non-map unit/replay tests, so the dev-box build path stays green.
+- **Deployment (Jetson / any CUDA box): `MERIDIAN_WITH_MAP=ON`, `MERIDIAN_MAP_NVBLOX=ON`.** `meridian_map` builds the core + `cpu` + `nvblox` backends; CUDA + nvblox are required and the build hard-fails without them. The deployed config sets `map.backend: nvblox` and hard-fails on a missing GPU at runtime (spec 00 §9.5). Every deployed binary is built this way.
+- **Non-CUDA dev / CI: `MERIDIAN_WITH_MAP=ON`, `MERIDIAN_MAP_NVBLOX=OFF`.** `meridian_map` builds the core + `cpu` backend only; `enable_language(CUDA)` and `find_package(nvblox)` are never reached, so no CUDA toolkit is needed. The binary has a **fully working map** via `map.backend: cpu` — lower-resolution / lower-throughput than nvblox (spec 06 §0), but a real TSDF+colour+mesh the dev Mac can run and visualise. `meridian_pipeline`/`meridian_ros` build the map stage (T4/T5, `Q_map`) unchanged — the map is present, only the backend differs.
+- **Minimal non-map build: `MERIDIAN_WITH_MAP=OFF`.** `meridian_map` early-returns and contributes nothing; `meridian_pipeline`/`meridian_ros` compile the map-facing wiring out behind the same guard and expose no `IMapLayer`. The binary has **no map at all** — for building/testing the non-map layers in isolation.
+- **Selection is fail-fast, never silent.** The guards are CMake/preprocessor only; runtime backend choice is `map.backend`, validated against the compiled-in backends (`map_factory.cpp`, spec 06 §8.1). A `MERIDIAN_MAP_NVBLOX=ON` binary with `map.backend: nvblox` never degrades to `cpu` on a missing GPU — it fail-fasts. A non-CUDA build that is asked for `map.backend: nvblox` fail-fasts at startup rather than substituting `cpu`.
+- **CI coverage.** CI builds the workspace three ways: an on-device/x86-GPU image with `MERIDIAN_MAP_NVBLOX=ON` (full system, §9.3); a no-CUDA x86/ARM image with `MERIDIAN_MAP_NVBLOX=OFF` (the `cpu`-backend map) running the non-GPU unit/replay tests and the §8.4 conformance suite for the `cpu` backend; and a `MERIDIAN_WITH_MAP=OFF` build to keep the map-excluded path green.
 
 ---
 
@@ -712,16 +746,19 @@ the LSP. On the x86 dev box, swap `--mixin orin` for `--mixin release` (and set
 6. **clang-tidy / clang-format** on every core TU; `-Werror` in core.
 7. **Build + unit + replay tests** under `colcon test` (GoogleTest); the replay
    test drives `meridian_pipeline` from a bag via `meridian_tools` with no ROS spinning
-   (proves the off-ROS path). The non-map build (`MERIDIAN_WITH_MAP=OFF`, §7.6) runs
-   the non-map unit/replay tests so the no-GPU dev-box path stays green.
+   (proves the off-ROS path). The no-CUDA build (`MERIDIAN_MAP_NVBLOX=OFF`, §7.6) runs
+   the non-GPU unit/replay tests plus the §8.4 surface-backend conformance suite for
+   the `cpu` backend, so the dev-box path (with a working map) stays green; the
+   map-excluded build (`MERIDIAN_WITH_MAP=OFF`) keeps that path green too.
 8. **Reproducible, dual base images.** CI runs in **two** tagged Docker images that
    snapshot the §3 apt versions so apt deps never float: an **Orin/JetPack** image
    (`nvcr.io/nvidia/l4t-jetpack`-based, CUDA 12.x, `CMAKE_CUDA_ARCHITECTURES=87`,
-   builds `MERIDIAN_WITH_MAP=ON`) and an **x86 dev** image (`ros:humble`-based, builds
-   `MERIDIAN_WITH_MAP=OFF`, or `ON` with `CMAKE_CUDA_ARCHITECTURES=89;87` when a CUDA
-   runner is available). Both images derive their dependency stack from a single
-   `docker/install-deps.sh`, so the Orin and x86 toolchains can never drift; the image
-   tags are the build's apt/CUDA pin (§3 pin discipline).
+   builds `MERIDIAN_MAP_NVBLOX=ON`) and an **x86 dev** image (`ros:humble`-based, builds
+   `MERIDIAN_MAP_NVBLOX=OFF` for the `cpu`-backend map, or `ON` with
+   `CMAKE_CUDA_ARCHITECTURES=89;87` when a CUDA runner is available). Both images derive
+   their dependency stack from a single `docker/install-deps.sh`, so the Orin and x86
+   toolchains can never drift; the image tags are the build's apt/CUDA pin (§3 pin
+   discipline).
 
 ---
 
@@ -765,12 +802,16 @@ nvblox GPU map links, and the off-ROS replay path runs — which is the bar this
 spec must clear.
 
 > **No-GPU dev box.** On an x86 laptop or Apple-Silicon machine without CUDA,
-> skip steps 6's nvblox build and 7, and build with `MERIDIAN_WITH_MAP=OFF`
-> (§7.6): `colcon build --mixin release --cmake-args -DMERIDIAN_WITH_MAP=OFF`.
-> This compiles and tests every layer except `meridian_map` (the front-end,
-> back-end, place recognition, sensors, all cross-cutting). It is a development
-> convenience only — the deployed Orin build is always `MERIDIAN_WITH_MAP=ON`
-> with the full GPU map; there is never a runtime CPU map path (spec 00 §9.5).
+> skip step 6's nvblox build and step 7, and build with `MERIDIAN_MAP_NVBLOX=OFF`
+> (§7.6): `colcon build --mixin release --cmake-args -DMERIDIAN_MAP_NVBLOX=OFF`
+> (this is also the auto-default when no CUDA compiler is detected). This compiles
+> and tests **every layer including a working map** — `meridian_map` builds with the
+> `cpu` surface backend, so `map.backend: cpu` runs a real TSDF+colour+mesh the dev
+> box can produce and visualise (lower-res / slower than nvblox, spec 06 §0). The
+> deployed Orin build is always `MERIDIAN_MAP_NVBLOX=ON` with `map.backend: nvblox`;
+> backend choice is explicit and the deployment never degrades itself to `cpu` on a
+> missing GPU (spec 00 §9.5). `MERIDIAN_WITH_MAP=OFF` remains available to drop the
+> map entirely for non-map-layer work.
 > Both configurations are produced from the same pinned Docker bases (§9.3 gate 8),
 > whose dependency stack comes from a single `docker/install-deps.sh` so the Orin
 > and x86 toolchains cannot drift.
@@ -785,7 +826,7 @@ choices, here is the one-line reason the alternative lost. This section is the
 
 | Job | Rejected option | Why rejected |
 |---|---|---|
-| **Dense mapping** | **VDBFusion / OpenVDB / NanoVDB (CPU, km-scale)** | The deployment target is a CUDA Jetson Orin where nvblox does GPU TSDF + colour + Marching Cubes in one library; a CPU OpenVDB path is a second, untested map backend that the simplicity mandate forbids. We do **not** ship it even as a fallback. (Earlier drafts floated VDBFusion as a "CPU/km-scale fallback" and a NanoVDB "Tier G archive" — both are dropped here; if extreme-extent outdoor mapping is ever needed it is a *future* `IMapLayer` implementation, not a current dual path.) |
+| **Dense mapping** | **VDBFusion / OpenVDB / NanoVDB (CPU, km-scale)** | These *libraries* are not linked: the `cpu` surface backend is Meridian's own small projective TSDF + Marching Cubes (spec 06 §0), not a second mapping library with its own data model and tuning surface. nvblox stays the GPU production backend. (Earlier drafts floated VDBFusion as a "CPU/km-scale fallback" and a NanoVDB "Tier G archive" — both dropped; extreme-extent out-of-core mapping, if ever needed, is a *future* derived layer, not a dual map path.) |
 | **Dense mapping** | **Voxblox (CPU)** | Ageing CPU codebase; nvblox supersedes it on GPU with the same block-hash semantics. Kept only as the ESDF *algorithm* reference (spec 06 Appendix R), never linked. |
 | Back-end optimiser | **g2o** | GTSAM ships `ISAM2` (true incremental Bayes tree), `GncOptimizer`, and `CombinedImuFactor` out of the box (spec 05 Appendix R); g2o would mean re-implementing incremental smoothing and GNC. |
 | Back-end optimiser | **Ceres as the global back-end** | Ceres is batch; the global graph needs *incremental* iSAM2. |

@@ -8,6 +8,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -23,7 +24,8 @@
 #include "meridian/common/sample.hpp"
 #include "meridian/config/config.hpp"
 #include "meridian/place/iloop_detector.hpp"
-#include "meridian/place/keyframe_store.hpp"
+#include "meridian/map/imap_layer.hpp"
+#include "meridian/map/keyframe_store.hpp"
 #include "meridian/sensors/raw_frames.hpp"
 
 namespace meridian {
@@ -191,6 +193,11 @@ private:
   // voxel-downsampled, published in the map frame. Throttled, and forced on a loop closure (when
   // the map de-warps). No-op without the keyframe store / back-end / an enabled sink key.
   void publish_map_cloud(Timestamp ts, bool force);
+  // Drives the L4 map (when map.enable): corrects moved keyframes on a graph update,
+  // integrates newly-placed keyframes at their corrected poses, and publishes the surface
+  // mesh. No-op without the map stage. Throttled like the map cloud.
+  void update_l4_map(const GraphUpdate& gu, Timestamp ts, bool force);
+  void publish_map_mesh(Timestamp ts);
   // Measurement-time anchor for back-end-path telemetry sampled outside a measurement
   // callback (queue depth, post-optimize diagnostics): the last keyframe's stamp, or 0
   // before the first keyframe. Data-driven, not wall-clock, so replay stays deterministic.
@@ -219,6 +226,11 @@ private:
   // the back-end. Declared after backend_ so it is destroyed first (it borrows backend_).
   std::shared_ptr<KeyframeStore> store_;
   std::unique_ptr<ILoopDetector> loop_detector_;
+  // L4 layered map (null when map.enable is off). Shares the canonical store_; integrates
+  // keyframes at corrected poses and publishes the surface mesh. Declared after store_ so
+  // it is destroyed before it (it borrows the shared store).
+  IMapLayer::Ptr map_;
+  std::unordered_set<std::uint64_t> mapped_ids_;  // keyframes already integrated into map_
   KeyframePoseSource pose_source_;
 
   BoundedQueue<SensorSample> q_sensors_;
@@ -250,6 +262,8 @@ private:
   std::vector<std::pair<std::uint64_t, PointCloudPtr>> pending_kf_for_detector_;
   // Folds since the assembled map cloud was last published (throttle). Back-end driver only.
   std::uint64_t folds_since_map_cloud_ = 0;
+  // Folds since the L4 surface mesh was last extracted+published (throttle).
+  std::uint64_t folds_since_mesh_ = 0;
   // Items staged into the back-end since its last fold (Replay's inline driver only;
   // the Live count lives in backend_loop()).
   std::uint64_t staged_since_opt_ = 0;

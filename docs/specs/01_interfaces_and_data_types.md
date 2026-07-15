@@ -959,16 +959,17 @@ struct GraphUpdate {
 ### 7.5 `IMapLayer` (L4)
 
 ```cpp
-// The layered map. ONE interface, but implementations form the stack:
-// VoxelHashMap (registration), TsdfRgbMap (NVBlox surface), and the mesh stage
-// reads the TsdfRgbMap. They all consume KeyframePackets' clouds + GraphUpdates.
+// The layered map. ONE facade over a stack: VoxelHashMap (registration), the
+// ISurfaceMap surface tier (TSDF+colour, backend-pluggable: nvblox GPU / cpu host /
+// deferred vulkan — spec 06 §0), and the mesh stage that reads it. They all consume
+// KeyframePackets' clouds + GraphUpdates.
 class IMapLayer {
 public:
   virtual ~IMapLayer() = default;
 
   // Integrate a keyframe's deskewed cloud (+ optional RGB) at its CURRENT pose.
   // Shares the cloud bytes via shared_ptr (no copy). For TSDF this is the
-  // running-average fusion (NVBlox semantics).
+  // running-average fusion, identical across surface backends (spec 06 §4.3).
   virtual void integrate(const KeyframePacket& kf, const Pose& T_map_body) = 0;
 
   // Loop-closure de-integration (MUST-FIX #4): when GraphUpdate says keyframes

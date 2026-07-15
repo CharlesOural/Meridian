@@ -16,6 +16,7 @@
   <depend>meridian_common</depend>
   <depend>meridian_config</depend>
   <depend>meridian_debug</depend>
+  <depend>meridian_map</depend>
   <!-- Sophus is provided by the dev image and found via find_package(Sophus); it has no
        standard rosdep key, so it is not listed here. -->
 

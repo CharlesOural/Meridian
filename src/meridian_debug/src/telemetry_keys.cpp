@@ -47,7 +47,7 @@ constexpr std::array kAll{
     sensors::ImuInGroup, sensors::LidarSweepDurationMs, sensors::LidarExtrinsicDefault,
     sensors::ValidatorPrefix, sensors::RatePrefix,
     // map / body / odom / wrapper
-    map::Cloud, map::Registered, map::Keyframe, body::Scan, odom::Body, wrapper::LidarCbN,
+    map::Cloud, map::Registered, map::Keyframe, map::Mesh, body::Scan, odom::Body, wrapper::LidarCbN,
     wrapper::LidarLostUpstreamN, wrapper::LidarConvertRejectedN,
     // health
     health::ImuRateHz, health::LidarRateHz, health::CameraRateHz, health::GnssRateHz,

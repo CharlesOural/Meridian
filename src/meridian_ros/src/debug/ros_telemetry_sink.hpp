@@ -91,6 +91,9 @@ private:
   rclcpp::Publisher<meridian_msgs::msg::StageTiming>::SharedPtr pub_timing_;
   rclcpp::Publisher<meridian_msgs::msg::Event>::SharedPtr pub_events_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_markers_;
+  // The L4 surface mesh is a standing map product, so it publishes latched
+  // (transient_local): a viewer connecting after the run still sees the final surface.
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_map_mesh_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;  // null when publish_path off
 
   mutable std::mutex m_;
