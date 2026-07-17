@@ -102,15 +102,17 @@ services:
       - dialout
     environment:
       ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
-      # RTK corrections from the Centipede network (free, open). NTRIP_MOUNTPOINT=NEAR
-      # picks the nearest live base and needs the GGA the driver publishes back; a 4-char
-      # base name from map.centipede-rtk.org pins one instead. NEAR4 is the low-bandwidth
-      # (MSM4) variant.
+      # RTK corrections from the Centipede network (free, open). NTRIP_MOUNTPOINT is a
+      # named base, NOT the NEAR auto-select: NEAR needs the rover GGA in the HTTP request
+      # header and ntrip_client can only send it over the socket, which this caster
+      # ignores (see sbg.launch.py). Set it to a base within ~30 km of the rig; list them
+      # from the sourcetable at http://crtk.net/ and see docs/RTK.md. EVCC is 17 km from
+      # the current site -- CHANGE IT if the rig moves regions.
       # Port 80, not the conventional NTRIP 2101: 2101 times out from this network while
       # 80 is open, and the caster answers NTRIP/2.0 on both. Try 2101 elsewhere.
       NTRIP_HOST: "${NTRIP_HOST:-crtk.net}"
       NTRIP_PORT: "${NTRIP_PORT:-80}"
-      NTRIP_MOUNTPOINT: "${NTRIP_MOUNTPOINT:-NEAR}"
+      NTRIP_MOUNTPOINT: "${NTRIP_MOUNTPOINT:-EVCC}"
       NTRIP_USERNAME: "${NTRIP_USERNAME:-centipede}"
       NTRIP_PASSWORD: "${NTRIP_PASSWORD:-centipede}"
     volumes:
