@@ -1,0 +1,65 @@
+schema: meridian.benchmark_scenario/v2
+id: newer_college_park_full
+role: long_run_global_regression
+license: CC-BY-NC-SA-4.0
+input:
+  format: ordered_mixed_ros2_ros1
+  required_runtime_checksum: true
+  sources:
+    - bags/newer-college/park
+    - bags/newer-college/ros1-extra/2021-11-30-17-20-07_3-park.bag
+    - bags/newer-college/ros1-extra/2021-11-30-17-23-25_4-park.bag
+    - bags/newer-college/ros1-extra/2021-11-30-17-26-36_5-park.bag
+    - bags/newer-college/ros1-extra/2021-11-30-17-30-06_6-park.bag
+    - bags/newer-college/ros1-extra/2021-11-30-17-33-19_7-park.bag
+  duration_s: 1572.13
+  estimator_reset_between_sources: false
+  exclude_ros1_packet_topics: true
+calibration:
+  camera_collection: bags/newer-college/calib/collection2
+  body_lidar: bags/newer-college/calib/os_imu_lidar_transforms.yaml
+  beam_intrinsics: bags/newer-college/calib/beam_intrinsics_os0-128.json
+ground_truth:
+  path: bags/newer-college/gt/tum/gt-nc-park-full8.csv
+  body_frame: base_link
+  poses: 15694
+  path_length_m: 2396.195
+estimate:
+  artifact: trajectory_base.tum
+  body_frame: base_link
+evaluation_profiles:
+  internal_interpolated:
+    purpose: meridian_development_and_acceptance
+    publication_eligible: false
+    association: interpolate
+    max_interpolation_gap_s: 0.20
+    alignment: se3_no_scale
+    no_trimming: true
+    rpe_distance_m: 10.0
+    minimum_coverage: 0.99
+  published_nearest_10ms:
+    purpose: published_newer_college_comparison
+    publication_eligible: true
+    association: nearest
+    max_dt_s: 0.01
+    unique_one_to_one: true
+    alignment: se3_no_scale
+    no_trimming: true
+    rpe_distance_m: 10.0
+    minimum_coverage: 0.99
+acceptance_gates:
+  evaluation_profile: internal_interpolated
+  ate_rmse_m:
+    competitive: 0.32
+    strong_global: 0.27
+    stretch: 0.20
+published_results_context:
+  evaluation_profile: published_nearest_10ms
+  comparison_only_not_acceptance_gate: true
+  reference_method: GLIM_with_loop_closure
+  reported_ate_rmse_m: 0.269
+  source: arXiv:2407.10344_Table_V
+  note: Requires the complete ordered Park sequence and the paper-comparable protocol.
+known_limits:
+  - no_gnss
+  - requires_mixed_format_replay_or_conversion

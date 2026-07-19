@@ -14,8 +14,9 @@ Usage (inside the dev container, after sourcing the workspace):
     python3 tools/record_tum.py OUT.tum [--topic /meridian/local/odometry]
 
 Then play the bag as usual; Ctrl-C this script when the bag finishes. Compare
-against the sequence's ground truth (see docs/TESTING.md):
-    python3 tools/eval_ate.py GT.txt OUT.tum
+against the sequence's ground truth with the selected evaluation profile:
+    python3 tools/eval_ate.py GT.txt OUT.tum \
+        --reference-body-frame base_link --estimate-body-frame base_link
 """
 import argparse
 import sys

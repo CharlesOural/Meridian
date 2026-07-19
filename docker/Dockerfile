@@ -11,7 +11,7 @@
 # it cannot build native on arm64; rviz2 (a runtime-only dep) is absent here, and
 # viz goes through the Foxglove bridge instead.
 #
-# Covers CPU contract, estimator, global-graph, ROS adapter, and replay work.
+# Covers CPU APIs, estimator, global graph, ROS adapter, and replay work.
 # GPU registration and the future nvblox dense candidate require the GPU image.
 ARG ROS_DISTRO=humble
 FROM ros:${ROS_DISTRO}-perception
@@ -20,7 +20,7 @@ ARG ROS_DISTRO
 ENV ROS_DISTRO=${ROS_DISTRO}
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Meridian dependency canon — one shared installer (see docs/DEVELOPMENT.md).
+# Meridian dependency canon — one shared installer.
 # MERIDIAN_BUILD_JOBS caps parallel compile jobs; lower it if the build OOMs.
 ARG MERIDIAN_BUILD_JOBS=6
 COPY install-deps.sh /tmp/install-deps.sh

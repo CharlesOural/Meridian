@@ -1,0 +1,44 @@
+schema: meridian.benchmark_scenario/v3
+id: newer_college_park_partial
+role: endurance_development_only
+license: CC-BY-NC-SA-4.0
+input:
+  format: rosbag2_sqlite3
+  path: bags/newer-college/park
+  duration_s: 571.052
+  required_runtime_checksum: true
+calibration:
+  camera_collection: bags/newer-college/calib/collection2
+  body_lidar: bags/newer-college/calib/os_imu_lidar_transforms.yaml
+  beam_intrinsics: bags/newer-college/calib/beam_intrinsics_os0-128.json
+ground_truth:
+  path: bags/newer-college/gt/tum/gt-nc-park.csv
+  body_frame: base_link
+  poses: 5716
+  path_length_m: 936.597
+estimate:
+  artifact: trajectory_base.tum
+  body_frame: base_link
+evaluation_profiles:
+  internal_interpolated:
+    purpose: meridian_endurance_development_only
+    publication_eligible: false
+    association: interpolate
+    coverage_protocol: meridian.fixed_cold_start/v1
+    startup_allowance_s: 2.2
+    maximum_startup_delay_s: 2.2
+    maximum_end_loss_s: 0.20
+    max_interpolation_gap_s: 0.20
+    alignment: se3_no_scale
+    no_estimate_dependent_trimming: true
+    no_extrapolation: true
+    rpe_distance_m: 10.0
+    minimum_window_coverage: 0.99
+    max_output_gap_s: 0.50
+    max_linear_speed_mps: 30.0
+    max_angular_speed_degps: 720.0
+published_comparison_allowed: false
+reason: this_db3_contains_only_official_park_chunks_0_to_2
+known_limits:
+  - no_gnss
+  - 63_gt_stamps_require_high_rate_trajectory_interpolation

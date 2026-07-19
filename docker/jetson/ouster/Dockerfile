@@ -21,7 +21,7 @@ RUN mkdir -p /opt/ouster_ws/src \
       https://github.com/ouster-lidar/ouster-ros.git /opt/ouster_ws/src/ouster-ros
 
 # rosdep resolves the driver + SDK system deps (jsoncpp, eigen, spdlog, curl,
-# libtins, pcap, pcl) from the cloned package.xml manifests.
+# libtins, pcap, pcl) from the cloned package.xml metadata.
 RUN apt-get update \
  && (rosdep init 2>/dev/null || true) \
  && rosdep update --rosdistro ${ROS_DISTRO} \

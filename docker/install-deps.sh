@@ -6,15 +6,16 @@
 #   - apt:    build tooling, ROS extras, and the apt-provided libs
 #             (Eigen 3.4, OpenCV 4, yaml-cpp, Boost, glog/gflags,
 #              SuiteSparse, METIS, linuxptp)
-#   - source: Sophus, GTSAM 4.2.1, small_gicp 1.0.0
+#   - source: Sophus, GTSAM
 
 
 set -euo pipefail
 
-# --- source-build defaults --------------------
-SOPHUS_TAG="${SOPHUS_TAG:-1.22.10}"
-GTSAM_TAG="${GTSAM_TAG:-4.2.1}"
-SMALL_GICP_REF="${SMALL_GICP_REF:-v1.0.0}"
+# Source dependencies follow each upstream repository's default branch. A
+# caller may still set an explicit ref to reproduce or investigate a build;
+# Meridian does not impose one as a repository policy.
+SOPHUS_REF="${SOPHUS_REF:-}"
+GTSAM_REF="${GTSAM_REF:-}"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -55,7 +56,9 @@ pip3 install --no-cache-dir evo
 
 # --- Sophus (core SO(3)/SE(3) representation) --------------------------------
 git clone https://github.com/strasdat/Sophus.git /tmp/Sophus
-git -C /tmp/Sophus checkout "${SOPHUS_TAG}"
+if [[ -n "${SOPHUS_REF}" ]]; then
+  git -C /tmp/Sophus checkout "${SOPHUS_REF}"
+fi
 cmake -S /tmp/Sophus -B /tmp/Sophus/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_SOPHUS_TESTS=OFF -DBUILD_SOPHUS_EXAMPLES=OFF \
@@ -63,11 +66,15 @@ cmake -S /tmp/Sophus -B /tmp/Sophus/build -G Ninja \
 cmake --build /tmp/Sophus/build --target install --parallel "${JOBS}"
 rm -rf /tmp/Sophus
 
-# --- GTSAM 4.2.1 (private local/global graph adapters) -----------------------
+# --- GTSAM (private local/global graph adapters) -----------------------------
 # system Eigen (one Eigen for the whole tree), no -march=native (portable image),
-# TBB off
+# TBB off. Meridian requires GTSAM >= 4.2.1, the first release with the ISAM2
+# marginal-factor slot-reuse fix. The package configure checks that minimum;
+# the source ref remains unpinned.
 git clone https://github.com/borglab/gtsam.git /tmp/gtsam
-git -C /tmp/gtsam checkout "${GTSAM_TAG}"
+if [[ -n "${GTSAM_REF}" ]]; then
+  git -C /tmp/gtsam checkout "${GTSAM_REF}"
+fi
 cmake -S /tmp/gtsam -B /tmp/gtsam/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DGTSAM_USE_SYSTEM_EIGEN=ON \
@@ -78,14 +85,6 @@ cmake -S /tmp/gtsam -B /tmp/gtsam/build -G Ninja \
   -DGTSAM_BUILD_UNSTABLE=ON
 cmake --build /tmp/gtsam/build --target install --parallel "${JOBS}"
 rm -rf /tmp/gtsam
-
-# --- small_gicp (loop-closure GICP verify) -------------------------------
-git clone https://github.com/koide3/small_gicp.git /tmp/small_gicp
-git -C /tmp/small_gicp checkout "${SMALL_GICP_REF}"
-cmake -S /tmp/small_gicp -B /tmp/small_gicp/build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF
-cmake --build /tmp/small_gicp/build --target install --parallel "${JOBS}"
-rm -rf /tmp/small_gicp
 
 ldconfig
 echo "==> Meridian dependency canon installed."
