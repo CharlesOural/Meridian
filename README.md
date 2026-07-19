@@ -3,13 +3,37 @@
 Meridian is a research SLAM framework for long-range off-road robots, targeting
 ROS 2 Humble and NVIDIA Jetson Orin.
 
-This repository snapshot preserves the V2 implementation and the evidence used
-to design its clean successor:
+The `v3` branch is a clean implementation baseline. Architecture and historical
+evidence are kept separately:
 
 - [V3 system specification](docs/SYSTEM_SPECS.md)
 - [V1/V2 engineering retrospective](docs/V1_V2_RETEX.md)
+- [Development runbook](docs/DEVELOPMENT.md)
+- [Optimization ledger](docs/OPTIMIZE.md)
 
-The source packages, focused tests, benchmark scenarios, and trajectory tools
-remain available as implementation evidence. Selected upstream research code
-lives in `../slam-reference`; it is reading and porting context, not a Meridian
-build dependency.
+The immutable V2 source snapshot is commit
+[`1f7a789`](https://github.com/CharlesOural/Meridian/tree/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44).
+Selected upstream research code lives in `../slam-reference`; it is reading and
+porting context, not a Meridian build dependency.
+
+Development environment:
+
+```bash
+docker compose -f compose.dev.yaml up -d --build
+docker compose -f compose.dev.yaml exec meridian bash
+```
+
+The image includes the `foxglove_bridge` ROS node and exposes port `8765`. Launch
+the bridge inside the container when required, then connect the Foxglove viewer
+from another machine to `ws://<development-host>:8765`:
+
+```bash
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765
+```
+
+The Jetson localization, sensor, timing, and Foxglove services are launched
+together:
+
+```bash
+docker compose -f compose.jetson.yaml up -d --build
+```

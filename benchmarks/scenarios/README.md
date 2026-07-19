@@ -20,3 +20,7 @@ python3 tools/eval_ate.py \
   --profile internal_interpolated \
   --track-label local
 ```
+
+`newer_college_park_partial.yaml` is the current V3 endurance scenario. The
+complete Park acceptance scenario will be added after the remaining official
+ROS 1 segments have a deterministic V3 ingestion path.

@@ -16,15 +16,15 @@ named complete-sequence runs support full-run accuracy or runtime conclusions.
 
 ### Exact version vocabulary
 
-The repository contains three distinct historical boundaries that must not be
-collapsed into the word “v1” or the current branch name “v2”.
+The repository contains four distinct historical boundaries that must not be
+collapsed into an ambiguous “v1” or “v2” label.
 
-| Name used here | Exact object | Meaning |
-| --- | --- | --- |
-| Tagged v1 | commit [`73a795edb5fd4ddc2e46f79d19fb4b0bb045820f`](https://github.com/CharlesOural/Meridian/tree/73a795edb5fd4ddc2e46f79d19fb4b0bb045820f), target of annotated tag `v1` | The released discrete-LIO frontend, keyframe backend, place/GNSS stack, and telemetry snapshot. |
-| Post-v1 hardening and mapping | commits after the tag through extraction baseline [`f5ca513158c95aaf88223486ec481c1d42730a21`](https://github.com/CharlesOural/Meridian/tree/f5ca513158c95aaf88223486ec481c1d42730a21) | Includes `9d99b94` convergence tuning, `b73e897` gyro-bias observation, `1cfc208` open-addressed/parallel association, and the CPU/nvblox map work. These mechanisms are not present at tag `v1`. |
-| Cleanup base | commit `aaa145da744d5a35079b3f008892341e03622853` | Deletes the legacy implementation before the rewrite. It is not a v2 implementation snapshot. |
-| V2 implementation audited here | working tree as exercised by Run L on 2026-07-18 | The current `meridian_core/local_rt/global/ros/tools/apps` sources, tests, benchmark scenarios, and final v2 docs. At the time of this audit they are untracked or modified above `aaa145d` and have no source commit identity. |
+| Name used here                 | Exact object                                                                                                                                                                           | Meaning                                                                                                                                                                                                                         |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tagged v1                      | commit [`73a795edb5fd4ddc2e46f79d19fb4b0bb045820f`](https://github.com/CharlesOural/Meridian/tree/73a795edb5fd4ddc2e46f79d19fb4b0bb045820f), target of annotated tag `v1`              | The released discrete-LIO frontend, keyframe backend, place/GNSS stack, and telemetry snapshot.                                                                                                                                 |
+| Post-v1 hardening and mapping  | commits after the tag through extraction baseline [`f5ca513158c95aaf88223486ec481c1d42730a21`](https://github.com/CharlesOural/Meridian/tree/f5ca513158c95aaf88223486ec481c1d42730a21) | Includes `9d99b94` convergence tuning, `b73e897` gyro-bias observation, `1cfc208` open-addressed/parallel association, and the CPU/nvblox map work. These mechanisms are not present at tag `v1`.                               |
+| Cleanup base                   | commit `aaa145da744d5a35079b3f008892341e03622853`                                                                                                                                      | Deletes the legacy implementation before the rewrite. It is not a v2 implementation snapshot.                                                                                                                                   |
+| V2 implementation audited here | commit [`1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44`](https://github.com/CharlesOural/Meridian/tree/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44), branch `v2` | The complete `meridian_core/local_rt/global/ros/tools/apps` sources, tests, benchmark scenarios, and final V2 documentation snapshot committed on 2026-07-19. |
 
 Future readers should use the full object IDs above. Deleted paths remain
 readable with, for example:
@@ -34,9 +34,8 @@ git show 73a795edb5fd4ddc2e46f79d19fb4b0bb045820f:src/meridian_frontend/src/lio/
 git show f5ca513158c95aaf88223486ec481c1d42730a21:src/meridian_map/src/layered_map.cpp
 ```
 
-The v2 relative source links below describe the working snapshot. They become
-durable only if that snapshot is committed. Git history containing only
-`aaa145d` will not contain those files.
+The V2 source links below target its immutable commit so this retrospective
+remains navigable after the clean V3 rewrite.
 
 ### Evidence strength and claim rules
 
@@ -185,12 +184,12 @@ changed the evaluated Newer College convergence threshold to `1e-3`.
 
 The post-v1 ADR records these full-sequence historical results:
 
-| Registration | Quad Easy | Math Medium | Quad Hard | Park |
-| --- | ---: | ---: | ---: | ---: |
-| Point-to-point baseline | `0.085 m` | `0.144 m` | `0.123 m` | `0.640 m` |
-| Pure point-to-plane | `0.081 m` | `1537 m` | `6091 m` | `129017 m` |
-| P2P warm-up 8, then point-to-plane | `0.083 m` | `87 m` | `5.8 m` | `1013 m` |
-| P2P warm-up 20, then point-to-plane | `0.086 m` | `29.7 m` | `0.30 m` | diverged |
+| Registration                        | Quad Easy | Math Medium | Quad Hard |       Park |
+| ----------------------------------- | --------: | ----------: | --------: | ---------: |
+| Point-to-point baseline             | `0.085 m` |   `0.144 m` | `0.123 m` |  `0.640 m` |
+| Pure point-to-plane                 | `0.081 m` |    `1537 m` |  `6091 m` | `129017 m` |
+| P2P warm-up 8, then point-to-plane  | `0.083 m` |      `87 m` |   `5.8 m` |   `1013 m` |
+| P2P warm-up 20, then point-to-plane | `0.086 m` |    `29.7 m` |  `0.30 m` |   diverged |
 
 Point-to-plane was about `23 ms` versus `73 ms` registration
 on gentle Quad Easy. It failed the aggressive/vegetated stressors because of a
@@ -589,20 +588,20 @@ discrete v1 release.
 V2 was a substantial offline local estimator and a separately implemented
 global component library. It was not an integrated local-plus-global runtime.
 
-| Capability | Implemented evidence | End-to-end evidence |
-| --- | --- | --- |
-| Core IDs, time, calibration, lineage, canonical records | Source and focused tests in [`meridian_core`](../src/meridian_core) | Used by the offline local application |
-| Local IMU/LiDAR, visual components, fixed-lag graph, health | Source and focused tests in [`meridian_local_rt`](../src/meridian_local_rt) | Complete runs H–L exercised local LiDAR–IMU only |
-| Offline bag replay, conversion, reports, trajectories | [`meridian_bag_localize`](../src/meridian_apps/src/bag_localize.cpp) | Sole runnable composition used by Run L |
-| Visual fusion | KLT/BRISK, landmark/factor, lane and graph tests | Prefix diagnostics only; no complete scored visual-fusion result |
-| Sparse submaps, place verification, PCM/GNC, GNSS, global graph | Source and component tests in [`meridian_global`](../src/meridian_global) | No executable connected local finality to this library |
-| Persistence | Seal spool and graph-journal component tests | No composed local outbox/global cache/optimizer resume |
-| Live ROS local/global nodes and `map -> odom` | Conversion and diagnostics libraries only | Not runnable |
-| Dense mapping | No active v2 mapping package | Not exercised |
-| Jetson, Quad Hard, Park | No final-path run | Not established |
+| Capability                                                      | Implemented evidence                                                        | End-to-end evidence                                              |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Core IDs, time, calibration, lineage, canonical records         | Source and focused tests in [`meridian_core`](https://github.com/CharlesOural/Meridian/tree/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_core)         | Used by the offline local application                            |
+| Local IMU/LiDAR, visual components, fixed-lag graph, health     | Source and focused tests in [`meridian_local_rt`](https://github.com/CharlesOural/Meridian/tree/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt) | Complete runs H–L exercised local LiDAR–IMU only                 |
+| Offline bag replay, conversion, reports, trajectories           | [`meridian_bag_localize`](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_apps/src/bag_localize.cpp)        | Sole runnable composition used by Run L                          |
+| Visual fusion                                                   | KLT/BRISK, landmark/factor, lane and graph tests                            | Prefix diagnostics only; no complete scored visual-fusion result |
+| Sparse submaps, place verification, PCM/GNC, GNSS, global graph | Source and component tests in [`meridian_global`](https://github.com/CharlesOural/Meridian/tree/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_global)   | No executable connected local finality to this library           |
+| Persistence                                                     | Seal spool and graph-journal component tests                                | No composed local outbox/global cache/optimizer resume           |
+| Live ROS local/global nodes and `map -> odom`                   | Conversion and diagnostics libraries only                                   | Not runnable                                                     |
+| Dense mapping                                                   | No active v2 mapping package                                                | Not exercised                                                    |
+| Jetson, Quad Hard, Park                                         | No final-path run                                                           | Not established                                                  |
 
 The sole executable is defined by
-[`meridian_apps/CMakeLists.txt`](../src/meridian_apps/CMakeLists.txt)
+[`meridian_apps/CMakeLists.txt`](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_apps/CMakeLists.txt)
 and does not depend on `meridian_global`. Run L’s report records
 `lidar-imu` mode, `39,763` IMU events, `1,991` LiDAR
 events, and zero camera events or visual factors. Its accuracy cannot be cited
@@ -624,10 +623,10 @@ The strongest V2 assets are conventions and failure semantics:
   bounds, and typed degradation.
 
 Source entry points:
-[core factor-batch metadata](../src/meridian_core/include/meridian/core/factor_batch_api.hpp),
-[local coordinator](../src/meridian_local_rt/include/meridian/local/local_estimator.hpp),
-[local graph](../src/meridian_local_rt/include/meridian/local/graph.hpp), and
-[offline app README](../src/meridian_apps/README.md).
+[core factor-batch metadata](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_core/include/meridian/core/factor_batch_api.hpp),
+[local coordinator](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/include/meridian/local/local_estimator.hpp),
+[local graph](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/include/meridian/local/graph.hpp), and
+[offline app README](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_apps/README.md).
 
 ## V2 IMU and initialization lessons
 
@@ -664,10 +663,10 @@ dynamic initialization into gyro-bias, velocity/gravity, gravity-sphere
 refinement, then one normal production replay.
 
 Sources:
-[motion initializer](../src/meridian_local_rt/src/motion_initializer.cpp),
-[motion tests](../src/meridian_local_rt/test/test_motion_initializer.cpp), and
+[motion initializer](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/motion_initializer.cpp),
+[motion tests](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/test/test_motion_initializer.cpp), and
 the resolved profile in
-[`bag_localize.cpp`](../src/meridian_apps/src/bag_localize.cpp).
+[`bag_localize.cpp`](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_apps/src/bag_localize.cpp).
 
 ### Static authority and startup coverage
 
@@ -704,9 +703,9 @@ Each `SensorId / CalibrationId` resolves its own profile; Newer
 College Alphasense values never transfer silently to the deployment SBG IMU.
 
 Sources:
-[Newer College calibration](../src/meridian_ros/src/newer_college_calibration.cpp),
-[calibration tests](../src/meridian_ros/test/test_newer_college_calibration.cpp),
-and [local graph config](../src/meridian_local_rt/include/meridian/local/graph.hpp).
+[Newer College calibration](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_ros/src/newer_college_calibration.cpp),
+[calibration tests](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_ros/test/test_newer_college_calibration.cpp),
+and [local graph config](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/include/meridian/local/graph.hpp).
 
 ### Timeline and unsupported IMU conditions
 
@@ -722,9 +721,9 @@ V3 needs an explicit inflated bridge, quarantine, or odometry-epoch break; it
 must not silently inherit V2’s complete rejection as field recovery.
 
 Sources:
-[event scheduler](../src/meridian_local_rt/src/event_scheduler.cpp),
-[IMU support](../src/meridian_local_rt/src/imu.cpp), and
-[graph interval admission](../src/meridian_local_rt/src/graph.cpp).
+[event scheduler](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/event_scheduler.cpp),
+[IMU support](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/imu.cpp), and
+[graph interval admission](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/graph.cpp).
 
 ## V2 LiDAR and local-map lessons
 
@@ -768,10 +767,10 @@ objective into at most six exact sufficient-statistic residual modes. Graph
 probes were O(6), stateless, and did not reassociate or reweight.
 
 Sources:
-[registration](../src/meridian_local_rt/src/lidar_registration.cpp),
-[cloud/index](../src/meridian_local_rt/src/lidar_registration_cloud.cpp),
-[private factor](../src/meridian_local_rt/src/direct_lidar_factor.cpp), and
-[sufficient-statistic test](../src/meridian_local_rt/test/test_direct_lidar_factor_sufficient_statistics.cpp).
+[registration](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/lidar_registration.cpp),
+[cloud/index](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/lidar_registration_cloud.cpp),
+[private factor](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/direct_lidar_factor.cpp), and
+[sufficient-statistic test](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/test/test_direct_lidar_factor_sufficient_statistics.cpp).
 
 ### Target-topology experiments
 
@@ -784,15 +783,15 @@ topology.
 All rows used complete Quad Easy LiDAR–IMU replay and the internal evaluation
 protocol.
 
-| Experiment | Model and target | Fixed-lag ATE | Runtime evidence | Causal lesson |
-| --- | --- | ---: | --- | --- |
-| BRINGUP-Q | retired surfel, three pose-synchronized sweeps | `0.840655 m` | `307.427 s`, RTF `0.6473` | Correct synchronization alone did not supply enough historical geometry |
-| BRINGUP-R | retired surfel, FIFO 15 still attributed to one pose | `0.511941 m` | report `467.909 s`, RTF `0.4253`; ledger separately says `468.14 s` | More geometry helped, but the wrong one-pose Jacobian caused 377 objective rejections |
-| Run H / FOUNDATION-G | T038 pose-aware live target only | `0.559663 m` | `198.087 s` for `198.998 s`, RTF `1.004599` | Loss-free unpaced throughput, but active history alone did not bound drift |
-| Run I / FOUNDATION-I | broad persistent finalized base | `0.072653 m` | `1159.687 s`, RTF `0.171597`; ledger-reported `1,896,024 KB` RSS; `9.798B` candidates | Broad fixed history anchored drift; the query/factor schedule was unusable |
-| Run J / FOUNDATION-J | nearest 12 finalized owners | `0.118963 m` | `378.790 s`, RTF `0.525352` | A centre-biased owner bank lost spatial diversity |
-| Run K / FOUNDATION-K | same owners, restored scalar information | `0.130191 m` | `295.459 s`, RTF `0.673521` | Scalar weight cannot recreate missing geometry |
-| Run L / FOUNDATION-L | persistent finalized base plus pose-aware live overlay | `0.071944 m` | `298.797685 s`, RTF `0.665997`; ledger-reported `407,836 KB` RSS | The two-layer topology recovered accuracy and cost, but remained slower than input |
+| Experiment           | Model and target                                       | Fixed-lag ATE | Runtime evidence                                                                      | Causal lesson                                                                         |
+| -------------------- | ------------------------------------------------------ | ------------: | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| BRINGUP-Q            | retired surfel, three pose-synchronized sweeps         |  `0.840655 m` | `307.427 s`, RTF `0.6473`                                                             | Correct synchronization alone did not supply enough historical geometry               |
+| BRINGUP-R            | retired surfel, FIFO 15 still attributed to one pose   |  `0.511941 m` | report `467.909 s`, RTF `0.4253`; ledger separately says `468.14 s`                   | More geometry helped, but the wrong one-pose Jacobian caused 377 objective rejections |
+| Run H / FOUNDATION-G | T038 pose-aware live target only                       |  `0.559663 m` | `198.087 s` for `198.998 s`, RTF `1.004599`                                           | Loss-free unpaced throughput, but active history alone did not bound drift            |
+| Run I / FOUNDATION-I | broad persistent finalized base                        |  `0.072653 m` | `1159.687 s`, RTF `0.171597`; ledger-reported `1,896,024 KB` RSS; `9.798B` candidates | Broad fixed history anchored drift; the query/factor schedule was unusable            |
+| Run J / FOUNDATION-J | nearest 12 finalized owners                            |  `0.118963 m` | `378.790 s`, RTF `0.525352`                                                           | A centre-biased owner bank lost spatial diversity                                     |
+| Run K / FOUNDATION-K | same owners, restored scalar information               |  `0.130191 m` | `295.459 s`, RTF `0.673521`                                                           | Scalar weight cannot recreate missing geometry                                        |
+| Run L / FOUNDATION-L | persistent finalized base plus pose-aware live overlay |  `0.071944 m` | `298.797685 s`, RTF `0.665997`; ledger-reported `407,836 KB` RSS                      | The two-layer topology recovered accuracy and cost, but remained slower than input    |
 
 RTF is `sensor duration / wall time`. Every H–L report says
 `pipeline_runtime.mode = unpaced`. H therefore demonstrates average
@@ -844,9 +843,9 @@ checksum schemas. V3 stores one canonical point pair and robust scale per batch
 revision and rebuilds association explicitly.
 
 Sources:
-[rolling target](../src/meridian_local_rt/src/rolling_lidar_target.cpp),
-[composite target](../src/meridian_local_rt/src/lidar_composite_target.cpp), and
-[finalized target](../src/meridian_local_rt/src/finalized_lidar_target_map.cpp).
+[rolling target](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/rolling_lidar_target.cpp),
+[composite target](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/lidar_composite_target.cpp), and
+[finalized target](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/finalized_lidar_target_map.cpp).
 
 ### Information, correlation, and finality
 
@@ -910,9 +909,9 @@ strong evidence to assemble one ready event into one v3 candidate transaction
 and simplify no-op globalization work.
 
 Sources:
-[candidate-isolated adapter](../src/meridian_local_rt/src/candidate_isolated_isam2.cpp),
-[graph implementation](../src/meridian_local_rt/src/graph.cpp), and
-[graph tests](../src/meridian_local_rt/test/test_graph.cpp).
+[candidate-isolated adapter](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/candidate_isolated_isam2.cpp),
+[graph implementation](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/graph.cpp), and
+[graph tests](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/test/test_graph.cpp).
 
 ### Dependency capabilities and exact-preserving optimization
 
@@ -949,8 +948,8 @@ remain in the local path. A downstream consumer re-deskews and seals the full
 raw sweep only after localization acceptance/finality.
 
 Sources:
-[registration-cloud boundary](../src/meridian_local_rt/src/lidar_registration_cloud.cpp)
-and [map payload](../src/meridian_local_rt/src/lidar_map_payload.cpp).
+[registration-cloud boundary](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/lidar_registration_cloud.cpp)
+and [map payload](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/lidar_map_payload.cpp).
 
 ### Sensor health, rollback, and safe map admission
 
@@ -969,9 +968,9 @@ This is a strong contract. Only LiDAR was wired end to end. Visual and GNSS
 health parity is unproven.
 
 Sources:
-[health registry](../src/meridian_local_rt/include/meridian/local/sensor_health.hpp),
-[map admission](../src/meridian_local_rt/src/map_admission_gate.cpp), and
-[coordinator recovery](../src/meridian_local_rt/src/local_estimator.cpp).
+[health registry](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/include/meridian/local/sensor_health.hpp),
+[map admission](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/map_admission_gate.cpp), and
+[coordinator recovery](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/local_estimator.cpp).
 
 ### Visual negative evidence
 
@@ -1000,9 +999,9 @@ rollback, exact state ownership, and a sensor-pure same-event batch
 transaction; it should not retain delayed attachment.
 
 Sources:
-[visual lane](../src/meridian_local_rt/src/visual_lane.cpp),
-[visual factor](../src/meridian_local_rt/src/visual_factor.cpp),
-[local visual integration tests](../src/meridian_local_rt/test/test_local_estimator_visual.cpp),
+[visual lane](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/visual_lane.cpp),
+[visual factor](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/visual_factor.cpp),
+[local visual integration tests](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/test/test_local_estimator_visual.cpp),
 and the historical experiment evidence summarized in this retrospective.
 
 ### Measure complete work and input integrity
@@ -1011,15 +1010,15 @@ Run L stage measurements below are from the final rolling window of at most
 1024 samples, except factor preparation, which contains all 984 samples. The
 stages are nested or have different event populations and must not be summed.
 
-| Stage | Mean | p95 | p99 | Maximum |
-| --- | ---: | ---: | ---: | ---: |
+| Stage                                  |        Mean |         p95 |          p99 |      Maximum |
+| -------------------------------------- | ----------: | ----------: | -----------: | -----------: |
 | Registration, including live composite | `54.674 ms` | `90.881 ms` | `111.186 ms` | `127.393 ms` |
-| Live composite build | `9.766 ms` | `11.973 ms` | `12.283 ms` | `13.285 ms` |
-| Graph transaction | `40.130 ms` | `85.152 ms` | `89.277 ms` | `95.119 ms` |
-| Registration view | `19.085 ms` | `20.457 ms` | `21.617 ms` | `23.760 ms` |
-| Deskew | `6.180 ms` | `7.222 ms` | `7.432 ms` | `7.801 ms` |
-| Finalized-base update | `1.561 ms` | `7.976 ms` | `8.367 ms` | `9.619 ms` |
-| Factor preparation | `13.529 ms` | `20.235 ms` | `21.350 ms` | `22.548 ms` |
+| Live composite build                   |  `9.766 ms` | `11.973 ms` |  `12.283 ms` |  `13.285 ms` |
+| Graph transaction                      | `40.130 ms` | `85.152 ms` |  `89.277 ms` |  `95.119 ms` |
+| Registration view                      | `19.085 ms` | `20.457 ms` |  `21.617 ms` |  `23.760 ms` |
+| Deskew                                 |  `6.180 ms` |  `7.222 ms` |   `7.432 ms` |   `7.801 ms` |
+| Finalized-base update                  |  `1.561 ms` |  `7.976 ms` |   `8.367 ms` |   `9.619 ms` |
+| Factor preparation                     | `13.529 ms` | `20.235 ms` |  `21.350 ms` |  `22.548 ms` |
 
 The driver’s inclusive `processReady` p99/max were
 `195.207/225.314 ms`. The report does not turn nested timings into an
@@ -1034,8 +1033,8 @@ faster algorithm that loses work has failed. Unpaced throughput and scheduled
 queue/deadline tests are distinct gates.
 
 Sources:
-[typed timing](../src/meridian_local_rt/src/pipeline_timing_internal.hpp),
-[run-report writer](../src/meridian_apps/src/bag_localize.cpp), and
+[typed timing](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/pipeline_timing_internal.hpp),
+[run-report writer](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_apps/src/bag_localize.cpp), and
 [benchmark scenarios](../benchmarks/scenarios/README.md).
 
 ## V2 global and persistence component lessons
@@ -1074,13 +1073,13 @@ precision/recall, GNSS field robustness, crash-resumed SLAM, or live
 `map -> odom`.
 
 Sources:
-[global coordinator](../src/meridian_global/include/meridian/global/global_coordinator.hpp),
-[global graph](../src/meridian_global/src/graph.cpp),
-[loop consensus](../src/meridian_global/src/loop_consensus.cpp),
-[GNSS FSM](../src/meridian_global/src/gnss_fsm.cpp),
-[seal spool](../src/meridian_global/src/seal_spool.cpp),
-[graph journal](../src/meridian_global/src/graph_journal.cpp), and
-[implementation provenance](../src/meridian_global/REFERENCE_PROVENANCE.md).
+[global coordinator](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_global/include/meridian/global/global_coordinator.hpp),
+[global graph](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_global/src/graph.cpp),
+[loop consensus](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_global/src/loop_consensus.cpp),
+[GNSS FSM](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_global/src/gnss_fsm.cpp),
+[seal spool](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_global/src/seal_spool.cpp),
+[graph journal](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_global/src/graph_journal.cpp), and
+[implementation provenance](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_global/REFERENCE_PROVENANCE.md).
 
 ## V2 artifact identity
 

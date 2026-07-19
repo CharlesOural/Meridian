@@ -1,0 +1,25 @@
+name: meridian-dev
+
+services:
+  meridian:
+    build:
+      context: ./docker/dev
+      dockerfile: Dockerfile
+      args:
+        ROS_DISTRO: humble
+        MERIDIAN_BUILD_JOBS: "${MERIDIAN_BUILD_JOBS:-6}"
+        USER_UID: "${USER_UID:-1000}"
+        USER_GID: "${USER_GID:-1000}"
+    image: meridian:humble
+    container_name: meridian-dev
+    user: dev
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    environment:
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+    ports:
+      - "${FOXGLOVE_PORT:-8765}:8765"
+    stdin_open: true
+    tty: true
+    command: bash

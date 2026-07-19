@@ -3,7 +3,7 @@
 <package format="3">
   <name>meridian_cmake</name>
   <version>0.0.0</version>
-  <description>Shared C++/CUDA toolchain and test helpers for Meridian packages.
+  <description>Shared C++ toolchain and test helpers for Meridian packages.
     Dependencies are discovered explicitly by the package that owns them.</description>
   <maintainer email="charles@cfglobal.fr">Charles Farhat</maintainer>
   <license>Proprietary</license>

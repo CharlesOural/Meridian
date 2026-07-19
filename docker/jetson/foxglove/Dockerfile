@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1
 #
-# Minimal Foxglove bridge: exposes the local ROS 2 graph as a WebSocket on :8765
-# so the Foxglove app (on the Mac) can preview topics. Temporary viz aid — safe to
-# delete together with its compose service.
+# Minimal Foxglove bridge: exposes the Jetson ROS 2 graph as a WebSocket on
+# port 8765 for a viewer running on a remote workstation.
 ARG ROS_DISTRO=humble
 FROM ros:${ROS_DISTRO}-ros-base
 

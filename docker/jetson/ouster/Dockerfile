@@ -2,7 +2,7 @@
 #
 # Standalone Ouster OS-series LiDAR driver. Builds ouster-ros (with its ouster-sdk
 # submodule) from source into /opt/ouster_ws and publishes PointCloud2 + IMU to
-# ROS 2. CPU-only, no CUDA; native arm64 on the Jetson.
+# ROS 2, built natively for arm64 on the Jetson.
 ARG ROS_DISTRO=humble
 FROM ros:${ROS_DISTRO}-ros-base
 

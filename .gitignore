@@ -17,9 +17,6 @@
 /bags/*
 !/bags/.gitkeep
 
-# vcs-imported source dependencies are not versioned here
-/src/nvblox/
-
 # OS / python junk
 .DS_Store
 __pycache__/
