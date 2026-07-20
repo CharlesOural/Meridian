@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>meridian_apps</name>
+  <version>0.1.0</version>
+  <description>Meridian live composition, launch, and private Rerun debug IO.</description>
+  <maintainer email="charles@cfglobal.fr">Charles Farhat</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>meridian_cmake</build_depend>
+
+  <depend>meridian_core</depend>
+  <depend>meridian_ros</depend>
+  <depend>rclcpp</depend>
+
+  <exec_depend>foxglove_bridge</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rosbag2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

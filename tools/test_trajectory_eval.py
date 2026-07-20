@@ -12,13 +12,11 @@ from tools.trajectory_eval import (
     EvaluationConfig,
     EvaluationError,
     FIXED_COLD_START_PROTOCOL,
-    FULL_REFERENCE_PROTOCOL,
     Trajectory,
     _config_from_arguments,
     associate_trajectories,
     build_argument_parser,
     evaluate_trajectories,
-    load_scenario_evaluation_config,
     load_tum,
 )
 
@@ -148,7 +146,7 @@ class CommandLineApiTest(unittest.TestCase):
     def test_both_body_frame_inputs_are_required(self) -> None:
         parser = build_argument_parser()
         arguments = parser.parse_args(["reference.tum", "estimate.tum"])
-        with self.assertRaisesRegex(EvaluationError, "manual mode requires"):
+        with self.assertRaisesRegex(EvaluationError, "body-frame.*required"):
             _config_from_arguments(arguments)
 
         arguments = parser.parse_args(
@@ -164,105 +162,6 @@ class CommandLineApiTest(unittest.TestCase):
         self.assertEqual(arguments.reference_body_frame, "base_link")
         self.assertEqual(arguments.estimate_body_frame, "base_link")
         self.assertEqual(_config_from_arguments(arguments).association, "interpolate")
-
-    def test_scenario_mode_rejects_protocol_override(self) -> None:
-        root = Path(__file__).parent.parent
-        parser = build_argument_parser()
-        arguments = parser.parse_args(
-            [
-                str(root / "bags/newer-college/gt/tum/gt-nc-quad-easy.csv"),
-                "trajectory_base.tum",
-                "--scenario",
-                str(root / "benchmarks/scenarios/newer_college_quad_easy.yaml"),
-                "--profile",
-                "internal_interpolated",
-                "--min-coverage",
-                "0.5",
-            ]
-        )
-        with self.assertRaisesRegex(EvaluationError, "forbids protocol overrides"):
-            _config_from_arguments(arguments)
-
-
-class ScenarioProfileTest(unittest.TestCase):
-    def test_quad_easy_fixed_and_published_profiles_are_distinct(self) -> None:
-        root = Path(__file__).parent.parent
-        scenario = root / "benchmarks/scenarios/newer_college_quad_easy.yaml"
-        ground_truth = root / "bags/newer-college/gt/tum/gt-nc-quad-easy.csv"
-        internal = load_scenario_evaluation_config(
-            scenario, "internal_interpolated", ground_truth, "local"
-        )
-        self.assertEqual(internal.coverage_protocol, FIXED_COLD_START_PROTOCOL)
-        self.assertEqual(internal.startup_allowance_s, 2.2)
-        self.assertEqual(internal.maximum_startup_delay_s, 2.2)
-        self.assertEqual(internal.maximum_end_loss_s, 0.20)
-        self.assertEqual(internal.min_coverage, 0.99)
-        self.assertFalse(internal.publication_eligible)
-
-        published = load_scenario_evaluation_config(
-            scenario, "published_nearest_10ms", ground_truth, "final-global"
-        )
-        self.assertEqual(published.coverage_protocol, FULL_REFERENCE_PROTOCOL)
-        self.assertEqual(published.association, "nearest")
-        self.assertEqual(published.max_dt, 0.01)
-        self.assertTrue(published.publication_eligible)
-
-    def test_all_native_ros2_scenarios_use_the_same_versioned_cold_start_policy(self) -> None:
-        root = Path(__file__).parent.parent
-        cases = (
-            ("newer_college_quad_easy.yaml", "gt-nc-quad-easy.csv"),
-            ("newer_college_quad_hard.yaml", "gt-nc-quad-hard.csv"),
-            ("newer_college_park_partial.yaml", "gt-nc-park.csv"),
-        )
-        for scenario_name, ground_truth_name in cases:
-            with self.subTest(scenario=scenario_name):
-                config = load_scenario_evaluation_config(
-                    root / "benchmarks/scenarios" / scenario_name,
-                    "internal_interpolated",
-                    root / "bags/newer-college/gt/tum" / ground_truth_name,
-                    "local",
-                )
-                self.assertEqual(config.coverage_protocol, FIXED_COLD_START_PROTOCOL)
-                self.assertEqual(config.startup_allowance_s, 2.2)
-                self.assertEqual(config.maximum_startup_delay_s, 2.2)
-                self.assertEqual(config.maximum_end_loss_s, 0.20)
-                self.assertEqual(config.min_coverage, 0.99)
-
-    def test_publication_profile_cannot_use_fixed_cold_start_protocol(self) -> None:
-        with self.assertRaisesRegex(EvaluationError, "cannot be publication eligible"):
-            base_frame_config(
-                association="interpolate",
-                coverage_protocol=FIXED_COLD_START_PROTOCOL,
-                startup_allowance_s=2.2,
-                maximum_startup_delay_s=2.2,
-                maximum_end_loss_s=0.2,
-                publication_eligible=True,
-            ).validate()
-
-    def test_duplicate_scenario_key_is_rejected(self) -> None:
-        root = Path(__file__).parent.parent
-        source = (
-            root / "benchmarks/scenarios/newer_college_quad_easy.yaml"
-        ).read_text(encoding="utf-8")
-        ambiguous = source.replace(
-            "    purpose: meridian_development_and_acceptance\n",
-            "    purpose: meridian_development_and_acceptance\n"
-            "    purpose: silently_replaced_value\n",
-            1,
-        )
-        temporary = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
-        temporary.write(ambiguous)
-        temporary.close()
-        scenario = Path(temporary.name)
-        self.addCleanup(scenario.unlink, missing_ok=True)
-        with self.assertRaisesRegex(EvaluationError, "duplicate key"):
-            load_scenario_evaluation_config(
-                scenario,
-                "internal_interpolated",
-                root / "bags/newer-college/gt/tum/gt-nc-quad-easy.csv",
-                "local",
-            )
-
 
 class MetricTest(unittest.TestCase):
     def curved_reference(self, count: int = 81) -> Trajectory:

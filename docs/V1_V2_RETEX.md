@@ -811,9 +811,9 @@ Run L also produced:
   loss.
 
 It passed the historical project objective of less than `0.08 m`.
-The current checked-in Quad Easy scenario instead names `0.07 m` as
-its competitive gate, so `0.071944 m` does not pass that newer
-threshold. The evaluator JSON’s `quality.passed` concerns coverage and
+One later v2 experiment used `0.07 m` as a competitive gate, so `0.071944 m`
+did not pass that threshold. The v3 branch no longer carries the scenario
+registry. The evaluator JSON’s `quality.passed` concerns coverage and
 trajectory-health gates, not ATE; even inaccurate Run H passes those quality
 checks. Run L is strong single-sequence internal evidence, not a SOTA, Jetson,
 Quad Hard, Park, scheduled-realtime, visual, global, or release result.
@@ -1034,8 +1034,7 @@ queue/deadline tests are distinct gates.
 
 Sources:
 [typed timing](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_local_rt/src/pipeline_timing_internal.hpp),
-[run-report writer](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_apps/src/bag_localize.cpp), and
-[benchmark scenarios](../benchmarks/scenarios/README.md).
+[run-report writer](https://github.com/CharlesOural/Meridian/blob/1f7a789cddb1f27d768e6ed097c1f21a8bfbbf44/src/meridian_apps/src/bag_localize.cpp). The scenario registry described by this historical section was removed from v3.
 
 ## V2 global and persistence component lessons
 
@@ -1125,8 +1124,8 @@ recovered.
   extraction candidates;
 - retained-source provenance and deterministic rebuild for non-invertible dense
   products;
-- one live/replay core, explicit replay mode, complete input reconciliation,
-  fixed scenario/evaluation profile, and full-run artifacts.
+- one ROS live/bag path, offline input comparison, explicit saved configuration,
+  and full-run artifacts.
 
 ### Do not port as hidden compatibility
 

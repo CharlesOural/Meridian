@@ -8,6 +8,7 @@ evidence are kept separately:
 
 - [V3 system specification](docs/SYSTEM_SPECS.md)
 - [V1/V2 engineering retrospective](docs/V1_V2_RETEX.md)
+- [Voxel-SLAM reference and comparison](docs/VOXEL_SLAM_COMPARISON.md)
 - [Development runbook](docs/DEVELOPMENT.md)
 - [Optimization ledger](docs/OPTIMIZE.md)
 
@@ -31,9 +32,5 @@ from another machine to `ws://<development-host>:8765`:
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765
 ```
 
-The Jetson localization, sensor, timing, and Foxglove services are launched
-together:
-
-```bash
-docker compose -f compose.jetson.yaml up -d --build
-```
+The Jetson Compose remains a deployment scaffold; its Meridian runtime is
+intentionally disabled while this first v3 slice is validated on Newer College.

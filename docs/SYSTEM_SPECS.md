@@ -28,6 +28,22 @@ Initial evaluation uses the complete datasets and calibration data under
 metrics, accompanied by runtime and input-queue integrity. Runtime factor is
 `RTF = sensor duration / wall duration`; `RTF >= 1` sustains recorded rate.
 
+Dataset evaluation deliberately exercises the deployed ROS input path. A
+generic launch starts Meridian and Foxglove Bridge and invokes the standard
+`ros2 bag play` process. Meridian records a lightweight Rerun `.rrd` containing
+converted input evidence and stage telemetry, extended with the estimated
+trajectory as estimator layers land. The Newer College ground truth under
+`bags/newer-college/gt/` remains the accuracy reference and the original bag
+remains the raw sensor authority.
+
+Evaluation is repeatable by launching the bag again; bit-for-bit scheduling is
+not a requirement. Small run-to-run uncertainty is acceptable and is reported
+alongside the metrics. There is no DDS-bypassing bag reader or separate replay
+executable: normal ROS transport, conversion, queues, and estimator behavior
+are exercised together because that is the system that must work live. Topic
+delivery/count comparison is an optional post-run check against rosbag2
+metadata, not an in-process acceptance mechanism.
+
 Sensor parameters are selected by explicit `SensorId` and `CalibrationId`.
 Newer College evaluation uses its OS0-128 and Alphasense IMU calibration
 profile; deployment uses the OS1-128 and SBG Ellipse-D profile. Timing, noise,
@@ -91,7 +107,6 @@ composition. One authority owns each transform edge.
 | `/meridian/global/odometry` | `nav_msgs/msg/Odometry` | Composed estimate in `map`, published after geographic alignment |
 | `/meridian/global/fix` | `sensor_msgs/msg/NavSatFix` | Georeferenced antenna estimate in WGS84 with ENU covariance |
 | `/meridian/localization/status` | Meridian typed message | Local and geographic validity, initialization source, map epoch, estimate revision, and sensor states |
-| `/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | Queue integrity, stage timing, health, and deadline information |
 
 `/meridian/local/odometry` is the causal high-rate propagation from the newest
 accepted estimator state. Each accepted graph revision restarts propagation
@@ -138,9 +153,49 @@ bounded local registration target.
 ## Operational visibility and deep debugging
 
 Standard ROS topics and TF are the operational system API and the source used
-by other robot components and Foxglove. Deep algorithm instrumentation is
-enabled explicitly with `ACTIVATE_DEBUG=full` and recorded in Rerun `.rrd`
-format. Deep-debug recording has no authority over estimation, map state, or ROS publication.
+by other robot components and Foxglove. Algorithm instrumentation is recorded
+in Rerun `.rrd` format. Debug recording has no authority over estimation, map
+state, or ROS publication, and Meridian does not publish Rerun-only previews or
+diagnostics as ROS topics.
+
+### Evaluation record and flow
+
+The RRD is a compact evidence record, not a repackaged bag and not an estimator
+checkpoint. The first ingress slice stores full-rate scalar IMU evidence,
+per-scan LiDAR metadata, conversion failures, recorder health, and a 1 Hz
+point-cloud preview capped by its point count. The preview is never published
+on ROS, and raw LiDAR payloads stay only in the source bag. Later slices add
+timestamped accepted local/global poses,
+covariance, estimator revision, initialization state, stage timing, and queue
+health without changing this ownership boundary.
+
+```text
+ros2 bag play
+  -> ROS 2 subscriptions
+  -> meridian_ros conversion
+  -> owned ROS-free observations
+  -> ObservationCallbacks -> future LocalPipeline
+  -> future ROS odometry, TF, and status
+  -> neutral debug sink -> compact run.rrd
+
+run.rrd estimated trajectory + integrity counters --+
+Newer College timestamped ground truth -------------+-> evaluation tool
+                                                       -> ATE / RPE / coverage report
+                                                       -> Rerun comparison view
+```
+
+The current trajectory evaluator consumes explicit estimate and ground-truth
+TUM files through a direct CLI. It associates timestamps, aligns only the
+permitted gauge, computes ATE and distance-based RPE, and reports coverage
+before accuracy. When trajectory entities are added to the RRD, a small
+extractor may query them through supported Rerun APIs; the metric implementation
+remains independent of Rerun's private file layout.
+
+Post-run tooling may compare accepted RRD rows with rosbag2 topic counts and
+report conversion/queue failures, trajectory coverage, and runtime factor.
+These checks remain outside the online pipeline. Repeating the standard bag
+launch provides the desired practical repeatability; measured run-to-run
+dispersion is reported when material, without requiring bit-for-bit execution.
 
 ## Software structure
 
@@ -151,32 +206,30 @@ stable; private layouts may evolve while implementing and benchmarking them.
 src/
   meridian_cmake/       shared build and test helpers
   meridian_core/        ROS-free frames, time, math, IDs, and common records
-  meridian_local_rt/    complete ROS-free local localization pipeline
-  meridian_ros/         ROS conversion, QoS, subscriptions, TF, and publication
-  meridian_apps/        live/replay composition, lifecycle, and optional debug IO
+  meridian_local_rt/    planned ROS-free local localization pipeline
+  meridian_ros/         ROS-to-core conversion and subscriptions; later ROS outputs
+  meridian_apps/        live composition, bag-session lifecycle, and Rerun debug IO
 
 tools/                  dataset inspection and evaluation utilities
 ```
 
-Additional packages are introduced when their complete vertical slice is
-implemented. The initial tree contains only the local localization system.
+Additional packages are introduced only with their complete vertical slice.
+The implemented first slice contains `meridian_core`, `meridian_ros`, and
+`meridian_apps`; `meridian_local_rt` and georeferencing components are planned,
+not current code.
 
-`meridian_apps` builds and runs the executable. It loads the typed
-configuration, constructs the local pipeline, connects ROS IO, attaches the
-optional debug recorder, starts processing, and performs clean shutdown.
-Localization algorithms and sensor scheduling remain in `meridian_local_rt`.
-The same composition owns a small ROS-free startup georeference coordinator;
-`meridian_core` supplies only the geodetic records and frame conversions. This
-keeps datum selection separate from local pose estimation without creating a
-premature global package.
+The current `meridian_apps` executable loads ROS parameters, constructs the
+Rerun sink and generic ingress node, runs the executor, and drains both workers
+at shutdown. Owned observations cross `ObservationCallbacks`, the narrow seam
+where the future ROS-free local pipeline will attach.
 
-The live executable and `ros2 bag play` exercise the normal DDS, QoS,
-subscription, executor, conversion, and local-pipeline path. A second
-`meridian_replay` executable reads a bag deterministically and passes every
-message through the same `meridian_ros` conversion and `LocalPipeline`
-ingestion APIs while bypassing DDS. It is an algorithmic regression reference,
-not an alternative localization implementation. Comparing both paths separates
-transport, scheduling, and queue failures from frontend or estimator failures.
+The Meridian executable always consumes normal ROS subscriptions. Recorded
+datasets use standard `ros2 bag play` and therefore exercise normal ROS 2
+transport, the executor, conversion, queues, and the local pipeline as a live
+sensor session does. The session launch owns process lifecycle and the RRD
+records what reaches Meridian's converted input boundary. Post-run comparison
+with bag metadata exposes transport or scheduling variation without maintaining
+a second ingestion path.
 
 ### Local package organization
 
@@ -235,10 +288,12 @@ frontend event is processed deterministically. A late event inside the active
 lag may request a state and exact interval reintegration; one older than the
 sealed boundary is rejected as `TooLateForActiveLag`.
 
-Every queue has configured item, byte, and age bounds with observable admission
-outcomes. End-of-bag replay advances a terminal input watermark, processes all
-events with complete support, and reports each unsupported tail observation
-instead of silently dropping it.
+The current ingress has a count-bounded LiDAR conversion queue and a separate
+count-bounded Rerun writer queue; IMU conversion runs directly in its callback.
+Queue rejection is recorded as an ingress failure. When bag playback exits,
+the session stops admission, drains both queues, writes recorder drop/error
+counters, and flushes the RRD. Byte/age bounds and algorithm-support tail
+handling belong to later estimator queues and are not claimed by this slice.
 
 The initial stable record set is:
 
@@ -261,8 +316,9 @@ The initial stable record set is:
   state, calibration, odom epoch, quality, and provenance; the bounded local
   voxel base consumes it now and a future submap builder may consume the same
   immutable payload;
-- `TerminalTrajectorySnapshot`: the accepted states still active when a replay
-  ends, used only to complete evaluation output;
+- `TerminalTrajectorySnapshot`: the accepted states still active when an
+  evaluation session shuts down cleanly, used only to complete evaluation
+  output;
 - `LocalEstimate`: current causal estimate and validity;
 - `LocalStatus`: initialization, input, queue, and localization health;
 - `GeographicDatum`, `MapOdomEstimate`, and `GeoreferenceStatus`: immutable
@@ -806,6 +862,7 @@ measurement.
 | [RKO-LIO](https://arxiv.org/abs/2509.06593) | Parallel direct point-to-point association with IMU deskew and prediction | Runtime and capture-range context |
 | Meridian v1 | Direct residual, bounded voxel hash, clipping, and natural-convergence behavior | Implementation starting point |
 | [FAST-LIO2](https://arxiv.org/abs/2107.06829) | Direct raw-point frontend and bounded incremental map | Map-maintenance and point-to-plane challenger |
+| [Voxel-SLAM](https://arxiv.org/abs/2410.08935) | Adaptive voxel planes, cluster sufficient statistics, sliding-window LiDAR–IMU BA, and hierarchical global geometry BA | Plane-BA and multi-timescale association challenger; see the [full comparison](VOXEL_SLAM_COMPARISON.md) |
 | [Faster-LIO](https://github.com/gaoxiang12/faster-lio) | Sparse incremental voxel indexing and bounded local queries | Data-layout and query-pruning context only |
 | [GLIM](https://arxiv.org/abs/2407.10344) | Pose-local scans, binary active constraints, unary fixed-target constraints | Ownership and finalization topology |
 | Meridian v2 | Atomic batches, owner revisions, MAD-Huber, information cap, finalized support | Validated correctness and failure lessons |
@@ -859,8 +916,8 @@ before robot-body masking, deskew, voxel selection, registration, factor
 construction, or local-target admission. Every downstream SLAM artifact
 therefore contains only the filtered geometry; filtering is performed once,
 not repeated at map insertion. The immutable raw sweep remains available to
-replay/debug and to future non-SLAM consumers that may require a different
-near-field policy.
+offline inspection/debug and to future non-SLAM consumers that may require a
+different near-field policy.
 
 Initial benchmark seeds are `[1.5 m, 50 m]` for the Newer College OS0-128 and
 `[1.5 m, 150 m]` for the Barakuda OS1-128. The OS1 upper bound is a registration
@@ -1208,10 +1265,10 @@ Only future source scans create new unary rows against fixed geometry. During a
 LiDAR failure, existing good geometry remains readable and frozen while failed
 payloads are excluded.
 
-Deterministic replay ends with one terminal accepted solve and emits the still
-active tail as a `TerminalTrajectorySnapshot` in timestamp order. It completes
-ATE/RPE evaluation without sealing those states, migrating their geometry, or
-inventing future measurements.
+Clean evaluation shutdown performs one terminal accepted solve and emits the
+still-active tail as a `TerminalTrajectorySnapshot` in timestamp order. This
+completes ATE/RPE evaluation without sealing those states, migrating their
+geometry, or inventing future measurements.
 
 #### Initial registration profile and benchmark
 
@@ -1338,34 +1395,32 @@ stage.
 
 ### Debug implementation
 
-There is no Rerun package. A neutral debug sink API allows every pipeline stage
-to emit timestamped debug records. Its private Rerun implementation lives under
-`meridian_apps`, is compiled only when enabled, and writes one `.rrd` run record
-without starting or connecting to a viewer.
+There is no separate Rerun package. A neutral debug sink API allows pipeline
+stages to emit timestamped records. Its private implementation lives under
+`meridian_apps`; the current ingress executable always writes one `.rrd`
+without starting or connecting to a Rerun viewer. A `NullDebugSink` keeps the
+ROS-free boundary usable in focused tests and future compositions.
 
 Rerun records what the process observes; it cannot reconstruct a sample lost in
-DDS before a subscription callback or the executor decision that was never
-exposed to the application. ROS replay validates that path, while
-`meridian_replay` provides the deterministic algorithmic reference.
+DDS before a subscription callback or an executor decision that was never
+exposed to the application. Standard bag playback intentionally validates that
+same live path. The offline analyzer compares configured bag topic counts with
+accepted rows and reports timing, gaps, ingress failures, and recorder health;
+none of this accounting exists as runtime acceptance policy.
 
-With `ACTIVATE_DEBUG=full`, the run record covers ROS ingestion and publication,
-sensor queues, initialization, IMU propagation, preprocessing, deskew,
-registration inputs and correspondences, frontend quality and observability,
-estimator updates, local-map decisions, outputs, failures, and per-stage timing.
-The IMU trace includes exact interval boundaries, gaps/epochs, preintegrated
-deltas, covariance condition, bias corrections, and raw/whitened residuals.
-The LiDAR trace includes target versions and owners, selected pairs, robust
-weights, directional spectrum, overlap scores, voxel-query/candidate counts,
-range-filter dispositions, batch disposition, map admission, and finalization.
-The disabled path does not construct heavy debug payloads.
+The initial record is deliberately small: accepted IMU scalars, one metadata
+row per accepted LiDAR scan, ingress failures, recorder health, and a decimated
+1 Hz LiDAR preview. Later algorithm slices add only the stage records needed to
+explain their behavior. Heavy geometry is constructed only when requested by
+the neutral sink.
 
 ## First implementation sequence
 
 The first vertical slice is built in this order:
 
-1. Implement the core frame/time/ID/configuration records, ROS conversion,
-   independent bounded queues, deterministic replay, and lightweight stage
-   telemetry.
+1. Implement core time/ID/observation records, generic ROS conversion, the
+   owned-observation callback seam, bounded LiDAR/Rerun queues, standard bag
+   playback, lightweight RRD telemetry, and the offline analyzer. **Complete.**
 2. Implement the exact-support IMU buffer, GTSAM combined-preintegration Ceres
    adapter, dense propagator, and their numerical parity tests.
 3. Implement LiDAR preprocessing, IMU deskew, deterministic voxel selection,
@@ -1376,14 +1431,14 @@ The first vertical slice is built in this order:
 5. Implement the sensor-neutral state timeline, Ceres batch window, combined
    IMU and direct LiDAR factors, fixed-linearization square-root
    marginalization, atomic commit, and finalization stream.
-6. Publish local/global-composed poses, TF, status, diagnostics, and Rerun debug
-   records, then run complete Quad Easy, Quad Hard, and Park gates in that
-   order.
+6. Publish local/global-composed poses, TF, and status; record diagnostics and
+   debug evidence in Rerun; then run complete Quad Easy, Quad Hard, and Park
+   evaluations in that order.
 
 Lag/state limits, LiDAR row/candidate/memory budgets, association validity,
 information ceilings, and ICP/Ceres iteration and time limits are required
 resolved configuration values. Finite conservative seeds are established on
-standalone fixtures before the first complete replay and then changed only by
+standalone fixtures before the first complete bag run and then changed only by
 recorded full-sequence experiments. LiDAR factor cadence is initially every
 eligible 10 Hz sweep. A lower ATE obtained by lost input, reduced coverage,
 stale geometry, or missed deadlines is invalid. Global-backend, visual, and

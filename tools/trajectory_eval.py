@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic, ROS-free trajectory evaluation for Meridian.
+"""ROS-free trajectory evaluation for Meridian.
 
 The external Newer College comparison protocol is equivalent to::
 
@@ -10,13 +10,8 @@ That is a one-to-one timestamp association followed by an SE(3) Umeyama
 alignment (rotation and translation, never scale).  Select it with
 ``--association nearest --max-dt 0.01``.
 
-For Meridian acceptance runs, pass a versioned ``--scenario`` and ``--profile``.
-The fixed cold-start profile begins its eligible window at the checked-in
-``GT_first + startup_allowance`` boundary and evaluates only untouched GT
-stamps on or after it.  The boundary never follows the estimate.  Startup
-delay and end loss are independent gates, while whole-reference coverage
-remains visible in every report.  No profile extrapolates poses or silently
-trims a result to improve its score.
+The evaluator is configured directly from the command line. It never
+extrapolates poses or silently trims a result to improve its score.
 
 TUM input rows are::
 
@@ -40,48 +35,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-import yaml
 
 
 FULL_REFERENCE_PROTOCOL = "meridian.full_reference/v1"
 FIXED_COLD_START_PROTOCOL = "meridian.fixed_cold_start/v1"
-SCENARIO_SCHEMA = "meridian.benchmark_scenario/v3"
-
-
-class _UniqueKeyLoader(yaml.SafeLoader):
-    """Safe YAML loader that rejects ambiguous duplicate keys."""
-
-
-def _construct_unique_mapping(
-    loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
-) -> Mapping[str, Any]:
-    loader.flatten_mapping(node)
-    result: Dict[Any, Any] = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        try:
-            duplicate = key in result
-        except TypeError as exc:
-            raise yaml.constructor.ConstructorError(
-                "while constructing a mapping",
-                node.start_mark,
-                "found an unhashable mapping key",
-                key_node.start_mark,
-            ) from exc
-        if duplicate:
-            raise yaml.constructor.ConstructorError(
-                "while constructing a mapping",
-                node.start_mark,
-                f"found duplicate key {key!r}",
-                key_node.start_mark,
-            )
-        result[key] = loader.construct_object(value_node, deep=deep)
-    return result
-
-
-_UniqueKeyLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
-)
 
 
 class EvaluationError(ValueError):
@@ -151,11 +108,6 @@ class EvaluationConfig:
     startup_allowance_s: float = 0.0
     maximum_startup_delay_s: Optional[float] = None
     maximum_end_loss_s: Optional[float] = None
-    scenario_id: Optional[str] = None
-    scenario_schema: Optional[str] = None
-    evaluation_profile: Optional[str] = None
-    profile_purpose: Optional[str] = None
-    publication_eligible: bool = False
 
     def validate(self) -> None:
         for name in ("reference_body_frame", "estimate_body_frame"):
@@ -215,19 +167,6 @@ class EvaluationConfig:
                 raise EvaluationError(
                     "fixed eligible window must not begin before the allowed startup delay"
                 )
-            if self.publication_eligible:
-                raise EvaluationError("a fixed cold-start profile cannot be publication eligible")
-        if self.publication_eligible:
-            if self.coverage_protocol != FULL_REFERENCE_PROTOCOL:
-                raise EvaluationError("publication profile must use the full reference")
-            if self.association != "nearest" or abs(self.max_dt - 0.01) > 1.0e-12:
-                raise EvaluationError(
-                    "publication profile must use unique nearest association at 10 ms"
-                )
-        for name in ("scenario_id", "scenario_schema", "evaluation_profile", "profile_purpose"):
-            value = getattr(self, name)
-            if value is not None and (not isinstance(value, str) or not value.strip()):
-                raise EvaluationError(f"{name} must be null or a non-empty string")
 
 
 @dataclass(frozen=True)
@@ -245,220 +184,6 @@ class AssociatedTrajectories:
             raise EvaluationError("invalid association time-error array")
         if not np.array_equal(self.reference.timestamps, self.estimate.timestamps):
             raise EvaluationError("associated timestamps are not identical")
-
-
-def _required_mapping(parent: Mapping[str, Any], key: str, context: str) -> Mapping[str, Any]:
-    value = parent.get(key)
-    if not isinstance(value, Mapping):
-        raise EvaluationError(f"{context}.{key} must be a mapping")
-    return value
-
-
-def _required_string(parent: Mapping[str, Any], key: str, context: str) -> str:
-    value = parent.get(key)
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
-        raise EvaluationError(f"{context}.{key} must be a non-empty trimmed string")
-    return value
-
-
-def _required_bool(parent: Mapping[str, Any], key: str, context: str) -> bool:
-    value = parent.get(key)
-    if not isinstance(value, bool):
-        raise EvaluationError(f"{context}.{key} must be a boolean")
-    return value
-
-
-def _required_number(parent: Mapping[str, Any], key: str, context: str) -> float:
-    value = parent.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise EvaluationError(f"{context}.{key} must be numeric")
-    result = float(value)
-    if not math.isfinite(result):
-        raise EvaluationError(f"{context}.{key} must be finite")
-    return result
-
-
-def _require_exact_keys(
-    mapping: Mapping[str, Any], expected: set[str], context: str
-) -> None:
-    non_string = [key for key in mapping if not isinstance(key, str)]
-    if non_string:
-        raise EvaluationError(f"{context} contains a non-string key")
-    actual = set(mapping)
-    missing = sorted(expected - actual)
-    unknown = sorted(actual - expected)
-    if missing or unknown:
-        details = []
-        if missing:
-            details.append("missing " + ", ".join(missing))
-        if unknown:
-            details.append("unknown " + ", ".join(unknown))
-        raise EvaluationError(f"{context} has invalid keys: {'; '.join(details)}")
-
-
-def _descriptor_path_matches(
-    provided: Path, declared: str, scenario_path: Path
-) -> bool:
-    declared_path = Path(declared)
-    if declared_path.is_absolute():
-        candidates = (declared_path,)
-    else:
-        candidates = tuple(
-            base / declared_path
-            for base in (Path.cwd(), scenario_path.parent, *scenario_path.parents)
-        )
-    provided_resolved = provided.resolve()
-    return any(candidate.resolve() == provided_resolved for candidate in candidates)
-
-
-def load_scenario_evaluation_config(
-    scenario_path: Path | str,
-    profile_name: str,
-    ground_truth_path: Path | str,
-    track_label: str = "unspecified",
-) -> EvaluationConfig:
-    """Load one immutable evaluation profile from a versioned scenario.
-
-    Scenario mode deliberately owns every option that can change association,
-    frames, the eligible reference window, coverage, or output-health gates.
-    This prevents a result-dependent CLI crop from being reported under a
-    checked-in profile name.
-    """
-
-    if (
-        not isinstance(profile_name, str)
-        or not profile_name.strip()
-        or profile_name != profile_name.strip()
-    ):
-        raise EvaluationError("profile_name must be a non-empty trimmed string")
-    source = Path(scenario_path)
-    try:
-        document = yaml.load(source.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
-    except (OSError, yaml.YAMLError) as exc:
-        raise EvaluationError(f"cannot load scenario {source}: {exc}") from exc
-    if not isinstance(document, Mapping):
-        raise EvaluationError(f"scenario {source} must contain one mapping")
-    schema = _required_string(document, "schema", "scenario")
-    if schema != SCENARIO_SCHEMA:
-        raise EvaluationError(
-            f"scenario {source} has schema {schema}, expected {SCENARIO_SCHEMA}"
-        )
-    scenario_id = _required_string(document, "id", "scenario")
-    ground_truth = _required_mapping(document, "ground_truth", "scenario")
-    estimate = _required_mapping(document, "estimate", "scenario")
-    declared_ground_truth = _required_string(ground_truth, "path", "scenario.ground_truth")
-    if not _descriptor_path_matches(Path(ground_truth_path), declared_ground_truth, source):
-        raise EvaluationError(
-            "ground-truth argument does not match the path declared by the scenario: "
-            f"{declared_ground_truth}"
-        )
-    reference_body_frame = _required_string(
-        ground_truth, "body_frame", "scenario.ground_truth"
-    )
-    estimate_body_frame = _required_string(estimate, "body_frame", "scenario.estimate")
-    profiles = _required_mapping(document, "evaluation_profiles", "scenario")
-    profile = profiles.get(profile_name)
-    if not isinstance(profile, Mapping):
-        raise EvaluationError(
-            f"scenario {scenario_id} has no evaluation profile named {profile_name}"
-        )
-    context = f"scenario.evaluation_profiles.{profile_name}"
-    purpose = _required_string(profile, "purpose", context)
-    publication_eligible = _required_bool(profile, "publication_eligible", context)
-    association = _required_string(profile, "association", context)
-    alignment = _required_string(profile, "alignment", context)
-    if alignment != "se3_no_scale":
-        raise EvaluationError(f"{context}.alignment must be se3_no_scale")
-    coverage_protocol = _required_string(profile, "coverage_protocol", context)
-    no_extrapolation = _required_bool(profile, "no_extrapolation", context)
-    if not no_extrapolation:
-        raise EvaluationError(f"{context} must forbid trajectory extrapolation")
-    rpe_distance_m = _required_number(profile, "rpe_distance_m", context)
-    max_output_gap = _required_number(profile, "max_output_gap_s", context)
-    max_linear_speed = _required_number(profile, "max_linear_speed_mps", context)
-    max_angular_speed_deg = _required_number(profile, "max_angular_speed_degps", context)
-
-    common: Dict[str, Any] = {
-        "reference_body_frame": reference_body_frame,
-        "estimate_body_frame": estimate_body_frame,
-        "association": association,
-        "max_output_gap": max_output_gap,
-        "max_linear_speed": max_linear_speed,
-        "max_angular_speed_deg": max_angular_speed_deg,
-        "rpe_distance_m": rpe_distance_m,
-        "track_label": track_label,
-        "coverage_protocol": coverage_protocol,
-        "scenario_id": scenario_id,
-        "scenario_schema": schema,
-        "evaluation_profile": profile_name,
-        "profile_purpose": purpose,
-        "publication_eligible": publication_eligible,
-    }
-    common_profile_keys = {
-        "purpose",
-        "publication_eligible",
-        "association",
-        "coverage_protocol",
-        "alignment",
-        "no_extrapolation",
-        "rpe_distance_m",
-        "max_output_gap_s",
-        "max_linear_speed_mps",
-        "max_angular_speed_degps",
-    }
-    if coverage_protocol == FIXED_COLD_START_PROTOCOL:
-        _require_exact_keys(
-            profile,
-            common_profile_keys
-            | {
-                "startup_allowance_s",
-                "maximum_startup_delay_s",
-                "maximum_end_loss_s",
-                "max_interpolation_gap_s",
-                "no_estimate_dependent_trimming",
-                "minimum_window_coverage",
-            },
-            context,
-        )
-        if association != "interpolate":
-            raise EvaluationError(f"{context} fixed cold-start profile must interpolate")
-        if not _required_bool(profile, "no_estimate_dependent_trimming", context):
-            raise EvaluationError(f"{context} must forbid estimate-dependent trimming")
-        common.update(
-            max_interpolation_gap=_required_number(
-                profile, "max_interpolation_gap_s", context
-            ),
-            min_coverage=_required_number(profile, "minimum_window_coverage", context),
-            startup_allowance_s=_required_number(profile, "startup_allowance_s", context),
-            maximum_startup_delay_s=_required_number(
-                profile, "maximum_startup_delay_s", context
-            ),
-            maximum_end_loss_s=_required_number(profile, "maximum_end_loss_s", context),
-        )
-    elif coverage_protocol == FULL_REFERENCE_PROTOCOL:
-        full_profile_keys = common_profile_keys | {"no_trimming", "minimum_coverage"}
-        if association == "nearest":
-            full_profile_keys |= {"unique_one_to_one", "max_dt_s"}
-        elif association == "interpolate":
-            full_profile_keys |= {"max_interpolation_gap_s"}
-        _require_exact_keys(profile, full_profile_keys, context)
-        if not _required_bool(profile, "no_trimming", context):
-            raise EvaluationError(f"{context} full-reference profile must forbid trimming")
-        common["min_coverage"] = _required_number(profile, "minimum_coverage", context)
-        if association == "nearest":
-            if not _required_bool(profile, "unique_one_to_one", context):
-                raise EvaluationError(f"{context} nearest association must be unique")
-            common["max_dt"] = _required_number(profile, "max_dt_s", context)
-        elif association == "interpolate":
-            common["max_interpolation_gap"] = _required_number(
-                profile, "max_interpolation_gap_s", context
-            )
-    else:
-        raise EvaluationError(f"{context} has unsupported coverage protocol {coverage_protocol}")
-
-    config = EvaluationConfig(**common)
-    config.validate()
-    return config
 
 
 def load_tum(path: Path | str, quaternion_norm_tolerance: float = 1.0e-2) -> Trajectory:
@@ -1030,11 +755,6 @@ def evaluate_trajectories(
     report: Dict[str, Any] = {
         "schema": "meridian.trajectory_evaluation.v3",
         "protocol": {
-            "scenario_id": settings.scenario_id,
-            "scenario_schema": settings.scenario_schema,
-            "evaluation_profile": settings.evaluation_profile,
-            "profile_purpose": settings.profile_purpose,
-            "publication_eligible": settings.publication_eligible,
             "track_label": settings.track_label,
             "reference_body_frame": settings.reference_body_frame,
             "estimate_body_frame": settings.estimate_body_frame,
@@ -1065,7 +785,7 @@ def evaluate_trajectories(
                 "startup_allowance_s": settings.startup_allowance_s,
                 "start_inclusive": True,
                 "selection": (
-                    "scenario_fixed_before_estimate_association"
+                    "fixed_before_estimate_association"
                     if settings.coverage_protocol == FIXED_COLD_START_PROTOCOL
                     else "full_reference"
                 ),
@@ -1209,15 +929,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("estimate", type=Path, help="TUM estimate in the same body frame")
     parser.add_argument(
-        "--scenario",
-        type=Path,
-        help="versioned benchmark scenario that owns the complete evaluation protocol",
-    )
-    parser.add_argument(
-        "--profile",
-        help="evaluation_profiles key from --scenario (required in scenario mode)",
-    )
-    parser.add_argument(
         "--association",
         choices=("interpolate", "nearest", "exact"),
         default=None,
@@ -1276,36 +987,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def _config_from_arguments(args: argparse.Namespace) -> EvaluationConfig:
-    scenario_owned = (
-        "association",
-        "max_dt",
-        "exact_tolerance",
-        "max_interpolation_gap",
-        "min_coverage",
-        "max_output_gap",
-        "max_linear_speed",
-        "max_angular_speed_deg",
-        "rpe_distance",
-        "reference_body_frame",
-        "estimate_body_frame",
-    )
-    if args.scenario is not None:
-        if not args.profile:
-            raise EvaluationError("--profile is required with --scenario")
-        overrides = [name for name in scenario_owned if getattr(args, name) is not None]
-        if overrides:
-            rendered = ", ".join("--" + name.replace("_", "-") for name in overrides)
-            raise EvaluationError(
-                "scenario mode forbids protocol overrides; remove: " + rendered
-            )
-        return load_scenario_evaluation_config(
-            args.scenario, args.profile, args.ground_truth, args.track_label
-        )
-    if args.profile is not None:
-        raise EvaluationError("--profile requires --scenario")
     if args.reference_body_frame is None or args.estimate_body_frame is None:
         raise EvaluationError(
-            "manual mode requires --reference-body-frame and --estimate-body-frame"
+            "--reference-body-frame and --estimate-body-frame are required"
         )
     config = EvaluationConfig(
         reference_body_frame=args.reference_body_frame,

@@ -1,0 +1,32 @@
+meridian_ingress:
+  ros__parameters:
+    imu_topic: /alphasense_driver_ros/imu
+    imu_frame: imu_sensor_frame
+    imu_sensor_id: newer_college_alphasense_imu
+    imu_calibration_id: newer_college_collection1_alphasense
+
+    lidar_topic: /os_cloud_node/points
+    lidar_frame: os_sensor
+    lidar_sensor_id: newer_college_os0_128
+    lidar_calibration_id: newer_college_collection1_os0
+
+    lidar_x_field: "x"
+    lidar_x_datatype: float32
+    lidar_y_field: "y"
+    lidar_y_datatype: float32
+    lidar_z_field: "z"
+    lidar_z_datatype: float32
+    lidar_time_field: "t"
+    lidar_time_datatype: uint32
+    lidar_time_scale_to_nanoseconds: 1.0
+    lidar_time_reference: offset_from_header
+    lidar_intensity_field: "intensity"
+    lidar_intensity_datatype: float32
+    lidar_ring_field: "ring"
+    lidar_ring_datatype: uint8
+
+    lidar_decode_queue_capacity: 4
+    lidar_max_scan_duration_ns: 120000000
+    lidar_max_points: 200000
+    preview_rate_hz: 1.0
+    preview_max_points: 4096
