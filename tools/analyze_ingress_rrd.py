@@ -50,6 +50,13 @@ INITIALIZATION_STATUS_PATH = "/local_rt/initialization/status"
 INITIALIZATION_COUNTS_PATH = "/local_rt/initialization/counts"
 ACCEPTED_SEED_PATH = "/local_rt/initialization/accepted_seed/velocity_odom_m_s"
 BOOTSTRAP_QUALITY_PATH = "/local_rt/bootstrap/quality"
+BOOTSTRAP_QUALITY_FIELDS = (
+    "source_point_count",
+    "correspondence_count",
+    "point_rmse_m",
+    "hessian_condition_number",
+    "accepted",
+)
 PREINTEGRATION_QUALITY_PATH = "/local_rt/preintegration/quality"
 PREINTEGRATION_BACKEND_PATH = "/local_rt/preintegration/backend"
 ESTIMATOR_QUALITY_PATH = "/local_rt/estimator/quality"
@@ -839,6 +846,14 @@ def _local_rt_report(
         "records": len(bootstrap_rows),
         "accepted_records": accepted_bootstrap,
         "rejected_records": len(bootstrap_rows) - accepted_bootstrap,
+        "width_min": min((len(row) for row in bootstrap_rows), default=None),
+        "width_max": max((len(row) for row in bootstrap_rows), default=None),
+        "field_stats": {
+            field: _stats(
+                row[index] for row in bootstrap_rows if index < len(row)
+            )
+            for index, field in enumerate(BOOTSTRAP_QUALITY_FIELDS)
+        },
     }
 
     preintegration_present, preintegration_table, preintegration_mask, preintegration_rows = (
@@ -1773,6 +1788,31 @@ def _print_report(report: Mapping[str, Any]) -> None:
             "LOCAL RT BOOTSTRAP: "
             f"{bootstrap['records']} records; accepted={bootstrap['accepted_records']}; "
             f"rejected={bootstrap['rejected_records']}"
+        )
+        bootstrap_stats = bootstrap["field_stats"]
+        print(
+            "  source points: "
+            f"mean={_stat_value(bootstrap_stats['source_point_count'], 'mean')}; "
+            f"min={_stat_value(bootstrap_stats['source_point_count'], 'min')}; "
+            f"max={_stat_value(bootstrap_stats['source_point_count'], 'max')}"
+        )
+        print(
+            "  correspondences: "
+            f"mean={_stat_value(bootstrap_stats['correspondence_count'], 'mean')}; "
+            f"p95={_stat_value(bootstrap_stats['correspondence_count'], 'p95')}; "
+            f"max={_stat_value(bootstrap_stats['correspondence_count'], 'max')}"
+        )
+        print(
+            "  point RMSE: "
+            f"mean={_stat_value(bootstrap_stats['point_rmse_m'], 'mean', ' m')}; "
+            f"p95={_stat_value(bootstrap_stats['point_rmse_m'], 'p95', ' m')}; "
+            f"max={_stat_value(bootstrap_stats['point_rmse_m'], 'max', ' m')}"
+        )
+        print(
+            "  Hessian condition: "
+            f"median={_stat_value(bootstrap_stats['hessian_condition_number'], 'median')}; "
+            f"p95={_stat_value(bootstrap_stats['hessian_condition_number'], 'p95')}; "
+            f"max={_stat_value(bootstrap_stats['hessian_condition_number'], 'max')}"
         )
 
         preintegration = local_rt["preintegration"]

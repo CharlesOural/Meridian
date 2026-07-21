@@ -10,6 +10,7 @@ evidence are kept separately:
 - [V1/V2 engineering retrospective](docs/V1_V2_RETEX.md)
 - [Voxel-SLAM reference and comparison](docs/VOXEL_SLAM_COMPARISON.md)
 - [Development runbook](docs/DEVELOPMENT.md)
+- [Barakuda dataset runbook](docs/BARAKUDA_DATASET.md)
 - [Optimization ledger](docs/OPTIMIZE.md)
 
 The immutable V2 source snapshot is commit

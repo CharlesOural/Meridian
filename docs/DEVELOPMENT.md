@@ -114,11 +114,14 @@ ros2 launch meridian_apps bag_debug.launch.py \
 ```
 
 This launch uses standard `ros2 bag play`; there is no Meridian replay
-executable. It does not filter bag topics or install QoS/count acceptance
-machinery. A short startup delay gives DDS discovery time but is not a delivery
-guarantee; after the player exits, a short grace period lets ROS callbacks
-settle and the node drains its bounded LiDAR and Rerun queues. Use `rate:=0.25`
-for slower visual inspection.
+executable. By default it does not filter bag topics. The optional `topics`
+argument supplies a whitespace-separated rosbag allow-list when a recording
+contains unrelated custom message types; selected topics still use normal ROS
+transport. The launch does not install QoS/count acceptance machinery. A short
+startup delay gives DDS discovery time but is not a delivery guarantee; after
+the player exits, a short grace period lets ROS callbacks settle and the node
+drains its bounded LiDAR and Rerun queues. Use `rate:=0.25` for slower visual
+inspection.
 
 Foxglove can inspect the original bag topics, including the original
 `/os_cloud_node/points` cloud. Meridian publishes no preview or diagnostics

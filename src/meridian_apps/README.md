@@ -20,10 +20,12 @@ ros2 launch meridian_apps bag_debug.launch.py \
 ```
 
 The launch starts the ingress and Foxglove Bridge, then invokes ordinary
-`ros2 bag play`. It plays the original topics without a custom replay process,
-topic filter, QoS override, completion service, or in-process expected counts.
-When the player exits, ingress drains its LiDAR decoder, `meridian_local_rt`
-drains observations with complete IMU support, and Rerun writes its footer.
+`ros2 bag play`. It plays all original topics by default, without a custom
+replay process, QoS override, completion service, or in-process expected
+counts. An optional `topics` argument passes an explicit allow-list to rosbag2
+for bags containing unrelated custom types. When the player exits, ingress
+drains its LiDAR decoder, `meridian_local_rt` drains observations with complete
+IMU support, and Rerun writes its footer.
 
 The RRD contains:
 

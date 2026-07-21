@@ -6,6 +6,7 @@ from launch.actions import (
     EmitEvent,
     ExecuteProcess,
     IncludeLaunchDescription,
+    OpaqueFunction,
     RegisterEventHandler,
     TimerAction,
 )
@@ -25,10 +26,40 @@ def _stop_after_player(event, _context):
     return [TimerAction(period=1.0, actions=[EmitEvent(event=Shutdown(reason=reason))])]
 
 
+def _make_player(context):
+    bag = LaunchConfiguration("bag").perform(context)
+    rate = LaunchConfiguration("rate").perform(context)
+    topics = LaunchConfiguration("topics").perform(context).split()
+    command = [
+        "ros2",
+        "bag",
+        "play",
+        bag,
+        "--clock",
+        "100.0",
+        "--rate",
+        rate,
+        # rosbag2 creates its publishers before this delay. It gives DDS
+        # discovery time to match without adding delivery policy to ingress.
+        "--delay",
+        "1.0",
+        "--disable-keyboard-controls",
+    ]
+    if topics:
+        command.extend(["--topics", *topics])
+
+    player = ExecuteProcess(cmd=command, output="screen")
+    return [
+        # This is startup sequencing, not a delivery or count guarantee.
+        TimerAction(period=1.0, actions=[player]),
+        RegisterEventHandler(
+            OnProcessExit(target_action=player, on_exit=_stop_after_player)
+        ),
+    ]
+
+
 def generate_launch_description() -> LaunchDescription:
-    bag = LaunchConfiguration("bag")
     config = LaunchConfiguration("config")
-    rate = LaunchConfiguration("rate")
     rrd = LaunchConfiguration("rrd")
 
     debug_stack = IncludeLaunchDescription(
@@ -40,25 +71,6 @@ def generate_launch_description() -> LaunchDescription:
         launch_arguments={"config": config, "rrd": rrd}.items(),
     )
 
-    player = ExecuteProcess(
-        cmd=[
-            "ros2",
-            "bag",
-            "play",
-            bag,
-            "--clock",
-            "100.0",
-            "--rate",
-            rate,
-            # rosbag2 creates its publishers before this delay. It gives DDS
-            # discovery time to match without adding delivery policy to ingress.
-            "--delay",
-            "1.0",
-            "--disable-keyboard-controls",
-        ],
-        output="screen",
-    )
-
     return LaunchDescription(
         [
             DeclareLaunchArgument("bag", description="Path to a rosbag2 directory"),
@@ -67,13 +79,16 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("rate", default_value="1.0"),
             DeclareLaunchArgument(
+                "topics",
+                default_value="",
+                description=(
+                    "Optional whitespace-separated rosbag topic allow-list; empty plays all"
+                ),
+            ),
+            DeclareLaunchArgument(
                 "rrd", default_value="/workspace/out/meridian_ingress.rrd"
             ),
             debug_stack,
-            # This is startup sequencing, not a delivery or count guarantee.
-            TimerAction(period=1.0, actions=[player]),
-            RegisterEventHandler(
-                OnProcessExit(target_action=player, on_exit=_stop_after_player)
-            ),
+            OpaqueFunction(function=_make_player),
         ]
     )

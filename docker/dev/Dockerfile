@@ -21,6 +21,7 @@ RUN apt-get update \
      python3-numpy python3-yaml \
      ros-${ROS_DISTRO}-rosbag2 \
      ros-${ROS_DISTRO}-rosbag2-storage-default-plugins \
+     ros-${ROS_DISTRO}-rosbag2-storage-mcap \
      ros-${ROS_DISTRO}-launch \
      ros-${ROS_DISTRO}-launch-ros \
      ros-${ROS_DISTRO}-sensor-msgs \
