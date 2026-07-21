@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>meridian_local_rt</name>
+  <version>0.1.0</version>
+  <description>ROS-free local real-time inertial and fixed-lag estimator foundation for Meridian.</description>
+  <maintainer email="charles@cfglobal.fr">Charles Farhat</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>meridian_cmake</build_depend>
+
+  <depend>meridian_core</depend>
+  <depend>eigen</depend>
+  <depend>ceres-solver</depend>
+  <depend>gtsam</depend>
+  <depend>sophus</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

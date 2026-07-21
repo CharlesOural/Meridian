@@ -30,3 +30,146 @@ meridian_ingress:
     lidar_max_points: 200000
     preview_rate_hz: 1.0
     preview_max_points: 4096
+
+    # Online-estimation noise and bias random-walk inputs below are scalar
+    # continuous-time densities; the loader squares them onto the three
+    # diagonal covariance-density axes. These deliberately model the complete
+    # online residual (sensor + calibration + timing + motion-model error), not
+    # just the IMU datasheet's white-noise floor.
+    local_rt.imu.gravity_m_s2: 9.80665
+    local_rt.imu.accelerometer_noise_density: 0.05
+    local_rt.imu.gyroscope_noise_density: 0.02
+    local_rt.imu.integration_covariance_density: 1.0e-8
+    local_rt.imu.accelerometer_bias_random_walk_density: 3.390710627779767e-05
+    local_rt.imu.gyroscope_bias_random_walk_density: 8.252445860125436e-06
+
+    # Transform quaternions are explicitly XYZW.
+    local_rt.extrinsics.base_from_imu.translation_m: [0.038, -0.008, 0.065]
+    local_rt.extrinsics.base_from_imu.quaternion_xyzw: [1.0, 0.0, 0.0, 0.0]
+    local_rt.extrinsics.imu_from_lidar.translation_m: [-0.037, -0.008, -0.026]
+    local_rt.extrinsics.imu_from_lidar.quaternion_xyzw: [1.0, 0.0, 0.0, 0.0]
+    local_rt.extrinsics.lidar_time_offset_to_imu_ns: 0
+
+    local_rt.imu_buffer.capacity: 8192
+    local_rt.imu_buffer.maximum_gap_ns: 20000000
+    local_rt.queues.imu_capacity: 8192
+    local_rt.queues.lidar_capacity: 64
+
+    # Generic local smoother/front-end profile. These are dataset-profile
+    # values only; no Newer College assumptions exist in meridian_local_rt.
+    local_rt.fixed_lag.maximum_states: 8
+    local_rt.fixed_lag.maximum_duration_ns: 1000000000
+    local_rt.fixed_lag.maximum_solver_iterations: 6
+    local_rt.fixed_lag.solver_threads: 2
+    local_rt.fixed_lag.maximum_solver_time_s: 0.08
+    local_rt.fixed_lag.function_tolerance: 1.0e-6
+    local_rt.fixed_lag.gradient_tolerance: 1.0e-10
+    local_rt.fixed_lag.parameter_tolerance: 1.0e-8
+    local_rt.fixed_lag.maximum_translation_correction_m: 3.0
+    local_rt.fixed_lag.maximum_rotation_correction_rad: 0.6
+    local_rt.fixed_lag.maximum_prior_translation_m: 2.0
+    local_rt.fixed_lag.maximum_prior_rotation_rad: 0.5
+    local_rt.fixed_lag.maximum_prior_motion_norm: 5.0
+    local_rt.fixed_lag.initial_translation_sigma_m: 0.01
+    local_rt.fixed_lag.initial_rotation_sigma_rad: 0.01
+    local_rt.fixed_lag.initial_velocity_sigma_m_s: 0.5
+    local_rt.fixed_lag.initial_gyro_bias_sigma_rad_s: 0.02
+    local_rt.fixed_lag.initial_accel_bias_sigma_m_s2: 0.3
+    local_rt.fixed_lag.marginalization_elimination_rank_tolerance: 1.0e-10
+    local_rt.fixed_lag.marginalization_compression_rank_tolerance: 1.0e-10
+
+    local_rt.lidar.minimum_range_m: 1.5
+    local_rt.lidar.maximum_range_m: 60.0
+    # V1-grounded normal-tracking density: the 1.0 m source selector yields
+    # roughly 2k registration points on the OS0 sweeps while the denser 0.5 m
+    # target retains surface support. These remain profile values, not dataset
+    # assumptions in meridian_local_rt.
+    local_rt.lidar.target_downsample_voxel_m: 0.5
+    local_rt.lidar.source_downsample_voxel_m: 1.0
+    local_rt.lidar.maximum_active_owners: 4
+    local_rt.lidar.maximum_factor_rows: 600
+    local_rt.lidar.minimum_correspondences: 100
+    local_rt.lidar.maximum_icp_iterations: 8
+    local_rt.lidar.maximum_backtracking_steps: 6
+    local_rt.lidar.maximum_correspondence_distance_m: 0.5
+    local_rt.lidar.point_sigma_m: 0.10
+    local_rt.lidar.huber_mad_multiplier: 2.0
+    local_rt.lidar.minimum_huber_scale_m: 0.10
+    local_rt.lidar.maximum_huber_scale_m: 1.0
+    local_rt.lidar.translation_convergence_m: 0.002
+    local_rt.lidar.rotation_convergence_rad: 0.001
+    local_rt.lidar.maximum_translation_step_m: 0.5
+    local_rt.lidar.maximum_rotation_step_rad: 0.15
+    local_rt.lidar.maximum_prediction_correction_m: 3.0
+    local_rt.lidar.maximum_prediction_correction_rad: 0.6
+    local_rt.lidar.relative_rank_tolerance: 1.0e-6
+    local_rt.lidar.lm_damping: 1.0e-4
+
+    local_rt.lidar.active_target.voxel_size_m: 1.0
+    local_rt.lidar.active_target.retention_radius_m: 50.0
+    local_rt.lidar.active_target.max_voxels: 30000
+    local_rt.lidar.active_target.max_points_per_voxel: 20
+    local_rt.lidar.active_target.minimum_point_spacing_m: 0.20
+    local_rt.lidar.active_target.max_neighbor_voxel_radius: 1
+
+    local_rt.lidar.finalized_target.voxel_size_m: 1.0
+    local_rt.lidar.finalized_target.retention_radius_m: 50.0
+    local_rt.lidar.finalized_target.max_voxels: 100000
+    local_rt.lidar.finalized_target.max_points_per_voxel: 20
+    local_rt.lidar.finalized_target.minimum_point_spacing_m: 0.20
+    local_rt.lidar.finalized_target.max_neighbor_voxel_radius: 1
+
+    local_rt.initialization.mode: DYNAMIC
+    local_rt.initialization.bias_prior.gyroscope_rad_s: [0.0, 0.0, 0.0]
+    local_rt.initialization.bias_prior.accelerometer_m_s2: [0.0, 0.0, 0.0]
+    local_rt.initialization.bias_prior.gyroscope_sigma_rad_s: 0.02
+    local_rt.initialization.bias_prior.accelerometer_sigma_m_s2: 0.3
+
+    local_rt.initialization.static.window_duration_ns: 2000000000
+    local_rt.initialization.static.block_duration_ns: 50000000
+    local_rt.initialization.static.minimum_samples: 300
+    local_rt.initialization.static.minimum_blocks: 30
+    local_rt.initialization.static.gyroscope_saturation_rad_s: 8.0
+    local_rt.initialization.static.accelerometer_saturation_m_s2: 80.0
+    local_rt.initialization.static.maximum_mean_angular_rate_rad_s: 0.15
+    local_rt.initialization.static.maximum_block_angular_dispersion_rad_s: 0.03
+    local_rt.initialization.static.maximum_specific_force_norm_error_m_s2: 0.5
+    local_rt.initialization.static.maximum_block_direction_dispersion_rad: 0.05
+
+    local_rt.initialization.dynamic.target_sweeps: 20
+    local_rt.initialization.dynamic.maximum_support_ns: 5000000000
+    local_rt.initialization.dynamic.minimum_range_m: 1.5
+    local_rt.initialization.dynamic.maximum_range_m: 60.0
+    local_rt.initialization.dynamic.gyroscope_finite_difference_step_rad_s: 1.0e-4
+    local_rt.initialization.dynamic.minimum_singular_value_ratio: 1.0e-6
+    local_rt.initialization.dynamic.maximum_condition_number: 1.0e8
+    local_rt.initialization.dynamic.maximum_gyro_bias_correction_rad_s: 0.2
+    local_rt.initialization.dynamic.maximum_gravity_magnitude_error_m_s2: 2.0
+    local_rt.initialization.dynamic.maximum_alignment_residual_rms: 200.0
+    local_rt.initialization.dynamic.maximum_held_out_rotation_error_rad: 0.25
+    local_rt.initialization.dynamic.maximum_held_out_translation_error_m: 1.0
+    local_rt.initialization.dynamic.maximum_refinement_rotation_change_rad: 0.2
+    local_rt.initialization.dynamic.maximum_refinement_translation_change_m: 1.0
+
+    local_rt.initialization.dynamic.bootstrap.downsample_voxel_size_m: 0.75
+    local_rt.initialization.dynamic.bootstrap.minimum_points: 200
+    local_rt.initialization.dynamic.bootstrap.maximum_accepted_rmse_m: 0.75
+    local_rt.initialization.dynamic.bootstrap.maximum_accepted_condition_number: 1.0e8
+
+    local_rt.initialization.dynamic.bootstrap.target.voxel_size_m: 0.75
+    local_rt.initialization.dynamic.bootstrap.target.retention_radius_m: 60.0
+    local_rt.initialization.dynamic.bootstrap.target.max_voxels: 40000
+    local_rt.initialization.dynamic.bootstrap.target.max_points_per_voxel: 3
+    local_rt.initialization.dynamic.bootstrap.target.minimum_point_spacing_m: 0.1
+    local_rt.initialization.dynamic.bootstrap.target.max_neighbor_voxel_radius: 2
+
+    local_rt.initialization.dynamic.bootstrap.registration.max_iterations: 10
+    local_rt.initialization.dynamic.bootstrap.registration.max_source_points: 4096
+    local_rt.initialization.dynamic.bootstrap.registration.minimum_correspondences: 200
+    local_rt.initialization.dynamic.bootstrap.registration.max_correspondence_distance_m: 1.5
+    local_rt.initialization.dynamic.bootstrap.registration.geman_mcclure_scale_m: 0.5
+    local_rt.initialization.dynamic.bootstrap.registration.translation_convergence_m: 0.001
+    local_rt.initialization.dynamic.bootstrap.registration.rotation_convergence_rad: 0.0005
+    local_rt.initialization.dynamic.bootstrap.registration.max_translation_step_m: 1.0
+    local_rt.initialization.dynamic.bootstrap.registration.max_rotation_step_rad: 0.2
+    local_rt.initialization.dynamic.bootstrap.registration.relative_rank_tolerance: 1.0e-6

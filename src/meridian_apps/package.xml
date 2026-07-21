@@ -11,6 +11,7 @@
   <build_depend>meridian_cmake</build_depend>
 
   <depend>meridian_core</depend>
+  <depend>meridian_local_rt</depend>
   <depend>meridian_ros</depend>
   <depend>rclcpp</depend>
 

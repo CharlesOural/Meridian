@@ -7,8 +7,11 @@
 #include <rclcpp/rclcpp.hpp>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
+#include "meridian/apps/local_rt_config_loader.hpp"
 #include "meridian/apps/rerun_debug_sink.hpp"
+#include "meridian/local_rt/pipeline.hpp"
 #include "meridian/ros/sensor_ingress_node.hpp"
 
 namespace {
@@ -38,16 +41,33 @@ int main(int argc, char** argv) {
     meridian::apps::RerunDebugSink debug_sink({.output_path = rrd_path});
     auto node =
         std::make_shared<meridian::ros::SensorIngressNode>(rclcpp::NodeOptions{}, debug_sink);
+    meridian::local_rt::LocalRtPipelineConfig local_rt_config =
+        meridian::apps::loadLocalRtPipelineConfig(*node);
+    auto local_rt_pipeline = std::make_shared<meridian::local_rt::LocalRtPipeline>(
+        std::move(local_rt_config), debug_sink);
+    node->setObservationCallbacks({
+        .imu =
+            [local_rt_pipeline](meridian::core::ImuSample sample) {
+              local_rt_pipeline->submit(std::move(sample));
+            },
+        .lidar =
+            [local_rt_pipeline](meridian::core::LidarSweep sweep) {
+              local_rt_pipeline->submit(std::move(sweep));
+            },
+    });
 
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions{}, 3U);
     executor.add_node(node);
     executor.spin();
 
     // MultiThreadedExecutor::spin has joined its callback workers here. Stop
-    // admission, drain the LiDAR worker, then drain and flush Rerun.
+    // ingress admission and drain its decoder before stopping the downstream
+    // pipeline, so no producer can submit after the local worker is drained.
     executor.remove_node(node);
     node->stop();
+    local_rt_pipeline->stopAndDrain();
     node.reset();
+    local_rt_pipeline.reset();
     debug_sink.shutdown();
 
     const std::uint64_t debug_drops = debug_sink.droppedEvents();
@@ -59,7 +79,7 @@ int main(int argc, char** argv) {
     std::cerr << "meridian_ingress: recording complete; rrd_bytes=" << rrd_bytes
               << ", debug_events_dropped=" << debug_drops << ", debug_log_errors=" << debug_errors
               << '\n';
-    return debug_errors == 0U ? 0 : 1;
+    return debug_errors == 0U && debug_drops == 0U ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << "meridian_ingress: " << error.what() << '\n';
     if (rclcpp::ok()) {

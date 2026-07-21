@@ -54,6 +54,9 @@ public:
     }
     failure_events_.fetch_add(1U, std::memory_order_relaxed);
   }
+  void record(const core::PreintegrationEvent&) noexcept override {}
+  void record(const core::InitializationEvent&) noexcept override {}
+  void record(const core::BootstrapPoseEvent&) noexcept override {}
   [[nodiscard]] std::uint64_t droppedEvents() const noexcept override { return 0U; }
   [[nodiscard]] std::uint64_t logErrors() const noexcept override { return 0U; }
 
@@ -236,8 +239,9 @@ TEST_F(SensorIngressNodeTest, ForwardsOwnedConfiguredObservationsAndRecordsDebug
             forwarded_lidar.fetch_add(1U, std::memory_order_relaxed);
           },
   };
-  auto ingress =
-      std::make_shared<SensorIngressNode>(optionsFor("forward"), sink, std::move(callbacks));
+  auto ingress = std::make_shared<SensorIngressNode>(optionsFor("forward"), sink);
+  ingress->setObservationCallbacks(std::move(callbacks));
+  EXPECT_THROW(ingress->setObservationCallbacks({}), std::logic_error);
   auto peer = std::make_shared<rclcpp::Node>("meridian_ingress_forward_test_peer");
   auto imu_publisher = peer->create_publisher<sensor_msgs::msg::Imu>("/meridian_test/imu_forward",
                                                                      rclcpp::SensorDataQoS());

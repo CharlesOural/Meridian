@@ -7,7 +7,10 @@ include(MeridianToolchain)
 include(MeridianTesting)
 
 add_library(meridian_core
+  src/geometry.cpp
   src/ids.cpp
+  src/initialization.cpp
+  src/navigation.cpp
   src/observations.cpp
   src/time.cpp
 )
@@ -33,6 +36,15 @@ install(DIRECTORY include/ DESTINATION include)
 if(BUILD_TESTING)
   meridian_add_gtest(test_time test/test_time.cpp)
   target_link_libraries(test_time meridian_core)
+
+  meridian_add_gtest(test_geometry test/test_geometry.cpp)
+  target_link_libraries(test_geometry meridian_core)
+
+  meridian_add_gtest(test_navigation test/test_navigation.cpp)
+  target_link_libraries(test_navigation meridian_core)
+
+  meridian_add_gtest(test_initialization test/test_initialization.cpp)
+  target_link_libraries(test_initialization meridian_core)
 
   meridian_add_gtest(test_observations test/test_observations.cpp)
   target_link_libraries(test_observations meridian_core)

@@ -175,6 +175,8 @@ SensorIngressNode::SensorIngressNode(const rclcpp::NodeOptions& options,
     : rclcpp::Node("meridian_ingress", options),
       debug_sink_(debug_sink),
       observation_callbacks_(std::move(observation_callbacks)),
+      observation_callbacks_configured_(static_cast<bool>(observation_callbacks_.imu) ||
+                                        static_cast<bool>(observation_callbacks_.lidar)),
       imu_config_(makeImuConfig(*this)),
       lidar_config_(makeLidarConfig(*this)),
       imu_topic_(requiredStringParameter(*this, "imu_topic")),
@@ -222,6 +224,17 @@ SensorIngressNode::SensorIngressNode(const rclcpp::NodeOptions& options,
 
 SensorIngressNode::~SensorIngressNode() {
   stop();
+}
+
+void SensorIngressNode::setObservationCallbacks(ObservationCallbacks observation_callbacks) {
+  if (observation_callbacks_configured_) {
+    throw std::logic_error("observation callbacks have already been configured");
+  }
+  if (!accepting_.load(std::memory_order_relaxed)) {
+    throw std::logic_error("observation callbacks cannot be configured after ingress stops");
+  }
+  observation_callbacks_ = std::move(observation_callbacks);
+  observation_callbacks_configured_ = true;
 }
 
 std::int64_t SensorIngressNode::steadyNowNs() noexcept {

@@ -9,19 +9,11 @@
 #include <string_view>
 #include <vector>
 
+#include "meridian/core/geometry.hpp"
 #include "meridian/core/ids.hpp"
 #include "meridian/core/time.hpp"
 
 namespace meridian::core {
-
-struct Vec3d final {
-  double x{};
-  double y{};
-  double z{};
-
-  [[nodiscard]] bool isFinite() const noexcept;
-  friend bool operator==(const Vec3d&, const Vec3d&) noexcept = default;
-};
 
 class ObservationHeader final {
 public:

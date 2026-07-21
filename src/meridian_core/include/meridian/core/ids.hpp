@@ -40,4 +40,16 @@ private:
   std::uint64_t value_;
 };
 
+class StateId final {
+public:
+  constexpr explicit StateId(std::uint64_t value) noexcept : value_(value) {}
+
+  [[nodiscard]] constexpr std::uint64_t value() const noexcept { return value_; }
+  friend constexpr bool operator==(StateId, StateId) noexcept = default;
+  friend constexpr auto operator<=>(StateId, StateId) noexcept = default;
+
+private:
+  std::uint64_t value_;
+};
+
 }  // namespace meridian::core

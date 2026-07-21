@@ -36,6 +36,10 @@ public:
   SensorIngressNode(const SensorIngressNode&) = delete;
   SensorIngressNode& operator=(const SensorIngressNode&) = delete;
 
+  // Installs the observation handoff exactly once. This must be called before
+  // the node is added to an executor so callbacks cannot race the assignment.
+  void setObservationCallbacks(ObservationCallbacks observation_callbacks);
+
   // Stops admission and drains the LiDAR decoder. Safe to call more than once.
   void stop() noexcept;
 
@@ -60,6 +64,7 @@ private:
 
   core::DebugSink& debug_sink_;
   ObservationCallbacks observation_callbacks_;
+  bool observation_callbacks_configured_{};
   ImuConversionConfig imu_config_;
   LidarConversionConfig lidar_config_;
 

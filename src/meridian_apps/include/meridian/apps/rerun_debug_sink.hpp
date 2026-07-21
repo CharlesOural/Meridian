@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -26,7 +27,8 @@ class RerunDebugSink final : public core::DebugSink {
 public:
   struct Options final {
     std::filesystem::path output_path;
-    std::size_t queue_capacity{8192U};
+    std::size_t queue_capacity{65'536U};
+    std::chrono::nanoseconds preintegration_debug_period{std::chrono::milliseconds(500)};
   };
 
   explicit RerunDebugSink(Options options);
@@ -40,6 +42,13 @@ public:
   void record(const core::LidarAcceptedEvent& event) noexcept override;
   void record(const core::LidarPreviewEvent& event) noexcept override;
   void record(const core::IngressFailureEvent& event) noexcept override;
+  void record(const core::PreintegrationEvent& event) noexcept override;
+  void record(const core::InitializationEvent& event) noexcept override;
+  void record(const core::BootstrapPoseEvent& event) noexcept override;
+  void record(const core::LocalTrajectoryEvent& event) noexcept override;
+  void record(const core::LocalRegistrationMapEvent& event) noexcept override;
+  void record(const core::StageTimingEvent& event) noexcept override;
+  void record(const core::LocalEstimatorEvent& event) noexcept override;
   [[nodiscard]] std::uint64_t droppedEvents() const noexcept override;
   [[nodiscard]] std::uint64_t logErrors() const noexcept override;
 
@@ -48,8 +57,12 @@ public:
   void shutdown() noexcept;
 
 private:
-  using Event = std::variant<core::ImuAcceptedEvent, core::LidarAcceptedEvent,
-                             core::LidarPreviewEvent, core::IngressFailureEvent>;
+  using Event =
+      std::variant<core::ImuAcceptedEvent, core::LidarAcceptedEvent, core::LidarPreviewEvent,
+                   core::IngressFailureEvent, core::PreintegrationEvent, core::InitializationEvent,
+                   core::BootstrapPoseEvent, core::LocalTrajectoryEvent,
+                   core::LocalRegistrationMapEvent, core::StageTimingEvent,
+                   core::LocalEstimatorEvent>;
 
   void enqueue(Event event) noexcept;
   void workerLoop(std::unique_ptr<rerun::RecordingStream> recording) noexcept;

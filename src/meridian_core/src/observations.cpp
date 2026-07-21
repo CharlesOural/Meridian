@@ -1,14 +1,9 @@
 #include "meridian/core/observations.hpp"
 
-#include <cmath>
 #include <stdexcept>
 #include <utility>
 
 namespace meridian::core {
-
-bool Vec3d::isFinite() const noexcept {
-  return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
-}
 
 ObservationHeader::ObservationHeader(SensorId sensor_id, CalibrationId calibration_id,
                                      MeasurementId measurement_id, TimeNs measurement_time,

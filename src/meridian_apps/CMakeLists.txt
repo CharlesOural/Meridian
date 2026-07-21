@@ -4,6 +4,7 @@ project(meridian_apps LANGUAGES CXX)
 find_package(ament_cmake REQUIRED)
 find_package(meridian_cmake REQUIRED)
 find_package(meridian_core REQUIRED)
+find_package(meridian_local_rt REQUIRED)
 find_package(meridian_ros REQUIRED)
 find_package(rclcpp REQUIRED)
 include(MeridianToolchain)
@@ -19,6 +20,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(rerun_sdk)
 
 add_executable(meridian_ingress
+  src/local_rt_config_loader.cpp
   src/meridian_ingress_main.cpp
   src/rerun_debug_sink.cpp
 )
@@ -28,6 +30,7 @@ target_include_directories(meridian_ingress
 )
 target_link_libraries(meridian_ingress
   meridian_core::meridian_core
+  meridian_local_rt::meridian_local_rt
   meridian_ros::meridian_ros_ingress
   rerun_sdk
 )

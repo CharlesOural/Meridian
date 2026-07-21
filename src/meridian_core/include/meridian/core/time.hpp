@@ -27,4 +27,25 @@ private:
   std::int64_t nanoseconds_;
 };
 
+// A half-open measurement-time interval [begin, end). Empty ranges are valid;
+// algorithm-specific records may require non-empty support.
+class TimeRange final {
+public:
+  TimeRange(TimeNs begin, TimeNs end);
+
+  [[nodiscard]] constexpr TimeNs begin() const noexcept { return begin_; }
+  [[nodiscard]] constexpr TimeNs end() const noexcept { return end_; }
+  [[nodiscard]] constexpr bool empty() const noexcept { return begin_ == end_; }
+  [[nodiscard]] constexpr bool contains(TimeNs time) const noexcept {
+    return begin_ <= time && time < end_;
+  }
+  [[nodiscard]] std::optional<std::int64_t> durationNs() const noexcept;
+
+  friend bool operator==(const TimeRange&, const TimeRange&) noexcept = default;
+
+private:
+  TimeNs begin_;
+  TimeNs end_;
+};
+
 }  // namespace meridian::core

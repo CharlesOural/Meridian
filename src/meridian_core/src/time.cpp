@@ -1,6 +1,7 @@
 #include "meridian/core/time.hpp"
 
 #include <limits>
+#include <stdexcept>
 
 namespace meridian::core {
 namespace {
@@ -59,6 +60,16 @@ std::optional<std::int64_t> TimeNs::checkedDifference(TimeNs lhs, TimeNs rhs) no
     return std::nullopt;
   }
   return left - right;
+}
+
+TimeRange::TimeRange(TimeNs begin, TimeNs end) : begin_(begin), end_(end) {
+  if (end_ < begin_) {
+    throw std::invalid_argument("TimeRange end precedes begin");
+  }
+}
+
+std::optional<std::int64_t> TimeRange::durationNs() const noexcept {
+  return TimeNs::checkedDifference(end_, begin_);
 }
 
 }  // namespace meridian::core

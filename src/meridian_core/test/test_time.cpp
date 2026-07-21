@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 
 #include "meridian/core/time.hpp"
 
@@ -44,6 +45,28 @@ TEST(TimeNs, CheckedArithmeticCatchesBothOverflowDirections) {
   EXPECT_FALSE(TimeNs::checkedDifference(maximum, TimeNs(-1)).has_value());
   EXPECT_FALSE(TimeNs::checkedDifference(minimum, TimeNs(1)).has_value());
   EXPECT_EQ(TimeNs::checkedDifference(TimeNs(10), TimeNs(3)), 7);
+}
+
+TEST(TimeRange, EnforcesOrderingAndUsesHalfOpenContainment) {
+  const TimeRange range(TimeNs(10), TimeNs(20));
+  EXPECT_EQ(range.begin(), TimeNs(10));
+  EXPECT_EQ(range.end(), TimeNs(20));
+  EXPECT_FALSE(range.empty());
+  EXPECT_TRUE(range.contains(TimeNs(10)));
+  EXPECT_TRUE(range.contains(TimeNs(19)));
+  EXPECT_FALSE(range.contains(TimeNs(20)));
+  ASSERT_TRUE(range.durationNs().has_value());
+  EXPECT_EQ(*range.durationNs(), 10);
+
+  const TimeRange empty(TimeNs(4), TimeNs(4));
+  EXPECT_TRUE(empty.empty());
+  EXPECT_THROW(static_cast<void>(TimeRange(TimeNs(5), TimeNs(4))), std::invalid_argument);
+}
+
+TEST(TimeRange, ReportsDurationOverflow) {
+  const TimeRange full(TimeNs(std::numeric_limits<std::int64_t>::min()),
+                       TimeNs(std::numeric_limits<std::int64_t>::max()));
+  EXPECT_FALSE(full.durationNs().has_value());
 }
 
 }  // namespace
