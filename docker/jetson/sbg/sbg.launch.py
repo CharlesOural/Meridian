@@ -66,16 +66,18 @@ def generate_launch_description():
             name="rtk_monitor",
             output="screen",
         ),
-        # Identity placeholder so the IMU frame exists in the TF tree for preview.
-        # Replace with the measured os_sensor<-sbg_imu extrinsic at calibration.
+        # Measured extrinsic, IMU as the tree root: os_sensor pose expressed in sbg_imu
+        # (parent sbg_imu, child os_sensor). Bench-measured on the Taurus/Mobilex mount;
+        # roll ~pi + yaw ~pi is the LiDAR's ~180deg flip relative to the IMU. RPY is applied
+        # Rz(yaw)Ry(pitch)Rx(roll), which is the convention static_transform_publisher uses.
         Node(
             package="tf2_ros",
             executable="static_transform_publisher",
             name="sbg_static_tf",
             arguments=[
-                "--x", "0", "--y", "0", "--z", "0",
-                "--roll", "0", "--pitch", "0", "--yaw", "0",
-                "--frame-id", "os_sensor", "--child-frame-id", "sbg_imu",
+                "--x", "-0.454687", "--y", "0.013142", "--z", "0.257027",
+                "--roll", "3.14", "--pitch", "0.001", "--yaw", "3.043",
+                "--frame-id", "sbg_imu", "--child-frame-id", "os_sensor",
             ],
         ),
     ])

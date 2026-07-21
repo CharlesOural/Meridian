@@ -9,10 +9,23 @@ name: meridian-jetson
 #   docker compose -f compose.jetson.yaml logs -f ouster
 #   Foxglove → Open connection → Foxglove WebSocket → ws://<jetson-host>:8765
 #
+# Recording a dataset off this stack: see docs/RECORDING.md and tools/record_bag.sh.
+#
 # Sensor addresses default to the values discovered on this rig; override them via
 # the environment (or a sibling .env file) without editing this file:
 #   OUSTER_HOSTNAME  the LiDAR's address (IPv4 link-local or os-<serial>.local)
 #   OUSTER_UDP_DEST  this host's end0 IP, where the sensor streams UDP
+
+# Every participant on the graph must load the same FastDDS profile. The profile replaces
+# the builtin transports, so a container that misses it keeps the default 536 KB shared
+# memory segment and ends up mismatched against the tuned one -- which costs messages on
+# both sides, not just its own. Anchored here so a service cannot silently drift.
+x-dds-env: &dds-env
+  ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+  FASTRTPS_DEFAULT_PROFILES_FILE: /dds.xml
+x-dds-volume: &dds-volume
+  ./docker/jetson/dds/fastdds_large.xml:/dds.xml:ro
+
 services:
   # Meridian runtime
   # meridian:
@@ -71,18 +84,44 @@ services:
     restart: unless-stopped
     depends_on:
       - ptp
-    environment:
-      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
-    # TIME_FROM_PTP_1588: stamp from the PTP-disciplined clock. ptp_utc_tai_offset=0
-    # because our grandmaster is free-running host time, not UTC (the -37s default
-    # would inject a 37 s cross-sensor offset).
-    command: >
-      ros2 launch ouster_ros sensor.launch.xml
-      sensor_hostname:=${OUSTER_HOSTNAME:-192.168.100.10}
-      udp_dest:=${OUSTER_UDP_DEST:-192.168.100.1}
-      timestamp_mode:=TIME_FROM_PTP_1588
-      ptp_utc_tai_offset:=0.0
-      viz:=false
+    environment: *dds-env
+    volumes:
+      - *dds-volume
+    # TIME_FROM_PTP_1588: stamp from the PTP-disciplined clock. ptp_utc_tai_offset=0 is
+    # correct only because ptp4l.conf announces utc_offset 0: the sensor derives its clock
+    # as UTC = PTP - currentUtcOffset, and what this grandmaster serves is already UTC, so
+    # nothing is left for the driver to re-add. The two settings are one decision -- with
+    # the linuxptp default (37) still announced, the sensor stamps every scan 37 s before
+    # the host-stamped IMU and no driver-side value makes the pair consistent.
+    # lidar_mode=1024x10 pins the sensor to 10 Hz (the sensor's stored mode is 20 Hz;
+    # the config and timing budgets are sized for 10 Hz). point_cloud_frame=os_sensor
+    # makes the cloud frame match the frame the LiDAR<-IMU extrinsic was measured to
+    # (the driver default os_lidar differs by 180deg about Z + a Z offset).
+    # proc_mask defaults to PCL|IMU|TLM, dropping the range/signal/nearir/reflec images and
+    # the LaserScan the driver would otherwise compute every scan. Nothing here consumes
+    # them and all are derivable from the cloud offline. Set OUSTER_PROC_MASK to the
+    # driver's IMG|PCL|IMU|SCAN|TLM to get them back for previewing.
+    # use_system_default_qos defaults to true: RELIABLE instead of the sensor-data default
+    # (BEST_EFFORT). BEST_EFFORT lets a subscriber that falls behind lose scans silently,
+    # which is exactly the failure a dataset must not have -- measured at 5.5% of scans
+    # lost while recording, and 0% with RELIABLE. Set OUSTER_RELIABLE_QOS=false to revert.
+    # List form, not a folded string: proc_mask's separator is `|`, and compose parses a
+    # string command with shell semantics, so the folded form truncates at the first pipe
+    # and silently drops every argument after it (including viz:=false).
+    command:
+      - ros2
+      - launch
+      - ouster_ros
+      - sensor.launch.xml
+      - sensor_hostname:=${OUSTER_HOSTNAME:-192.168.100.10}
+      - udp_dest:=${OUSTER_UDP_DEST:-192.168.100.1}
+      - timestamp_mode:=TIME_FROM_PTP_1588
+      - ptp_utc_tai_offset:=0.0
+      - lidar_mode:=1024x10
+      - point_cloud_frame:=os_sensor
+      - proc_mask:=${OUSTER_PROC_MASK:-PCL|IMU|TLM}
+      - use_system_default_qos:=${OUSTER_RELIABLE_QOS:-true}
+      - viz:=false
 
   sbg:
     build:
@@ -101,7 +140,7 @@ services:
     group_add:
       - dialout
     environment:
-      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+      <<: *dds-env
       # RTK corrections from the Centipede network (free, open). NTRIP_MOUNTPOINT is a
       # named base, NOT the NEAR auto-select: NEAR needs the rover GGA in the HTTP request
       # header and ntrip_client can only send it over the socket, which this caster
@@ -116,13 +155,21 @@ services:
       NTRIP_USERNAME: "${NTRIP_USERNAME:-centipede}"
       NTRIP_PASSWORD: "${NTRIP_PASSWORD:-centipede}"
     volumes:
+      - *dds-volume
       - ./docker/jetson/sbg/sbg_config.yaml:/config/sbg_config.yaml:ro
       - ./docker/jetson/sbg/sbg.launch.py:/sbg.launch.py:ro
       - ./docker/jetson/sbg/rtk_monitor.py:/rtk_monitor.py:ro
     command: ros2 launch /sbg.launch.py
 
   # ZED 2i as a plain UVC stereo camera (no ZED SDK; none ships for this L4T).
+  # Only the LIO stack consumes no camera, so this service is opt-in: it belongs to the
+  # `camera` profile and stays down unless asked for, keeping its ~165 MB/s off the graph
+  # during LIO-only runs.
+  #   docker compose -f compose.jetson.yaml --profile camera up -d zed
+  # ZED_WIDTH/ZED_HEIGHT pick the UVC mode; the default is the sensor's maximum
+  # (4416x1242 @15, 2208x1242 per eye). See zed_uvc.launch.py for the mode table.
   zed:
+    profiles: ["camera"]
     build:
       context: ./docker/jetson/zed
       args:
@@ -139,11 +186,16 @@ services:
     group_add:
       - video
     environment:
-      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+      <<: *dds-env
+      ZED_WIDTH: "${ZED_WIDTH:-4416}"
+      ZED_HEIGHT: "${ZED_HEIGHT:-1242}"
     volumes:
+      - *dds-volume
       - ./docker/jetson/zed/zed_uvc.launch.py:/zed_uvc.launch.py:ro
     command: ros2 launch /zed_uvc.launch.py
 
+  # Builds FROM meridian-sbg:humble to copy the SBG message definitions in -- the bridge
+  # cannot serve a topic whose schema it cannot resolve, so build the sbg service first.
   foxglove:
     build:
       context: ./docker/jetson/foxglove
@@ -156,5 +208,27 @@ services:
                                     # transport works across containers (UDP-only
                                     # discovery succeeds without this, but data drops)
     restart: unless-stopped
-    environment:
-      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+    environment: *dds-env
+    volumes:
+      - *dds-volume
+
+  # Dataset recorder image. Present so `docker compose build` produces it alongside the
+  # drivers it depends on (it builds FROM meridian-sbg and meridian-ouster, so build those
+  # first). It is never started as a service -- recording is a foreground, Ctrl-C-to-stop
+  # operation driven by tools/record_bag.sh, which runs this image directly.
+  #   docker compose -f compose.jetson.yaml --profile record build recorder
+  #   tools/record_bag.sh full campus
+  recorder:
+    profiles: ["record"]
+    build:
+      context: ./docker/jetson/recorder
+      args:
+        ROS_DISTRO: humble
+    image: meridian-recorder:humble
+    network_mode: host
+    ipc: host
+    environment: *dds-env
+    volumes:
+      - *dds-volume
+      - ./bags:/bags
+    command: ["bash", "-lc", "echo 'use tools/record_bag.sh'; exit 0"]

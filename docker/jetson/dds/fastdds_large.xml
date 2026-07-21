@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+FastDDS tuning for this rig's large samples. The default shared-memory segment is ~536 KB,
+while one OS-1-128 scan is 6.3 MB and one 4416x1242 stereo frame is 11 MB: every such
+sample overflows the segment and falls back to fragmented UDP loopback, which drops under
+concurrent load and costs whole LiDAR scans.
+
+segment_size 512 MB holds a deep queue of both. The UDP descriptor is kept as a fallback
+so a participant that cannot map the segment (a non-root process, or one without
+--ipc host) still communicates instead of going silent.
+-->
+<dds xmlns="http://www.eprosima.com">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_large</transport_id>
+        <type>SHM</type>
+        <segment_size>536870912</segment_size>
+        <!-- Bound a single fragment below the segment so the largest sample (11 MB)
+             transfers whole rather than being split across port queue entries.
+             camelCase: this field is common to all transports, unlike the SHM-specific
+             snake_case ones, and FastDDS rejects the whole descriptor if it is misnamed. -->
+        <maxMessageSize>16777216</maxMessageSize>
+        <port_queue_capacity>1024</port_queue_capacity>
+      </transport_descriptor>
+      <transport_descriptor>
+        <transport_id>udp_fallback</transport_id>
+        <type>UDPv4</type>
+        <sendBufferSize>16777216</sendBufferSize>
+        <receiveBufferSize>16777216</receiveBufferSize>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="large_data" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_large</transport_id>
+          <transport_id>udp_fallback</transport_id>
+        </userTransports>
+        <!-- The listed transports replace the defaults; leaving the builtin ones on would
+             re-add the 536 KB SHM descriptor and races between the two segments. -->
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

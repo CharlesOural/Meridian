@@ -1,0 +1,9 @@
+# Keep the build context small: only src/ and docker/ are COPYed into images.
+.git
+bags
+build
+install
+log
+docs
+**/__pycache__
+*.pyc
